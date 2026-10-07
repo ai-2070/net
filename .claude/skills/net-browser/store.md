@@ -362,10 +362,12 @@ writes.
     the joiner announces the node's own `tags` again, and an announcement
     replaces the whole tag set, so it wipes a listing created a moment before.
     This matters when the host leaves and another player takes over: `await
-    joined.close()` first, then `createLobby`.
-  - **Taking over a lobby.** The joiner sees the host go as
-    `subscribeStatus` with `error.code === 'owner-lost'` or `phase` `closed` /
-    `failed`. The new host re-opens it with `createLobby` and the same `info`
+    joined.close()` first, then `createLobby`. `close()` resolves only once
+    that withdrawal has been announced, so awaiting it is enough.
+  - **Taking over a lobby.** The joiner sees the host go as `subscribeStatus`
+    reporting `phase` `closed` or `failed`. Its `error` is `null` when the
+    host said goodbye: `owner-lost` surfaces only from the next `ready()` /
+    `act()` on the handle, so don't wait for it in the listener. The new host re-opens it with `createLobby` and the same `info`
     (Rose & Blade carries its fight id there), so the others find the same
     game under a new code.
   - **The credential's `game` and the lobby's `game` are separate names.**

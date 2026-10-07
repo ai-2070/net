@@ -403,9 +403,13 @@ subscription at once. `lobby.self` is the host's own player (below).
 - **Close a joined lobby before creating one on the same node.** Leaving a
   lobby announces the node's own `tags` again, which replaces the whole tag set
   and wipes a listing created a moment before. When the host leaves and another
-  player takes over, `await joined.close()` first, then `createLobby`.
-- **Taking over.** A player sees the host go through `subscribeStatus`: an
-  `error.code` of `owner-lost`, or a `phase` of `closed` or `failed`. The player
+  player takes over, `await joined.close()` first, then `createLobby`. `close()`
+  resolves only once that withdrawal has been announced, so awaiting it is
+  enough.
+- **Taking over.** A player sees the host go through `subscribeStatus`, as a
+  `phase` of `closed` or `failed`. When the host said goodbye the status carries
+  no error: `owner-lost` surfaces only from the next `ready()` or `act()` on the
+  handle, so watch the phase. The player
   taking over calls `createLobby` with the same `info`, so the others find the
   same game again under a new code.
 - **Two different `game` names.** `requestCredential({ game })` names the anchor

@@ -579,17 +579,22 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
   const node = options.node;
   const keep = [...(options.tags ?? [])];
   const seeking = [...keep, seekTag(options.game, host)];
-  let stopped = false;
+  let stopped: Promise<void> | null = null;
   const announce = () => {
-    if (!stopped) node.announce(seeking).catch(() => {});
+    if (stopped === null) node.announce(seeking).catch(() => {});
   };
   announce();
   const timer = setInterval(announce, LOBBY_ANNOUNCE_MS);
-  const stop = () => {
-    if (stopped) return;
-    stopped = true;
+  // Withdraws the seek tag. Settles once that announcement has, so a
+  // `close()` that awaits it is an ordering barrier: an announcement
+  // replaces the node's whole tag set, and a withdrawal still in flight
+  // when the page goes on to `createLobby` would land after the new
+  // listing and erase it.
+  const stop = (): Promise<void> => {
+    if (stopped !== null) return stopped;
     clearInterval(timer);
-    node.announce(keep).catch(() => {});
+    stopped = node.announce(keep).catch(() => {});
+    return stopped;
   };
 
   // Reach the host before joining. Until this player's announcement has
@@ -604,7 +609,7 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
         break;
       } catch (error) {
         if (Date.now() >= deadline) {
-          stop();
+          void stop();
           throw new LobbyError('not-found', `could not reach the lobby's host ${host}: ${String((error as Error)?.message ?? error)}`);
         }
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -624,13 +629,14 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
       ...(options.interest === undefined ? {} : { interest: options.interest }),
     });
   } catch (error) {
-    stop();
+    void stop();
     throw error;
   }
   const close = joined.close.bind(joined);
   (joined as { close: () => Promise<void> }).close = async () => {
-    stop();
+    const withdrawn = stop();
     await close();
+    await withdrawn;
   };
   return joined;
 }

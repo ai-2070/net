@@ -108,6 +108,7 @@ net-mesh --output ndjson anchor serve \
   --tls-cert cert.pem --tls-key key.pem \
   --issuer-identity issuer.toml --insecure-permissions \
   --game my-game --allow-origin https://localhost:8443 \
+  --allow-origin http://localhost:8443 \
   --game-stats-secs 5     # optional: per-game counters on stdout
 ```
 
@@ -116,8 +117,12 @@ net-mesh --output ndjson anchor serve \
 - The certificate comes from **mkcert** (`mkcert -install` once, then `mkcert
   -cert-file cert.pem -key-file key.pem localhost 127.0.0.1`), so the browser
   trusts it. `localhost` counts as a secure context, so the page itself may be
-  served over plain HTTP on one machine; across a LAN both page and anchor
-  need HTTPS, and every machine must trust your mkcert CA.
+  served over plain HTTP on one machine. Across a LAN both page and anchor
+  need HTTPS on the LAN address: add it to the certificate (`mkcert …
+  localhost 127.0.0.1 <lan-host-or-ip>`), use it in `--url` and
+  `--allow-origin`, and have every machine trust your mkcert CA.
+- `--allow-origin` is matched exactly, scheme and port included: list the
+  origin the page is really served from.
 - `--insecure-permissions` accepts key files with loose permissions (Windows,
   a checked-out dev folder). Never on a real anchor.
 - With `--output ndjson`, wait for the line carrying `credential_endpoint`
@@ -318,8 +323,9 @@ on the node, and when the page comes back to the front:
 - **A probe catches the rest.** Call a service nobody serves:
   `node.call('my-game.alive', new Uint8Array(0), 5000)`. The anchor itself
   refuses it, so a rejection with `kind === 'rpc-refused'` **proves the session
-  is alive**; a timeout means it is gone. A `query` won't do: the node answers
-  it from what it last heard.
+  is alive**. A timeout is inconclusive (a delayed packet, an unenrolled node):
+  take the session for gone only after **two unanswered probes in a row**. A
+  `query` won't do: the node answers it from what it last heard.
 - **Re-check on `visibilitychange`** to `visible`, and before showing a lobby
   list or hosting if the last check is older than ~20 s. One check at a time;
   everything that asks waits on it.
@@ -331,7 +337,13 @@ on the node, and when the page comes back to the front:
   page for gone.
 
 ```typescript
-async function alive(node: BrowserNode): Promise<boolean> {
+let node = await connect({ credentialB64, bootstrapUrl });
+let inMatch = false;                        // true while a match runs on this node
+let checking: Promise<void> | null = null;  // one check at a time
+
+// One probe: true when the anchor answered, false when nothing came back
+// in time (inconclusive on its own).
+function probe(): Promise<boolean> {
   return Promise.race([
     node.call('my-game.alive', new Uint8Array(0), 5000).then(
       () => true,
@@ -340,12 +352,18 @@ async function alive(node: BrowserNode): Promise<boolean> {
     new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5500)),
   ]);
 }
-document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && !inMatch && !(await alive(node))) {
-    node.close();
-    const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game });
-    node = await connect({ credentialB64, bootstrapUrl });
-  }
+
+async function recheck(): Promise<void> {
+  if (inMatch) return;
+  if ((await probe()) || (await probe())) return;  // gone only after two misses in a row
+  try { node.close(); } catch { /* already gone */ }
+  const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game: 'my-game' });
+  node = await connect({ credentialB64, bootstrapUrl });
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  checking ??= recheck().catch(() => {}).finally(() => { checking = null; });
 });
 ```
 

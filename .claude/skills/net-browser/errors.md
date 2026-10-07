@@ -193,8 +193,11 @@ is no longer reported as cancelled on a follower.
 
 `rpc-refused` is an answer, so it proves the far end is there. A page checking
 whether its session with the anchor survived a stay in the background calls a
-service nobody serves: `rpc-refused` means alive, a timeout means the session
-is gone. See `session.md` § *Staying connected: background tabs*.
+service nobody serves: `rpc-refused` means alive. A timeout means only that no
+answer arrived before the deadline, which an unenrolled node or a delayed packet
+also produces, so it is inconclusive: treat the session as gone after a
+`disconnected` event or two unanswered probes in a row. See `session.md` §
+*Staying connected: background tabs*.
 
 ## Store errors
 

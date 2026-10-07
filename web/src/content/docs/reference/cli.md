@@ -223,13 +223,14 @@ net-mesh --output ndjson anchor serve \
   --rtc-bind 127.0.0.1:0 \
   --tls-cert cert.pem --tls-key key.pem \
   --issuer-identity issuer.json --insecure-permissions \
-  --game my-game --allow-origin https://localhost:8443
+  --game my-game --allow-origin https://localhost:8443 --allow-origin http://localhost:8443
 ```
 
 - **`psk.hex`** is 32 random bytes as hex, and `issuer.json` comes from `net-mesh identity generate --out issuer.json`. Keep both out of version control.
 - **`--insecure-permissions`** accepts key files with loose permissions, as a checked-out dev folder often has. Never use it on a real anchor.
 - **Ready** is the NDJSON line carrying `credential_endpoint`. Open the page after it.
-- **Secure context.** Browsers treat `localhost` as one, so on one machine the page itself may be plain HTTP. Across a LAN, serve the page over HTTPS too, bind both to the LAN address, and have every machine trust your mkcert CA.
+- **`--allow-origin` is matched exactly**, scheme and port included: list the origin the page is actually served from (the example allows the page on port 8443 over either scheme).
+- **Secure context.** Browsers treat `localhost` as one, so on one machine the page itself may be plain HTTP. Across a LAN, serve the page over HTTPS too and bind both to the LAN address. The certificate must then name that address, since `--url` and the page's origin use it: `mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 <lan-host-or-ip>`. Use the LAN address in `--url` and `--allow-origin`, and have every machine trust your mkcert CA.
 - **Pointing the page at it.** Read the anchor URL from the page's query string (`?anchor=https://localhost:8444`), falling back to the public anchor.
 
 ## Serve IPv4 and IPv6 players

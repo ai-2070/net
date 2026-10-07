@@ -304,6 +304,35 @@ describe('joining reaches a host that only accepts discovered peers', () => {
     expect(await ids(seek)).toEqual([]);
   });
 
+  // An announcement replaces the node's whole tag set, so a withdrawal still
+  // in flight when the page goes on to `createLobby` lands after the new
+  // listing and erases it: `close()` resolves only once it has settled.
+  it('resolves close only once the seek tag is withdrawn', async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const { joiner } = strictJoiner(mesh, hostNode);
+    const withdrawal = Promise.withResolvers<void>();
+    const slow = {
+      ...joiner,
+      announce: async (tags: readonly string[]) => {
+        if (tags.length === 0) await withdrawal.promise;
+        return joiner.announce(tags);
+      },
+    };
+    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    let closed = false;
+    const closing = world.close().then(() => {
+      closed = true;
+    });
+    await settle();
+    expect(closed).toBe(false);
+    withdrawal.resolve();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
   it('names an unreachable host, typed, at the deadline', async () => {
     const mesh = createLocalMesh();
     const hostNode = mesh.node();

@@ -175,17 +175,25 @@ state says so.
 
 - Record `disconnected` events from `node.onEvent`.
 - Probe the rest. Call a service nobody serves: the anchor refuses it, so an
-  `RpcError` with `kind === 'rpc-refused'` proves the session is alive, and a
-  timeout means it is gone. A `query` cannot tell you: the node answers it from
-  what it last heard.
+  `RpcError` with `kind === 'rpc-refused'` proves the session is alive. A
+  timeout only means no answer came in time (a delayed packet does that too),
+  so take the session for gone after two unanswered probes in a row. A `query`
+  cannot tell you: the node answers it from what it last heard.
 - Probe when the page becomes visible again, and before listing or hosting
-  lobbies if the last probe is older than about 20 seconds.
+  lobbies if the last probe is older than about 20 seconds. Run one check at a
+  time, and have everything that asks wait on it.
 - If the session is gone, close the node and connect a new one, as a reload
   would. Leave a node that is in a match alone, and have a backgrounded page
   send a heartbeat so the other players do not take it for gone.
 
 ```typescript
-async function alive(node: BrowserNode): Promise<boolean> {
+let node = await connect({ credentialB64, bootstrapUrl });
+let inMatch = false;                        // true while a match runs on this node
+let checking: Promise<void> | null = null;  // one check at a time
+
+// One probe: true when the anchor answered, false when nothing came back
+// in time (inconclusive on its own).
+function probe(): Promise<boolean> {
   return Promise.race([
     node.call('my-game.alive', new Uint8Array(0), 5000).then(
       () => true,
@@ -195,11 +203,17 @@ async function alive(node: BrowserNode): Promise<boolean> {
   ]);
 }
 
-document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || inMatch || (await alive(node))) return;
-  node.close();
+async function recheck(): Promise<void> {
+  if (inMatch) return;
+  if ((await probe()) || (await probe())) return;  // gone only after two misses in a row
+  try { node.close(); } catch { /* already gone */ }
   const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game: 'my-game' });
   node = await connect({ credentialB64, bootstrapUrl });
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  checking ??= recheck().catch(() => {}).finally(() => { checking = null; });
 });
 ```
 

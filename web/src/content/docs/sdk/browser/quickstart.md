@@ -61,7 +61,7 @@ first player that uses it.
 const node = await connect({
   ...rememberedIdentity(),
   credentialB64,                          // the whole `net-bootstrap:…` string
-  bootstrapUrl: 'https://anchor.ai2070.net', // optional; the credential carries one
+  bootstrapUrl,                           // the anchor that issued the credential
 });
 
 console.log(node.nodeIdHex(), node.anchorIdHex());
