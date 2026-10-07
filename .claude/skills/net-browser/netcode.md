@@ -93,6 +93,50 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
   repeated until a snapshot acknowledges it, so it survives loss.
 - The default `interpolate` lerps numeric fields (nested too) and takes the
   rest from the newer state; supply your own for angles that wrap.
+- **`interpolationDelayMs` is fixed.** Over bursty links (a relayed pair, a
+  busy Wi-Fi) a fixed delay either stutters or adds lag everyone feels. If it
+  stutters, raise it; a custom loop can adapt it (see below).
+
+## No authority: a full mesh
+
+`hostNetcode` / `joinNetcode` assume one authoritative host. A game where
+**each page simulates what it owns** (its own player, plus shared objects for
+whoever leads) can skip them and build on the same parts. Rose & Blade, a three.js melee game
+with physics ragdolls and 2–16 players, works this way:
+
+- **Transport:** one lossy `openStream({ reliability: 'fireAndForget', peer,
+  label, lossy: true })` to every other page, each reopened on its next send
+  after it goes stale (see `session.md` § *Streams*). Direct links per pair,
+  with the glare and answering rules in `session.md`.
+- **Ownership:** every page broadcasts its own entities. One page **leads**
+  (shared AI, props, the match clock); when it goes, the next takes over and
+  re-opens the lobby (`store.md` § lobby gotchas).
+- **Rate:** 120 broadcasts a second, one per rendered frame at most; 60 above
+  8 players, since each page uploads to every other (8v8 at 120 Hz is about
+  9 Mbit/s up). Things that change rarely ride a 60 Hz pulse instead, so a
+  higher send rate doesn't multiply their cost.
+- **Adaptive interpolation delay.** Show each page's frames
+  `delay` in the past, per sender: the 95th percentile of how late its frames
+  arrived over the last 3 s, plus 1.2 frame gaps, plus a few ms, clamped to
+  12–400 ms. Raise it at once when frames come later; ease it back down over
+  about a second. A fixed 40 ms stuttered on real links.
+- **Events (a hit, a cut) ride several broadcasts:** the 1st, 2nd, 3rd, 5th,
+  9th, 17th… after they happen, for a bounded window, de-duplicated by id at
+  the receiver. That survives a lost broadcast without every frame carrying
+  every event.
+- **Packing (still JSON):** fields that change every frame go every time; the
+  rest of each entity is a versioned "cold" part sent when it changes (again
+  1, 2, 4, 8… broadcasts later), in full twice a second, and to a page that
+  just joined. A receiver missing a cold version treats that entity as lost for
+  the broadcast, never mixing old and new.
+- **Size:** frames above 7000 B are split into parts, below the leaf's
+  8104 B event bound (`maxEventBytes`).
+- **Liveness:** a page sends a heartbeat a second when backgrounded (it sends
+  no frames then); one silent for 4 s is taken for gone, and its entities stay
+  drawn 2.5 s longer for whoever takes them over.
+- **Measuring links:** a small ping/pong on the same stream feeds a
+  `ClockEstimator` per peer (median RTT, jitter); `(await
+  node.peerAttempt(peer)).direct` says whether each pair is direct. Show both in a debug overlay.
 
 ## Rules that bite
 

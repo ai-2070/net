@@ -189,6 +189,18 @@ this build does not know to `'replaced'`. A proxied follower receives the
 **precise** retire reason across the leader proxy, so a byte-budget retirement
 is no longer reported as cancelled on a follower.
 
+## `rpc-refused` as a liveness answer
+
+`rpc-refused` is usually an answer, so it proves the far end is there. The
+exception is status 4 (backpressure) with "calls in flight" in the message:
+the leaf's own call table was full and nothing was sent. A page checking
+whether its session with the anchor survived a stay in the background calls a
+service nobody serves: any other `rpc-refused` means alive. A timeout means only that no
+answer arrived before the deadline, which an unenrolled node or a delayed packet
+also produces, so it is inconclusive: treat the session as gone after a
+`disconnected` event or two unanswered probes in a row. See `session.md` §
+*Staying connected: background tabs*.
+
 ## Store errors
 
 A refused store operation is a `StoreError` with its own `.code` — a closed set

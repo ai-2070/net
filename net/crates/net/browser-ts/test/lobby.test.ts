@@ -304,6 +304,72 @@ describe('joining reaches a host that only accepts discovered peers', () => {
     expect(await ids(seek)).toEqual([]);
   });
 
+  // An announcement replaces the node's whole tag set, so a withdrawal still
+  // in flight when the page goes on to `createLobby` lands after the new
+  // listing and erases it: `close()` resolves only once it has settled.
+  it('resolves close only once the seek tag is withdrawn', async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const { joiner } = strictJoiner(mesh, hostNode);
+    const withdrawal = Promise.withResolvers<void>();
+    const slow = {
+      ...joiner,
+      announce: async (tags: readonly string[]) => {
+        if (tags.length === 0) await withdrawal.promise;
+        return joiner.announce(tags);
+      },
+    };
+    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    let closed = false;
+    const closing = world.close().then(() => {
+      closed = true;
+    });
+    await settle();
+    expect(closed).toBe(false);
+    withdrawal.resolve();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
+  // A seeking announcement still in flight at close would land after the
+  // withdrawal and put the seek tag back: the withdrawal waits for it.
+  it('withdraws only after the seeking announcements in flight have settled', async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const { joiner } = strictJoiner(mesh, hostNode);
+    let holding: PromiseWithResolvers<void> | null = null;
+    const held = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const slow = {
+      ...joiner,
+      announce: async (tags: readonly string[]) => {
+        const seeking = tags.length > 0;
+        if (seeking && holding !== null) {
+          held.resolve();
+          await holding.promise;
+        }
+        order.push(seeking ? 'seek' : 'withdraw');
+        return joiner.announce(tags);
+      },
+    };
+    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    holding = Promise.withResolvers<void>();
+    // The re-announce timer's next seeking announcement, held in flight:
+    // waited for by its arrival, not by a sleep the timer might outrun.
+    await held.promise;
+    order.length = 0;
+    const closing = world.close();
+    await settle();
+    expect(order).toEqual([]);
+    holding.resolve();
+    await closing;
+    expect(order).toEqual(['seek', 'withdraw']);
+  });
+
   it('names an unreachable host, typed, at the deadline', async () => {
     const mesh = createLocalMesh();
     const hostNode = mesh.node();

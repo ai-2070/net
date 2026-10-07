@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { BrowserNode, connect, parseAttemptStatus, peerIdHex } from '../src/node.js';
+import { BrowserNode, connect, parseAttemptStatus, parseCounters, peerIdHex } from '../src/node.js';
 import {
   fromWasmError,
   IceServerConflictError,
@@ -277,6 +277,21 @@ describe('BrowserNode', () => {
     const node = await connected(new FakeNode({ anchorIdHex: '00000000000000aa' }));
     expect(node.anchorIdHex()).toBe('00000000000000aa');
     expect(node.counters()).toEqual({ packets_sent: '18446744073709551615', dropped_oversize: '2' });
+  });
+
+  // The leaf nests its per-reason drops (`counters.rs`'s `to_json`), and a
+  // nested group stringified whole read "[object Object]": every drop
+  // reason gone, behind a doc comment promising each one.
+  it('flattens the nested drop reasons into one counter each', () => {
+    const counters = parseCounters(
+      '{"packets_in":"3","drops":{"no_session":"18446744073709551615","replay":"0"}}',
+    );
+    expect(counters).toEqual({
+      packets_in: '3',
+      'drops.no_session': '18446744073709551615',
+      'drops.replay': '0',
+    });
+    expect(Object.values(counters)).not.toContain('[object Object]');
   });
 
   it('sends a session-independent signalling envelope', async () => {
@@ -810,6 +825,32 @@ describe('peer attempts', () => {
     await answering;
     expect(inner.peerAccepts).toEqual([PEER]);
     expect(inner.peerOffers).toEqual([]);
+  });
+
+  // Glare: when the peer (the lower id) has just offered, the higher id
+  // answers it rather than offering back, which would cancel it.
+  it('answers a fresh offer from a lower id instead of offering back', async () => {
+    const inner = new FakeNode({ nodeIdHex: 'ff00000000000000', peerOfferDialog: OLD });
+    const node = await connected(inner);
+    inner.emit(
+      `{"type":"signal","from":"${BigInt(`0x${PEER}`)}","to":"${BigInt('0xff00000000000000')}",` +
+        `"dialog":"1","kind":1,"payload":"","not_after":"0"}`,
+    );
+    await expect(node.connectPeer(PEER)).resolves.toEqual({ type: 'direct', peer: PEER, dialog: OLD });
+    expect(inner.peerAccepts).toEqual([PEER]);
+    expect(inner.peerOffers).toEqual([]);
+  });
+
+  it('offers as before when the fresh offer came to the lower id', async () => {
+    const inner = new FakeNode({ nodeIdHex: '0000000000000001', peerOfferDialog: OLD });
+    const node = await connected(inner);
+    inner.emit(
+      `{"type":"signal","from":"${BigInt(`0x${PEER}`)}","to":"1",` +
+        `"dialog":"1","kind":1,"payload":"","not_after":"0"}`,
+    );
+    await node.connectPeer(PEER);
+    expect(inner.peerOffers).toEqual([PEER]);
+    expect(inner.peerAccepts).toEqual([]);
   });
 
   // Settled attempts are not remembered: a later call is a fresh one.

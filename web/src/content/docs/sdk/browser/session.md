@@ -24,8 +24,9 @@ session.generation();      // exact decimal, moves on every handoff
 ```
 
 Use `openSession` unless you know you want otherwise. Two tabs calling `connect()`
-on one origin are two nodes contending for one identity — which is what the
-election exists to prevent.
+with one identity (a `rememberedIdentity()` already persisted, or the same
+injected secrets) are two nodes contending for it — which is what the election exists to prevent. Without
+one, each tab's `connect()` is a separate node.
 
 ## Declare what a new leader must restore
 
@@ -83,6 +84,54 @@ So a lobby, a store and netcode can each call `connectPeer` for the same host
 without knocking out each other's attempt. This holds per node: another tab's
 node is outside it.
 
+### Two pages, one offerer
+
+Two pages may call `connectPeer` on each other at the same time. Left alone,
+each page's answer would retire its own offer, both would run out their ICE
+deadline, and the pair would stay relayed. So the lower node id offers. On the
+higher id, `connectPeer` answers an offer from the peer that arrived in the last
+10 seconds instead of offering back, and answers an offer that crosses its own
+while it is under way. On either side, `acceptPeer` while the node's own
+`connectPeer` for that peer is under way takes that call's outcome. Offers are
+learned from the node's `signal` events, so no page code is needed, and both
+pages may simply call `connectPeer` again after an attempt ended.
+
+Someone must still answer when only one side offers.
+
+The answering page calls `acceptPeer` **by state, not by memory**: whenever
+`peerAttempt(peer)` shows the pair is neither direct nor connecting, whoever
+offered before. With no offer waiting, `acceptPeer` gives up after a few seconds
+and changes nothing, so calling it on a timer is safe. Gating it on flags such
+as "we offered once" or "it was direct once" leaves every later offer
+unanswered.
+
+| `peerAttempt(peer)` | The pair is | What to do |
+|---|---|---|
+| `direct: true` | direct | nothing |
+| `state` `gathering` or `open`, not direct | connecting | nothing: a new offer would cancel it |
+| `state` `iceTimeout`, `udpBlocked` or `failed` | ended, relayed | either page may `connectPeer` again; the other answers |
+| throws | never attempted | the page reaching out offers |
+
+`peerAttempt` is on `connect()`'s node only.
+
+### Play over the relay first
+
+The routed session is up long before ICE finishes, and most direct links land
+after the first second or so. Don't hold the player on a loading screen for
+them: race `connectPeer` against a short timer, open the stream over the relay,
+and record the real outcome when it lands.
+
+```typescript
+const attempt = node.connectPeer(peer);
+attempt.then((outcome) => { if (outcome.type === 'direct') markDirect(peer); }).catch(() => {});
+await Promise.race([attempt.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 1500))]);
+const stream = node.openStream({ reliability: 'fireAndForget', peer, label, lossy: true });
+```
+
+When the pair goes direct, the stream opened on the relayed session goes stale
+and its `send` rejects with `session`. Reopen it with the same `peer` and
+`label`.
+
 ## A player that comes back
 
 A game's page usually does not hold a credential of its own. It asks a game
@@ -93,16 +142,87 @@ visits:
 import { connect, requestCredential, rememberedIdentity } from '@net-mesh/browser';
 
 const { credentialB64, bootstrapUrl } = await requestCredential({
-  anchorUrl: 'https://anchor.example', game: 'my-game',
+  anchorUrl: 'https://anchor.ai2070.net', game: 'my-game',
 });
 const node = await connect({ credentialB64, bootstrapUrl, ...rememberedIdentity() });
 ```
 
-`requestCredential` is `POST /credential` on an anchor run with `--game`
-(see [CLI](/docs/reference/cli)); it fails with a typed `CredentialRequestError`.
-`rememberedIdentity()` keeps this origin's player secrets in `localStorage`, so
-the same player is the same node on every visit (pass another key for a second
-player on one origin).
+`https://anchor.ai2070.net` is NET's public anchor: it admits any game id,
+and keeps each site's games apart. Read an override from the page URL, so the
+same build can run against a local anchor during development:
+
+```typescript
+const anchorUrl = new URLSearchParams(location.search).get('anchor') ?? 'https://anchor.ai2070.net';
+```
+
+`requestCredential` is `POST /credential` on an anchor run with `--game` or
+`--open-games` (see [CLI](/docs/reference/cli)); it fails with a typed
+`CredentialRequestError`. `rememberedIdentity()` keeps this origin's player
+secrets in `localStorage`, so the same player is the same node on every visit
+(pass another key for a second player on one origin).
+
+Remembering has a cost: a reloaded page comes back as the node it was, while a
+host may still hold that node's old session. A game whose players need not
+persist can leave `rememberedIdentity()` out. Each load is then a new player,
+and a reload never collides with the session it left behind.
+
+## Background tabs
+
+A page left in the background can lose its session with the anchor: the
+browser throttles or freezes it, and the anchor drops it. The node then neither
+sees other players' lobbies nor is seen hosting one, and nothing in the page's
+state says so.
+
+- Record `disconnected` events from `node.onEvent`.
+- Probe the rest. Call a service nobody serves: the anchor refuses it, so an
+  `RpcError` with `kind === 'rpc-refused'` proves the session is alive (except
+  status 4, backpressure, which is the leaf's own full call table). A
+  timeout only means no answer came in time (a delayed packet does that too),
+  so take the session for gone after two unanswered probes in a row. A `query`
+  cannot tell you: the node answers it from what it last heard.
+- Probe when the page becomes visible again, and before listing or hosting
+  lobbies if the last probe is older than about 20 seconds. Run one check at a
+  time, and have everything that asks wait on it.
+- If the session is gone, close the node and connect a new one, as a reload
+  would. Leave a node that is in a match alone, and have a backgrounded page
+  send a heartbeat so the other players do not take it for gone.
+
+```typescript
+let node = await connect({ credentialB64, bootstrapUrl });
+let inMatch = false;                        // true while a match runs on this node
+let checking: Promise<void> | null = null;  // one check at a time
+
+type Heard = 'alive' | 'silent' | 'unsent';
+
+// One probe. 'alive': the anchor answered (a refusal is an answer).
+// 'silent': nothing came back in time, inconclusive on its own. 'unsent':
+// the leaf's own call table was full (status 4), so no probe left the page.
+function probe(): Promise<Heard> {
+  return Promise.race([
+    node.call('my-game.alive', new Uint8Array(0), 5000).then(
+      (): Heard => 'alive',
+      (error): Heard =>
+        error?.kind !== 'rpc-refused' ? 'silent' : error.failure?.status === 4 ? 'unsent' : 'alive',
+    ),
+    new Promise<Heard>((resolve) => setTimeout(() => resolve('silent'), 5500)),
+  ]);
+}
+
+async function recheck(): Promise<void> {
+  if (inMatch) return;
+  // Gone only after two silent probes in a row; an unsent one proves nothing,
+  // so the check ends and runs again next time.
+  if ((await probe()) !== 'silent' || (await probe()) !== 'silent') return;
+  try { node.close(); } catch { /* already gone */ }
+  const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game: 'my-game' });
+  node = await connect({ credentialB64, bootstrapUrl });
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  checking ??= recheck().catch(() => {}).finally(() => { checking = null; });
+});
+```
 
 ## Lifecycle
 

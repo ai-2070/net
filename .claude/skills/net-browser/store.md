@@ -282,9 +282,12 @@ The path the package's own demo (`net/crates/net/browser-ts/demo/main.js`,
 writes.
 
 - **Transport: `connect()`, one tab per player.** A store over `openSession` is
-  not established. All tabs of one origin in one browser profile are **one
-  node**, so test two players with **two browser profiles** (or two browsers),
-  not two tabs.
+  not established. With `rememberedIdentity()`, all tabs of one origin in one
+  browser profile load **one identity** once it is stored, so they are one
+  player (two tabs calling it for the first time at once can each create
+  their own, so open the second tab after the first has connected): test two
+  players with **two browser profiles** (or two browsers), not two tabs.
+  Without it, each tab's `connect()` is a new node.
 - **`maxEventBytes` is required on both sides and must match** — use 8104.
 - **The host player plays through `hostPlayer(host, { audience })`**, never
   `joinStore` on its own node (that throws `invalid-data` — a node has no session
@@ -349,6 +352,32 @@ writes.
   to `joinLobby` (a joiner announces a `seek` tag so the host can find it, and
   an announcement replaces the whole tag set). Unlisted lobbies are not secret —
   gate with `authorize`. Codes: `lobby.link()` / `lobbyCodeFromUrl()`.
+- **Lobby gotchas a real game hit** (Rose & Blade):
+  - **An empty `listLobbies` right after `connect()` is not real yet.**
+    Announcements take a moment to reach a node that just connected. Poll
+    every 500 ms for about 4 s before showing "no games".
+  - **A closed tab's lobby stays listed until its announcement lapses.** The
+    host re-announces every `LOBBY_ANNOUNCE_MS` (2 s); a tab killed outright
+    withdraws nothing. Expect a stale entry for a short while, and a
+    `joinLobby` that answers `not-found`.
+  - **Close a joined lobby before creating one on the same node.** Closing
+    the joiner announces the node's own `tags` again, and an announcement
+    replaces the whole tag set, so it wipes a listing created a moment before.
+    This matters when the host leaves and another player takes over: `await
+    joined.close()` first, then `createLobby`. `close()` resolves only once
+    the withdrawal (after any announcement still in flight) has settled,
+    so awaiting it orders the two. A failed withdrawal is swallowed, not
+    thrown.
+  - **Taking over a lobby.** The joiner sees the host go as `subscribeStatus`
+    reporting `phase` `closed` or `failed`. Its `error` is `null` when the
+    host said goodbye: `owner-lost` surfaces only from the next `ready()` /
+    `act()` on the handle, so don't wait for it in the listener. The new host re-opens it with `createLobby` and the same `info`
+    (Rose & Blade carries its fight id there), so the others find the same
+    game under a new code.
+  - **The credential's `game` and the lobby's `game` are separate names.**
+    `requestCredential({ game })` picks the anchor game (the isolation
+    boundary); `createLobby({ game })` / `listLobbies({ game })` scope the
+    listings inside it. They may differ.
 - **Discovery before join** (without a lobby). Share the host's `node.nodeIdHex()` out of band (the
   demo uses a `?host=<hex>` link). The host announces a tag and **re-announces
   every ~2 s** — announcements are leases that expire. The joiner polls

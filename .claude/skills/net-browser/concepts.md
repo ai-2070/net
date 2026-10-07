@@ -97,8 +97,13 @@ Three traps a game hits first (the full recipe is `store.md` § Game recipe):
   held to the same `authorize`, handlers and projection.
 - **Announcements are leases.** A host that announces once vanishes from
   `query` a few seconds later; re-announce on a timer.
-- **Two tabs are one player.** Same origin + same browser profile = one node, so
-  test with two browser profiles, not two tabs.
+- **With `rememberedIdentity()`, two tabs are one player.** It keeps the
+  secrets in `localStorage`, which every tab of one origin in one browser
+  profile shares, so once they are stored both tabs come up as the same node,
+  and a player cannot join itself. (If storage is blocked or full, or two tabs
+  create the identity at the same moment, each gets fresh secrets.) Test with
+  two browser profiles. Without it, `connect()` makes a
+  new node per tab, and two tabs are two players.
 
 ## 5. Choose the plane by the question, not by the API
 

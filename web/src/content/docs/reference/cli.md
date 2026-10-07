@@ -192,6 +192,8 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 
 `--open-games <state-file>` lets **any game on any site** use the anchor, with no `--game` and no `--allow-origin` for it. A page calls `requestCredential({ anchorUrl, game })` with a game id of its choosing and gets a credential, the same as for a registered game.
 
+NET runs one at `https://anchor.ai2070.net`, which any page may use. Run your own for capacity, for a region closer to your players, or to control the relay.
+
 ```sh
 net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
   --issuer-identity issuer.json --open-games /var/lib/net-anchor/open-games.txt \
@@ -209,6 +211,27 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 - **The state file** lists the open games held, one `<origin> <game>` per line. It lets a restarted anchor still admit a page that reconnects with a credential issued before the restart. Without it, such pages must fetch a new credential. Game roots are derived from `--issuer-identity`, not stored, so the file holds no secrets.
 - **Counters.** With `--game-stats-secs`, every game line carries its `origin` when it is an open game, and the line gains `open_games` (games held, capacity, state-file write errors). The start report shows `open_games: true`.
 - **Relay cost.** A public anchor relays for players whose networks cannot connect directly, and that bandwidth is yours. `--rtc-max-peers` (browser sessions held at once, default 1024; size it to the host) and, if set, the per-game player cap bound how many players it serves. They do not bound bytes, so watch the host's traffic.
+
+### A local anchor for development
+
+A dev script can start an anchor beside the page, so a game runs without the public one. Everything is local; the certificate comes from [mkcert](https://github.com/FiloSottile/mkcert) so the browser trusts it (`mkcert -install` once, then `mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1`):
+
+```sh
+net-mesh --output ndjson anchor serve \
+  --bind 127.0.0.1:0 --psk-file psk.hex \
+  --listen 127.0.0.1:8444 --url https://localhost:8444 \
+  --rtc-bind 127.0.0.1:0 \
+  --tls-cert cert.pem --tls-key key.pem \
+  --issuer-identity issuer.json --insecure-permissions \
+  --game my-game --allow-origin https://localhost:8443 --allow-origin http://localhost:8443
+```
+
+- **`psk.hex`** is 32 random bytes as hex, and `issuer.json` comes from `net-mesh identity generate --out issuer.json`. Keep both out of version control.
+- **`--insecure-permissions`** accepts key files with loose permissions, as a checked-out dev folder often has. Never use it on a real anchor.
+- **Ready** is the NDJSON line carrying `credential_endpoint`. Open the page after it.
+- **`--allow-origin` is matched exactly**, scheme and port included: list the origin the page is actually served from (the example allows the page on port 8443 over either scheme).
+- **Secure context.** Browsers treat `localhost` as one, so on one machine the page itself may be plain HTTP. Across a LAN, serve the page over HTTPS too, and move the anchor's `--bind`, `--listen` and `--rtc-bind` from `127.0.0.1` to the LAN address and add `--rtc-stun-bind <lan-ip>:0`: a browser with no camera or microphone permission lists no interfaces, so it needs a STUN endpoint to gather a candidate other players can reach (the RTC socket does not serve one). The certificate must then name that address, since `--url` and the page's origin use it: `mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 <lan-host-or-ip>`. Use the LAN address in `--url` and `--allow-origin`, and have every machine trust your mkcert CA.
+- **Pointing the page at it.** Read the anchor URL from the page's query string (`?anchor=https://localhost:8444`), falling back to the public anchor.
 
 ## Serve IPv4 and IPv6 players
 
