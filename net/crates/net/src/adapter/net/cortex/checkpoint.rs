@@ -31,16 +31,13 @@ const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// sometimes saw its own forced call succeed. A set, not one slot: two
 /// tests arming at once must not overwrite each other.
 #[cfg(test)]
-static FORCE_POST_RENAME: std::sync::Mutex<Vec<std::path::PathBuf>> =
-    std::sync::Mutex::new(Vec::new());
+static FORCE_POST_RENAME: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// Arm [`FORCE_POST_RENAME`] for the next [`publish`] of `path`.
 #[cfg(test)]
 fn force_post_rename(path: &Path) {
-    FORCE_POST_RENAME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(path.to_path_buf());
+    FORCE_POST_RENAME.lock().push(path.to_path_buf());
 }
 
 #[derive(Serialize, Deserialize)]
@@ -159,9 +156,7 @@ pub(super) fn store(
 fn publish(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     #[cfg(test)]
     let forced = {
-        let mut armed = FORCE_POST_RENAME
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut armed = FORCE_POST_RENAME.lock();
         match armed.iter().position(|p| p == path) {
             Some(i) => {
                 armed.swap_remove(i);
