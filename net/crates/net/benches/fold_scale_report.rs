@@ -73,50 +73,65 @@ const SECTIONS: [&str; 5] = ["footprint", "cache", "sweep", "mixed", "alloc"];
 
 struct Counting;
 
-/// Whether allocations are being counted. Off except in `footprint`, so
-/// the timed sections pay one relaxed load per allocation, not two
-/// read-modify-write atomics.
+/// Whether allocation volume is being counted ([`CUMULATIVE`],
+/// [`ALLOC_CALLS`]). Off except in `footprint` and the alloc probes.
+/// [`LIVE`] does not depend on it.
 static COUNTING: AtomicBool = AtomicBool::new(false);
-/// Bytes currently allocated (allocations minus deallocations) while
-/// counting was on.
+/// Bytes currently allocated by the whole process, tracked at all
+/// times. Only deltas are read. Tracking it unconditionally is what
+/// makes a delta exact: a window that frees memory allocated before it
+/// began (a replaced or evicted entry built earlier) must subtract
+/// those bytes, which a gated counter could only do by also
+/// subtracting frees it never added, and so drift below the true
+/// resident footprint. The cost is one relaxed add per allocation and
+/// per free in every section, timed ones included.
 static LIVE: AtomicI64 = AtomicI64::new(0);
 /// Bytes allocated while counting was on.
 static CUMULATIVE: AtomicU64 = AtomicU64::new(0);
 /// Allocation calls (alloc + realloc) while counting was on.
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Record a successful allocation of `size` bytes in the volume
+/// counters, if counting is on.
+fn count_volume(size: usize) {
+    if COUNTING.load(Ordering::Relaxed) {
+        CUMULATIVE.fetch_add(size as u64, Ordering::Relaxed);
+        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // SAFETY: every method forwards to `System` with the caller's own
 // arguments, so `System`'s guarantees carry over unchanged; the counters
-// are only bookkeeping beside the forwarded call.
+// are only bookkeeping beside the forwarded call, and they record a
+// call only when it succeeded.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
-            CUMULATIVE.fetch_add(layout.size() as u64, Ordering::Relaxed);
-            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
         // SAFETY: forwarded verbatim; the caller upholds `alloc`'s contract.
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            count_volume(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if COUNTING.load(Ordering::Relaxed) {
-            LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
-        }
+        LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
         // SAFETY: forwarded verbatim; `ptr` came from this allocator,
         // which is `System`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            LIVE.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
-            CUMULATIVE.fetch_add(new_size as u64, Ordering::Relaxed);
-            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
         // SAFETY: forwarded verbatim; `ptr` came from this allocator,
         // which is `System`.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        // A failed realloc leaves the old block allocated and unchanged.
+        if !new_ptr.is_null() {
+            LIVE.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            count_volume(new_size);
+        }
+        new_ptr
     }
 }
 
