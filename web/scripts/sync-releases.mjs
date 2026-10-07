@@ -117,6 +117,7 @@ const TITLES = {
   "RELEASE_v0.35_DOUBLEBACK.md": "v0.35.0 — Doubleback",
   "RELEASE_v0.36_PARANOID.md": "v0.36.0 — Paranoid",
   "RELEASE_v0.37.1_TURBO_LOVER.md": "v0.37.1 — Turbo Lover",
+  "RELEASE_v0.41_THUNDERSTRUCK.md": "v0.41.0 — Thunderstruck",
   "RELEASE_v0.40_HIGHWAY_STAR.md": "v0.40.0 — Highway Star",
   "RELEASE_v0.39_KICKSTART_MY_HEART.md": "v0.39.0 — Kickstart My Heart",
   "RELEASE_v0.38.2_TWO_TRIBES.md": "v0.38.2 — Two Tribes",
