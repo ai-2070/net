@@ -123,9 +123,16 @@ and record the real outcome when it lands.
 
 ```typescript
 const attempt = node.connectPeer(peer);
-attempt.then((outcome) => { if (outcome.type === 'direct') markDirect(peer); }).catch(() => {});
-await Promise.race([attempt.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 1500))]);
-const stream = node.openStream({ reliability: 'fireAndForget', peer, label, lossy: true });
+attempt
+  .then((outcome) => { if (outcome.type === 'direct') markDirect(peer); })
+  .catch(() => {});
+await Promise.race([
+  attempt.catch(() => undefined),
+  new Promise((resolve) => setTimeout(resolve, 1500)),
+]);
+const stream = node.openStream({
+  reliability: 'fireAndForget', peer, label, lossy: true,
+});
 ```
 
 When the pair goes direct, the stream opened on the relayed session goes stale
@@ -152,7 +159,8 @@ and keeps each site's games apart. Read an override from the page URL, so the
 same build can run against a local anchor during development:
 
 ```typescript
-const anchorUrl = new URLSearchParams(location.search).get('anchor') ?? 'https://anchor.ai2070.net';
+const anchorUrl =
+  new URLSearchParams(location.search).get('anchor') ?? 'https://anchor.ai2070.net';
 ```
 
 `requestCredential` is `POST /credential` on an anchor run with `--game` or
@@ -201,8 +209,10 @@ function probe(): Promise<Heard> {
   return Promise.race([
     node.call('my-game.alive', new Uint8Array(0), 5000).then(
       (): Heard => 'alive',
-      (error): Heard =>
-        error?.kind !== 'rpc-refused' ? 'silent' : error.failure?.status === 4 ? 'unsent' : 'alive',
+      (error): Heard => {
+        if (error?.kind !== 'rpc-refused') return 'silent';
+        return error.failure?.status === 4 ? 'unsent' : 'alive';
+      },
     ),
     new Promise<Heard>((resolve) => setTimeout(() => resolve('silent'), 5500)),
   ]);
@@ -214,7 +224,8 @@ async function recheck(): Promise<void> {
   // so the check ends and runs again next time.
   if ((await probe()) !== 'silent' || (await probe()) !== 'silent') return;
   try { node.close(); } catch { /* already gone */ }
-  const { credentialB64, bootstrapUrl } = await requestCredential({ anchorUrl, game: 'my-game' });
+  const { credentialB64, bootstrapUrl } =
+    await requestCredential({ anchorUrl, game: 'my-game' });
   node = await connect({ credentialB64, bootstrapUrl });
 }
 

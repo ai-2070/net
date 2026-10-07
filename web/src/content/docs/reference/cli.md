@@ -223,7 +223,8 @@ net-mesh --output ndjson anchor serve \
   --rtc-bind 127.0.0.1:0 \
   --tls-cert cert.pem --tls-key key.pem \
   --issuer-identity issuer.json --insecure-permissions \
-  --game my-game --allow-origin https://localhost:8443 --allow-origin http://localhost:8443
+  --game my-game \
+  --allow-origin https://localhost:8443 --allow-origin http://localhost:8443
 ```
 
 - **`psk.hex`** is 32 random bytes as hex, and `issuer.json` comes from `net-mesh identity generate --out issuer.json`. Keep both out of version control.
