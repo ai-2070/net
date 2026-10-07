@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/cortex/checkpoint.rs
+  s_d8b00bedd146e9::t_a00b986fe41ff3 34-35,40,159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8486991850f5889b61f50598fe1a17e393b26dbf",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
