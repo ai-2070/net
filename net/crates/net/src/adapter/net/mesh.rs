@@ -27500,7 +27500,7 @@ impl MeshNode {
                         node.trickle_local_candidate(from_node, dialog).await;
                         node.spawn_dialog_completion(from_node, dialog, peer, true);
                     }
-                    super::rtc::SignalOutcome::Reject { dialog, reason } => {
+                    super::rtc::SignalOutcome::Reject { dialog, reason, .. } => {
                         let _ = node
                             .send_rtc_signal(
                                 from_node,
@@ -27680,12 +27680,20 @@ impl MeshNode {
                     .insert((claimed_node_id, dialog), budget_key);
                 Ok(sdp)
             }
-            super::rtc::SignalOutcome::Reject { dialog, reason } => {
+            super::rtc::SignalOutcome::Reject {
+                dialog,
+                reason,
+                detail,
+            } => {
                 self.rtc_attempt_keys.remove(&(claimed_node_id, dialog));
                 self.release_signal_budget(budget_key, dialog);
-                Err(AdapterError::Connection(format!(
-                    "the offer was refused: {reason:?}"
-                )))
+                // The driver's words ride along: `Busy` alone named four
+                // different failures, and only one of them is a full
+                // node.
+                Err(AdapterError::Connection(match detail {
+                    Some(detail) => format!("the offer was refused: {reason:?} ({detail})"),
+                    None => format!("the offer was refused: {reason:?}"),
+                }))
             }
             super::rtc::SignalOutcome::Ignored => {
                 // #10: a duplicate Offer for a live dialog. The
@@ -28013,6 +28021,18 @@ impl MeshNode {
             }
             self.release_signal_budget(claimed_node_id, dialog);
         }
+    }
+
+    /// The RTC sessions this node holds right now, and the most it
+    /// will hold (`RtcConfig::max_peers`): `(live, max)`. `None` on a
+    /// node without RTC. Read so an operator can see a node filling up
+    /// before it starts refusing offers, and so the listener can refuse
+    /// a full node's offer by name.
+    #[cfg(feature = "webrtc")]
+    pub fn rtc_session_load(&self) -> Option<(usize, usize)> {
+        let driver = self.rtc_driver.as_ref()?;
+        let max = self.config.rtc.as_ref()?.max_peers;
+        Some((driver.transport().live_peers(), max))
     }
 
     /// The §12 global provisional bound this anchor was configured

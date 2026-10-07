@@ -2082,6 +2082,11 @@ async fn drain_session(
     }
 }
 
+/// The driver's refusal when it already holds
+/// [`RtcConfig::max_peers`] sessions. Named so a caller can tell "this
+/// node is full" from every other reason an offer fails.
+pub const MAX_PEERS_REACHED: &str = "rtc: max_peers reached";
+
 /// Remove dead sessions, bumping the generation and counting whatever
 /// was still owed.
 fn reap(
@@ -2305,7 +2310,7 @@ async fn handle_signal(
     match signal {
         RtcSignal::CreateOffer { reply } => {
             if sessions.len() >= config.max_peers {
-                let _ = reply.send(Err("rtc: max_peers reached".into()));
+                let _ = reply.send(Err(MAX_PEERS_REACHED.into()));
                 return;
             }
             let mut session = match new_session(config, transport, sockets) {
@@ -2361,7 +2366,7 @@ async fn handle_signal(
         }
         RtcSignal::AcceptOffer { offer_sdp, reply } => {
             if sessions.len() >= config.max_peers {
-                let _ = reply.send(Err("rtc: max_peers reached".into()));
+                let _ = reply.send(Err(MAX_PEERS_REACHED.into()));
                 return;
             }
             let offer = match SdpOffer::from_sdp_string(&offer_sdp) {

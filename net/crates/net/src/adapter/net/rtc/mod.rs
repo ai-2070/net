@@ -49,7 +49,7 @@ pub use config::{
     DEFAULT_INGRESS_QUEUE_PACKETS, DEFAULT_MAX_PEERS, DEFAULT_MAX_PROVISIONAL,
     DEFAULT_SEND_QUEUE_BYTES, DEFAULT_SEND_QUEUE_PACKETS,
 };
-pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal};
+pub use driver::{RtcDriver, RtcDriverHandle, RtcSignal, MAX_PEERS_REACHED};
 #[cfg(any(test, feature = "fixtures"))]
 pub use driver::{RtcInstallPause, RtcTestHooks};
 pub use engine::{

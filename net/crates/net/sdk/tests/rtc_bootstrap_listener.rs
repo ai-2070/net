@@ -143,6 +143,11 @@ async fn post_offer(
     (status, body)
 }
 
+fn message_of(body: &[u8]) -> String {
+    let parsed: ErrorBody = serde_json::from_slice(body).expect("an error body");
+    parsed.message
+}
+
 fn refusal_of(body: &[u8]) -> String {
     let parsed: ErrorBody = serde_json::from_slice(body).expect("an error body");
     serde_json::to_value(parsed.refusal)
@@ -2161,6 +2166,14 @@ async fn a_page_gets_a_credential_for_its_game_that_the_offer_path_accepts() {
         "offer_refused",
         "the credential itself was accepted"
     );
+    // And the page is told WHY. The engine used to drop the driver's
+    // reason and answer `Busy` for a bad SDP, a full node and two other
+    // failures alike, so the message carried nothing to act on.
+    let message = message_of(&body);
+    assert!(
+        message.contains("rtc: bad offer"),
+        "the driver's own reason reaches the page: {message}"
+    );
     assert_eq!(
         registry
             .stats()
@@ -2606,4 +2619,75 @@ async fn a_tls_connection_that_never_sends_a_request_is_closed() {
         .expect("a connection that says nothing after its handshake is closed");
 
     handle.shutdown().await;
+}
+
+/// A full anchor answers `at_capacity`, naming its session count.
+///
+/// The driver refuses an offer once it holds `RtcConfig::max_peers`
+/// sessions, and that refusal used to reach the page as `offer_refused`
+/// with the message `Busy`, indistinguishable from a bad SDP. The
+/// listener now reads the session load first and refuses by name, the
+/// same way it already refused at the provisional-session bound.
+///
+/// Inverse: drop the `rtc_session_load` check in `post_offer` and the
+/// message is the driver's (`Busy (rtc: max_peers reached)`), not the
+/// session count, so the last assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_full_anchor_refuses_an_offer_as_at_capacity() {
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), PSK);
+    cfg.rtc = Some(RtcConfig {
+        max_peers: 1,
+        // The first session never connects, so the driver reaps it once
+        // its ICE deadline passes. Long enough that the second offer is
+        // always made while the first still holds the slot.
+        ice_deadline: Duration::from_secs(60),
+        ..rtc_config()
+    });
+    let anchor = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    anchor.start();
+    let router = bootstrap_router(Arc::clone(&anchor), &config(PSK));
+    let credential = credential_for(PSK, Duration::from_secs(600));
+    assert_eq!(anchor.rtc_session_load(), Some((0, 1)), "empty to start");
+
+    let first = offerer().await;
+    let sdp = first
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, body) = post_offer(&router, &credential, first.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        anchor.rtc_session_load(),
+        Some((1, 1)),
+        "the accepted offer holds the anchor's one session"
+    );
+
+    let second = offerer().await;
+    let sdp = second
+        .rtc_driver()
+        .expect("driver")
+        .create_offer()
+        .await
+        .expect("offer")
+        .1;
+    let (status, body) = post_offer(&router, &credential, second.node_id(), &sdp).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refusal_of(&body),
+        "at_capacity",
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let message = message_of(&body);
+    assert!(
+        message.contains("1 of its 1"),
+        "the refusal names the session count: {message}"
+    );
 }

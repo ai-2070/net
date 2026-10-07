@@ -681,6 +681,17 @@ impl RtcTransport {
     pub fn retained_slots(&self) -> usize {
         self.slots.len()
     }
+
+    /// How many peers are live: slots handed out and not yet closed.
+    /// Every driver session holds one from `new_session` until its
+    /// close or reap, so this is the count
+    /// [`RtcConfig::max_peers`](super::RtcConfig::max_peers) bounds.
+    pub fn live_peers(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|e| !e.closed.load(Ordering::Acquire))
+            .count()
+    }
 }
 
 #[cfg(test)]

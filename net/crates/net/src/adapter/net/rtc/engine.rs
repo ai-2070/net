@@ -176,8 +176,13 @@ pub enum SignalOutcome {
     Reject {
         /// Dialog to reject.
         dialog: u64,
-        /// Why.
+        /// Why, in the wire's vocabulary.
         reason: RtcRejectReason,
+        /// The driver's own words, when it gave any. The wire reason is
+        /// a small fixed set, and `Busy` alone stood for four different
+        /// driver failures; this keeps the one that happened, for the
+        /// log and for a caller that can carry text.
+        detail: Option<String>,
     },
 }
 
@@ -232,10 +237,30 @@ pub async fn handle_signal(
                         peer,
                     }
                 }
-                Err(_) => SignalOutcome::Reject {
-                    dialog,
-                    reason: RtcRejectReason::Busy,
-                },
+                Err(detail) => {
+                    // A full node is a standing state under load, not an
+                    // anomaly: logged at warn, it would bury the refusals
+                    // that are.
+                    if detail == super::MAX_PEERS_REACHED {
+                        tracing::debug!(
+                            from_node = format!("{from_node:#x}"),
+                            dialog,
+                            "rtc: refused an offer (at capacity)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            from_node = format!("{from_node:#x}"),
+                            dialog,
+                            reason = %detail,
+                            "rtc: refused an offer"
+                        );
+                    }
+                    SignalOutcome::Reject {
+                        dialog,
+                        reason: RtcRejectReason::Busy,
+                        detail: Some(detail),
+                    }
+                }
             }
         }
         RtcSignalMsg::Answer { dialog, sdp } => {
@@ -256,7 +281,7 @@ pub async fn handle_signal(
                     dialogs.mark_answered(from_node, dialog);
                     SignalOutcome::AnswerApplied { dialog, peer }
                 }
-                Err(_) => {
+                Err(detail) => {
                     // Terminal: the dialog is gone from the table,
                     // so the expiry sweep will never see it. An
                     // answer this driver cannot apply is `ice_failed`
@@ -267,6 +292,7 @@ pub async fn handle_signal(
                     SignalOutcome::Reject {
                         dialog,
                         reason: RtcRejectReason::Declined,
+                        detail: Some(detail),
                     }
                 }
             }
