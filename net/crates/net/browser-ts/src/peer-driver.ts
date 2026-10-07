@@ -88,6 +88,17 @@ export const PEER_TICK_MS = 50;
 export const PEER_OFFER_WAIT_MS = 5_000;
 
 /**
+ * How long an offer that arrived stays worth answering in place of
+ * offering back: the offerer's own ICE deadline (`wasm.rs`'s
+ * `PEER_ICE_DEADLINE_MS`). An older offer's attempt has ended at its
+ * sender, so answering it would only retire this side's own offer for
+ * nothing — and the leaf holds an unanswered offer until something
+ * takes it, so without a bound a stale one would hijack every later
+ * `connectPeer`.
+ */
+export const PEER_OFFER_FRESH_MS = 10_000;
+
+/**
  * The pair's live dialog when it is already direct and open, `undefined`
  * (or `null`) otherwise: the healthy-pair reading a surface's
  * `connectPeer` must not offer over.
@@ -147,10 +158,48 @@ function answerSettles(outcome: PeerConnectOutcome): boolean {
  *
  * Settled attempts are forgotten: the next call starts fresh. Another
  * tab's node is outside this gate, as it is outside this surface.
+ *
+ * **Between two nodes, the lower id offers (glare).** The gate above
+ * cannot stop the *peer's* offer cancelling this node's: when both
+ * ends call `connectPeer` at once — two pages reaching each other, or
+ * both re-trying after an attempt ended — each answer retires the
+ * answerer's own offer, both run out their ICE deadline, and the pair
+ * stays relayed. So when this node's id is the higher of the pair:
+ *
+ * - its `connectPeer` answers an offer from the peer that arrived
+ *   within {@link PEER_OFFER_FRESH_MS}, instead of offering back;
+ * - while its own offer is under way, an offer arriving from the peer
+ *   is answered, and the answer's outcome is the call's.
+ *
+ * And on either side, an `acceptPeer` while this surface's own
+ * `connectPeer` for the peer is under way takes that call's outcome:
+ * on the lower id the crossing offer is the one to ignore, and on the
+ * higher id the `connectPeer` already answers it.
+ *
+ * Offers are learned from the surface's `signal` events
+ * ({@link noteOffer}); with none noted, or this node's id unknown,
+ * `connectPeer` offers exactly as before.
  */
 export class PeerAttempts {
   readonly #connecting = new Map<string, Promise<PeerConnectOutcome>>();
   readonly #accepting = new Map<string, Promise<PeerConnectOutcome>>();
+  /** When an offer from each peer last arrived, by {@link now}. */
+  readonly #offers = new Map<string, number>();
+
+  /**
+   * @param self This node's id, 16 hex, or `null` while unknown (no
+   *   tie-break then).
+   * @param now The clock offer arrivals are stamped with.
+   */
+  constructor(
+    private readonly self: () => string | null = () => null,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  /** A verified offer from `peer` (16 hex) arrived. */
+  noteOffer(peer: string): void {
+    this.#offers.set(peer.toLowerCase(), this.now());
+  }
 
   /**
    * Run `drive` as this peer's offer, unless one is already under way,
@@ -161,11 +210,16 @@ export class PeerAttempts {
    * a round trip, and an `acceptPeer` could take the pair direct and
    * leave the gate between a caller's early reading and its offer, which
    * would then replace the healthy link.
+   *
+   * `answer` answers the offer the peer filed, if one is waiting
+   * (`null` when none is): how the higher id of a pair yields to the
+   * lower id's offer rather than crossing it.
    */
   connect(
     peer: string,
     healthy: HealthyDialog,
     drive: () => Promise<PeerConnectOutcome>,
+    answer?: () => Promise<PeerConnectOutcome | null>,
   ): Promise<PeerConnectOutcome> {
     const key = peer.toLowerCase();
     const joining = this.#connecting.get(key);
@@ -178,17 +232,74 @@ export class PeerAttempts {
       }
       const dialog = await healthy();
       if (dialog !== undefined && dialog !== null) return { type: 'direct', peer, dialog };
-      return drive();
+      if (answer === undefined || !this.#yields(key)) return drive();
+      // The lower id already offered: answer it rather than cross it.
+      if (this.#takeOffer(key, this.now() - PEER_OFFER_FRESH_MS)) {
+        const answered = await answer();
+        if (answered !== null) return answered;
+      }
+      return this.#offerYielding(key, drive, answer);
     })();
     return PeerAttempts.#track(this.#connecting, key, started);
   }
 
-  /** Run `drive` as this peer's answer, unless one is already under way. */
+  /**
+   * Run `drive` as this peer's answer, unless one is already under way,
+   * or this surface's own `connectPeer` for the peer is (see the class
+   * comment).
+   */
   accept(peer: string, drive: () => Promise<PeerConnectOutcome>): Promise<PeerConnectOutcome> {
     const key = peer.toLowerCase();
     const joining = this.#accepting.get(key);
     if (joining !== undefined) return joining;
+    const connecting = this.#connecting.get(key);
+    if (connecting !== undefined && this.self() !== null) return connecting;
     return PeerAttempts.#track(this.#accepting, key, drive());
+  }
+
+  /** Whether this node is the higher id of the pair, and so answers. */
+  #yields(key: string): boolean {
+    const self = this.self()?.toLowerCase();
+    // 16 hex each, so the strings order as the ids do.
+    return self !== undefined && self.length === key.length && self > key;
+  }
+
+  /** Consume a noted offer that arrived after `since`, if there is one. */
+  #takeOffer(key: string, since: number): boolean {
+    const at = this.#offers.get(key);
+    if (at === undefined || at <= since) return false;
+    this.#offers.delete(key);
+    return true;
+  }
+
+  /**
+   * Offer, but answer an offer from the peer that crosses it: this
+   * node is the higher id, so the crossing offer is the one the pair
+   * keeps. The offer's own drive then ends `superseded` by the answer,
+   * and is not the call's outcome.
+   */
+  async #offerYielding(
+    key: string,
+    drive: () => Promise<PeerConnectOutcome>,
+    answer: () => Promise<PeerConnectOutcome | null>,
+  ): Promise<PeerConnectOutcome> {
+    const since = this.now();
+    const offering = drive();
+    let settled = false;
+    const done = () => {
+      settled = true;
+    };
+    offering.then(done, done);
+    const crossed = (async (): Promise<PeerConnectOutcome | null> => {
+      while (!settled) {
+        await tick();
+        if (settled || !this.#takeOffer(key, since)) continue;
+        const answered = await answer();
+        if (answered !== null) return answered;
+      }
+      return null;
+    })();
+    return Promise.race([offering, crossed.then((answered) => answered ?? offering)]);
   }
 
   static #track(
@@ -204,6 +315,28 @@ export class PeerAttempts {
     started.then(forget, forget);
     return started;
   }
+}
+
+/**
+ * The `kind` a `signal` event carries for an offer: `SignalKind::tag`
+ * in `control_plane.rs`, which the leaf writes as a bare number.
+ */
+export const SIGNAL_KIND_OFFER = '1';
+
+/**
+ * Tell `attempts` about an offer, when `event` is a verified one (a
+ * `signal` event of kind {@link SIGNAL_KIND_OFFER}). Every other event
+ * is ignored, as is a sender id that is not an exact decimal u64.
+ */
+export function noteOffer(
+  attempts: PeerAttempts,
+  event: { readonly type: string; readonly kind?: string; readonly from?: string },
+): void {
+  if (event.type !== 'signal' || event.kind !== SIGNAL_KIND_OFFER) return;
+  if (event.from === undefined || !/^\d{1,20}$/.test(event.from)) return;
+  const id = BigInt(event.from);
+  if (id > 0xffffffffffffffffn) return;
+  attempts.noteOffer(id.toString(16).padStart(16, '0'));
 }
 
 /** Offer, drive to an open channel, then handshake (§9 steps 3-4). */
@@ -264,6 +397,26 @@ export async function acceptPeer(
       }
       await tick();
     }
+  }
+  return driveAttempt(peer, dialog, (status) => status.direct, primitives, parse);
+}
+
+/**
+ * Answer the offer `peer` filed if one is waiting now, without waiting
+ * for one: `null` when none is, or when the leaf refuses the answer —
+ * the caller ({@link PeerAttempts.connect}, yielding to the lower id)
+ * then offers as it would have.
+ */
+export async function answerWaitingOffer(
+  peer: string,
+  primitives: PeerPrimitives,
+  parse: (json: string) => PeerAttemptStatus,
+): Promise<PeerConnectOutcome | null> {
+  let dialog: string;
+  try {
+    dialog = await primitives.acceptOffer(peer);
+  } catch {
+    return null;
   }
   return driveAttempt(peer, dialog, (status) => status.direct, primitives, parse);
 }

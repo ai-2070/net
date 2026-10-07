@@ -82,18 +82,21 @@ newer attempt) it is the call's outcome too; only after an inconclusive one does
 the call offer. Concurrent `acceptPeer` calls share one answer.
 So a lobby, a store and netcode can each call `connectPeer` for the same host
 without knocking out each other's attempt. This holds per node: another tab's
-node is outside it, and so is the other page.
+node is outside it.
 
 ### Two pages, one offerer
 
-Nothing stops page A's offer cancelling page B's. That bites after an attempt
-**ended** (`iceTimeout`, `udpBlocked` or `failed`): if both pages offer again,
-each new offer cancels the other's attempt, both run out their ICE deadline,
-and the pair stays relayed for good. Give each pair one offerer. After an
-attempt ended, only the page whose node id is the lower offers again
-(`myId < peerId`; the hex ids compare correctly as strings), and the other
-answers. For a first contact, let the page new to the group reach out, and have
-the others wait a few seconds before reaching it.
+Two pages may call `connectPeer` on each other at the same time. Left alone,
+each page's answer would retire its own offer, both would run out their ICE
+deadline, and the pair would stay relayed. So the lower node id offers. On the
+higher id, `connectPeer` answers an offer from the peer that arrived in the last
+10 seconds instead of offering back, and answers an offer that crosses its own
+while it is under way. On either side, `acceptPeer` while the node's own
+`connectPeer` for that peer is under way takes that call's outcome. Offers are
+learned from the node's `signal` events, so no page code is needed, and both
+pages may simply call `connectPeer` again after an attempt ended.
+
+Someone must still answer when only one side offers.
 
 The answering page calls `acceptPeer` **by state, not by memory**: whenever
 `peerAttempt(peer)` shows the pair is neither direct nor connecting, whoever
@@ -106,7 +109,7 @@ unanswered.
 |---|---|---|
 | `direct: true` | direct | nothing |
 | `state` `gathering` or `open`, not direct | connecting | nothing: a new offer would cancel it |
-| `state` `iceTimeout`, `udpBlocked` or `failed` | ended, relayed | the lower id offers, the higher id answers |
+| `state` `iceTimeout`, `udpBlocked` or `failed` | ended, relayed | either page may `connectPeer` again; the other answers |
 | throws | never attempted | the page reaching out offers |
 
 `peerAttempt` is on `connect()`'s node only.

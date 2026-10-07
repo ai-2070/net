@@ -184,18 +184,18 @@ Rules that bite:
   newer attempt), offering only after an inconclusive one. Every offer replaces
   the pair's link, so this is what lets a lobby, a store and netcode each reach
   the same host. This holds per node: another tab's node is outside the rule,
-  as it is outside the surface — and so is **the other page**. See the next
-  bullet.
-- **Two pages offering to each other at once is glare.** The idempotency above
-  stops a node cancelling *its own* attempt; nothing stops page A's offer
-  cancelling page B's. It bites after an attempt **ended** (`iceTimeout`,
-  `udpBlocked`, `failed`): if both pages offer again, each new offer cancels the
-  other's attempt, both run out their ICE deadline, and the pair stays relayed
-  for good. Give the pair one offerer: when the last attempt ended, only the page
-  whose node id is the **lower** (`myId < peerId`, hex strings compare
-  correctly) offers again, and the other answers. For a first contact, let the
-  page new to the group reach out and have the others wait a few seconds
-  before reaching it (Rose & Blade waits 3 s).
+  as it is outside the surface.
+- **Two pages calling `connectPeer` on each other is safe: the lower id
+  offers.** Without a rule, each page's answer would retire its own offer (glare),
+  both would run out their ICE deadline, and the pair would stay relayed. So on
+  the **higher** id, `connectPeer` answers an offer from the peer that arrived
+  within the last 10 s (`PEER_OFFER_FRESH_MS`) instead of offering back, and
+  answers an offer that crosses its own while it is under way; either way the
+  answer's outcome is the call's. On either side, an `acceptPeer` while the
+  node's own `connectPeer` for that peer is under way takes that call's
+  outcome. Offers are learned from the node's `signal` events, so this needs
+  no page code. Both pages may simply retry with `connectPeer` after an
+  attempt ended.
 - **Answer by state, not by memory.** The answering page calls `acceptPeer(id)`
   whenever `peerAttempt(id)` shows the pair is neither direct nor connecting,
   whoever offered before. With no offer waiting, `acceptPeer` gives up after a
@@ -208,7 +208,7 @@ Rules that bite:
   |---|---|---|
   | `direct: true` | direct | neither |
   | `state` `gathering` or `open`, not direct | connecting | neither: a new offer cancels it |
-  | `state` `iceTimeout`, `udpBlocked` or `failed` | ended, relayed | lower id offers, higher id answers |
+  | `state` `iceTimeout`, `udpBlocked` or `failed` | ended, relayed | either may `connectPeer` again; the other answers |
   | throws | never attempted | the page reaching out offers |
 
 - **Don't wait for direct before playing.** The relayed session is up long

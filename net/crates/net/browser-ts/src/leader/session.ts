@@ -68,7 +68,9 @@ import {
 } from '../node.js';
 import {
   acceptPeer as driveAccept,
+  answerWaitingOffer,
   connectPeer as driveConnect,
+  noteOffer,
   PeerAttempts,
   type PeerPrimitives,
 } from '../peer-driver.js';
@@ -144,8 +146,8 @@ export class MeshSession {
    * iteration a page is already written to handle.
    */
   private readonly streams = new Set<LeafStream>();
-  /** One attempt per peer at a time: see {@link PeerAttempts}. */
-  private readonly attempts = new PeerAttempts();
+  /** One attempt per peer at a time, and one offerer per pair: see {@link PeerAttempts}. */
+  private readonly attempts = new PeerAttempts(() => this.inner.node_id_hex() ?? null);
   /**
    * The generation the streams in that set were opened under.
    *
@@ -173,6 +175,7 @@ export class MeshSession {
   constructor(private readonly inner: LeafWasmSession) {
     this.streamGeneration = inner.generation();
     inner.on_event((json) => this.hub.deliver(json, parseSessionEvent));
+    this.hub.onAny((event) => noteOffer(this.attempts, event));
     this.hub.onAny((event) => {
       // `leader_lost` is this tab losing the leader it was talking
       // to; `not_leader` is this tab discovering it *was* the leader
@@ -365,6 +368,13 @@ export class MeshSession {
    * offer: it is a proxy round trip here, and read ahead of the gate it
    * could be stale by the time the offer went out. See
    * {@link PeerAttempts}.
+   *
+   * **And between two nodes, the lower id offers.** When this node's id
+   * is the higher of the pair, an offer the peer sent in the last
+   * `PEER_OFFER_FRESH_MS` (10 s) — or one that crosses this call's own —
+   * is answered instead of offered over, so two pages reaching each
+   * other at once (glare) converge rather than cancel. See
+   * {@link PeerAttempts}.
    */
   async connectPeer(nodeIdHex: string): Promise<PeerConnectOutcome> {
     return this.attempts.connect(
@@ -379,6 +389,7 @@ export class MeshSession {
         }
       },
       () => driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+      () => answerWaitingOffer(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
     );
   }
 

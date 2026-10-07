@@ -45,8 +45,10 @@ import {
 import { LeafStream, type OpenStreamOptions } from './stream.js';
 import {
   acceptPeer as driveAccept,
+  answerWaitingOffer,
   connectPeer as driveConnect,
   handshakePeer as driveHandshake,
+  noteOffer,
   PeerAttempts,
   type PeerPrimitives,
 } from './peer-driver.js';
@@ -343,8 +345,8 @@ export class BrowserNode {
    * handle.
    */
   private readonly streams = new Set<LeafStream>();
-  /** One attempt per peer at a time: see {@link PeerAttempts}. */
-  private readonly attempts = new PeerAttempts();
+  /** One attempt per peer at a time, and one offerer per pair: see {@link PeerAttempts}. */
+  private readonly attempts = new PeerAttempts(() => this.nodeId);
   /**
    * The live org handles (plan §4.5), so {@link BrowserNode.close}
    * can retire ownership: pending calls fail typed and each dropped
@@ -860,6 +862,13 @@ export class BrowserNode {
    * attempt), offering only after an inconclusive one. See
    * {@link PeerAttempts}.
    *
+   * **And between two nodes, the lower id offers.** When this node's id
+   * is the higher of the pair, an offer the peer sent in the last
+   * `PEER_OFFER_FRESH_MS` (10 s) — or one that crosses this call's own —
+   * is answered instead of offered over, so two pages reaching each
+   * other at once (glare) converge rather than cancel. See
+   * {@link PeerAttempts}.
+   *
    * Returns a {@link PeerConnectOutcome}. It **rejects** only for
    * something that is not a disposition of the attempt — a closed
    * node, a peer that answered `Reject`, a malformed peer id.
@@ -883,6 +892,7 @@ export class BrowserNode {
         }
       },
       () => driveConnect(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
+      () => answerWaitingOffer(nodeIdHex, this.peerPrimitives(), parseAttemptStatus),
     );
   }
 
@@ -1186,6 +1196,7 @@ export class BrowserNode {
       if (event.rtcAddr !== null) this.anchorRtcAddr = event.rtcAddr;
       if (event.rtcAddrs.length > 0) this.anchorRtcAddrs = event.rtcAddrs;
     }
+    noteOffer(this.attempts, event);
     this.hub.dispatch(event);
   }
 }

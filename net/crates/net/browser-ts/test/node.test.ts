@@ -827,6 +827,32 @@ describe('peer attempts', () => {
     expect(inner.peerOffers).toEqual([]);
   });
 
+  // Glare: when the peer (the lower id) has just offered, the higher id
+  // answers it rather than offering back, which would cancel it.
+  it('answers a fresh offer from a lower id instead of offering back', async () => {
+    const inner = new FakeNode({ nodeIdHex: 'ff00000000000000', peerOfferDialog: OLD });
+    const node = await connected(inner);
+    inner.emit(
+      `{"type":"signal","from":"${BigInt(`0x${PEER}`)}","to":"${BigInt('0xff00000000000000')}",` +
+        `"dialog":"1","kind":1,"payload":"","not_after":"0"}`,
+    );
+    await expect(node.connectPeer(PEER)).resolves.toEqual({ type: 'direct', peer: PEER, dialog: OLD });
+    expect(inner.peerAccepts).toEqual([PEER]);
+    expect(inner.peerOffers).toEqual([]);
+  });
+
+  it('offers as before when the fresh offer came to the lower id', async () => {
+    const inner = new FakeNode({ nodeIdHex: '0000000000000001', peerOfferDialog: OLD });
+    const node = await connected(inner);
+    inner.emit(
+      `{"type":"signal","from":"${BigInt(`0x${PEER}`)}","to":"1",` +
+        `"dialog":"1","kind":1,"payload":"","not_after":"0"}`,
+    );
+    await node.connectPeer(PEER);
+    expect(inner.peerOffers).toEqual([PEER]);
+    expect(inner.peerAccepts).toEqual([]);
+  });
+
   // Settled attempts are not remembered: a later call is a fresh one.
   it('starts a fresh attempt once the earlier one has settled', async () => {
     const inner = new FakeNode({ peerOfferDialog: OLD });
