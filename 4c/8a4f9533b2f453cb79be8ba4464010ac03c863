@@ -1,0 +1,55 @@
+web/src/content/docs/sdk/browser/README.md
+  s_297e9db2706ffd::t_51d93783e444de 17
+web/src/content/docs/reference/cli.md
+  s_297e9db2706ffd::t_78ec5a6e62fd29 220-226
+  s_297e9db2706ffd::t_1c5ccb4d2b778f 195-196,215-219,227-228,230-233
+  s_297e9db2706ffd::t_9c53b670aaeae5 229
+  s_297e9db2706ffd::t_a6aa52f806630c 234
+web/src/content/docs/sdk/browser/quickstart.md
+  s_297e9db2706ffd::t_51d93783e444de 20-23,49,51,64
+  s_297e9db2706ffd::t_8d9daf044c5119 18-19
+web/src/content/docs/sdk/browser/session.md
+  s_297e9db2706ffd::t_3f480b1335b4ed 84-129,146-200
+  s_297e9db2706ffd::t_51d93783e444de 141
+.claude/skills/net-browser/store.md
+  s_297e9db2706ffd::t_7eeb4bc13f783d 352
+  s_297e9db2706ffd::t_da11b9d572e5b5 353-373
+web/src/content/docs/sdk/browser/store.md
+  s_297e9db2706ffd::t_b9b08f581d2d3f 395-414
+web/src/content/docs/concepts/webrtc-transport.md
+  s_297e9db2706ffd::t_312deddaf01b08 56-59
+web/src/content/docs/sdk/browser/netcode.md
+  s_297e9db2706ffd::t_90d4c92fe5d91c 147-191
+.claude/skills/net-browser/SKILL.md
+  s_297e9db2706ffd::t_8d9daf044c5119 37-41
+  s_297e9db2706ffd::t_726d24e850dfa6 6-7,61-62,122-123,137-139,173-176
+  s_297e9db2706ffd::t_51d93783e444de 45-46
+.claude/skills/net-browser/errors.md
+  s_297e9db2706ffd::t_8084254a657d1b 192-198
+.claude/skills/net-browser/session.md
+  s_297e9db2706ffd::t_cdad572e080052 84-100,102-128
+  s_297e9db2706ffd::t_9a2aecb4b9f26a 187-226
+  s_297e9db2706ffd::t_b93e0fd4a7320d 101
+  s_297e9db2706ffd::t_fb247382fc7034 308-345,348-351
+  s_297e9db2706ffd::t_51d93783e444de 16,46
+  s_297e9db2706ffd::t_a8fced2620af1a 346-347
+.claude/skills/net-browser/netcode.md
+  s_297e9db2706ffd::t_5885e6821d09c5 96-103,106-139
+  s_297e9db2706ffd::t_7eeb4bc13f783d 104-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4c8a4f9533b2f453cb79be8ba4464010ac03c863",
+  "prompts": {},
+  "sessions": {
+    "s_297e9db2706ffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dab5b01d-0706-4dfe-98fa-eb10fb0b8d32",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
