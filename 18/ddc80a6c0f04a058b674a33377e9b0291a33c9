@@ -1,0 +1,38 @@
+net/crates/net/browser-ts/src/lobby.ts
+  s_297e9db2706ffd::t_d341e8c62254bc 612,632
+  s_297e9db2706ffd::t_d5913583ac3d6e 582,584,588-594,596-597,637,639
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_297e9db2706ffd::t_1cfd73233b8d87 307-335
+.claude/skills/net-browser/session.md
+  s_297e9db2706ffd::t_47035c05a3b901 120-125
+  s_297e9db2706ffd::t_50b5ffa5c9d507 111
+  s_297e9db2706ffd::t_15b176554a4343 326-328,340-346,355-366
+web/src/content/docs/sdk/browser/session.md
+  s_297e9db2706ffd::t_15b176554a4343 178-181,183-184,190-196,206-209,212-216
+.claude/skills/net-browser/store.md
+  s_297e9db2706ffd::t_65e8b4a00cd0ef 365-370
+web/src/content/docs/sdk/browser/store.md
+  s_297e9db2706ffd::t_65e8b4a00cd0ef 406-412
+.claude/skills/net-browser/errors.md
+  s_297e9db2706ffd::t_15b176554a4343 196-200
+web/src/content/docs/sdk/browser/quickstart.md
+  s_297e9db2706ffd::t_4c3859814e9fe0 64
+web/src/content/docs/reference/cli.md
+  s_297e9db2706ffd::t_722a8f1c82b6d5 226,232-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "18ddc80a6c0f04a058b674a33377e9b0291a33c9",
+  "prompts": {},
+  "sessions": {
+    "s_297e9db2706ffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dab5b01d-0706-4dfe-98fa-eb10fb0b8d32",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
