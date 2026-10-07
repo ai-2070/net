@@ -1,0 +1,43 @@
+web/src/content/docs/sdk/browser/session.md
+  s_297e9db2706ffd::t_75d0b3f7c468d3 85,89-99,112
+net/crates/net/browser-ts/src/peer-driver.ts
+  s_297e9db2706ffd::t_1449b4811716c3 161-181,186-202,213-216,222,235-241,246-250,255-256,260-302
+  s_297e9db2706ffd::t_b4c0fb9f40e320 90,320-341,404
+  s_297e9db2706ffd::t_23b579572c8dfd 91-100
+  s_297e9db2706ffd::t_bca8125e3da239 303,405-423
+  s_297e9db2706ffd::t_6424dbce14f875 304
+net/crates/net/browser-ts/src/leader/session.ts
+  s_297e9db2706ffd::t_301867ae2ab015 374
+  s_297e9db2706ffd::t_6d243ea192e3a7 73
+  s_297e9db2706ffd::t_d14d0014dd74c9 371-373,375-377
+  s_297e9db2706ffd::t_d0eca6cf42e10a 71,149-150,178,392
+net/crates/net/browser-ts/test/peer-driver.test.ts
+  s_297e9db2706ffd::t_e1f197557c3027 477
+  s_297e9db2706ffd::t_fa8fee61d1993b 495
+  s_297e9db2706ffd::t_97d48c65c81767 22,26-27,371-476,478-494
+net/crates/net/browser-ts/src/node.ts
+  s_297e9db2706ffd::t_ee5e43f2e66bc8 51
+  s_297e9db2706ffd::t_d0eca6cf42e10a 48,348-349,895,1199
+  s_297e9db2706ffd::t_301867ae2ab015 867
+  s_297e9db2706ffd::t_d14d0014dd74c9 865-866,868-871
+net/crates/net/browser-ts/test/node.test.ts
+  s_297e9db2706ffd::t_ea2fe124723f87 830-855
+.claude/skills/net-browser/session.md
+  s_297e9db2706ffd::t_fc985dcb7d9198 187-198,211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "524947bf605f4b58a44fc75d0ff4f73cd182370f",
+  "prompts": {},
+  "sessions": {
+    "s_297e9db2706ffd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dab5b01d-0706-4dfe-98fa-eb10fb0b8d32",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
