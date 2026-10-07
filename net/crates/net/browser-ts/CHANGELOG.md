@@ -14,6 +14,30 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## 0.41.0 — the whole module surface is exported
+
+- **Every module-level export is reachable from an entry point.** Code
+  that builds its own transport or tooling on the primitives the
+  high-level verbs use no longer copies them out of the package:
+  - `@net-mesh/browser/netcode`: the wire helpers `eventPeer`,
+    `peerHex`, `encodeFrame`, `decodeFrame`, `chunkOf`,
+    `snapshotFrames` and the limits;
+  - `@net-mesh/browser/store`: the store internals (wire codec,
+    ledger, chunker, assembly, patch, owner and replica);
+  - the root: the peer driver, the org trampolines and refusal
+    constants, `StreamIdentityError` and the `LeafWasmOrg*` types;
+  - `leader`: `PromotionFailedEvent`.
+
+  Additive: nothing that was exported before changed.
+- **A host whose hex node id has no letters is joinable.** `joinStore`
+  read its `host` the way it reads an event's peer, where a string of
+  digits is decimal, so for about one host id in 1,800 the joiner
+  addressed a different node and could never join. An id the caller
+  holds (a lobby's host, a descriptor's `peerIdHex`, `nodeIdHex()`) is
+  now read as hex. The same fix covers the host store's own authority,
+  the region directory's hosts and the handoff link. 0.39 fixed the
+  joiner's own id; this is the host's.
+
 ## 0.39.0 — connectPeer waits for an attempt under way
 
 - **`connectPeer` no longer cancels an attempt that is still under

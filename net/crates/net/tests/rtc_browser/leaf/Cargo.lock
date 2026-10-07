@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh-wire"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "blake2 0.11.0",
  "bytes",
