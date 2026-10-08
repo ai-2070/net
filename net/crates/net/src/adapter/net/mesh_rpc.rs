@@ -4446,6 +4446,11 @@ impl MeshNode {
     /// registration back, both the registry entry and the inbound
     /// dispatcher, and fail. A handler is never left registered without the
     /// folded tag that protected dispatch requires.
+    ///
+    /// Insert, self-index and rollback all run under ONE `announce_mu`
+    /// hold. Every announce reads the registry under that lock, so none can
+    /// observe a service that is about to be rolled back and publish its
+    /// `nrpc:` tag (PR #1210 review).
     fn publish_local_service(
         &self,
         service: &str,
@@ -4453,12 +4458,25 @@ impl MeshNode {
         registration_id: u64,
         visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
     ) -> Result<(), ServeError> {
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id, visibility);
-        if let Err(e) = self.index_self_with_local_services() {
+        let announce_guard = self.lock_announce_mu();
+        let indexed = match &announce_guard {
+            Some(guard) => {
+                self.rpc_local_services_arc().insert(
+                    service.to_string(),
+                    registration_id,
+                    visibility,
+                );
+                self.index_self_with_local_services(guard)
+            }
+            None => Err(AdapterError::Connection(
+                "self-index: the announce lock was not obtainable".to_string(),
+            )),
+        };
+        if let Err(e) = indexed {
             self.rpc_local_services_arc()
                 .remove_if(service, registration_id);
             let _ = self.unregister_rpc_inbound(channel_hash, registration_id);
+            drop(announce_guard);
             return Err(ServeError::CapabilityRefused(e.to_string()));
         }
         Ok(())

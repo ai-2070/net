@@ -24126,7 +24126,7 @@ impl MeshNode {
     /// entry point — see the constant for why a `timeout` around the future
     /// cannot supply this bound, and §18.0g for the lost wakeup it was traced
     /// to.
-    fn lock_announce_mu(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    pub(super) fn lock_announce_mu(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
         let acquired = self.lock_announce_mu_within(ANNOUNCE_LOCK_DEADLINE);
         if acquired.is_none() {
             tracing::error!(
@@ -45035,18 +45035,15 @@ impl MeshNode {
     /// registration back, so a service is never registered without the
     /// folded tag protected dispatch requires.
     #[cfg(feature = "cortex")]
-    pub(crate) fn index_self_with_local_services(&self) -> Result<(), AdapterError> {
-        // Serialized with every announce (cubic, PR #1210): under
-        // `announce_mu`, the service snapshot taken here and the version
+    pub(crate) fn index_self_with_local_services(
+        &self,
+        _announce_guard: &parking_lot::MutexGuard<'_, ()>,
+    ) -> Result<(), AdapterError> {
+        // Serialized with every announce (cubic, PR #1210): the caller holds
+        // `announce_mu`, so the service snapshot taken here and the version
         // drawn below cannot interleave with an announce that read the
         // registry earlier but draws a higher version later and so
         // replaces this self-index with a set that lacks the service.
-        let Some(_announce_guard) = self.lock_announce_mu() else {
-            return Err(AdapterError::Connection(format!(
-                "self-index: the announce lock was not obtainable within \
-                 {ANNOUNCE_LOCK_DEADLINE:?}"
-            )));
-        };
         let baseline = self.user_caps_snapshot();
         // The registration must fit what the next announce would install,
         // published and self-indexed, not only this narrower self-index set.
@@ -53866,6 +53863,40 @@ mod fold_publisher_helpers_tests {
             let entry = s.get(&(0, node.node_id)).expect("self entry");
             assert_eq!(entry.generation, 1_000_000, "the newer entry stands");
         });
+    }
+
+    /// PR #1210 review: `serve_rpc` inserted the service into the registry
+    /// BEFORE taking `announce_mu` for the self-index, and rolled a refused
+    /// one back after releasing it, so a concurrent announce could read the
+    /// doomed service and publish its `nrpc:` tag. Insert, self-index and
+    /// rollback now share one lock hold: while another holder has the lock,
+    /// the registry does not show the service.
+    #[cfg(feature = "cortex")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_reaches_the_registry_only_under_the_announce_lock() {
+        let node = build_node_for_test().await;
+        let listed = |node: &MeshNode| {
+            node.rpc_local_services
+                .all_snapshot()
+                .iter()
+                .any(|s| s == "guarded")
+        };
+        let held = node.announce_mu.lock();
+        let serving = {
+            let node = node.clone();
+            tokio::task::spawn_blocking(move || {
+                node.serve_rpc("guarded", Arc::new(NoopRpc))
+                    .map_err(|e| e.to_string())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !listed(&node),
+            "the service is visible to announces before the lock is held"
+        );
+        drop(held);
+        let _handle = serving.await.expect("join").expect("serve");
+        assert!(listed(&node));
     }
 
     /// PR #1210 review: an announce that loses the self-fold merge to a
