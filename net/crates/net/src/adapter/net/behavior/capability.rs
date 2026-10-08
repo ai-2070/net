@@ -2189,10 +2189,46 @@ fn decoder_sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
 /// tag's length is its encoded UTF-8 length, measured before it is parsed
 /// or deduplicated. Elements parse exactly as `Tag`'s own `Deserialize`
 /// does.
+/// One tag decoded with its length checked on the borrowed text the
+/// deserializer offers, BEFORE anything is allocated for it: an oversized
+/// tag is refused without first being copied into an owned `String`
+/// (cubic, PR #1210). Parses exactly as `Tag`'s own `Deserialize` does.
+struct BoundedTag(Tag);
+
+impl<'de> Deserialize<'de> for BoundedTag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use super::fold::MAX_CAPABILITY_TAG_LEN;
+
+        struct BoundedTagVisitor;
+        impl serde::de::Visitor<'_> for BoundedTagVisitor {
+            type Value = BoundedTag;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a capability tag of at most {MAX_CAPABILITY_TAG_LEN} bytes"
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<BoundedTag, E> {
+                if raw.len() > MAX_CAPABILITY_TAG_LEN {
+                    return Err(E::custom(format!(
+                        "capability tag is {} bytes, over the cap of {MAX_CAPABILITY_TAG_LEN}",
+                        raw.len()
+                    )));
+                }
+                Tag::parse(raw).map(BoundedTag).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(BoundedTagVisitor)
+    }
+}
+
 fn deserialize_tags_capped<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<HashSet<Tag>, D::Error> {
-    use super::fold::{MAX_CAPABILITY_TAGS, MAX_CAPABILITY_TAG_LEN};
+    use super::fold::MAX_CAPABILITY_TAGS;
 
     struct CappedTags;
     impl<'de> serde::de::Visitor<'de> for CappedTags {
@@ -2212,21 +2248,14 @@ fn deserialize_tags_capped<'de, D: serde::Deserializer<'de>>(
             let hint = seq.size_hint().unwrap_or(0).min(MAX_CAPABILITY_TAGS);
             let mut tags = HashSet::with_capacity(hint);
             let mut count = 0usize;
-            while let Some(raw) = seq.next_element::<String>()? {
+            while let Some(BoundedTag(tag)) = seq.next_element::<BoundedTag>()? {
                 count += 1;
                 if count > MAX_CAPABILITY_TAGS {
                     return Err(serde::de::Error::custom(format!(
                         "capability set carries more than {MAX_CAPABILITY_TAGS} tags"
                     )));
                 }
-                if raw.len() > MAX_CAPABILITY_TAG_LEN {
-                    return Err(serde::de::Error::custom(format!(
-                        "capability tag {} is {} bytes, over the cap of {MAX_CAPABILITY_TAG_LEN}",
-                        count - 1,
-                        raw.len()
-                    )));
-                }
-                tags.insert(Tag::parse(&raw).map_err(serde::de::Error::custom)?);
+                tags.insert(tag);
             }
             Ok(tags)
         }

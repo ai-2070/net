@@ -1989,11 +1989,32 @@ fn fold_stats_carry_the_sweep_counters() {
 
     let mut legacy = serde_json::to_value(&stats).expect("serialize");
     let obj = legacy.as_object_mut().expect("object");
-    obj.remove("sweep_walks");
-    obj.remove("sweep_yielded");
+    // JSON from before the sweep counters (Slice 2) and the admission
+    // counters (Slice 6): every one of those fields absent.
+    const LATER_FIELDS: [&str; 7] = [
+        "sweep_walks",
+        "sweep_yielded",
+        "interned",
+        "interned_bytes",
+        "interned_overhead_bytes",
+        "limit_rejections",
+        "budget_rejections",
+    ];
+    for field in LATER_FIELDS {
+        assert!(obj.remove(field).is_some(), "{field} was serialized");
+    }
     let parsed: FoldStats = serde_json::from_value(legacy).expect("legacy JSON parses");
     assert_eq!(parsed.sweep_walks, 0);
     assert_eq!(parsed.sweep_yielded, 0);
+    assert_eq!(parsed.interned, 0);
+    assert_eq!(parsed.interned_bytes, 0);
+    assert_eq!(parsed.interned_overhead_bytes, 0);
+    assert_eq!(parsed.limit_rejections, 0);
+    assert_eq!(parsed.budget_rejections, 0);
+    assert_eq!(
+        parsed.applies_total, stats.applies_total,
+        "the rest is kept"
+    );
 }
 
 #[test]
@@ -2340,4 +2361,65 @@ fn fx_u64_hasher_byte_fallback_matches_its_documented_edges() {
     // `write_u64` steps, so it cannot equal either chunk alone.
     let nine = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
     assert_ne!(via_bytes(&nine), via_bytes(&nine[..8]));
+}
+
+/// A sink may read `stats()` from `record` even while a `set_audit_sink`
+/// writer is queued on the sink slot (cubic, PR #1210). The emitting path
+/// used to hold the slot's read guard across `record`; `stats()` reads the
+/// slot again, and parking_lot's fair lock parks that re-entrant read
+/// behind the queued writer, which waits for the outer read: a deadlock.
+/// The sink here queues the writer itself, from a second thread, and only
+/// then reads `stats()`; the apply runs under a deadline.
+#[test]
+fn a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock() {
+    struct QueueWriterThenReadStats {
+        fold: std::sync::OnceLock<std::sync::Weak<Fold<AuditingCapFold>>>,
+        done: std::sync::atomic::AtomicBool,
+    }
+    impl super::FoldAuditSink for QueueWriterThenReadStats {
+        fn record(&self, _event: super::AuditEvent) {
+            if self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let Some(fold) = self.fold.get().and_then(std::sync::Weak::upgrade) else {
+                return;
+            };
+            let writer = {
+                let fold = Arc::clone(&fold);
+                std::thread::spawn(move || fold.set_audit_sink(None))
+            };
+            // Let the writer reach the slot's lock and queue.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = fold.stats();
+            let _ = writer.join();
+        }
+    }
+
+    let fold = Arc::new(Fold::<AuditingCapFold>::with_sweep_interval(
+        std::time::Duration::ZERO,
+    ));
+    let sink = Arc::new(QueueWriterThenReadStats {
+        fold: std::sync::OnceLock::new(),
+        done: std::sync::atomic::AtomicBool::new(false),
+    });
+    let _ = sink.fold.set(Arc::downgrade(&fold));
+    fold.set_audit_sink(Some(sink as Arc<dyn super::FoldAuditSink>));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let fold = Arc::clone(&fold);
+        std::thread::spawn(move || {
+            let kp = EntityKeypair::generate();
+            let ok = fold
+                .apply(sign_audit_ann(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
+                .is_ok();
+            let _ = tx.send(ok);
+        })
+    };
+    let applied = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the apply completed instead of deadlocking");
+    worker.join().expect("worker");
+    assert!(applied);
+    assert!(!fold.has_audit_sink(), "the queued writer ran");
 }

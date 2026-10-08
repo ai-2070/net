@@ -47,6 +47,7 @@
 //!   undue tail, and longer-lived entries a lap or more ahead. Both are
 //!   a small, bounded share of the fold, not a walk of it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Length of one wheel slot.
@@ -77,7 +78,13 @@ pub(super) struct ExpiryWheel<Q> {
     epoch: Instant,
     /// First slot not yet fully drained. Every scheduled node sits at a
     /// slot at or after it, so a sweep starting here misses nothing.
-    cursor: u64,
+    ///
+    /// Atomic so that a read-locked probe that finds nothing due can
+    /// advance it (`fetch_max`, monotonic under concurrent probes); every
+    /// other write happens under the state write lock. Without that, an
+    /// idle fold's probe range grew from a few slots toward the whole
+    /// ring on every sweep (cubic, PR #1210).
+    cursor: AtomicU64,
     heads: Box<[u32]>,
     nodes: Vec<Node<Q>>,
     free: u32,
@@ -94,10 +101,14 @@ pub(super) struct Drain {
 }
 
 impl<Q> ExpiryWheel<Q> {
+    fn cursor(&self) -> u64 {
+        self.cursor.load(Ordering::Relaxed)
+    }
+
     pub(super) fn new(epoch: Instant) -> Self {
         Self {
             epoch,
-            cursor: 0,
+            cursor: AtomicU64::new(0),
             heads: vec![NIL; RING].into_boxed_slice(),
             nodes: Vec::new(),
             free: NIL,
@@ -119,7 +130,7 @@ impl<Q> ExpiryWheel<Q> {
     /// restored entry anchored in the past, say) is placed at the cursor,
     /// which the next sweep visits.
     fn position_of(&self, deadline: Instant) -> u32 {
-        let slot = self.slot_of(deadline).max(self.cursor);
+        let slot = self.slot_of(deadline).max(self.cursor());
         (slot % RING as u64) as u32
     }
 
@@ -216,15 +227,16 @@ impl<Q> ExpiryWheel<Q> {
         self.nodes.clear();
         self.free = NIL;
         self.len = 0;
-        self.cursor = self.slot_of(now);
+        self.cursor.store(self.slot_of(now), Ordering::Relaxed);
     }
 
     /// The slots a sweep at `now` visits, as `(first, last)`: from the
     /// cursor up to and including `now`'s slot, at most one lap, since a
     /// lap visits every ring position once.
     fn due_slots(&self, now: Instant) -> (u64, u64) {
-        let last = self.slot_of(now).max(self.cursor);
-        let first = self.cursor.max((last + 1).saturating_sub(RING as u64));
+        let cursor = self.cursor();
+        let last = self.slot_of(now).max(cursor);
+        let first = cursor.max((last + 1).saturating_sub(RING as u64));
         (first, last)
     }
 
@@ -245,6 +257,12 @@ impl<Q> ExpiryWheel<Q> {
                 at = node.next;
             }
         }
+        // Nothing is due anywhere up to `now`. A node in a slot before
+        // `last` would have a deadline before `now` and so be due; none is,
+        // so no current-lap node sits before `last` and the next probe can
+        // start there. `last`'s own slot can still fill: the cursor stops
+        // at it, never past.
+        self.cursor.fetch_max(last, Ordering::Relaxed);
         (false, visited)
     }
 
@@ -256,7 +274,7 @@ impl<Q> ExpiryWheel<Q> {
     /// critical section.
     pub(super) fn take_due(&mut self, now: Instant, max: usize, out: &mut Vec<Q>) -> Drain {
         let (first, last) = self.due_slots(now);
-        self.cursor = first;
+        self.cursor.store(first, Ordering::Relaxed);
         let mut drain = Drain::default();
         // `max` bounds what THIS call takes, whatever `out` already holds.
         let limit = out.len().saturating_add(max);
@@ -283,7 +301,7 @@ impl<Q> ExpiryWheel<Q> {
             // Every node left at this position is due in a later slot.
             // The current slot may still fill, so the cursor stops there.
             if slot < last {
-                self.cursor = slot + 1;
+                self.cursor.store(slot + 1, Ordering::Relaxed);
             }
         }
         drain.exhausted = true;
@@ -442,6 +460,30 @@ mod tests {
         assert!(drain.exhausted);
         assert_eq!(out.len(), 50);
         assert_eq!(wheel.len(), 0);
+    }
+
+    /// An idle probe advances the cursor, so the next idle probe visits
+    /// only the slots since, not every slot since the wheel's epoch. A node
+    /// one lap ahead sits at an early ring position: the first probe
+    /// passes it (not due); a second probe a second later must not visit
+    /// it again (cubic, PR #1210).
+    #[test]
+    fn an_idle_probe_advances_the_cursor() {
+        let epoch = Instant::now();
+        let mut wheel = ExpiryWheel::new(epoch);
+        let lap = SLOT * RING as u32;
+        wheel.insert("next lap", at(epoch, 5_000) + lap);
+        let (due, visited) = wheel.probe_due(at(epoch, 10_000));
+        assert!(!due);
+        assert_eq!(visited, 1, "the lap-ahead node is passed once");
+        assert_eq!(wheel.cursor(), wheel.slot_of(at(epoch, 10_000)));
+        let (due, visited) = wheel.probe_due(at(epoch, 11_000));
+        assert!(!due);
+        assert_eq!(visited, 0, "the next probe starts where the last stopped");
+        // A deadline inside the current slot is still found.
+        wheel.insert("soon", at(epoch, 11_050));
+        assert!(wheel.probe_due(at(epoch, 11_060)).0);
+        wheel.assert_consistent();
     }
 
     #[test]

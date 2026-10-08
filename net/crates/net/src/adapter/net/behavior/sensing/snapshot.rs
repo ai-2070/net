@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use super::controller::{CandidateProvider, TagAssertion};
 use super::identity::{AudienceScopeCommitment, CapabilityId};
-use crate::adapter::net::behavior::fold::{CapabilityFold, Fold};
+use crate::adapter::net::behavior::fold::{CapabilityFold, Fold, TagStr};
 use crate::adapter::net::behavior::proximity::ProximityGraph;
 use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
 
@@ -132,12 +132,15 @@ where
     F: Fn(u64) -> Option<AudienceScopeCommitment>,
 {
     // ONE pass under the state read lock: node id, max declaring
-    // generation, full tag union. Nothing else happens inside.
-    let mut raw: Vec<(u64, u64, Vec<String>)> = fold.with_state(|state| {
+    // generation, full tag union. Nothing else happens inside: the union
+    // holds the fold's shared `TagStr` handles (a refcount bump each), and
+    // the owned strings `DeclaredProvider::tags` carries are made after
+    // the lock is released (cubic, PR #1210).
+    let mut raw: Vec<(u64, u64, Vec<TagStr>)> = fold.with_state(|state| {
         let mut out = Vec::new();
         for (node_id, keys) in state.by_node.iter().map(|(n, r)| (n, r.keys())) {
             let mut generation: Option<u64> = None;
-            let mut tags: BTreeSet<String> = BTreeSet::new();
+            let mut tags: BTreeSet<TagStr> = BTreeSet::new();
             for key in keys {
                 let Some(entry) = state.entries.get(key) else {
                     continue;
@@ -146,7 +149,7 @@ where
                     generation =
                         Some(generation.map_or(entry.generation, |g| g.max(entry.generation)));
                 }
-                tags.extend(entry.payload.tags.iter().map(|t| t.as_str().to_owned()));
+                tags.extend(entry.payload.tags.iter().cloned());
             }
             if let Some(generation) = generation {
                 out.push((*node_id, generation, tags.into_iter().collect()));
@@ -159,7 +162,7 @@ where
         .map(|(node_id, capability_generation, tags)| DeclaredProvider {
             node_id,
             capability_generation,
-            tags,
+            tags: tags.into_iter().map(String::from).collect(),
             entity_root: entity_root_of(node_id),
         })
         .collect()

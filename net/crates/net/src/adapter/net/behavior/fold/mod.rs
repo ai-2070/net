@@ -904,10 +904,11 @@ impl<K: FoldKind> Fold<K> {
     /// invoke it directly to make expiry deterministic without
     /// relying on the runtime's scheduler.
     pub fn sweep_expired_now(&self) -> usize {
-        let sink_holder = self.audit_sink.clone();
-        let sink_guard = sink_holder.read();
-        let sink_ref = sink_guard.as_ref();
-        let reaped = expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink_ref);
+        // The sink is cloned out of its slot: no slot guard is held while
+        // the sweep calls `record` (see `emit_audit`).
+        let sink = self.audit_sink.read().clone();
+        let reaped =
+            expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink.as_ref());
         if reaped > 0 {
             self.signal_changed();
         }
@@ -924,7 +925,13 @@ impl<K: FoldKind> Fold<K> {
         let Some(event) = event else {
             return;
         };
-        if let Some(sink) = self.audit_sink.read().as_ref() {
+        // Clone the sink out and release the slot's read guard BEFORE
+        // `record` runs: a sink that reads `stats()` (which reads this
+        // slot) would otherwise re-enter the guard, and with a
+        // `set_audit_sink` writer queued between the two reads the
+        // re-entrant read waits on the writer, which waits on us.
+        let sink = self.audit_sink.read().clone();
+        if let Some(sink) = sink {
             sink.record(event);
         }
     }

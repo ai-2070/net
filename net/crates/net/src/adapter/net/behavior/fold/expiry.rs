@@ -195,10 +195,10 @@ pub(super) fn spawn_expiry_task<K: FoldKind>(
             // before the state implies a malformed construction
             // path; defensively drop to None rather than
             // panicking on a partial-shutdown invariant break.
-            let sink_holder = audit_sink.upgrade();
-            let sink_guard = sink_holder.as_ref().map(|h| h.read());
-            let sink_ref = sink_guard.as_ref().and_then(|g| g.as_ref());
-            let reaped = sweep_expired::<K>(&state, &index, &metrics, sink_ref);
+            // Clone the sink out of its slot so no slot guard is held while
+            // the sweep calls `record` (see `Fold::emit_audit`).
+            let sink = audit_sink.upgrade().and_then(|slot| slot.read().clone());
+            let reaped = sweep_expired::<K>(&state, &index, &metrics, sink.as_ref());
             // Wake fold-change subscribers if this sweep actually
             // removed anything — a TTL-expired peer's tools should
             // surface as a `Removed` on any `watch_*` consumer

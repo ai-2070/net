@@ -110,7 +110,12 @@ pub struct TagDictionaryStats {
 #[derive(Debug, Default)]
 pub struct TagDictionary {
     /// Canonical tag → number of stored occurrences.
-    uses: HashMap<TagStr, u32>,
+    ///
+    /// `u64`: an occurrence count must stay exact for its tag to retire
+    /// on the last release. A tag can occur up to `MAX_CAPABILITY_TAGS`
+    /// times in each of up to `u32::MAX` entries, past `u32`; a saturated
+    /// count would never return to zero (cubic, PR #1210).
+    uses: HashMap<TagStr, u64>,
     /// Sum of `len()` over `uses`' keys.
     bytes: usize,
     budget: TagBudget,
@@ -289,10 +294,10 @@ impl TagDictionary {
 
     /// Current counters.
     pub fn stats(&self) -> TagDictionaryStats {
-        // hashbrown: one (TagStr, u32) slot plus one control byte per
+        // hashbrown: one (TagStr, u64) slot plus one control byte per
         // bucket; buckets ≈ capacity · 8/7. Each canonical allocation
         // carries an `Arc` header of two counts.
-        let slot = std::mem::size_of::<(TagStr, u32)>() + 1;
+        let slot = std::mem::size_of::<(TagStr, u64)>() + 1;
         let table = self.uses.capacity() * 8 / 7 * slot;
         let headers = self.uses.len() * 2 * std::mem::size_of::<usize>();
         TagDictionaryStats {
@@ -311,7 +316,7 @@ impl TagDictionary {
 
     /// The stored use count for `tag`. For tests.
     #[cfg(test)]
-    pub(crate) fn uses_of(&self, tag: &str) -> u32 {
+    pub(crate) fn uses_of(&self, tag: &str) -> u64 {
         self.uses.get(tag).copied().unwrap_or(0)
     }
 }
@@ -421,6 +426,31 @@ mod tests {
         // "shared" is still used by `other`, so dropping it frees nothing.
         let mut third = tags(&["new", "third"]);
         assert!(dict.admit(&mut third, Some(&new)).is_err());
+    }
+
+    /// A use count past `u32::MAX` stays exact: no saturation that would
+    /// keep the tag in the dictionary after its last release.
+    #[test]
+    fn use_counts_stay_exact_past_u32() {
+        let mut dict = TagDictionary::default();
+        let mut first = tags(&["t"]);
+        dict.admit(&mut first, None).expect("admit");
+        if let Some(count) = dict.uses.get_mut("t") {
+            *count = u64::from(u32::MAX);
+        }
+        let mut more = tags(&["t"]);
+        dict.admit(&mut more, None).expect("one more use");
+        assert_eq!(
+            dict.uses_of("t"),
+            u64::from(u32::MAX) + 1,
+            "exact, not saturated"
+        );
+        if let Some(count) = dict.uses.get_mut("t") {
+            *count = 2;
+        }
+        dict.release(&more);
+        dict.release(&first);
+        assert!(dict.canonical("t").is_none(), "the last release retires it");
     }
 
     #[test]

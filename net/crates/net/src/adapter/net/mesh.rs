@@ -41559,6 +41559,19 @@ impl MeshNode {
             return;
         };
 
+        // A blob-heat flood past the per-announce cap is refused whole HERE,
+        // before any side effect of this function: the dedup cache, the
+        // TOFU pin, the `peer_subnets` binding, route install and the
+        // forward (cubic, PR #1210). The later filter keeps the same rule
+        // for the chain-heat strip it also performs.
+        if from_node != ctx.local_node_id && Self::blob_heat_over_cap(&ann.capabilities) {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "capability: blob-heat tags over the per-announce cap; refused whole"
+            );
+            return;
+        }
+
         // Direct peers may only announce their own caps. Forwarded
         // announcements (hop_count > 0) are relayed through a peer
         // that isn't the origin, so we skip the check in that path
@@ -41934,6 +41947,19 @@ impl MeshNode {
         ctx.ack_ranges_peer_cache.remove(&ann.node_id);
     }
 
+    /// Whether `caps` carries more than `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE`
+    /// blob-heat tags, which refuses the announcement whole.
+    fn blob_heat_over_cap(caps: &crate::adapter::net::behavior::capability::CapabilitySet) -> bool {
+        caps.tags
+            .iter()
+            .filter(|tag| {
+                matches!(tag, Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count()
+            > MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE
+    }
+
     /// Drop every `heat:<hex>=...` reserved tag from `caps` whose
     /// `<hex>` is not matched by an accompanying `causal:<hex>*`
     /// tag in the same set. This enforces "you can only annotate
@@ -41947,15 +41973,7 @@ impl MeshNode {
     fn filter_unauthorized_heat_tags(
         caps: &mut crate::adapter::net::behavior::capability::CapabilitySet,
     ) -> bool {
-        let blob_heat = caps
-            .tags
-            .iter()
-            .filter(|tag| {
-                matches!(tag, Tag::Reserved { prefix, body }
-                    if prefix == "heat:" && body.starts_with("blob:"))
-            })
-            .count();
-        if blob_heat > MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE {
+        if Self::blob_heat_over_cap(caps) {
             return false;
         }
         // Collect every hex this peer claims via causal: tags.
@@ -45010,6 +45028,17 @@ impl MeshNode {
     /// folded tag protected dispatch requires.
     #[cfg(feature = "cortex")]
     pub(crate) fn index_self_with_local_services(&self) -> Result<(), AdapterError> {
+        // Serialized with every announce (cubic, PR #1210): under
+        // `announce_mu`, the service snapshot taken here and the version
+        // drawn below cannot interleave with an announce that read the
+        // registry earlier but draws a higher version later and so
+        // replaces this self-index with a set that lacks the service.
+        let Some(_announce_guard) = self.lock_announce_mu() else {
+            return Err(AdapterError::Connection(format!(
+                "self-index: the announce lock was not obtainable within \
+                 {ANNOUNCE_LOCK_DEADLINE:?}"
+            )));
+        };
         let baseline = self.user_caps_snapshot();
         // The registration must fit what the next announce would install,
         // published and self-indexed, not only this narrower self-index set.
@@ -45055,11 +45084,25 @@ impl MeshNode {
         };
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
-        self.capability_fold.apply(fold_ann).map_err(|e| {
-            AdapterError::Connection(format!(
-                "self-index refused by this node's own capability fold: {e}"
-            ))
-        })?;
+        match self.capability_fold.apply(fold_ann) {
+            Ok(super::behavior::fold::ApplyOutcome::Rejected) => {
+                // The fold kept a newer self entry: this one, carrying the
+                // just-registered service, did not land, so the caller rolls
+                // the registration back (cubic, PR #1210). A newer self entry
+                // is never a peer's: intake drops self-origin announcements.
+                return Err(AdapterError::Connection(
+                    "self-index lost to a newer self entry in this node's own \
+                     capability fold"
+                        .to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(AdapterError::Connection(format!(
+                    "self-index refused by this node's own capability fold: {e}"
+                )));
+            }
+        }
         // Review-9: post-apply floor recheck (see the dispatch
         // path) — self-index is held to the identical ordering
         // guarantees.
@@ -53435,6 +53478,49 @@ mod fold_publisher_helpers_tests {
                 .tags
                 .iter()
                 .any(|t| *t == "nrpc:over")));
+        });
+    }
+
+    /// cubic, PR #1210: a self-index that loses the merge to a newer self
+    /// entry (`Ok(Rejected)`) used to be taken for success, registering a
+    /// service whose `nrpc:` tag never reached the self-fold, which
+    /// protected dispatch requires. It is now an error, and the
+    /// registration rolls back.
+    #[cfg(feature = "cortex")]
+    #[tokio::test]
+    async fn a_service_whose_self_index_loses_to_a_newer_self_entry_rolls_back() {
+        use super::super::mesh_rpc::ServeError;
+        let node = build_node_for_test().await;
+        let newer = CapabilityAnnouncement::new(
+            node.node_id,
+            node.identity.entity_id().clone(),
+            1_000_000,
+            CapabilitySet::new().add_tag("newer"),
+        );
+        node.capability_fold
+            .apply(
+                super::super::behavior::fold::capability_bridge::translate_announcement(
+                    &newer, None,
+                ),
+            )
+            .expect("a newer self entry");
+
+        match node.serve_rpc("lost", Arc::new(NoopRpc)) {
+            Err(ServeError::CapabilityRefused(_)) => {}
+            Err(e) => panic!("expected CapabilityRefused, got {e}"),
+            Ok(_) => panic!("registered a service whose tag did not land"),
+        }
+        assert!(
+            !node
+                .rpc_local_services
+                .all_snapshot()
+                .iter()
+                .any(|s| s == "lost"),
+            "registry entry rolled back"
+        );
+        node.capability_fold.with_state(|s| {
+            let entry = s.get(&(0, node.node_id)).expect("self entry");
+            assert_eq!(entry.generation, 1_000_000, "the newer entry stands");
         });
     }
 
@@ -65076,6 +65162,56 @@ mod identity_readiness_tests {
             Err(IdentityProofReject::NoChallenge),
             "a consumed challenge is not reusable, whoever presents it"
         );
+    }
+
+    /// cubic, PR #1210: a blob-heat flood past the per-announce cap is
+    /// refused before ANY side effect of the inbound handler, not after
+    /// the TOFU pin, the dedup cache and the forward already ran. The same
+    /// announcement at exactly the cap is processed normally.
+    #[tokio::test]
+    async fn a_blob_heat_flood_is_refused_before_any_intake_side_effect() {
+        use super::super::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        let (node, _root) = publisher().await;
+        let ctx = node.dispatch_ctx();
+        let announce = |n_blob: usize, version: u64| {
+            let peer_key = EntityKeypair::generate();
+            let peer = peer_key.node_id();
+            install_incarnation(&node, peer, 0xB10B + version);
+            let mut caps = CapabilitySet::new();
+            for i in 0..n_blob {
+                caps.tags.insert(Tag::Reserved {
+                    prefix: "heat:".to_string(),
+                    body: format!("blob:{i:064x}=1.00"),
+                });
+            }
+            let mut ann =
+                CapabilityAnnouncement::new(peer, peer_key.entity_id().clone(), version, caps)
+                    .with_ttl(300);
+            ann.sign(&peer_key);
+            MeshNode::handle_capability_announcement(&ann.to_bytes(), peer, &ctx);
+            (peer, version)
+        };
+
+        let (over, v) = announce(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1, 1);
+        assert!(node.peer_entity_ids.get(&over).is_none(), "no TOFU pin");
+        assert!(
+            !node.seen_announcements.contains_key(&(over, v, true)),
+            "no dedup-cache entry"
+        );
+        assert!(
+            node.capability_fold
+                .with_state(|s| s.keys_for(over).is_none()),
+            "nothing folded"
+        );
+
+        let (at_cap, _) = announce(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE, 2);
+        assert!(
+            node.peer_entity_ids.get(&at_cap).is_some(),
+            "at the cap the announcement is processed (control)"
+        );
+        assert!(node
+            .capability_fold
+            .with_state(|s| s.keys_for(at_cap).is_some()));
     }
 
     /// A signed, hop-0 capability announcement PINS, and deliberately

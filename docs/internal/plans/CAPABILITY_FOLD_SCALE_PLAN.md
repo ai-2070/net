@@ -1777,7 +1777,7 @@ until it is reviewed. Facts are from the tree at `a44083765` (paths under
    - **Per-announcement cap, enforced in the hook before interning:**
      `MAX_CAPABILITY_TAGS = 256` and `MAX_CAPABILITY_TAG_LEN = 256` bytes.
      An oversize announcement is rejected.
-   - `FoldStats` gains `interned_tags` and `interned_bytes` gauges.
+   - `FoldStats` gains `interned` and `interned_bytes` gauges.
    - The cap is a behavior change for any publisher sending more than 256
      tags. None in the tree does; the fixture carries 31.
 
@@ -2529,7 +2529,8 @@ monotonic.
 **Release migration note, in addition to Slice 6's:**
 - `ServeError` gains `CapabilityRefused`.
 - Every `CapabilitySet` decode, not only an announcement's, refuses more
-  than 256 encoded tags or a tag over 256 bytes.
+  than 8,192 encoded tags (`MAX_CAPABILITY_TAGS`, raised from 256; see
+  "Tag cap raised") or a tag over 256 bytes.
 - `announce_capabilities*` refuses when the augmented or self-indexed set
   would exceed the caps, with the previous baseline kept.
 
@@ -2541,23 +2542,6 @@ monotonic.
 - Clippy, strict and all-targets.
 - `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
 - fmt.
-
-### Slice 7: bitmap buckets (Track B2) — held
-
-Not authorized until Track B2's decisions (entry-level identity, ordering,
-slot reclamation) are written into this plan and re-reviewed.
-Decisions reviewed: `roaring` and entry-slot identity are approved.
-Implementation stays gated on Slice 6's acceptance.
-
-Proof, once authorized:
-
-- New witness `cross_class_split_predicate_does_not_match`: class A of node
-  N has `alpha`, class B has `beta`, and a query for both returns nothing.
-- New witness `output_order_independent_of_arrival`: the same population
-  inserted in opposite orders, plus churn and a restore, gives identical
-  output.
-- Slice 4's permanent comparison witness stays green.
-- Retained index bytes drop against a separate B1+B2 target.
 
 #### Tag cap raised: 256 → 8,192 (2026-10-08)
 
@@ -2612,6 +2596,103 @@ decoded again, and the live blob-heat amplification filter
 - Clippy, strict and all-targets.
 - `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
 - fmt.
+
+#### cubic review of PR #1210 at `b952241ec`: thirteen comments, all fixed
+
+The three P1s each have a witness, and each witness was confirmed RED with
+its fix reverted.
+
+1. **A sink calling `stats()` could deadlock.** Every audit-emitting path
+   (`emit_audit`, `sweep_expired_now`, the expiry task) held the sink
+   slot's read guard across `record`, and `stats()` re-reads that slot.
+   With a `set_audit_sink` writer queued between the two reads, parking_lot's
+   fair lock parks the re-entrant read behind the writer, which waits on
+   the outer read.
+   - **Fix:** clone the sink `Arc` out and drop the guard before
+     `record`. The `FoldAuditSink` doc now states what `record` may call.
+   - Witness: `a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock`
+     (the sink queues the writer itself, then reads `stats()`, under a
+     10 s deadline).
+2. **A registered service could be missing from the self-fold.**
+   - `index_self_with_local_services` ran outside `announce_mu`, so an
+     announce could interleave and replace the self-index with a set that
+     lacked the service.
+   - A self-apply that lost the merge to a newer self entry
+     (`Ok(Rejected)`) was taken for success, so `serve_rpc` registered a
+     service whose `nrpc:` tag never landed.
+   - **Fix:** the self-index takes `announce_mu`, and a `Rejected`
+     self-apply is an error, so the registration rolls back.
+   - Witness:
+     `a_service_whose_self_index_loses_to_a_newer_self_entry_rolls_back`.
+   - **Tried and reverted:** drawing announce versions above the held self
+     entry's generation, so a restored fold could never out-rank local
+     announces. It broke `capability_auth_call_path` and
+     `capability_auth_conformance`. Their documented version-space
+     contract injects restrictive policies at version 100 and above so the
+     auto-self-index (v1) and the spawned re-announce (v2) cannot
+     supersede them. Nothing in production restores a capability fold, and
+     intake drops self-origin announcements, so a newer self entry is test
+     or operator state. The contract stands.
+3. **The blob-heat refusal ran after intake side effects** (the dedup
+   cache, TOFU pin, `peer_subnets`, routes, forward).
+   - **Fix:** a `blob_heat_over_cap` preflight right after decode, before
+     the first side effect. The later filter keeps the same rule for its
+     chain-heat strip.
+   - Witness: `a_blob_heat_flood_is_refused_before_any_intake_side_effect`
+     (no pin, no dedup entry, nothing folded; exactly the cap is processed
+     normally).
+
+The other ten:
+
+- **Idle sweeps never advanced the wheel cursor**, so an idle fold's probe
+  range grew toward the whole ring and passed live lap-ahead nodes on every
+  sweep.
+  - **Fix:** the cursor is an `AtomicU64`, and a probe that finds nothing
+    due advances it (`fetch_max`) to the current slot. No current-lap node
+    can sit in an earlier slot without being due.
+  - Witness: `an_idle_probe_advances_the_cursor`, RED-checked.
+- **Dictionary use counts were `u32`, saturating.** They are `u64`, exact
+  for any reachable occurrence count. Witness: `use_counts_stay_exact_past_u32`.
+- **The capped tag decoder allocated before checking length.**
+  `BoundedTag` checks the borrowed `&str` first. The existing boundary
+  witnesses cover behavior.
+- **Sensing `extract_declarers` allocated a `String` per tag under the
+  fold read lock.** It now collects `TagStr` handles there and converts
+  after the lock is released. The public `DeclaredProvider::tags` type is
+  unchanged.
+- **The legacy-JSON `FoldStats` test** now removes all seven later fields,
+  not two.
+- **Docs and CLI:**
+  - a stale `assign_from_tag_strs` doc;
+  - a per-call `format!` in the CLI's `observe` (now a borrowed compare;
+    `concat!` cannot take a `const`);
+  - `interned_tags` corrected to `interned`;
+  - "Tag cap raised" moved under Slice 6;
+  - the migration note now says 8,192.
+
+**Gates.**
+- The unit suite: 6,055 pass.
+- Clippy, strict in three configurations and all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- `cargo check --workspace --all-targets`.
+- fmt.
+
+### Slice 7: bitmap buckets (Track B2) — held
+
+Not authorized until Track B2's decisions (entry-level identity, ordering,
+slot reclamation) are written into this plan and re-reviewed.
+Decisions reviewed: `roaring` and entry-slot identity are approved.
+Implementation stays gated on Slice 6's acceptance.
+
+Proof, once authorized:
+
+- New witness `cross_class_split_predicate_does_not_match`: class A of node
+  N has `alpha`, class B has `beta`, and a query for both returns nothing.
+- New witness `output_order_independent_of_arrival`: the same population
+  inserted in opposite orders, plus churn and a restore, gives identical
+  output.
+- Slice 4's permanent comparison witness stays green.
+- Retained index bytes drop against a separate B1+B2 target.
 
 #### Slice 7 evidence packet (implemented; awaiting acceptance)
 
@@ -2866,7 +2947,7 @@ apply's write lock, so there is no stale candidate left to re-check.
   exactly the entries whose TTL elapsed.
 - **The interner's budget is breached by publisher churn** (if B1 is built).
   The aggregate budget covers historical publishers by construction, and
-  the churn footprint run measures it. A gauge (`FoldStats::interned_tags`
+  the churn footprint run measures it. A gauge (`FoldStats::interned`
   and retained bytes) shows it to operators. The gauge is not the bound.
 - **The `KeyHasher` change breaks an out-of-tree `FoldKind`.** Fallback:
   confirm `FoldKind` is crate-private, or ship the change with a release
