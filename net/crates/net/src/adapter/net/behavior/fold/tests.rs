@@ -2493,3 +2493,31 @@ fn a_full_expiry_wheel_refuses_a_new_entry_before_any_change() {
     fold.with_state(|s| assert_eq!(s.len(), 2));
     fold.restore(snap, true).expect("a restore that fits");
 }
+
+/// cubic, PR #1210: a restore built and cloned every snapshot row before
+/// checking this fold's capacity, so a snapshot from a much larger fold
+/// was fully materialized just to be refused. It now stops at the first
+/// row past the capacity.
+#[test]
+fn an_oversized_restore_is_refused_before_materializing_the_snapshot() {
+    let big: Fold<CapFold> = Fold::new();
+    for node in 0..50u64 {
+        big.apply(cap_announcement(0x100 + node, 0x1000, 1, vec!["x"]))
+            .expect("big");
+    }
+    let fold: Fold<CapFold> = Fold::new();
+    fold.state.write().set_schedule_limit(2);
+    super::snapshot::REHYDRATED.with(|n| n.set(0));
+    match fold.restore(big.snapshot(), false) {
+        Err(FoldError::RestoreRefused {
+            reason: PayloadRejection::IndexFull { slots: 2 },
+        }) => {}
+        other => panic!("expected RestoreRefused(IndexFull), got {other:?}"),
+    }
+    assert_eq!(
+        super::snapshot::REHYDRATED.with(|n| n.get()),
+        3,
+        "stopped at the first row past the capacity"
+    );
+    fold.with_state(|s| assert_eq!(s.len(), 0));
+}

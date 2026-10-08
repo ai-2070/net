@@ -808,6 +808,13 @@ pub trait FoldIndex<K: FoldKind>: Send + Sync {
         Ok(())
     }
 
+    /// Most entries the index can hold at once. A restore stops building
+    /// its rows past this, before cloning a snapshot it could never
+    /// install. Default: unbounded.
+    fn entry_capacity(&self) -> usize {
+        usize::MAX
+    }
+
     /// Admission storage counters. Default: zeros.
     fn admission_stats(&self) -> AdmissionStats {
         AdmissionStats::default()

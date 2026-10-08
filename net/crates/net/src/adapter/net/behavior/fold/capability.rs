@@ -838,6 +838,10 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
             .preflight(payloads.iter().map(|p| p.tags.as_slice()))
     }
 
+    fn entry_capacity(&self) -> usize {
+        self.slots.limit
+    }
+
     fn admission_stats(&self) -> AdmissionStats {
         let stats = self.dictionary.stats();
         AdmissionStats {

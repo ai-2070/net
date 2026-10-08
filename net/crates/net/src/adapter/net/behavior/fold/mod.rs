@@ -665,7 +665,18 @@ impl<K: FoldKind> Fold<K> {
         // `from_state` dropping already-expired entries at dump time),
         // and a key listed twice (under two publishers, for a fold keyed
         // on the payload) keeps its later row.
-        let mut rows: Vec<(K::Key, FoldEntry<K>)> = Vec::with_capacity(snap.entries.len());
+        //
+        // Bounded by what this fold can hold (its expiry wheel and its
+        // index): a snapshot from a larger fold is refused at the first row
+        // past that, not after rehydrating and cloning all of it (cubic,
+        // PR #1210). Both limits are fixed at construction.
+        let capacity = self
+            .state
+            .read()
+            .schedule_limit()
+            .min(self.index.read().entry_capacity());
+        let mut rows: Vec<(K::Key, FoldEntry<K>)> =
+            Vec::with_capacity(snap.entries.len().min(capacity));
         let mut row_of: HashMap<K::Key, usize, K::KeyHasher> = HashMap::default();
         for snap_entry in &snap.entries {
             let Some(entry) =
@@ -676,6 +687,11 @@ impl<K: FoldKind> Fold<K> {
             match row_of.get(&snap_entry.key) {
                 Some(&at) => rows[at] = (snap_entry.key.clone(), entry),
                 None => {
+                    if rows.len() == capacity {
+                        return Err(FoldError::RestoreRefused {
+                            reason: PayloadRejection::IndexFull { slots: capacity },
+                        });
+                    }
                     row_of.insert(snap_entry.key.clone(), rows.len());
                     rows.push((snap_entry.key.clone(), entry));
                 }
@@ -698,13 +714,6 @@ impl<K: FoldKind> Fold<K> {
         // The state as a whole must fit the admission budget, checked
         // before anything is cleared: a refused restore leaves the old
         // fold exactly as it was.
-        if rows.len() > state.schedule_limit() {
-            return Err(FoldError::RestoreRefused {
-                reason: PayloadRejection::IndexFull {
-                    slots: state.schedule_limit(),
-                },
-            });
-        }
         {
             let payloads: Vec<&K::Payload> = rows.iter().map(|(_, e)| &e.payload).collect();
             index
