@@ -120,9 +120,6 @@ pub struct TagDictionary {
     bytes: usize,
     budget: TagBudget,
     budget_rejections: u64,
-    /// Indices of incoming tags not yet canonical, reused across calls.
-    /// Only a payload that brings new tags writes to it.
-    fresh: Vec<usize>,
 }
 
 impl TagDictionary {
@@ -206,42 +203,48 @@ impl TagDictionary {
     }
 
     /// Decide whether admitting `incoming` (and releasing `outgoing`)
-    /// fits the budget, without changing anything but the scratch list.
+    /// fits the budget, without changing anything.
+    ///
+    /// Linear in the payload sizes: it runs under the fold's write locks,
+    /// and at [`MAX_CAPABILITY_TAGS`] a pairwise scan would be ~10⁸
+    /// comparisons per announcement (PR #1210 review).
     fn check(
         &mut self,
         incoming: &[TagStr],
         outgoing: Option<&[TagStr]>,
     ) -> Result<(), PayloadRejection> {
-        // New distinct tags, deduplicated within the payload. Only a
-        // payload carrying non-canonical tags reaches the push.
-        self.fresh.clear();
-        for (at, tag) in incoming.iter().enumerate() {
-            if self.uses.contains_key(tag.as_str()) {
-                continue;
-            }
-            if self.fresh.iter().any(|&seen| incoming[seen] == *tag) {
-                continue;
-            }
-            self.fresh.push(at);
-        }
-        if self.fresh.is_empty() {
-            // Nothing new: the release can only shrink the dictionary.
+        if incoming
+            .iter()
+            .all(|tag| self.uses.contains_key(tag.as_str()))
+        {
+            // Nothing new, and the release can only shrink the
+            // dictionary. The warm refresh stops here, allocating nothing.
             return Ok(());
         }
-        let new_tags = self.fresh.len();
-        let new_bytes: usize = self.fresh.iter().map(|&at| incoming[at].len()).sum();
+
+        // New distinct tags, deduplicated within the payload. Only a
+        // payload that brings new tags builds these sets.
+        let mut fresh: HashSet<&str> = HashSet::new();
+        let mut new_bytes = 0usize;
+        for tag in incoming {
+            if !self.uses.contains_key(tag.as_str()) && fresh.insert(tag.as_str()) {
+                new_bytes += tag.len();
+            }
+        }
+        let new_tags = fresh.len();
 
         // Room the outgoing payload frees: tags whose every stored use
         // is in `outgoing` and that `incoming` does not carry again.
         let (mut freed_tags, mut freed_bytes) = (0usize, 0usize);
         if let Some(outgoing) = outgoing {
-            for (at, tag) in outgoing.iter().enumerate() {
-                if outgoing[..at].contains(tag) {
-                    continue; // counted at its first occurrence
-                }
-                let occurrences = outgoing.iter().filter(|t| *t == tag).count();
-                let stored = self.uses.get(tag.as_str()).copied().unwrap_or(0) as usize;
-                if stored == occurrences && !incoming.contains(tag) {
+            let mut occurrences: HashMap<&str, u64> = HashMap::with_capacity(outgoing.len());
+            for tag in outgoing {
+                *occurrences.entry(tag.as_str()).or_insert(0) += 1;
+            }
+            let carried: HashSet<&str> = incoming.iter().map(TagStr::as_str).collect();
+            for (tag, occurrences) in occurrences {
+                let stored = self.uses.get(tag).copied().unwrap_or(0);
+                if stored == occurrences && !carried.contains(tag) {
                     freed_tags += 1;
                     freed_bytes += tag.len();
                 }
@@ -474,5 +477,103 @@ mod tests {
         assert!(dict.preflight(rows.iter().map(Vec::as_slice)).is_ok());
         let rows = [tags(&["a", "b"]), tags(&["c"])];
         assert!(dict.preflight(rows.iter().map(Vec::as_slice)).is_err());
+    }
+
+    /// The pairwise budget arithmetic `check` used before it went linear
+    /// (PR #1210 review): `(tags_after, bytes_after)`, or `None` when the
+    /// payload brings nothing new.
+    fn pairwise_oracle(
+        dict: &TagDictionary,
+        incoming: &[TagStr],
+        outgoing: Option<&[TagStr]>,
+    ) -> Option<(usize, usize)> {
+        let mut fresh: Vec<usize> = Vec::new();
+        for (at, tag) in incoming.iter().enumerate() {
+            if dict.uses.contains_key(tag.as_str()) {
+                continue;
+            }
+            if fresh.iter().any(|&seen| incoming[seen] == *tag) {
+                continue;
+            }
+            fresh.push(at);
+        }
+        if fresh.is_empty() {
+            return None;
+        }
+        let new_tags = fresh.len();
+        let new_bytes: usize = fresh.iter().map(|&at| incoming[at].len()).sum();
+        let (mut freed_tags, mut freed_bytes) = (0usize, 0usize);
+        if let Some(outgoing) = outgoing {
+            for (at, tag) in outgoing.iter().enumerate() {
+                if outgoing[..at].contains(tag) {
+                    continue;
+                }
+                let occurrences = outgoing.iter().filter(|t| *t == tag).count();
+                let stored = dict.uses.get(tag.as_str()).copied().unwrap_or(0) as usize;
+                if stored == occurrences && !incoming.contains(tag) {
+                    freed_tags += 1;
+                    freed_bytes += tag.len();
+                }
+            }
+        }
+        Some((
+            dict.uses.len() - freed_tags + new_tags,
+            dict.bytes - freed_bytes + new_bytes,
+        ))
+    }
+
+    /// The linear `check` decides exactly as the pairwise one did, at the
+    /// budget boundary, over replacements mixing duplicates, tags shared
+    /// with other payloads, last uses and brand-new tags.
+    #[test]
+    fn linear_check_matches_the_pairwise_oracle() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for _ in 0..200 {
+            let mut dict = TagDictionary::default();
+            let mut stored: Vec<Vec<TagStr>> = Vec::new();
+            for _ in 0..1 + next(4) {
+                let mut payload: Vec<TagStr> = (0..next(12))
+                    .map(|_| TagStr::from(format!("t{}", next(16))))
+                    .collect();
+                dict.admit(&mut payload, None).expect("unbounded");
+                stored.push(payload);
+            }
+            let incoming: Vec<TagStr> = (0..next(12))
+                .map(|_| TagStr::from(format!("t{}", next(24))))
+                .collect();
+            let outgoing = if next(3) == 0 {
+                None
+            } else {
+                Some(stored[next(stored.len() as u64) as usize].clone())
+            };
+            let outgoing = outgoing.as_deref();
+            match pairwise_oracle(&dict, &incoming, outgoing) {
+                None => {
+                    dict.budget = TagBudget {
+                        max_tags: 0,
+                        max_bytes: 0,
+                    };
+                    assert!(dict.check(&incoming, outgoing).is_ok(), "nothing new");
+                }
+                Some((tags_after, bytes_after)) => {
+                    dict.budget = TagBudget {
+                        max_tags: tags_after,
+                        max_bytes: bytes_after,
+                    };
+                    assert!(dict.check(&incoming, outgoing).is_ok(), "at the boundary");
+                    dict.budget.max_tags = tags_after - 1;
+                    assert!(dict.check(&incoming, outgoing).is_err(), "one tag over");
+                    dict.budget.max_tags = tags_after;
+                    dict.budget.max_bytes = bytes_after - 1;
+                    assert!(dict.check(&incoming, outgoing).is_err(), "one byte over");
+                }
+            }
+        }
     }
 }
