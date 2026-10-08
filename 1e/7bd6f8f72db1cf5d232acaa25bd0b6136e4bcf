@@ -1,0 +1,60 @@
+net/crates/net/cli/src/commands/typegen/live.rs
+  s_b4293f9d895548::t_cab933ea6ff442 46-51
+net/crates/net/src/adapter/net/behavior/fold/tag_dictionary.rs
+  s_b4293f9d895548::t_b8e7cf11a66f07 443-447
+  s_b4293f9d895548::t_5b4d15729ddd07 113-118,297,300,319,431-442,448-453
+  s_b4293f9d895548::t_ee9c9733441074 454-455
+net/crates/net/src/adapter/net/subnet/assignment.rs
+  s_b4293f9d895548::t_cab933ea6ff442 238-241
+net/crates/net/src/adapter/net/behavior/fold/wheel.rs
+  s_b4293f9d895548::t_e3e8ce22acedf9 485
+  s_b4293f9d895548::t_9688f50636fdf6 50,81-87,104-107,111,133,230,237-239,260-265,277,304,465-484,486-487
+  s_b4293f9d895548::t_76ae24d18e7821 488
+net/crates/net/src/adapter/net/behavior/sensing/snapshot.rs
+  s_b4293f9d895548::t_3f34189a3eeee9 135-139,143,152,165
+  s_b4293f9d895548::t_3b2c9254ca41f4 61
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_b4293f9d895548::t_7ce0496d3491ac 1780,2950
+  s_b4293f9d895548::t_63fd3d28edf59a 2600-2619,2636-2679
+  s_b4293f9d895548::t_ce8f68ba166120 2532-2533,2680-2695
+  s_b4293f9d895548::t_1cb195946804ff 2620-2635
+  s_b4293f9d895548::t_579f573d82de8e 2696
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_b4293f9d895548::t_ff13eb7ddd6bf8 1992-2005,2009-2013
+  s_b4293f9d895548::t_b8e7cf11a66f07 2014-2017
+  s_b4293f9d895548::t_7a66b26e5d98eb 2365-2425
+net/crates/net/src/adapter/net/mesh.rs
+  s_b4293f9d895548::t_b8e7cf11a66f07 53501-53502,53504-53505,65202-65203,65212-65214
+  s_b4293f9d895548::t_8ac6c5d9ee0d53 45090-45092,53484-53488,53491-53492,53494,53498,53503,53506-53520,53523
+  s_b4293f9d895548::t_4cb0ecf386a695 53489-53490,53493,53495-53497,53499-53500,53521-53522,53524-53526,65215
+  s_b4293f9d895548::t_dc88ab3a28b436 45031-45041,45087-45089,45093-45105
+  s_b4293f9d895548::t_fdda19822381ca 41562-41574,41950-41962,41976,65167-65201,65204-65211
+  s_b4293f9d895548::t_2eed70e996c961 65216
+net/crates/net/src/adapter/net/behavior/fold/audit.rs
+  s_b4293f9d895548::t_47fdd40884b309 33-36
+  s_b4293f9d895548::t_e0d7ec57602c40 37
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_b4293f9d895548::t_03213d688c6a82 2192-2206,2211-2227,2251,2258
+  s_b4293f9d895548::t_b8e7cf11a66f07 2207-2210
+  s_b4293f9d895548::t_a2a4e9b38811d0 2231
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_b4293f9d895548::t_47fdd40884b309 198-201
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_b4293f9d895548::t_47fdd40884b309 907-911,928-934
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1e7bd6f8f72db1cf5d232acaa25bd0b6136e4bcf",
+  "prompts": {},
+  "sessions": {
+    "s_b4293f9d895548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a49f9cc-58d8-4a8f-9aac-096640090b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
