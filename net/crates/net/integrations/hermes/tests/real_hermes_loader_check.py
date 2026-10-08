@@ -89,7 +89,7 @@ def main() -> int:
 
     manager = PluginManager()
     manifest = PluginManifest(
-        name="net", version="0.41.1", kind="standalone", key="net", path=str(PLUGIN_DIR)
+        name="net", version="0.42.0", kind="standalone", key="net", path=str(PLUGIN_DIR)
     )
     ctx = PluginContext(manifest, manager)
 
