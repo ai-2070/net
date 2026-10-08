@@ -524,14 +524,11 @@ fn section_footprint(templates: &Templates) {
 
     COUNTING.store(false, Ordering::Relaxed);
 
+    println!("\n## footprint: inverted-index breakdown (estimated, B/entry)\n");
     println!(
-        "
-## footprint: inverted-index breakdown (estimated, B/entry)
-"
-    );
-    println!(
-        "Buckets are the inverted index (outer maps + sets + owned key strings).          Slot table and free list are Slice 7's bookkeeping, reported separately so          a bucket saving cannot hide them. Estimates from capacities.
-"
+        "Buckets are the inverted index (outer maps + sets + owned key strings). \
+         Slot table and free list are Slice 7's bookkeeping, reported separately so \
+         a bucket saving cannot hide them. Estimates from capacities.\n"
     );
     println!(
         "| configuration | entries | buckets total | maps | sets | key strings | slot table | free list | slots occupied / capacity / free | buckets | memberships |"

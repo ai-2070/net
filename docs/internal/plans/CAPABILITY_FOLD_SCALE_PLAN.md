@@ -2677,6 +2677,57 @@ The other ten:
 - `cargo check --workspace --all-targets`.
 - fmt.
 
+#### Review of PR #1210 at `c2eab8372`: nine items
+
+Seven fixed, each with a witness confirmed RED with its fix reverted. Two
+were already closed by `c2eab8372`. One is recorded as a residual risk.
+
+1. **A node with more than 256 hot blobs was refused whole by every
+   peer.** The receive side refuses an announcement over
+   `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` whole, but nothing on the send side
+   kept a node under the cap.
+   - **Fix:** the blob-heat paths keep the hottest 256 (ties broken by tag
+     text). The shared announce check (`check_augmented_announceable`, now
+     used by `announce_attempt` and the self-index) refuses an over-cap
+     published set locally.
+   - Witnesses: `trim_blob_heat_tags_keeps_the_hottest_up_to_the_cap` and
+     `a_node_with_more_hot_blobs_than_the_cap_still_announces`.
+2. **`TagDictionary::check` was quadratic under both write locks**:
+   ~1.7×10⁸ comparisons at 8,192 tags.
+   - **Fix:** a hash set for the new tags, and a count map plus a set for
+     the replacement arithmetic, built only when a payload brings new tags.
+     The warm refresh still returns before allocating.
+   - Witness: `linear_check_matches_the_pairwise_oracle` pins the decision
+     to the old algorithm at the budget boundary.
+3. **A graceful candidacy release that timed out leaked its tag.**
+   Already fixed in `c2eab8372` (the retrying withdraw).
+4. **The holders lock was held while blocking on `announce_mu`.**
+   Already fixed in `c2eab8372` (`announce_mu` is taken first).
+5. **`announce_attempt` took a `Rejected` self-apply for success**,
+   committing the baseline and the emission while the self-fold held
+   another entry.
+   - **Fix:** it is refused with nothing committed, as the self-index
+     already was. No production path writes a newer self entry. The
+     `capability_auth_*` suites, which inject one, still pass.
+   - Witness: `an_announce_that_loses_to_a_newer_self_entry_commits_nothing`.
+6. **A rolled-back `serve_rpc` could briefly publish a phantom `nrpc:`
+   tag.** The registry insert ran before `announce_mu` was taken, and the
+   rollback ran after it was released.
+   - **Fix:** insert, self-index and rollback run under one hold.
+     `index_self_with_local_services` takes the held guard as a parameter.
+   - Witness: `a_service_reaches_the_registry_only_under_the_announce_lock`.
+7. **One identity can exhaust the fold-wide tag budget.** Under the owner
+   ruling (no eviction, fail closed) this is intended. See Risks.
+8. **The expiry wheel had no node limit.** Only the capability fold's slot
+   table bounded entries, so another fold kind could schedule a node at
+   the `u32::MAX` sentinel.
+   - **Fix:** the wheel has a limit. `Fold::apply` refuses a new entry
+     (`IndexFull`) before any mutation, a Replace reuses its node, and
+     `restore` refuses a state that would not fit before clearing.
+   - Witness: `a_full_expiry_wheel_refuses_a_new_entry_before_any_change`.
+9. **Two `println!` strings in `fold_scale_report`** had lost their
+   escapes. Fixed.
+
 ### Slice 7: bitmap buckets (Track B2) — held
 
 Not authorized until Track B2's decisions (entry-level identity, ordering,
@@ -2949,6 +3000,15 @@ apply's write lock, so there is no stale candidate left to re-check.
   The aggregate budget covers historical publishers by construction, and
   the churn footprint run measures it. A gauge (`FoldStats::interned`
   and retained bytes) shows it to operators. The gauge is not the bound.
+- **One identity can exhaust the tag budget (accepted residual).** The
+  budget is per fold, not per publisher. One identity announcing under
+  ~122 class hashes × 8,192 distinct tags fills the default 1M tags.
+  After that, every payload bringing a new tag is refused (fail closed)
+  until entries expire or are evicted. Refreshes carrying only
+  already-known tags still land. The owner ruling chose no eviction and
+  no per-publisher quota, so this is intended. The signal is
+  `budget_rejections` with the offending publisher in the audit record.
+  A per-identity quota is the follow-up if it is ever seen in practice.
 - **The `KeyHasher` change breaks an out-of-tree `FoldKind`.** Fallback:
   confirm `FoldKind` is crate-private, or ship the change with a release
   note.
