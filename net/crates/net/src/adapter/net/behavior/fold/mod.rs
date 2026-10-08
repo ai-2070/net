@@ -434,8 +434,15 @@ impl<K: FoldKind> Fold<K> {
             MergeAction::Insert => {
                 // No existing entry to evict; install fresh.
                 let mut entry = build_entry::<K>(ann);
-                // Admission first: all-or-nothing, so a refusal leaves
-                // the state and index exactly as they were.
+                // Room in the expiry wheel, then admission: both before any
+                // mutation, so a refusal leaves the state and index exactly
+                // as they were.
+                if !state.can_schedule() {
+                    let reason = PayloadRejection::IndexFull {
+                        slots: state.schedule_limit(),
+                    };
+                    return Err(self.refuse_payload(node_id, reason));
+                }
                 if let Err(reason) = index.admit(&mut entry.payload, None) {
                     return Err(self.refuse_payload(node_id, reason));
                 }
@@ -691,6 +698,13 @@ impl<K: FoldKind> Fold<K> {
         // The state as a whole must fit the admission budget, checked
         // before anything is cleared: a refused restore leaves the old
         // fold exactly as it was.
+        if rows.len() > state.schedule_limit() {
+            return Err(FoldError::RestoreRefused {
+                reason: PayloadRejection::IndexFull {
+                    slots: state.schedule_limit(),
+                },
+            });
+        }
         {
             let payloads: Vec<&K::Payload> = rows.iter().map(|(_, e)| &e.payload).collect();
             index

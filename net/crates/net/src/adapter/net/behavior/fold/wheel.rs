@@ -89,6 +89,10 @@ pub(super) struct ExpiryWheel<Q> {
     nodes: Vec<Node<Q>>,
     free: u32,
     len: usize,
+    /// Most nodes the slab may hold. `NIL` is a node index's sentinel, so
+    /// at most `NIL` nodes (indices `0..NIL`) are addressable. Callers
+    /// check [`Self::has_room`] before an insert and refuse the entry.
+    limit: usize,
 }
 
 /// What [`ExpiryWheel::take_due`] did.
@@ -113,12 +117,30 @@ impl<Q> ExpiryWheel<Q> {
             nodes: Vec::new(),
             free: NIL,
             len: 0,
+            limit: NIL as usize,
         }
     }
 
     /// Scheduled keys: always equal to the fold's entry count.
     pub(super) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Most keys the wheel can schedule at once.
+    pub(super) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Whether one more key can be scheduled: a freed node to reuse, or
+    /// room to grow the slab. Never wraps into `NIL`.
+    pub(super) fn has_room(&self) -> bool {
+        self.free != NIL || self.nodes.len() < self.limit
+    }
+
+    /// Lower the node limit, so a test can reach it.
+    #[cfg(test)]
+    pub(super) fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(NIL as usize);
     }
 
     fn slot_of(&self, at: Instant) -> u64 {
@@ -179,7 +201,10 @@ impl<Q> ExpiryWheel<Q> {
             at
         } else {
             let at = u32::try_from(self.nodes.len()).unwrap_or(NIL);
-            debug_assert!(at != NIL, "expiry wheel exceeded u32 nodes");
+            debug_assert!(
+                self.nodes.len() < self.limit && at != NIL,
+                "expiry wheel insert past its limit; callers check has_room"
+            );
             self.nodes.push(Node {
                 key: Some(key),
                 deadline,

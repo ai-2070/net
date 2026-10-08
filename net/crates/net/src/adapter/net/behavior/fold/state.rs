@@ -420,6 +420,25 @@ impl<K: FoldKind> FoldState<K> {
         entry.expiry_node = self.wheel.insert(key.clone(), entry.expires_at);
     }
 
+    /// Whether a new entry can be scheduled, checked before an Insert
+    /// mutates anything. The expiry wheel addresses at most `u32::MAX`
+    /// nodes, which bounds every fold kind, not only the capability fold
+    /// its slot table already bounds (PR #1210 review).
+    pub(super) fn can_schedule(&self) -> bool {
+        self.wheel.has_room()
+    }
+
+    /// Most entries the expiry wheel can schedule at once.
+    pub(super) fn schedule_limit(&self) -> usize {
+        self.wheel.limit()
+    }
+
+    /// Lower the expiry wheel's node limit, so a test can reach it.
+    #[cfg(test)]
+    pub(crate) fn set_schedule_limit(&mut self, limit: usize) {
+        self.wheel.set_limit(limit);
+    }
+
     /// Move an installed entry's expiry placement to `deadline`. Never
     /// allocates, so a warm refresh stays allocation-free.
     pub(super) fn reschedule(&mut self, node: u32, deadline: Instant) {
@@ -886,8 +905,9 @@ pub enum PayloadRejection {
         /// The cap.
         max: usize,
     },
-    /// The secondary index has no slot left for a new entry: every one
-    /// of its `slots` positions is occupied. Never wraps.
+    /// The fold has no slot left for a new entry: every one of `slots`
+    /// positions is occupied, in the secondary index's slot table or the
+    /// expiry wheel. Never wraps.
     #[error("index full: all {slots} entry slots are occupied")]
     IndexFull {
         /// The slot-space size.

@@ -2438,3 +2438,58 @@ fn a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock() {
     assert!(applied);
     assert!(!fold.has_audit_sink(), "the queued writer ran");
 }
+
+/// PR #1210 review: the expiry wheel's node handles are `u32` with
+/// `u32::MAX` as the end-of-list sentinel, and only the capability fold's
+/// slot table bounded the entry count; any other fold kind could schedule
+/// a node at the sentinel itself. A full wheel now refuses a new entry
+/// before anything changes (a Replace reuses its node and still lands),
+/// and refuses a restore that would not fit.
+#[test]
+fn a_full_expiry_wheel_refuses_a_new_entry_before_any_change() {
+    let fold: Fold<CapFold> = Fold::new();
+    fold.state.write().set_schedule_limit(2);
+    fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["a"]))
+        .expect("first");
+    fold.apply(cap_announcement(0x43, 0x1000, 1, vec!["b"]))
+        .expect("second");
+    let snap = fold.snapshot();
+
+    match fold.apply(cap_announcement(0x44, 0x1000, 1, vec!["c"])) {
+        Err(FoldError::PayloadRejected {
+            reason: PayloadRejection::IndexFull { slots: 2 },
+            ..
+        }) => {}
+        other => panic!("expected IndexFull, got {other:?}"),
+    }
+    fold.with_state(|s| {
+        assert_eq!(s.len(), 2, "nothing installed");
+        assert_eq!(s.scheduled_len(), 2);
+        assert!(s.keys_for(0x44).is_none(), "no by_node record");
+    });
+    assert!(fold
+        .query(CapQuery {
+            class: 0x1000,
+            required_tag: Some("c".into()),
+        })
+        .is_empty());
+
+    fold.apply(cap_announcement(0x42, 0x1000, 2, vec!["a2"]))
+        .expect("a replacement reuses its node");
+
+    // A restore that fits nowhere is refused, leaving the fold as it was.
+    let unlimited: Fold<CapFold> = Fold::new();
+    for node in 0x50..0x53 {
+        unlimited
+            .apply(cap_announcement(node, 0x1000, 1, vec!["d"]))
+            .expect("unlimited");
+    }
+    match fold.restore(unlimited.snapshot(), true) {
+        Err(FoldError::RestoreRefused {
+            reason: PayloadRejection::IndexFull { slots: 2 },
+        }) => {}
+        other => panic!("expected RestoreRefused(IndexFull), got {other:?}"),
+    }
+    fold.with_state(|s| assert_eq!(s.len(), 2));
+    fold.restore(snap, true).expect("a restore that fits");
+}
