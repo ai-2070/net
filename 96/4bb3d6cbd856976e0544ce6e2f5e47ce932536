@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/fold/tag_dictionary.rs
+  s_b4293f9d895548::t_4f4315815822ec 481-578
+  s_b4293f9d895548::t_bb1350f29e724f 206-210,216-224,226-231,234,240-247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "964bb3d6cbd856976e0544ce6e2f5e47ce932536",
+  "prompts": {},
+  "sessions": {
+    "s_b4293f9d895548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a49f9cc-58d8-4a8f-9aac-096640090b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
