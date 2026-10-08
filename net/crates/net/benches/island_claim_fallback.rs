@@ -153,7 +153,7 @@ fn seed_host(node: &Arc<MeshNode>, signer: &EntityKeypair) {
         fixture_meta(),
         CapabilityMembership {
             class_hash: CLASS,
-            tags: vec![MATCH_TAG.to_string()],
+            tags: vec![MATCH_TAG.into()],
             hardware: None,
             state: NodeState::Idle,
             region: None,

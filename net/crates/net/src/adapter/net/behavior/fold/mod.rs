@@ -10,6 +10,7 @@
 //! See `docs/internal/plans/SCALING_MULTIFOLD_PLAN.md` for the design
 //! rationale.
 
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,16 +32,21 @@ pub mod reservation;
 pub mod routing;
 pub mod snapshot;
 pub mod state;
+pub mod tag_dictionary;
+pub mod tag_str;
+mod wheel;
 pub mod wire;
 
+#[cfg(test)]
+mod tag_tests;
 #[cfg(test)]
 mod tests;
 
 pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
     capability_tags_for, capability_tags_for_all, nodes_with_capability_tag, reflex_addr_for,
-    CapabilityFilter, CapabilityFold, CapabilityMatch, CapabilityMembership, CapabilityQuery,
-    HardwareSummary, NodeState,
+    CapabilityFilter, CapabilityFold, CapabilityIndexInner, CapabilityMatch, CapabilityMembership,
+    CapabilityQuery, HardwareSummary, IndexMemory, NodeState,
 };
 pub use capability_aggregation::{Aggregation, CapacityQuery, CapacityRow, GroupBy, TagMatcher};
 pub use dispatch::{
@@ -59,9 +65,14 @@ pub use reservation::{
 pub use routing::{RouteAnnouncement, RouteRow, RoutingFold, RoutingQuery};
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
-    ApplyOutcome, BuildU64Hasher, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState,
-    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet, NodeRecord, PublisherRevision,
+    AdmissionStats, ApplyOutcome, BuildU64Hasher, EntryTransition, FoldEntry, FoldError, FoldIndex,
+    FoldState, FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet, NodeRecord, PayloadRejection,
+    PublisherRevision,
 };
+pub use tag_dictionary::{
+    validate_capability_tags, TagBudget, MAX_CAPABILITY_TAGS, MAX_CAPABILITY_TAG_LEN,
+};
+pub use tag_str::TagStr;
 pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 
 /// One typed fold definition. Each concrete fold (capability,
@@ -140,6 +151,15 @@ pub trait FoldKind: Send + Sync + Sized + 'static {
     /// [`Fold::new`] and again on [`Fold::restore`] before
     /// re-populating from a snapshot.
     fn build_index() -> Self::Index;
+
+    /// Cheap payload limits checked before merge, for every intake path
+    /// (signed dispatch, local apply) and for every row a restore would
+    /// install. A violation refuses the whole announcement (or restore)
+    /// with nothing changed. Default: no limits.
+    fn validate(payload: &Self::Payload) -> Result<(), PayloadRejection> {
+        let _ = payload;
+        Ok(())
+    }
 
     /// How the runtime should treat an incoming announcement vs
     /// the existing entry at its key. Default: last-write-wins
@@ -280,8 +300,15 @@ impl<K: FoldKind> Fold<K> {
     /// (e.g. tests that drive expiry via
     /// [`Self::sweep_expired_now`]) opt out this way.
     pub fn with_sweep_interval(interval: Duration) -> Self {
+        Self::with_sweep_interval_and_index(interval, K::build_index())
+    }
+
+    /// [`Self::with_sweep_interval`] with a caller-built secondary index,
+    /// for an index configured at creation (the capability fold's tag
+    /// budget: `CapabilityIndexInner::with_tag_budget`).
+    pub fn with_sweep_interval_and_index(interval: Duration, index: K::Index) -> Self {
         let state = Arc::new(RwLock::new(FoldState::new()));
-        let index = Arc::new(RwLock::new(K::build_index()));
+        let index = Arc::new(RwLock::new(index));
         let metrics = Arc::new(FoldMetrics::new());
         let audit_sink: Arc<RwLock<Option<Arc<dyn FoldAuditSink>>>> = Arc::new(RwLock::new(None));
         // Generation-0 channel. The initial receiver is dropped
@@ -386,6 +413,12 @@ impl<K: FoldKind> Fold<K> {
             });
         }
 
+        // Payload limits, before merge and before any lock: cheap, and a
+        // malformed advertisement never reaches the state.
+        if let Err(reason) = K::validate(&ann.payload) {
+            return Err(self.refuse_payload(ann.node_id, reason));
+        }
+
         let key = K::key_for(ann.node_id, &ann.payload);
         // Copied out before the accept arms move `ann` into
         // `build_entry` (§5). `NodeId` is `Copy`, so this is free.
@@ -400,15 +433,30 @@ impl<K: FoldKind> Fold<K> {
         match action {
             MergeAction::Insert => {
                 // No existing entry to evict; install fresh.
-                let entry = build_entry::<K>(ann);
+                let mut entry = build_entry::<K>(ann);
+                // Room in the expiry wheel, then admission: both before any
+                // mutation, so a refusal leaves the state and index exactly
+                // as they were.
+                if !state.can_schedule() {
+                    let reason = PayloadRejection::IndexFull {
+                        slots: state.schedule_limit(),
+                    };
+                    return Err(self.refuse_payload(node_id, reason));
+                }
+                if let Err(reason) = index.admit(&mut entry.payload, None) {
+                    return Err(self.refuse_payload(node_id, reason));
+                }
                 index.on_insert(&key, &entry.payload);
+                self.metrics.set_admission(index.admission_stats());
                 state.attach_key(node_id, key.clone());
+                state.schedule(&key, &mut entry);
                 let audit = K::audit_event(EntryTransition::Created {
                     key: &key,
                     new: &entry,
                 });
                 self.emit_audit(audit);
                 state.entries.insert(key, entry);
+                debug_assert_eq!(state.scheduled_len(), state.entries.len());
                 self.metrics.on_insert();
                 self.signal_changed();
                 Ok(ApplyOutcome::Inserted)
@@ -419,12 +467,22 @@ impl<K: FoldKind> Fold<K> {
                 // runtime sound (no `unwrap`) if a future `merge` impl
                 // ever violates that contract: we'd undercount replaces
                 // in metrics, never silently lose data.
-                let new_entry = build_entry::<K>(ann);
+                let mut new_entry = build_entry::<K>(ann);
                 let Some(old_entry) = state.entries.get(&key) else {
                     self.metrics.on_reject();
                     return Ok(ApplyOutcome::Rejected);
                 };
+                // Admission first, net of what the old payload releases;
+                // all-or-nothing, so a refusal leaves everything as it was.
+                if let Err(reason) = index.admit(&mut new_entry.payload, Some(&old_entry.payload)) {
+                    return Err(self.refuse_payload(node_id, reason));
+                }
+                self.metrics.set_admission(index.admission_stats());
                 let old_owner = old_entry.node_id;
+                // The replacement inherits the entry's one expiry
+                // placement, moved to the new deadline below.
+                new_entry.expiry_node = old_entry.expiry_node;
+                let (expiry_node, deadline) = (new_entry.expiry_node, new_entry.expires_at);
                 // PERF_AUDIT §4.5 — steady-state refresh (same
                 // tags/region/state, new generation/TTL) skips the
                 // index churn. The default `index_payload_equivalent`
@@ -449,6 +507,7 @@ impl<K: FoldKind> Fold<K> {
                 if let Some(slot) = state.entries.get_mut(&key) {
                     *slot = new_entry;
                 }
+                state.reschedule(expiry_node, deadline);
                 // Same owner (always, for a fold keyed on the
                 // publisher): `attach_key` advances the revision and
                 // re-lists the key if the record lost it, so a refresh
@@ -523,7 +582,9 @@ impl<K: FoldKind> Fold<K> {
         let mut removed = 0usize;
         for key in keys {
             if let Some(old_entry) = state.entries.remove(&key) {
+                state.unschedule(old_entry.expiry_node);
                 index.on_remove(&key, &old_entry.payload);
+                index.release(&old_entry.payload);
                 let audit = K::audit_event(EntryTransition::Evicted {
                     key: &key,
                     old: &old_entry,
@@ -534,6 +595,8 @@ impl<K: FoldKind> Fold<K> {
                 removed += 1;
             }
         }
+        debug_assert_eq!(state.scheduled_len(), state.entries.len());
+        self.metrics.set_admission(index.admission_stats());
         if removed > 0 {
             self.signal_changed();
         }
@@ -587,18 +650,6 @@ impl<K: FoldKind> Fold<K> {
             K::KIND_ID,
         );
 
-        let mut state = self.state.write();
-        let mut index = self.index.write();
-
-        if !force && !state.entries.is_empty() {
-            return Err(FoldError::RestoreOverLiveState {
-                current_len: state.entries.len(),
-            });
-        }
-
-        state.clear_for_restore();
-        index.clear();
-
         let anchor = Instant::now();
         // Wall-clock interval since the snapshot was taken. Clock
         // skew (now < taken_at) saturates to zero — a clock that
@@ -609,33 +660,85 @@ impl<K: FoldKind> Fold<K> {
         let elapsed_since_dump =
             Duration::from_micros(now_unix_us.saturating_sub(snap.taken_at_unix_us));
 
+        // The effective restored state, built before any lock: rows whose
+        // TTL elapsed during downtime are dropped (the same shape as
+        // `from_state` dropping already-expired entries at dump time),
+        // and a key listed twice (under two publishers, for a fold keyed
+        // on the payload) keeps its later row.
+        //
+        // Bounded by what this fold can hold (its expiry wheel and its
+        // index): a snapshot from a larger fold is refused at the first row
+        // past that, not after rehydrating and cloning all of it (cubic,
+        // PR #1210). Both limits are fixed at construction.
+        let capacity = self
+            .state
+            .read()
+            .schedule_limit()
+            .min(self.index.read().entry_capacity());
+        let mut rows: Vec<(K::Key, FoldEntry<K>)> =
+            Vec::with_capacity(snap.entries.len().min(capacity));
+        let mut row_of: HashMap<K::Key, usize, K::KeyHasher> = HashMap::default();
         for snap_entry in &snap.entries {
             let Some(entry) =
                 FoldSnapshot::<K>::rehydrate_entry(snap_entry, anchor, elapsed_since_dump)
             else {
-                // Entry's remaining TTL was consumed by downtime
-                // between dump and restore. Drop, same shape as
-                // `from_state` dropping already-expired entries at
-                // dump time.
                 continue;
             };
-            let key = snap_entry.key.clone();
-            // A snapshot can list one key twice (under two publishers,
-            // for a fold keyed on the payload). The later row wins, as
-            // `entries.insert` would have it, and the earlier one is
-            // unwound the way a cross-publisher Replace unwinds it:
-            // out of the index and out of its owner's record. Left in
-            // the record, `evict_node(earlier owner)` would remove the
-            // later owner's entry.
-            if let Some(earlier) = state.entries.remove(&key) {
-                index.on_remove(&key, &earlier.payload);
-                state.detach_key(earlier.node_id, &key);
+            match row_of.get(&snap_entry.key) {
+                Some(&at) => rows[at] = (snap_entry.key.clone(), entry),
+                None => {
+                    if rows.len() == capacity {
+                        return Err(FoldError::RestoreRefused {
+                            reason: PayloadRejection::IndexFull { slots: capacity },
+                        });
+                    }
+                    row_of.insert(snap_entry.key.clone(), rows.len());
+                    rows.push((snap_entry.key.clone(), entry));
+                }
+            }
+        }
+        // Every row must pass the payload limits; one that does not
+        // refuses the whole restore, before the live fold is touched.
+        for (_, entry) in &rows {
+            K::validate(&entry.payload).map_err(|reason| FoldError::RestoreRefused { reason })?;
+        }
+
+        let mut state = self.state.write();
+        let mut index = self.index.write();
+
+        if !force && !state.entries.is_empty() {
+            return Err(FoldError::RestoreOverLiveState {
+                current_len: state.entries.len(),
+            });
+        }
+        // The state as a whole must fit the admission budget, checked
+        // before anything is cleared: a refused restore leaves the old
+        // fold exactly as it was.
+        {
+            let payloads: Vec<&K::Payload> = rows.iter().map(|(_, e)| &e.payload).collect();
+            index
+                .preflight_restore(&payloads)
+                .map_err(|reason| FoldError::RestoreRefused { reason })?;
+        }
+
+        state.clear_for_restore();
+        index.clear();
+
+        for (key, mut entry) in rows {
+            // Cannot fail: the preflight checked this exact state against
+            // the same budget, into the same emptied index.
+            if let Err(reason) = index.admit(&mut entry.payload, None) {
+                debug_assert!(false, "restore admission failed after preflight: {reason}");
+                continue;
             }
             index.on_insert(&key, &entry.payload);
             state.attach_key(entry.node_id, key.clone());
+            state.schedule(&key, &mut entry);
             state.entries.insert(key, entry);
         }
 
+        debug_assert_eq!(state.scheduled_len(), state.entries.len());
+        self.metrics.set_admission(index.admission_stats());
         let new_len = state.entries.len() as u64;
         self.metrics.on_snapshot_restored(new_len);
         // Restore replaced the entire entry set (cleared, then
@@ -643,6 +746,29 @@ impl<K: FoldKind> Fold<K> {
         // restored set is empty.
         self.signal_changed();
         Ok(())
+    }
+
+    /// Account for a refused payload and build its error: the normal
+    /// rejection count, the typed limit or budget counter, and one bounded
+    /// audit record (sizes and counts, never tag contents). Nothing in the
+    /// fold changed.
+    fn refuse_payload(&self, node_id: NodeId, reason: PayloadRejection) -> FoldError {
+        self.metrics.on_reject();
+        if reason.is_budget() {
+            self.metrics.on_budget_reject();
+        } else {
+            self.metrics.on_limit_reject();
+        }
+        self.emit_audit(Some(AuditEvent {
+            kind: AuditKind::Custom(if reason.is_budget() {
+                "payload-budget-rejected"
+            } else {
+                "payload-limit-rejected"
+            }),
+            key_repr: format!("node:{node_id:#x}"),
+            detail: Some(reason.to_string()),
+        }));
+        FoldError::PayloadRejected { node_id, reason }
     }
 
     /// Read-only handle to the metric counters.
@@ -655,6 +781,12 @@ impl<K: FoldKind> Fold<K> {
     /// One atomic load per counter + one read lock on the
     /// audit-sink slot; cheap enough to call per-tick.
     pub fn stats(&self) -> metrics::FoldStats {
+        // Lock-free, like every other counter here: the admission
+        // counters are published into `metrics` under the index lock by
+        // the operations that change them. Taking the index lock here
+        // would deadlock an audit sink that calls `stats()` from
+        // `record`, which runs while an apply still holds that lock.
+        let admission = self.metrics.admission();
         metrics::FoldStats {
             kind: K::KIND_ID,
             channel_prefix: K::CHANNEL_PREFIX.to_string(),
@@ -670,6 +802,11 @@ impl<K: FoldKind> Fold<K> {
             snapshots_restored: self.metrics.snapshots_restored(),
             sweep_walks: self.metrics.sweep_walks(),
             sweep_yielded: self.metrics.sweep_yielded(),
+            interned: admission.interned,
+            interned_bytes: admission.interned_bytes,
+            interned_overhead_bytes: admission.overhead_bytes,
+            limit_rejections: self.metrics.limit_rejections(),
+            budget_rejections: self.metrics.budget_rejections(),
             has_audit_sink: self.has_audit_sink(),
         }
     }
@@ -790,10 +927,11 @@ impl<K: FoldKind> Fold<K> {
     /// invoke it directly to make expiry deterministic without
     /// relying on the runtime's scheduler.
     pub fn sweep_expired_now(&self) -> usize {
-        let sink_holder = self.audit_sink.clone();
-        let sink_guard = sink_holder.read();
-        let sink_ref = sink_guard.as_ref();
-        let reaped = expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink_ref);
+        // The sink is cloned out of its slot: no slot guard is held while
+        // the sweep calls `record` (see `emit_audit`).
+        let sink = self.audit_sink.read().clone();
+        let reaped =
+            expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink.as_ref());
         if reaped > 0 {
             self.signal_changed();
         }
@@ -810,7 +948,13 @@ impl<K: FoldKind> Fold<K> {
         let Some(event) = event else {
             return;
         };
-        if let Some(sink) = self.audit_sink.read().as_ref() {
+        // Clone the sink out and release the slot's read guard BEFORE
+        // `record` runs: a sink that reads `stats()` (which reads this
+        // slot) would otherwise re-enter the guard, and with a
+        // `set_audit_sink` writer queued between the two reads the
+        // re-entrant read waits on the writer, which waits on us.
+        let sink = self.audit_sink.read().clone();
+        if let Some(sink) = sink {
             sink.record(event);
         }
     }
@@ -864,5 +1008,6 @@ fn build_entry<K: FoldKind>(ann: SignedAnnouncement<K::Payload>) -> FoldEntry<K>
         payload: ann.payload,
         received_at: now,
         expires_at: now.checked_add(ttl).unwrap_or(now),
+        expiry_node: wheel::NIL,
     }
 }

@@ -1355,10 +1355,11 @@ fn sweep_evicts_across_multiple_chunks_when_count_exceeds_chunk_size() {
 }
 
 #[test]
-fn sweep_metrics_count_walks_and_yielded_entries() {
-    // Pins the counters CAPABILITY_FOLD_SCALE_PLAN.md's Slice 0
-    // reports. Since Slice 2 a sweep makes ONE walk that yields every
-    // entry once, however many eviction chunks follow it.
+fn sweep_metrics_count_walks_and_visited_entries() {
+    // Pins the counters CAPABILITY_FOLD_SCALE_PLAN.md reports. Since
+    // Slice 8 a sweep visits expiry-wheel nodes, not the primary map: an
+    // idle sweep over a live fold visits none, and a mass expiry visits
+    // each due entry once, plus the read-locked probe's first hit.
     let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
     let kp = EntityKeypair::generate();
     const LIVE: u64 = 100;
@@ -1369,11 +1370,11 @@ fn sweep_metrics_count_walks_and_yielded_entries() {
     }
 
     assert_eq!(fold.sweep_expired_now(), 0);
-    assert_eq!(fold.metrics().sweep_walks(), 1, "empty sweep: one walk");
+    assert_eq!(fold.metrics().sweep_walks(), 1, "one sweep, one walk");
     assert_eq!(
         fold.metrics().sweep_yielded(),
-        LIVE,
-        "empty sweep yields every entry once"
+        0,
+        "idle sweep visits nothing"
     );
 
     for i in LIVE..LIVE + EXPIRED {
@@ -1384,24 +1385,19 @@ fn sweep_metrics_count_walks_and_yielded_entries() {
     let walks_before = fold.metrics().sweep_walks();
     let yielded_before = fold.metrics().sweep_yielded();
     assert_eq!(fold.sweep_expired_now(), EXPIRED as usize);
-    assert_eq!(
-        fold.metrics().sweep_walks() - walks_before,
-        1,
-        "one walk, then two eviction chunks"
-    );
+    assert_eq!(fold.metrics().sweep_walks() - walks_before, 1);
     assert_eq!(
         fold.metrics().sweep_yielded() - yielded_before,
-        LIVE + EXPIRED,
-        "every entry yielded exactly once"
+        EXPIRED + 1,
+        "each due entry once across chunks, plus the probe's first hit"
     );
+    fold.with_state(|s| s.assert_expiry_index());
 }
 
-/// CAPABILITY_FOLD_SCALE_PLAN.md Slice 2 witness. A mass expiry
-/// yields at most the entry count captured BEFORE the sweep (not
-/// `entries.len()` after it, which the eviction has shrunk). Two
-/// eviction chunks are enough to discriminate: the old
-/// restart-per-chunk walk yielded ~48k entries here (two partial walks
-/// plus the final empty walk) against 20k present.
+/// CAPABILITY_FOLD_SCALE_PLAN.md Slice 2 witness, kept under Slice 8. A
+/// mass expiry visits at most the entry count captured BEFORE the sweep.
+/// The old restart-per-chunk walk yielded ~48k entries here against 20k
+/// present.
 #[test]
 fn mass_expiry_yields_each_entry_once() {
     let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
@@ -1432,95 +1428,180 @@ fn mass_expiry_yields_each_entry_once() {
         yielded <= pre_sweep,
         "yielded {yielded} entries, more than the {pre_sweep} present before the sweep"
     );
+    fold.with_state(|s| s.assert_expiry_index());
 }
 
-/// The per-key re-check survives the split into a collection walk
-/// and chunked eviction. An entry refreshed AFTER the walk collected
-/// it must not be evicted, and an entry evicted by `evict_node` in
-/// between must not be double-removed or counted.
+/// Slice 8: one due slot larger than `SWEEP_CHUNK_SIZE`, drained one
+/// chunk at a time. Between chunks (each a released write lock) the wheel
+/// still holds exactly one node per entry, and the keys not yet drained
+/// are still scheduled, not dropped.
 #[test]
-fn sweep_rechecks_entries_refreshed_or_removed_after_collection() {
+fn multi_chunk_drain_keeps_placement_invariant() {
     let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
     let kp = EntityKeypair::generate();
-    for node in [0xA, 0xB, 0xC] {
-        fold.apply(sign_cap_ann_with_ttl(&kp, node, 0x100, 1, 0, vec!["t"]))
+    let due = expiry::SWEEP_CHUNK_SIZE as u64 * 2 + 100;
+    for i in 0..due {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 0, vec!["t"]))
             .expect("apply expiring");
     }
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    let now = std::time::Instant::now();
-    let collected = expiry::collect_expired_segment(&fold.state, 0, usize::MAX, now).expired;
-    assert_eq!(collected.len(), 3, "the walk collects all three");
-
-    // Between collection and eviction: A is refreshed with a long TTL,
-    // B is evicted by the operator path. C is untouched.
-    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 2, 3600, vec!["t"]))
-        .expect("refresh A");
-    fold.evict_node(0xB, "test");
-
-    let evicted = expiry::evict_chunk(
-        &fold.state,
-        &fold.index,
-        &fold.metrics,
-        None,
-        &collected,
-        now,
-    );
-    assert_eq!(evicted, 1, "only C is still present and expired");
-    fold.with_state(|s| {
-        assert!(s.by_node.contains_key(&0xA), "refreshed A survives");
-        assert!(!s.by_node.contains_key(&0xB));
-        assert!(!s.by_node.contains_key(&0xC));
-    });
-    assert_eq!(fold.metrics().expiries(), 1);
-    assert_eq!(fold.metrics().entries(), 1);
-}
-
-/// The walk runs in segments, releasing the state lock between them,
-/// yet still examines each entry exactly once: the resume point is
-/// reduced by what the previous segments evicted, since each eviction
-/// took one occupied slot out of the walked prefix. A resume that
-/// ignored evictions would skip survivors (fewer examined, expired
-/// entries left behind); one that re-walked would count them twice.
-#[test]
-fn segmented_sweep_examines_each_entry_once_and_evicts_every_expired_one() {
-    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
-    let kp = EntityKeypair::generate();
-    const N: u64 = 1000;
-    for i in 0..N {
-        // Every third entry expires at once; the rest stay live.
-        let ttl = if i % 3 == 0 { 0 } else { 3600 };
-        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, ttl, vec!["t"]))
-            .expect("apply");
+    for i in due..due + 50 {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 3600, vec!["t"]))
+            .expect("apply live");
     }
     std::thread::sleep(std::time::Duration::from_millis(10));
-    let expired = (0..N).filter(|i| i % 3 == 0).count();
 
-    let walks_before = fold.metrics().sweep_walks();
-    let yielded_before = fold.metrics().sweep_yielded();
-    // 64-entry segments: sixteen segments over 1,000 entries.
-    let evicted =
-        expiry::sweep_expired_in_segments(&fold.state, &fold.index, &fold.metrics, None, 64);
-
-    assert_eq!(evicted, expired, "every expired entry evicted");
-    assert_eq!(fold.metrics().entries(), N - expired as u64);
-    assert_eq!(
-        fold.metrics().sweep_walks() - walks_before,
-        1,
-        "one logical walk"
-    );
-    assert_eq!(
-        fold.metrics().sweep_yielded() - yielded_before,
-        N,
-        "each entry examined exactly once across segments"
-    );
     let now = std::time::Instant::now();
-    fold.with_state(|s| {
-        assert!(
-            s.entries.values().all(|e| e.expires_at > now),
-            "no expired entry survives the sweep"
+    let mut keys = Vec::new();
+    let mut chunks = 0;
+    let mut evicted = 0;
+    loop {
+        let chunk = expiry::evict_due_chunk(
+            &fold.state,
+            &fold.index,
+            &fold.metrics,
+            None,
+            now,
+            &mut keys,
         );
+        chunks += 1;
+        evicted += chunk.evicted;
+        fold.with_state(|s| {
+            s.assert_expiry_index();
+            assert_eq!(
+                s.entries.len() as u64,
+                due + 50 - evicted as u64,
+                "undrained keys are still resident and scheduled"
+            );
+        });
+        if chunk.drain.exhausted {
+            break;
+        }
+    }
+    assert_eq!(chunks, 3, "two full chunks and a remainder");
+    assert_eq!(evicted as u64, due);
+}
+
+/// Slice 8: a refresh before the old deadline moves the entry's one
+/// placement to the new deadline's slot. Nothing is left at the old one.
+#[test]
+fn refresh_before_old_deadline_moves_placement() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 1, 300, vec!["t"]))
+        .expect("apply");
+    let key = fold.with_state(|s| s.keys_for(0xA).expect("A")[0]);
+    let (before, _) = fold
+        .with_state(|s| s.expiry_position(&key))
+        .expect("placed");
+
+    fold.apply(sign_cap_ann_with_ttl(&kp, 0xA, 0x100, 2, 450, vec!["t"]))
+        .expect("refresh");
+    let (linked, wanted) = fold
+        .with_state(|s| s.expiry_position(&key))
+        .expect("placed");
+    assert_ne!(before, linked, "moved off the old slot");
+    assert_eq!(linked, wanted, "linked at the new deadline's slot");
+    fold.with_state(|s| {
+        s.assert_expiry_index();
+        assert_eq!(s.scheduled_len(), 1, "one placement, not two");
     });
+}
+
+/// Slice 8: eviction removes the entry's placement with it.
+#[test]
+fn evicted_entry_leaves_no_slot() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for node in [0xA, 0xB] {
+        fold.apply(sign_cap_ann_with_ttl(&kp, node, 0x100, 1, 300, vec!["t"]))
+            .expect("apply");
+    }
+    fold.evict_node(0xA, "test");
+    fold.with_state(|s| {
+        s.assert_expiry_index();
+        assert_eq!(s.scheduled_len(), 1);
+    });
+}
+
+/// Slice 8: restore schedules every restored entry at its re-anchored
+/// deadline. The first sweep after it evicts exactly what elapsed, and
+/// nothing early.
+#[test]
+fn first_sweep_after_restore_evicts_exactly_elapsed() {
+    let source: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for (node, ttl) in [(0xA, 3600), (0xB, 3600), (0xC, 3600)] {
+        source
+            .apply(sign_cap_ann_with_ttl(&kp, node, 0x100, 1, ttl, vec!["t"]))
+            .expect("apply");
+    }
+    let mut snap = source.snapshot();
+    // A: 40 ms left. B: an hour. C: already gone (dropped at restore).
+    for entry in &mut snap.entries {
+        entry.expires_offset_ns = match entry.node_id {
+            0xA => 40_000_000,
+            0xB => 3_600_000_000_000,
+            _ => 0,
+        };
+    }
+
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    fold.restore(snap, false).expect("restore");
+    fold.with_state(|s| s.assert_expiry_index());
+    assert_eq!(
+        fold.metrics().entries(),
+        2,
+        "C's TTL elapsed before restore"
+    );
+    assert_eq!(fold.sweep_expired_now(), 0, "nothing is due yet");
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(fold.sweep_expired_now(), 1, "exactly A");
+    fold.with_state(|s| {
+        assert!(s.keys_for(0xA).is_none());
+        assert!(s.keys_for(0xB).is_some());
+        s.assert_expiry_index();
+    });
+}
+
+/// Slice 8: an idle sweep over a live fold visits no entry.
+#[test]
+fn idle_sweep_touches_no_live_entry() {
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+    let kp = EntityKeypair::generate();
+    for i in 0..1000 {
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 300, vec!["t"]))
+            .expect("apply");
+    }
+    let before = fold.metrics().sweep_yielded();
+    for _ in 0..3 {
+        assert_eq!(fold.sweep_expired_now(), 0);
+    }
+    assert_eq!(fold.metrics().sweep_yielded() - before, 0);
+}
+
+/// Slice 8: a sweep's cost is set by what is due, not by the fold's
+/// size. Two folds hold 1k and 10k live entries and the same 100 expired
+/// ones, and their sweeps visit the same number of nodes.
+#[test]
+fn sweep_cost_is_independent_of_live_entry_count() {
+    let kp = EntityKeypair::generate();
+    let visits = |live: u64| {
+        let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+        for i in 0..live {
+            fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 300, vec!["t"]))
+                .expect("apply live");
+        }
+        for i in live..live + 100 {
+            fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 0, vec!["t"]))
+                .expect("apply expiring");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let before = fold.metrics().sweep_yielded();
+        assert_eq!(fold.sweep_expired_now(), 100);
+        fold.metrics().sweep_yielded() - before
+    };
+    assert_eq!(visits(1_000), visits(10_000));
 }
 
 /// A same-owner Replace re-lists the key in the publisher's record, so
@@ -1874,6 +1955,11 @@ fn fold_stats_round_trips_through_serde_json() {
         snapshots_restored: 0,
         sweep_walks: 4,
         sweep_yielded: 40,
+        interned: 9,
+        interned_bytes: 90,
+        interned_overhead_bytes: 900,
+        limit_rejections: 1,
+        budget_rejections: 2,
         has_audit_sink: true,
     };
     let json = serde_json::to_string(&stats).expect("serialize");
@@ -1889,22 +1975,46 @@ fn fold_stats_carry_the_sweep_counters() {
     let fold: Fold<CapFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
     let kp = EntityKeypair::generate();
     for i in 0..5 {
-        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 3600, vec!["t"]))
+        fold.apply(sign_cap_ann_with_ttl(&kp, i, 0x100, 1, 0, vec!["t"]))
             .expect("apply");
     }
-    fold.sweep_expired_now();
-    fold.sweep_expired_now();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    assert_eq!(fold.sweep_expired_now(), 5);
+    assert_eq!(fold.sweep_expired_now(), 0);
     let stats = fold.stats();
     assert_eq!(stats.sweep_walks, 2);
-    assert_eq!(stats.sweep_yielded, 10);
+    // Five due nodes plus the probe's first hit; the idle second sweep
+    // visits none.
+    assert_eq!(stats.sweep_yielded, 6);
 
     let mut legacy = serde_json::to_value(&stats).expect("serialize");
     let obj = legacy.as_object_mut().expect("object");
-    obj.remove("sweep_walks");
-    obj.remove("sweep_yielded");
+    // JSON from before the sweep counters (Slice 2) and the admission
+    // counters (Slice 6): every one of those fields absent.
+    const LATER_FIELDS: [&str; 7] = [
+        "sweep_walks",
+        "sweep_yielded",
+        "interned",
+        "interned_bytes",
+        "interned_overhead_bytes",
+        "limit_rejections",
+        "budget_rejections",
+    ];
+    for field in LATER_FIELDS {
+        assert!(obj.remove(field).is_some(), "{field} was serialized");
+    }
     let parsed: FoldStats = serde_json::from_value(legacy).expect("legacy JSON parses");
     assert_eq!(parsed.sweep_walks, 0);
     assert_eq!(parsed.sweep_yielded, 0);
+    assert_eq!(parsed.interned, 0);
+    assert_eq!(parsed.interned_bytes, 0);
+    assert_eq!(parsed.interned_overhead_bytes, 0);
+    assert_eq!(parsed.limit_rejections, 0);
+    assert_eq!(parsed.budget_rejections, 0);
+    assert_eq!(
+        parsed.applies_total, stats.applies_total,
+        "the rest is kept"
+    );
 }
 
 #[test]
@@ -2181,45 +2291,17 @@ fn apply_moves_the_payload_instead_of_cloning_it() {
 }
 
 // ---------------------------------------------------------------
-// Review §2 — one mixer behind both index aliases.
+// The fold-id mixer is not degenerate.
 // ---------------------------------------------------------------
 
-/// `state::BuildU64Hasher` (fold ids) and
-/// `capability::BuildU64TupleHasher` (capability index keys) were
-/// briefly two byte-identical `Hasher` impls — same rotate/xor/multiply
-/// step, same `FX_SEED`, same byte fallback — with nothing linking
-/// them, so a correction to either would silently miss the other.
-///
-/// They now alias one `FxU64Hasher`. This pins that behaviorally
-/// rather than structurally: feed both the SAME sequence of
-/// `write_u64` calls and require the same digest. A re-fork that
-/// changed the constant, the rotate, or the operation order in one
-/// copy fails here; a re-fork that copied it faithfully would not,
-/// which is fine — that one cannot drift by definition.
+/// `BuildU64Hasher` builds a real mixer: distinct inputs, distinct
+/// digests, and a non-zero digest for a non-zero input. (Its twin
+/// capability-index alias was removed with Slice 7's bitmap buckets.)
 #[test]
-fn both_index_hasher_aliases_are_the_same_mixer() {
+fn fold_id_hasher_is_a_real_mixer() {
     use std::hash::{BuildHasher, Hasher};
 
-    // A tuple key's own sequence, so the arity the alias names
-    // advertise is exercised rather than assumed away.
-    let writes: [u64; 3] = [0, 0xDEAD_BEEF_CAFE_F00D, u64::MAX];
-
-    let digest = |h: &mut dyn Hasher| {
-        for w in writes {
-            h.write_u64(w);
-        }
-        h.finish()
-    };
-
-    let mut ids = BuildU64Hasher::default().build_hasher();
-    let mut keys = super::capability::BuildU64TupleHasher::default().build_hasher();
-    assert_eq!(
-        digest(&mut ids),
-        digest(&mut keys),
-        "the fold-id and capability-index aliases must build one mixer",
-    );
-
-    // And the mixer is not the degenerate one an accidental
+    // The mixer is not the degenerate one an accidental
     // `write_u64` no-op would leave behind: distinct inputs, distinct
     // digests, and a non-zero digest for a non-zero input.
     let once = |v: u64| {
@@ -2279,4 +2361,163 @@ fn fx_u64_hasher_byte_fallback_matches_its_documented_edges() {
     // `write_u64` steps, so it cannot equal either chunk alone.
     let nine = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
     assert_ne!(via_bytes(&nine), via_bytes(&nine[..8]));
+}
+
+/// A sink may read `stats()` from `record` even while a `set_audit_sink`
+/// writer is queued on the sink slot (cubic, PR #1210). The emitting path
+/// used to hold the slot's read guard across `record`; `stats()` reads the
+/// slot again, and parking_lot's fair lock parks that re-entrant read
+/// behind the queued writer, which waits for the outer read: a deadlock.
+/// The sink here queues the writer itself, from a second thread, waits
+/// until the writer is observably at the lock, and only then reads
+/// `stats()`; the apply runs under a deadline.
+#[test]
+fn a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock() {
+    struct QueueWriterThenReadStats {
+        fold: std::sync::OnceLock<std::sync::Weak<Fold<AuditingCapFold>>>,
+        done: std::sync::atomic::AtomicBool,
+    }
+    impl super::FoldAuditSink for QueueWriterThenReadStats {
+        fn record(&self, _event: super::AuditEvent) {
+            if self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let Some(fold) = self.fold.get().and_then(std::sync::Weak::upgrade) else {
+                return;
+            };
+            let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = {
+                let fold = Arc::clone(&fold);
+                let done = Arc::clone(&writer_done);
+                std::thread::spawn(move || {
+                    fold.set_audit_sink(None);
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            };
+            // Wait until the writer is DEFINITELY at the slot's lock, not
+            // for a guessed delay (cubic, PR #1210): parking_lot sets the
+            // writer bit as soon as a writer is waiting, even while readers
+            // still hold the lock, and a non-recursive `try_read` then
+            // fails. So the writer is queued (or holding, or done) once
+            // `try_read` fails or it has finished.
+            while !writer_done.load(std::sync::atomic::Ordering::SeqCst)
+                && fold.audit_sink.try_read().is_some()
+            {
+                std::thread::yield_now();
+            }
+            let _ = fold.stats();
+            let _ = writer.join();
+        }
+    }
+
+    let fold = Arc::new(Fold::<AuditingCapFold>::with_sweep_interval(
+        std::time::Duration::ZERO,
+    ));
+    let sink = Arc::new(QueueWriterThenReadStats {
+        fold: std::sync::OnceLock::new(),
+        done: std::sync::atomic::AtomicBool::new(false),
+    });
+    let _ = sink.fold.set(Arc::downgrade(&fold));
+    fold.set_audit_sink(Some(sink as Arc<dyn super::FoldAuditSink>));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let fold = Arc::clone(&fold);
+        std::thread::spawn(move || {
+            let kp = EntityKeypair::generate();
+            let ok = fold
+                .apply(sign_audit_ann(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
+                .is_ok();
+            let _ = tx.send(ok);
+        })
+    };
+    let applied = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the apply completed instead of deadlocking");
+    worker.join().expect("worker");
+    assert!(applied);
+    assert!(!fold.has_audit_sink(), "the queued writer ran");
+}
+
+/// PR #1210 review: the expiry wheel's node handles are `u32` with
+/// `u32::MAX` as the end-of-list sentinel, and only the capability fold's
+/// slot table bounded the entry count; any other fold kind could schedule
+/// a node at the sentinel itself. A full wheel now refuses a new entry
+/// before anything changes (a Replace reuses its node and still lands),
+/// and refuses a restore that would not fit.
+#[test]
+fn a_full_expiry_wheel_refuses_a_new_entry_before_any_change() {
+    let fold: Fold<CapFold> = Fold::new();
+    fold.state.write().set_schedule_limit(2);
+    fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["a"]))
+        .expect("first");
+    fold.apply(cap_announcement(0x43, 0x1000, 1, vec!["b"]))
+        .expect("second");
+    let snap = fold.snapshot();
+
+    match fold.apply(cap_announcement(0x44, 0x1000, 1, vec!["c"])) {
+        Err(FoldError::PayloadRejected {
+            reason: PayloadRejection::IndexFull { slots: 2 },
+            ..
+        }) => {}
+        other => panic!("expected IndexFull, got {other:?}"),
+    }
+    fold.with_state(|s| {
+        assert_eq!(s.len(), 2, "nothing installed");
+        assert_eq!(s.scheduled_len(), 2);
+        assert!(s.keys_for(0x44).is_none(), "no by_node record");
+    });
+    assert!(fold
+        .query(CapQuery {
+            class: 0x1000,
+            required_tag: Some("c".into()),
+        })
+        .is_empty());
+
+    fold.apply(cap_announcement(0x42, 0x1000, 2, vec!["a2"]))
+        .expect("a replacement reuses its node");
+
+    // A restore that fits nowhere is refused, leaving the fold as it was.
+    let unlimited: Fold<CapFold> = Fold::new();
+    for node in 0x50..0x53 {
+        unlimited
+            .apply(cap_announcement(node, 0x1000, 1, vec!["d"]))
+            .expect("unlimited");
+    }
+    match fold.restore(unlimited.snapshot(), true) {
+        Err(FoldError::RestoreRefused {
+            reason: PayloadRejection::IndexFull { slots: 2 },
+        }) => {}
+        other => panic!("expected RestoreRefused(IndexFull), got {other:?}"),
+    }
+    fold.with_state(|s| assert_eq!(s.len(), 2));
+    fold.restore(snap, true).expect("a restore that fits");
+}
+
+/// cubic, PR #1210: a restore built and cloned every snapshot row before
+/// checking this fold's capacity, so a snapshot from a much larger fold
+/// was fully materialized just to be refused. It now stops at the first
+/// row past the capacity.
+#[test]
+fn an_oversized_restore_is_refused_before_materializing_the_snapshot() {
+    let big: Fold<CapFold> = Fold::new();
+    for node in 0..50u64 {
+        big.apply(cap_announcement(0x100 + node, 0x1000, 1, vec!["x"]))
+            .expect("big");
+    }
+    let fold: Fold<CapFold> = Fold::new();
+    fold.state.write().set_schedule_limit(2);
+    super::snapshot::REHYDRATED.with(|n| n.set(0));
+    match fold.restore(big.snapshot(), false) {
+        Err(FoldError::RestoreRefused {
+            reason: PayloadRejection::IndexFull { slots: 2 },
+        }) => {}
+        other => panic!("expected RestoreRefused(IndexFull), got {other:?}"),
+    }
+    assert_eq!(
+        super::snapshot::REHYDRATED.with(|n| n.get()),
+        3,
+        "stopped at the first row past the capacity"
+    );
+    fold.with_state(|s| assert_eq!(s.len(), 0));
 }

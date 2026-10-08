@@ -950,12 +950,16 @@ impl<'a> PreparedScope<'a> {
     /// is retained as the readable reference definition;
     /// `tags_match_scope_agrees_with_materialized_scope` pins the two to
     /// the same verdict across the matrix.
-    pub(crate) fn matches(&self, tags: &[String], same_subnet: bool) -> bool {
+    pub(crate) fn matches<S: AsRef<str>>(&self, tags: &[S], same_subnet: bool) -> bool {
         tags_match_prepared(tags, self, same_subnet)
     }
 }
 
-fn tags_match_prepared(tags: &[String], prepared: &PreparedScope<'_>, same_subnet: bool) -> bool {
+fn tags_match_prepared<S: AsRef<str>>(
+    tags: &[S],
+    prepared: &PreparedScope<'_>,
+    same_subnet: bool,
+) -> bool {
     use ScopeFilter as F;
     let filter = prepared.filter;
 
@@ -971,7 +975,7 @@ fn tags_match_prepared(tags: &[String], prepared: &PreparedScope<'_>, same_subne
     let (mut has_tenant, mut has_region) = (false, false);
     let (mut tenant_hit, mut region_hit) = (false, false);
     for tag in tags {
-        let Some(body) = tag.strip_prefix("scope:") else {
+        let Some(body) = tag.as_ref().strip_prefix("scope:") else {
             continue;
         };
         if body == "subnet-local" {
@@ -1082,7 +1086,19 @@ pub struct CapabilitySet {
     /// bytes regardless of `HashSet` iteration order (which is
     /// process-local random and would otherwise cause spurious
     /// signature-verification failures across processes).
-    #[serde(default, serialize_with = "serialize_tags_sorted")]
+    ///
+    /// Decoding enforces the per-advertisement tag caps
+    /// ([`MAX_CAPABILITY_TAGS`](super::fold::MAX_CAPABILITY_TAGS) /
+    /// [`MAX_CAPABILITY_TAG_LEN`](super::fold::MAX_CAPABILITY_TAG_LEN)) on
+    /// the encoded vector itself, before the `HashSet` collapses
+    /// duplicates or any filter drops a tag: a wire vector of one more
+    /// identical tag than the cap, or one overlong tag, fails to decode
+    /// whole.
+    #[serde(
+        default,
+        serialize_with = "serialize_tags_sorted",
+        deserialize_with = "deserialize_tags_capped"
+    )]
     pub tags: HashSet<Tag>,
     /// Free-form key-value metadata.
     ///
@@ -2168,6 +2184,86 @@ fn decoder_sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
 /// signed — readers reconstruct the same `HashSet` regardless of
 /// iteration order. Skipping the sort avoids ~N × `Tag::to_string()`
 /// allocations on every compact serialize.
+/// Decode a tag vector, enforcing the per-advertisement caps on the
+/// encoded input: every element counts, duplicates included, and each
+/// tag's length is its encoded UTF-8 length, measured before it is parsed
+/// or deduplicated. Elements parse exactly as `Tag`'s own `Deserialize`
+/// does.
+/// One tag decoded with its length checked on the borrowed text the
+/// deserializer offers, BEFORE anything is allocated for it: an oversized
+/// tag is refused without first being copied into an owned `String`
+/// (cubic, PR #1210). Parses exactly as `Tag`'s own `Deserialize` does.
+struct BoundedTag(Tag);
+
+impl<'de> Deserialize<'de> for BoundedTag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use super::fold::MAX_CAPABILITY_TAG_LEN;
+
+        struct BoundedTagVisitor;
+        impl serde::de::Visitor<'_> for BoundedTagVisitor {
+            type Value = BoundedTag;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a capability tag of at most {MAX_CAPABILITY_TAG_LEN} bytes"
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<BoundedTag, E> {
+                if raw.len() > MAX_CAPABILITY_TAG_LEN {
+                    return Err(E::custom(format!(
+                        "capability tag is {} bytes, over the cap of {MAX_CAPABILITY_TAG_LEN}",
+                        raw.len()
+                    )));
+                }
+                Tag::parse(raw).map(BoundedTag).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(BoundedTagVisitor)
+    }
+}
+
+fn deserialize_tags_capped<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashSet<Tag>, D::Error> {
+    use super::fold::MAX_CAPABILITY_TAGS;
+
+    struct CappedTags;
+    impl<'de> serde::de::Visitor<'de> for CappedTags {
+        type Value = HashSet<Tag>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "a sequence of at most {MAX_CAPABILITY_TAGS} capability tags"
+            )
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let hint = seq.size_hint().unwrap_or(0).min(MAX_CAPABILITY_TAGS);
+            let mut tags = HashSet::with_capacity(hint);
+            let mut count = 0usize;
+            while let Some(BoundedTag(tag)) = seq.next_element::<BoundedTag>()? {
+                count += 1;
+                if count > MAX_CAPABILITY_TAGS {
+                    return Err(serde::de::Error::custom(format!(
+                        "capability set carries more than {MAX_CAPABILITY_TAGS} tags"
+                    )));
+                }
+                tags.insert(tag);
+            }
+            Ok(tags)
+        }
+    }
+
+    deserializer.deserialize_seq(CappedTags)
+}
+
 fn serialize_tags_sorted<S: serde::Serializer>(
     tags: &HashSet<Tag>,
     serializer: S,
@@ -3350,6 +3446,85 @@ mod tests {
         assert!(score.is_finite(), "score must be finite, got {score}");
     }
     use super::*;
+
+    /// An announcement's wire JSON with its tag vector replaced by `tags`,
+    /// verbatim: duplicates and all.
+    fn announcement_bytes_with_raw_tags(tags: &[String]) -> Vec<u8> {
+        let ann = CapabilityAnnouncement::new(
+            7,
+            crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]),
+            1,
+            CapabilitySet::new().add_tag("seed"),
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&ann.to_bytes()).expect("announcement json");
+        json["capabilities"]["tags"] = serde_json::Value::Array(
+            tags.iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+        serde_json::to_vec(&json).expect("re-encode")
+    }
+
+    /// Review defect 3 at `50a8c60d4`: the per-advertisement caps govern
+    /// the encoded vector, not the set it collapses into. One identical
+    /// tag over the cap used to deduplicate to one and pass.
+    #[test]
+    fn decode_counts_duplicate_tags_against_the_cap() {
+        use crate::adapter::net::behavior::fold::MAX_CAPABILITY_TAGS;
+        let at_cap = vec!["same".to_string(); MAX_CAPABILITY_TAGS];
+        let ann = CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&at_cap))
+            .expect("exactly the cap of encoded tags decodes");
+        assert_eq!(ann.capabilities.tags.len(), 1, "then deduplicate");
+
+        let over = vec!["same".to_string(); MAX_CAPABILITY_TAGS + 1];
+        assert!(
+            CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&over)).is_none(),
+            "one identical encoded tag over the cap refuses the whole announcement"
+        );
+    }
+
+    /// One distinct tag over the cap fails to decode whole, before any
+    /// filter could thin it. (The blob-heat filter's own, smaller cap
+    /// refuses an announcement whole too: see
+    /// `filter_unauthorized_heat_tags_refuses_a_blob_heat_flood_whole`.)
+    #[test]
+    fn decode_refuses_an_over_cap_vector_of_distinct_tags() {
+        use crate::adapter::net::behavior::fold::MAX_CAPABILITY_TAGS;
+        let tags: Vec<String> = (0..=MAX_CAPABILITY_TAGS)
+            .map(|i| format!("heat:blob:{i:064x}=1.0"))
+            .collect();
+        assert!(
+            CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&tags)).is_none()
+        );
+    }
+
+    /// An overlong tag is refused at decode, by its encoded UTF-8 length,
+    /// before any filter (such as the unauthorized chain-heat strip)
+    /// could remove it first. The boundary is exact.
+    #[test]
+    fn decode_measures_encoded_tag_length_before_any_filter() {
+        use crate::adapter::net::behavior::fold::MAX_CAPABILITY_TAG_LEN;
+        // "heat:" + hex + "=1" padded with two-byte chars to the cap.
+        let prefix = "heat:abcd=1";
+        let fill = MAX_CAPABILITY_TAG_LEN - prefix.len();
+        let exact = format!("{prefix}{}", "a".repeat(fill));
+        assert_eq!(exact.len(), MAX_CAPABILITY_TAG_LEN);
+        assert!(
+            CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&[exact]))
+                .is_some()
+        );
+        let multibyte_over = format!("{prefix}{}é", "a".repeat(fill - 1));
+        assert_eq!(multibyte_over.len(), MAX_CAPABILITY_TAG_LEN + 1);
+        assert!(
+            CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&[
+                multibyte_over
+            ]))
+            .is_none(),
+            "an overlong unauthorized chain-heat tag is refused, not stripped"
+        );
+    }
     /// Fixed-bytes `EntityId` for unit-test fixtures. Valid as a
     /// *value* (it's just 32 bytes) but not a valid ed25519 public
     /// key — callers that also exercise signature verification

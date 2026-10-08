@@ -392,6 +392,27 @@ fn fold_tables(fold: &Fold<CapabilityFold>) -> (u64, u64) {
     })
 }
 
+/// Slice 7: the inverted index split into buckets (maps, sets, key
+/// strings) and slot bookkeeping, per entry, plus the raw counts.
+fn index_breakdown_row(config: &str, fold: &Fold<CapabilityFold>) -> String {
+    let (n, mem) = fold.with_state_and_index(|s, index| (s.len() as f64, index.memory_breakdown()));
+    let per = |b: u64| b as f64 / n;
+    format!(
+        "| {config} | {n:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {} / {} / {} | {} | {} |",
+        per(mem.bucket_total()),
+        per(mem.bucket_maps),
+        per(mem.bucket_sets),
+        per(mem.bucket_key_strings),
+        per(mem.slot_table),
+        per(mem.free_list),
+        mem.occupied_slots,
+        mem.slot_capacity,
+        mem.free_slots,
+        mem.buckets,
+        mem.memberships,
+    )
+}
+
 fn print_footprint(config: &str, fp: &Footprint) {
     let n = fp.entries;
     let index = fp.retained - fp.payload_heap - fp.primary as i64 - fp.reverse as i64;
@@ -433,9 +454,11 @@ fn section_footprint(templates: &Templates) {
     );
     println!("|---|---|---|---|---|---|---|---|");
 
+    let mut breakdown: Vec<String> = Vec::new();
     for n in [N, 1_000_000] {
         let (fold, fp) = measure_fold(n, &|i| templates.envelope(node_id(i), 1, LIVE_TTL_SECS, 0));
         print_footprint("fixture repetition", &fp);
+        breakdown.push(index_breakdown_row("fixture repetition", &fold));
         if n != N {
             drop(fold);
             continue;
@@ -474,12 +497,17 @@ fn section_footprint(templates: &Templates) {
             reverse,
         };
         print_footprint("after 3× 20% churn", &churned);
+        breakdown.push(index_breakdown_row("after 3× 20% churn", &fold));
         drop(fold);
 
         let (fold, fp) = measure_fold(N, &|i| {
             templates.envelope_with_unique_tags(node_id(i), 1, UNIQUE)
         });
         print_footprint(&format!("mixed: +{UNIQUE} unique tags"), &fp);
+        breakdown.push(index_breakdown_row(
+            &format!("mixed: +{UNIQUE} unique tags"),
+            &fold,
+        ));
         drop(fold);
 
         // Translated per entry, NOT cloned from a template: production
@@ -495,6 +523,20 @@ fn section_footprint(templates: &Templates) {
     }
 
     COUNTING.store(false, Ordering::Relaxed);
+
+    println!("\n## footprint: inverted-index breakdown (estimated, B/entry)\n");
+    println!(
+        "Buckets are the inverted index (outer maps + sets + owned key strings). \
+         Slot table and free list are Slice 7's bookkeeping, reported separately so \
+         a bucket saving cannot hide them. Estimates from capacities.\n"
+    );
+    println!(
+        "| configuration | entries | buckets total | maps | sets | key strings | slot table | free list | slots occupied / capacity / free | buckets | memberships |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    for row in breakdown {
+        println!("{row}");
+    }
 }
 
 // ---------------------------------------------------------------------------

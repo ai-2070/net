@@ -3287,6 +3287,7 @@ dependencies = [
  "reed-solomon-erasure",
  "regex",
  "ring",
+ "roaring",
  "semver",
  "serde",
  "serde_json",
@@ -4807,6 +4808,16 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roaring"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18bd8a37d17a58532776dcdf6041ce64929adca78e8489d5cacbafe99229d3e1"
+dependencies = [
+ "bytemuck",
+ "byteorder",
 ]
 
 [[package]]

@@ -29,6 +29,15 @@ use crate::adapter::net::current_timestamp_micros as unix_micros_now;
 use super::state::{FoldEntry, FoldState, NodeId};
 use super::FoldKind;
 
+#[cfg(test)]
+thread_local! {
+    /// Invocations of `rehydrate_entry` on this thread (every snapshot row
+    /// walked, including rows skipped as expired or overwritten as key
+    /// duplicates), so a test can see
+    /// how much of a snapshot a refused restore walked.
+    pub(super) static REHYDRATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// On-wire representation of one entry in a [`FoldSnapshot`].
 /// The shape mirrors [`FoldEntry`] except that the two `Instant`
 /// fields become offsets relative to the snapshot's
@@ -134,6 +143,8 @@ impl<K: FoldKind> FoldSnapshot<K> {
         anchor: Instant,
         elapsed_since_dump: Duration,
     ) -> Option<FoldEntry<K>> {
+        #[cfg(test)]
+        REHYDRATED.with(|n| n.set(n.get() + 1));
         let expires_offset = Duration::from_nanos(snap_entry.expires_offset_ns);
         if elapsed_since_dump >= expires_offset {
             return None;
@@ -149,6 +160,7 @@ impl<K: FoldKind> FoldSnapshot<K> {
             generation: snap_entry.generation,
             received_at,
             expires_at,
+            expiry_node: super::wheel::NIL,
         })
     }
 }

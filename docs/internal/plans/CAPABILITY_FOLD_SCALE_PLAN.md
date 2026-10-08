@@ -1151,8 +1151,36 @@ valid.
 - `FoldStats` has two new public fields, `sweep_walks` and
   `sweep_yielded`. Code that builds a `FoldStats` with a struct literal
   must set them. Deserializing older JSON is unaffected.
+- **Slice 6, capability tags (source):**
+  - `CapabilityMembership::tags` is `Vec<TagStr>`, not `Vec<String>`.
+    `TagStr` converts from `String` / `&str` with `Into`, and derefs to
+    `str`. `tags.contains(&some_string)` no longer compiles: compare by
+    content (`tags.iter().any(|t| *t == some_string)`).
+  - `find_nodes_matching_scoped`'s `same_subnet_lookup` closure takes
+    `&[TagStr]`.
+  - `FoldStats` gains `interned`, `interned_bytes`,
+    `interned_overhead_bytes`, `limit_rejections` and `budget_rejections`.
+  - `FoldError` gains `PayloadRejected` and `RestoreRefused`, so an
+    exhaustive `match` on it needs two arms.
+  - `FoldKind` and `FoldIndex` gain methods with defaults; implementors
+    need nothing.
+  - The wire form, the signature transcript and the snapshot form are
+    unchanged.
+- **Slice 6, capability tags (behavior):**
+  - A capability advertisement carrying more than 8,192 tags (duplicates
+    counted), or any tag over 256 UTF-8 bytes, is refused whole by every
+    receiver. (The first ruling said 256 tags; it was raised, see "Tag cap
+    raised".) An inbound announcement carrying more than 256 blob-heat
+    tags is now refused whole too, instead of being cut to 256. Local `announce_capabilities*` and `publish_fold` return an
+    error instead of sending it.
+  - A capability fold refuses, whole, an advertisement whose new distinct
+    tags would exceed its tag budget (default 1,000,000 tags / 64 MiB of
+    tag bytes, configurable at creation).
 
 ### Slices 0–5 at a glance (1M resident unless stated)
+
+Slice 8 (delivered after these) takes the steady sweep to 0.00 ms; see
+"Slice 8" below.
 
 | measure | Slice 0 baseline | after Slice 5 |
 |---|---|---|
@@ -1639,6 +1667,292 @@ breakdown. B1 alone cannot remove the index tuple sets: at the plan's own
 bytes-per-entry target is set for B1 alone without first subtracting the
 index bytes B1 does not touch.
 
+### Track B decisions (proposed 2026-10-07, awaiting review)
+
+This section answers the decisions Track B lists. Slices 6 and 7 stay held
+until it is reviewed. Facts are from the tree at `a44083765` (paths under
+`src/adapter/net/behavior/`).
+
+**Facts the decisions rest on.**
+
+- **Signing.** `CapabilityMembership.tags` is `Vec<String>`
+  (`fold/capability.rs:87`). The signature covers the payload's postcard
+  serde form, re-encoded at verify (`fold/wire.rs:230-273`, `:340-353`),
+  not its in-memory type. A type whose serde form is byte-identical to
+  `Vec<String>` changes neither the wire nor the signature.
+- **Intake converges on `Fold::apply`.**
+  - Legacy: `project_tags` → `translate_announcement`
+    (`capability_bridge.rs:1375`, `:1431`).
+  - Typed: `FoldDispatch::dispatch` → `decode_and_verify` → `apply`
+    (`fold/dispatch.rs:96-127`).
+  - Local publish signs a caller-built struct (`mesh.rs:44713`, `:44744`)
+    and also reaches `apply`.
+  - Only `Fold::restore` bypasses `apply` (`mod.rs:589`).
+- **Readers.** Production code reads `tags` at about 30 sites, as strings:
+  iteration, membership, `Tag::parse`, axis parsing, clone-out (survey list
+  in the PR).
+  - The one public borrowed surface is `find_nodes_matching_scoped`'s
+    `same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool`
+    (`capability_bridge.rs:1713-1718`). It is called only from `mesh.rs`
+    (`:47242`, `:48090`).
+  - No binding (Node, Python, Go/C) or SDK signature carries tags. They
+    receive node ids.
+- **No cap exists.** Nothing limits capability tag count or tag length.
+  The wire payload (8,108 bytes, `wire/src/protocol.rs:36`) is the only
+  bound, and `mesh.rs:~47226` says so.
+- **Snapshots.** They serialize the payload through serde, with no format
+  version. Nothing in production persists one (`snapshot`/`restore` are
+  called only from tests).
+- **The index.** `by_tag`, `by_synthetic` and `by_region` are
+  `HashMap<String, HashSet<(u64, NodeId)>>`, plus `by_state`
+  (`fold/capability.rs:362-383`).
+  - The evaluator has AND (`intersect`, seeded from the smallest set), OR
+    (`group_union`) and single-bucket fast paths. It has no NOT.
+  - Publisher dedup is by explicit sort + dedup at
+    `capability_bridge.rs:566`, `:1549`, `:1779` and `:1976`. `:1518`
+    sorts without a dedup. The plan's earlier `:1384` / `:1614` references
+    are stale.
+
+#### B1 decisions (Slice 6, tag interning)
+
+1. **Seam: a tag handle type inside the existing payload.**
+   - `tags: Vec<String>` becomes `tags: Vec<TagStr>`. `TagStr` is a
+     receiver-local shared string (`Arc<str>` inside) that derefs to
+     `str`.
+   - `TagStr` serializes and deserializes as a plain string, so the
+     postcard bytes, the signature transcript, the snapshot form and
+     every cross-language fixture are byte-identical.
+   - There is no second "stored payload" type, so `FoldKind::Payload`
+     keeps serving dispatch, storage, query output and snapshots
+     unchanged.
+   - Interning happens in one place for all intake: a new
+     `FoldKind::intern` hook with a no-op default. `Fold::apply` calls it
+     under the state write lock, before merge. `Fold::restore` calls it
+     per restored entry.
+   - The capability fold's hook swaps each decoded `TagStr` for the
+     dictionary's copy. Legacy translate, typed dispatch, local publish
+     and restore therefore produce identical entries, which is the
+     witness.
+   - Decode still allocates one `String` per tag, as it does today. The
+     dictionary keeps only one string per distinct tag.
+2. **Reader access: string borrows, no id resolution.** Because a `TagStr`
+   *is* the string, readers keep `&str` access under the state guard they
+   already hold. They pay no lookup and no `Arc` clone per read: `Deref`
+   borrows.
+   - The `&[String]` sites become `&[TagStr]`, or
+     `impl IntoIterator<Item = &str>` where that is simpler.
+   - **Public source change:** the `same_subnet_lookup` closure parameter
+     becomes `&[TagStr]`. `SubnetPolicy::assign_from_rendered_tags` and
+     `PreparedScope::matches` become generic over `AsRef<str>`.
+   - `capability_tags_for*` keep returning `Vec<String>`, with an owned
+     copy, as today.
+3. **Compatibility.**
+   - Wire: unchanged, pinned by a golden test. A `CapabilityMembership`
+     with N tags must encode to exactly the bytes of the same struct
+     declared with `Vec<String>`, and verify against a signature made
+     before the change.
+   - Snapshot: the same serde form, so no version bump. None are
+     persisted anyway.
+   - Source: constructing `tags` changes for every literal (tests,
+     benches, downstream). Mitigation: `From<String>`, `From<&str>` and
+     `FromIterator` for the vector. That keeps
+     `tags: vec!["gpu".into()]` compiling. The change goes into the
+     release migration note.
+   - Tag order and content are preserved. The raw and synthetic
+     namespaces stay separate, because only `tags` is interned and
+     synthetic keys are index-internal.
+4. **Lifetime budget: reference-counted, with defined exhaustion.**
+   - The dictionary is a per-fold `HashSet<TagStr>`, keyed by content. The
+     `Arc` count is the reference count.
+   - When an entry is removed or replaced, each of its tags whose count
+     drops to 1 (the dictionary's own copy) is released, so retained size
+     tracks live tags only.
+   - A per-fold budget (defaults: 1M distinct tags, 64 MiB of tag bytes)
+     is checked before anything is inserted. An announcement that would
+     add new tags past the budget is **rejected** as a whole: a new
+     `ApplyOutcome::Rejected` reason, a `FoldStats::interner_rejected`
+     counter, and an audit event.
+   - Tags already in the dictionary are always admitted. Rejection
+     allocates nothing in the dictionary.
+   - **Per-announcement cap, enforced in the hook before interning:**
+     `MAX_CAPABILITY_TAGS = 256` and `MAX_CAPABILITY_TAG_LEN = 256` bytes.
+     An oversize announcement is rejected.
+   - `FoldStats` gains `interned` and `interned_bytes` gauges.
+   - The cap is a behavior change for any publisher sending more than 256
+     tags. None in the tree does; the fixture carries 31.
+
+**B1 target.** The payload heap is 1,641 B/entry with 31.4 tags (Slice 0).
+A tag costs a 24 B `String` plus its exact-length heap, about 53 B. As a
+`TagStr` it costs 16 B plus a share of one dictionary string. Target:
+payload heap **≤ 800 B/entry** at 100k on the fixture. Index bytes are
+measured separately (see B2).
+
+#### B2 decisions (Slice 7, bitmap buckets)
+
+1. **Identity: one dense `u32` slot per (class, node) entry.**
+   - The index keeps `slot_of: HashMap<Key, u32>` and
+     `key_of: Vec<Option<Key>>`.
+   - Bitmaps (`RoaringBitmap`) replace each `HashSet<(u64, NodeId)>`
+     bucket in `by_tag`, `by_synthetic`, `by_region` and `by_state`.
+   - Predicates evaluate per entry, so a class-A tag and a class-B tag of
+     one node never combine. Publishers are deduplicated afterwards,
+     exactly as now.
+2. **Ordering: keep the explicit sort + dedup at all four dedup sites,**
+   and the sort at `:1518`. Bitmaps yield slot order, which is arrival
+   order, not `NodeId` order. No site relies on index order today.
+3. **Slot reclamation: a free list.** A slot freed by expiry, eviction or
+   Replace-with-key-change goes on a free list and is reused before the
+   slot space grows. Live slots ≤ live entries, so the slot space is
+   bounded by the fold's peak entry count.
+   - Each bitmap clears the slot's bit in `on_remove`, so a reused slot
+     inherits nothing.
+   - Witness: `reused_slot_inherits_no_membership`.
+4. **Dependency: `roaring`.** A pure-Rust MIT/Apache crate, widely used.
+   It is a new direct dependency of the core crate, and every tracked
+   lockfile is refreshed the way the `foldhash` change refreshed them.
+   - Needs explicit sign-off; the risk is review bandwidth, as the plan
+     says.
+   - **Alternative if declined:** a fixed-width `Vec<u64>` bitset per
+     bucket. It is denser for hot tags but wastes space on sparse ones.
+     Not recommended at 1M slots.
+5. **Evaluator.**
+   - AND becomes bitmap `&`, seeded from the smallest bitmap, as now.
+   - OR becomes `|`.
+   - The single-bucket fast path iterates one bitmap.
+   - Candidate streaming (Slice 4) maps slots back to keys through
+     `key_of`.
+   - Slice 4's permanent comparison witness (`resolve_candidate_keys`
+     against the pre-Slice-4 resolver) must stay green unchanged.
+
+**B2 target.** Measure first. Slice 7 starts by splitting the footprint
+report's "index (remainder)" into bucket sets, wheel and rest. The
+remainder is 905 B/entry at 100k, and now includes the Slice 8 wheel.
+Target: index bucket bytes **at least 60% lower** than the measured
+bucket share. Bucket sets dominate it: 31 memberships × 16-byte keys plus
+table overhead.
+
+**Order.** B1 then B2, each its own PR with its own measurements, per the
+plan. B2 does not depend on B1. If review prefers, B2 can go first: it
+touches only the index.
+
+#### Owner rulings and corrected B1 contract (2026-10-07)
+
+The owner review of `0a343f6f1` resolved the four open questions. It also
+corrected the B1 proposal above. Where the two differ, **this section
+supersedes the "B1 decisions" above.** It also supersedes the Track B
+introduction's u32 tag ids and id-resolution seam: B1 stores
+string-bearing `TagStr` handles, and readers never resolve ids. The owner
+authorized Slice 6 under this contract. That is not acceptance and not
+permission to merge. Slice 7 starts only after Slice 6 is accepted. Slice
+8 has its own acceptance ledger and is not signed off here.
+
+**Rulings.**
+
+1. **Per-advertisement caps: 256 tags, 256 UTF-8 bytes per tag.**
+   *(Tag count superseded: raised to 8,192 on 2026-10-08, see "Tag cap
+   raised". The per-tag length and everything else below stand.)*
+   - Count the original vector, duplicates included.
+   - Content and order are preserved. Nothing is truncated, normalized or
+     silently dropped.
+   - 257 tags, or any tag over 256 bytes, rejects the whole
+     advertisement.
+   - The caps are independent of the encoded-message and transport bound.
+   - The same rule applies to legacy, typed, local and restored entries.
+     Local publish entry points (`announce_capabilities*`,
+     `publish_capability_membership`) validate first, so a local producer
+     gets a meaningful error instead of a silent receiver drop.
+   - Tests: exactly 256 is accepted, 257 is rejected, and length is
+     measured in UTF-8 bytes (a multibyte tag at the boundary).
+2. **Budget: fail closed, whole-advertisement rejection.**
+   - Defaults: 1,000,000 canonical tags and 64 MiB of canonical UTF-8 tag
+     data. These are not a process-memory bound or a capacity guarantee.
+     A creation-time budget overrides them.
+   - Dictionary and container overhead is reported separately, not
+     counted against the budget.
+   - Budget arithmetic is **net**: a replacement that releases an old
+     last-use tag frees room for the new one.
+   - A refusal changes nothing: no live payload, index, expiry placement
+     or deadline, publisher revision or cache validity. It increments the
+     normal rejection count plus a typed interner reason and counter, and
+     emits one bounded structured audit record (counts, never tag
+     contents).
+   - Tags already canonical consume no new budget. Ordinary merge and
+     size rules still apply to them.
+   - No partial admission, no eviction of other publishers, no automatic
+     growth.
+3. **`roaring` is approved for Slice 7.**
+   - Use a compatible stable release (0.11.x was consulted), with narrow
+     features. The nightly SIMD feature stays off.
+   - Refresh every tracked lockfile that resolves the package, and
+     exercise the native and wasm feature graphs.
+   - Bitmap serialization is receiver-local, never a wire contract.
+4. **Order: Slice 6, then Slice 7,** each with its own implementation,
+   evidence and performance attribution.
+
+**Corrected B1 contract.**
+
+- **Commit only for accepted mutations.**
+  - Cheap size validation (ruling 1) runs before merge.
+  - Dictionary admission runs only after merge has decided Insert or
+    Replace, inside `Fold::apply`'s existing state + index write guards.
+    There is no second ingestion path.
+  - Admission is all-or-nothing. It computes the net budget effect first,
+    and on refusal nothing has been touched, so there is nothing to roll
+    back.
+  - A stale or rejected advertisement never reaches the dictionary.
+  - Content-based merge and index equivalence, and the warm
+    zero-allocation refresh gate, are preserved.
+- **Liveness is fold-owned, not `Arc`-owned.**
+  - The dictionary keeps an explicit use count per canonical tag,
+    incremented and decremented only by the fold's own stored entries:
+    admit, replace, evict, expire, restore unwind.
+  - Removing the last stored use retires the tag from the dictionary,
+    even if a caller still holds a `TagStr` from a query result or a
+    snapshot. Those handles keep their bytes alive outside the budget,
+    as public query outputs already do today.
+  - The budget therefore describes fold-owned canonical storage.
+  - `TagStr` keeps content-based `Eq` / `Hash` / `Borrow<str>` and
+    immutable data.
+- **Restore is complete or refused.**
+  - Restore first builds the effective restored state: expired rows are
+    dropped, and the later row of a duplicated key wins.
+  - It then validates every row (ruling 1) and preflights the budget over
+    that state.
+  - If anything fails, restore returns an error and **the old fold is left
+    as it was**. Only then does it clear and rebuild.
+  - A successful restore keeps publisher revisions monotonic, rebuilds the
+    indices and keeps the expiry-wheel conservation invariant.
+  - Snapshots are trusted local state. No authentication is added.
+- **Shared backing for raw-tag index keys.** `by_tag` is keyed by
+  `TagStr`, sharing the canonical allocation instead of holding its own
+  `String` per bucket, and is looked up by `&str` through `Borrow`.
+  Synthetic keys stay a separate map: distinct namespace, derived strings.
+  Neither change alters tag sequence or the signature transcript.
+- **Golden oracle.** The old `Vec<String>` encoding is kept in a test as
+  the oracle:
+  - byte equality of the encoded payload and signed envelope;
+  - a signature made over the old type verifies on the new one;
+  - an old snapshot round-trips without a format bump.
+
+  The new admission limits are tested separately from binary-format
+  compatibility.
+
+**B2 wording and invariants, carried into Slice 7.**
+
+- **The free list bounds slot space by the PEAK live entry count, not the
+  current one.** After 1,000 live entries shrink to 100, the table may
+  hold 1,000 positions with 900 free. No compaction is required.
+- Report occupied slots, table capacity and free slots separately. Reuse
+  before growth. Handle `u32` exhaustion without wrapping.
+- Every raw, synthetic, state and region membership of a slot is cleared
+  before the slot is reused, under the coherent state + index guards.
+  Test reuse across a different class and publisher, and through expiry,
+  eviction and restore.
+- Keep explicit `NodeId` sort + dedup and the permanent set-equivalence
+  oracle.
+- Measure bucket memory separately from slot maps, the free list and the
+  wheel, so the 60% bucket-saving target cannot hide new bookkeeping.
+
 ### Track C: allocation-free apply
 
 Independent of B, and smaller:
@@ -1959,6 +2273,9 @@ release notes, or the trait is confirmed crate-private.
 
 Not authorized until Track B1's four decisions (seam, reader access,
 compatibility, lifetime budget) are written into this plan and re-reviewed.
+They are written, reviewed and corrected ("Owner rulings and corrected B1
+contract (2026-10-07)"). **Authorized** under that contract. Acceptance is
+separate.
 
 Proof, once authorized:
 
@@ -1973,10 +2290,460 @@ Proof, once authorized:
 - The full fold unit surface, `org_routing_wiring_tests` and the
   `cross_lang_*` suites stay green.
 
+#### Slice 6 evidence packet (implemented; awaiting acceptance)
+
+Implemented under "Owner rulings and corrected B1 contract". This packet is
+for acceptance review. Slice 7 has not started.
+
+**What landed.**
+
+- **`TagStr`** (`fold/tag_str.rs`). An `Arc<str>` handle with content
+  `Eq` / `Ord` / `Hash`, `Borrow<str>`, `Deref<str>` and immutable text.
+  It serializes as a plain string.
+  - `CapabilityMembership::tags` is `Vec<TagStr>`.
+- **`TagDictionary`** (`fold/tag_dictionary.rs`), held in
+  `CapabilityIndexInner`:
+  - canonical tag → fold-owned occurrence count;
+  - net, all-or-nothing `admit`, and `release`;
+  - `preflight` for restore;
+  - a `TagBudget` (defaults 1,000,000 tags / 64 MiB, or
+    `CapabilityIndexInner::with_tag_budget` passed to the new
+    `Fold::with_sweep_interval_and_index`).
+- **Generic hooks, all default no-ops,** so no other fold changes:
+  - `FoldKind::validate`: the size caps, checked before merge and per
+    restore row;
+  - `FoldIndex::admit`: after merge decides Insert or Replace, inside
+    `apply`'s existing state + index guards, before any other mutation;
+  - `FoldIndex::release`: eviction, expiry;
+  - `FoldIndex::preflight_restore`, `FoldIndex::admission_stats`.
+- **Refusals.**
+  - Errors: `FoldError::PayloadRejected { node_id, reason }` and
+    `FoldError::RestoreRefused { reason }`, with a typed
+    `PayloadRejection` (`TooManyTags`, `TagTooLong`, `TagBudget`).
+  - Counters: the normal `applies_rejected` plus
+    `FoldStats::{limit_rejections, budget_rejections}`.
+  - Audit: one bounded record, `payload-limit-rejected` or
+    `payload-budget-rejected`, whose detail holds counts only and never
+    a tag.
+- **Restore is preflighted.** The effective state (expired rows dropped,
+  later duplicate wins) is built and size-checked before any lock is
+  taken. The budget is preflighted under the guards, before the clear. A
+  refusal returns `RestoreRefused` with the old fold untouched.
+- **`by_tag` keys are `TagStr`.** Buckets share the canonical allocation
+  and are looked up by `&str`. Synthetic keys stay in their own `String`
+  map.
+- **Local publish refuses first.**
+  - `announce_capabilities*` validates the caller's set before it becomes
+    the baseline, and the fully augmented set (services, tools,
+    transport, NAT) before it is published.
+  - `publish_fold` (so `publish_capability_membership`) validates before
+    a generation is consumed.
+- **Readers.**
+  - `&[String]` signatures became `&[TagStr]` or generic `AsRef<str>`:
+    `find_nodes_matching_scoped`'s closure, `PreparedScope::matches`,
+    `CapabilityMatcher::matches_any`, `declares_capability`,
+    `SubnetPolicy::assign_from_rendered_tags`.
+  - `capability_tags_for*` still return `Vec<String>`.
+  - `tags_union_for` now dedups on `&str` instead of cloning each tag
+    first.
+
+**Measured** (`fold_scale_report`, same machine, against Slice 8):
+
+| measure | Slice 8 | Slice 6 |
+|---|---|---|
+| payload heap, B/entry, 100k (target ≤ 800) | 1,641 | **508** |
+| retained, B/entry, 100k | 3,317 | **2,184** (−34%) |
+| retained, B/entry, 1M | 4,199 | **3,066** (−27%) |
+| retained after 3× 20% churn, 100k | 4,082 | 2,947 |
+| warm index-equivalent refresh, allocations (gate) | 0 | **0** |
+| cold insert, allocations per call | 1.07 | 1.06 |
+
+One reporter caveat. The "payload heap" column measures payloads built
+outside the fold, before interning. For the cloned-template rows those
+already share allocations. For "translated per entry" they do not (1,992
+B/entry), so that row's "index (remainder)" goes negative. Its meaningful
+figure is **retained**: 2,184, identical to the template row. That shows
+the real decode path interns to the same footprint. The dictionary's own
+overhead is reported separately (`FoldStats::interned_overhead_bytes`) and
+is not counted by the budget.
+
+**Witnesses.**
+
+- Golden oracle (`fold/tag_tests.rs`), with the old `Vec<String>` type
+  kept as `LegacyMembership`:
+  - `tag_str_encoding_matches_the_string_oracle`: payload bytes and the
+    whole signed envelope are byte-identical, and an old-type signature
+    verifies as the new type;
+  - `old_snapshot_restores_without_a_format_bump`: old snapshot bytes
+    decode and restore with order, content and duplicates kept.
+  - `FoldSnapshot<K>` itself is not deserializable for a concrete fold
+    (its derived serde bound asks `K: Deserialize`), and no production
+    path decodes one. The test decodes into a field-for-field mirror.
+- Caps:
+  - `tag_caps_apply_on_every_intake_path`: typed apply, typed signed
+    dispatch, legacy translation. 256 accepted, 257 by duplicates
+    refused, multibyte 258 bytes refused, counters checked.
+  - `caps_count_duplicates_and_measure_utf8_bytes` (unit): the exact-cap
+    and multibyte boundary.
+  - `local_publish_refuses_an_over_cap_advertisement` (mesh): announce and
+    typed publish refused, no baseline adopted, no generation consumed.
+- Budget:
+  - `a_budget_refusal_changes_nothing`: Insert and Replace refusals. It
+    checks payload, generation, deadline, expiry placement, publisher
+    revision, cache validity (`Arc::ptr_eq` hit), the index, the
+    dictionary, the counters, and an audit record that names no tag.
+  - `a_replacement_frees_its_last_use_tag_for_a_new_one`: net budget at
+    a full dictionary.
+  - Unit: `a_refused_admission_changes_nothing`,
+    `a_replacement_frees_its_last_use_for_the_new_tag`,
+    `duplicates_within_a_payload_are_one_new_tag`.
+- Liveness and admission point:
+  - `a_merge_rejected_advertisement_never_reaches_the_dictionary`;
+  - `a_pinned_reader_does_not_keep_a_tag_in_the_dictionary`: a cloned
+    payload and a snapshot both pin; eviction still retires the tag;
+  - unit `admit_canonicalizes_and_counts_fold_owned_uses`.
+- Intake identity: `intake_paths_share_one_canonical_allocation`. Legacy
+  and typed entries share one allocation per tag, and so do restored
+  entries.
+- Restore:
+  - `a_restore_over_a_limit_is_refused_and_leaves_the_fold`;
+  - `a_restore_over_the_budget_is_refused_and_leaves_the_fold`, which
+    also covers the in-budget success: monotonic revision, an exact
+    dictionary, the wheel invariant.
+
+**RED-checked** (each witness fails with the named piece removed):
+- eviction's `release` → `a_pinned_reader_does_not_keep_a_tag_in_the_dictionary`;
+- restore's budget preflight → `a_restore_over_the_budget_is_refused_and_leaves_the_fold`;
+- the budget comparison → `a_budget_refusal_changes_nothing`;
+- `apply`'s `validate` → `tag_caps_apply_on_every_intake_path`;
+- the net release credit → `a_replacement_frees_its_last_use_tag_for_a_new_one`.
+
+**Gates run.**
+- The unit suite: 6,038 pass.
+- Integration binaries:
+  - every capability-, gang-, aggregator- and sensing-related binary:
+    79 pass;
+  - both `cross_lang_*` suites: 23 pass.
+- `cargo check --workspace --all-targets` and
+  `cargo check --all-features --all-targets`.
+- Clippy: strict `--lib --bins` in all three feature configurations, and
+  all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- fmt.
+
+**Source changes found in-tree.** The CLI (`typegen/live.rs`) called
+`tags.contains(&String)`. It now compares by content.
+- Integration tests and benches that built `tags` from `Vec<String>`
+  now convert with `Into`.
+- The bindings and the SDK carry no tags and needed nothing.
+
+#### Slice 6 review HOLD at `50a8c60d4`: four defects, fixed
+
+Two source reviews found four production defects in Slice 6's
+integration code. The dictionary's admission, release, expiry and atomic
+restore passed. Each defect is fixed, each fix has a witness, and each
+witness was confirmed RED with its fix removed.
+
+1. **A refused augmented announce mutated the baseline and consumed a
+   version** (`mesh.rs`, `announce_attempt`).
+   - The caller's set was checked and installed as the baseline before the
+     automatic tags (services, tools, transport, NAT, ACK ranges) were
+     added. The augmented set was checked only afterwards, after
+     `capability_version` had moved.
+   - A refusal therefore left the rejected baseline for keep-alives to
+     re-send.
+   - **Fix:** the augmentation block moved into `augment_public_caps`, a
+     pure method. `announce_attempt` checks the augmented public set and
+     the self-fold set before anything is committed. The version advances
+     only after the checks pass. The baseline and the pingwave summary are
+     committed only after this node's own fold accepts the announcement.
+   - Witness: `a_refused_augmented_announce_changes_nothing`. It checks
+     that the baseline, the version, the published emission's version and
+     the self-fold tags are all unchanged, and that the previous baseline
+     still re-announces.
+2. **Private-service refusals were discarded.**
+   - The cap check covered only the public set. Owner-scoped and granted
+     `nrpc:` tags were added afterwards.
+   - The self-fold `apply` error was dropped, in `announce_attempt` and in
+     `index_self_with_local_services`.
+   - `serve_rpc*` therefore succeeded for a handler whose folded tag the
+     self-fold had refused, and protected dispatch requires that tag.
+   - **Fix, announce side:** `announce_attempt` also checks
+     `self_fold_caps` (public plus private services), and a self-fold
+     refusal returns an error with nothing committed.
+   - **Fix, registration side:** `index_self_with_local_services` returns
+     `Result`. It first checks the whole announceable state
+     (`check_announceable`: published and self-indexed) and propagates a
+     fold refusal.
+   - The four `serve_rpc*` paths register through `publish_local_service`.
+     On refusal it rolls back the registry entry and the inbound
+     dispatcher, then returns the new
+     `ServeError::CapabilityRefused`.
+   - Witnesses: `serve_rpc_rolls_back_a_service_whose_tag_cannot_be_announced`
+     (a retry is refused for the same reason, not as a duplicate; it
+     succeeds once room is made) and
+     `an_announce_whose_private_services_overflow_the_self_fold_is_refused`.
+3. **Legacy and live intake checked the caps after deduplicating and
+   filtering.**
+   - `CapabilitySet::tags` decoded straight into a `HashSet<Tag>`, so 257
+     identical tags became one.
+   - The live intake path strips unauthorized chain-heat tags and caps
+     blob-heat tags at 256. Both ran before any length or count check:
+     257 blob-heat tags were silently cut to 256, and an overlong
+     chain-heat tag was stripped instead of refused.
+   - **Fix:** `CapabilitySet::tags` decodes through
+     `deserialize_tags_capped`. It counts every encoded element,
+     duplicates included, and measures each tag's encoded UTF-8 length
+     before parsing or deduplication. A violation fails the decode, so
+     `CapabilityAnnouncement::from_bytes` refuses the whole announcement
+     before any filter runs.
+   - This applies to every `CapabilitySet` decode. A set that cannot be
+     announced does not decode.
+   - Witnesses (`behavior/capability.rs`):
+     - `decode_counts_duplicate_tags_against_the_cap`: 256 identical tags
+       decode, 257 refuse;
+     - `decode_refuses_257_blob_heat_tags_instead_of_truncating`;
+     - `decode_measures_encoded_tag_length_before_any_filter`: exact 256
+       bytes accepted, 257 with a multibyte character refused.
+4. **`Fold::stats()` could deadlock from an audit sink.**
+   - `stats()` took the index read lock, and a budget refusal records its
+     audit event while `apply` still holds the index write lock.
+   - **Fix:** the index's admission counters are published into
+     `FoldMetrics` atomics under the lock by every operation that changes
+     them (insert, replace, evict, expire, restore). `stats()` reads them
+     without taking any lock, as it did before Slice 6.
+   - The `FoldAuditSink` contract now says what `record` may call:
+     counters, yes; anything that takes the state or index lock, no.
+   - Witness: `an_audit_sink_can_read_stats_during_a_refusal`. Its sink
+     calls `fold.stats()` from `record`, and the apply runs on a thread
+     with a 10 s deadline. With `stats()` taking the index lock again it
+     times out.
+
+**Residual, stated.** The tag caps are checked before the announce
+version moves. A refusal by this node's own fold for its **budget** can
+only be found by the apply, which runs after the version moves. That
+refusal commits nothing (no baseline, no pingwave summary, no emission)
+but leaves a gap in announce versions, which receivers accept as
+monotonic.
+
+**Release migration note, in addition to Slice 6's:**
+- `ServeError` gains `CapabilityRefused`.
+- Every `CapabilitySet` decode, not only an announcement's, refuses more
+  than 8,192 encoded tags (`MAX_CAPABILITY_TAGS`, raised from 256; see
+  "Tag cap raised") or a tag over 256 bytes.
+- `announce_capabilities*` refuses when the augmented or self-indexed set
+  would exceed the caps, with the previous baseline kept.
+
+**Gates.**
+- The unit suite: 6,045 pass.
+- 36 capability, nRPC, RPC, gang, aggregator, sensing and cross-language
+  integration binaries: 263 pass.
+- `cargo check --workspace --all-targets`.
+- Clippy, strict and all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- fmt.
+
+#### Tag cap raised: 256 → 8,192 (2026-10-08)
+
+CI at `37a0331c7` and `c4d0c2c68` showed what ruling 1's 256-tag count
+costs. Two tests failed deterministically:
+
+- **`serve_rpc_reannounce_baseline`.** It registers 320 public services
+  on one node. Every public service adds an `nrpc:` tag, so the 257th
+  registration was refused with `CapabilityRefused`.
+- **`nrpc_tool_watch::tool_watch_overflow_drops_deltas_and_emits_resync`.**
+  It overflows a watch buffer with one announcement of 1,600 tools, about
+  6,400 tags. The fold refused it whole, so the expected Resync never
+  came.
+
+**Why 256 was too low.** A default tool contributes 4 tags (`tool_id`,
+`name`, `version`, `stateless`). It adds `ai-tool:` at announce time and
+an `nrpc:` tag when served, so a tool costs 5–7 tags. At 256, one node
+could advertise only ~40–50 tools or ~250 public services, which breaks
+tool-heavy nodes such as an MCP bridge. The ruling had sized the cap
+against the bench fixture's 31 tags.
+
+**Decision (owner, 2026-10-08):** raise the count.
+
+- `MAX_CAPABILITY_TAGS` is **8,192**: the smallest power of two that
+  admits the 6,400-tag flood test unchanged, about 1,600–2,000 tools per
+  node.
+- Everything else in ruling 1 stands: duplicates counted, whole
+  refusal, the same rule on every intake path, and 256 bytes per tag.
+  Together they bound one advertisement's tag data at 2 MiB.
+- The dictionary budget is unchanged.
+
+**One consequence, fixed in the same change.** Raising the count reopened
+part of review defect 3. An announcement with 257–8,192 blob-heat tags
+decoded again, and the live blob-heat amplification filter
+(`MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` = 256) silently cut it to 256.
+
+- `filter_unauthorized_heat_tags` now returns `false`, changing nothing,
+  when blob-heat tags exceed 256. Live intake refuses that announcement
+  whole.
+- Witness: `filter_unauthorized_heat_tags_refuses_a_blob_heat_flood_whole`
+  (exactly 256 kept; 257 refused untouched). It replaces the test that
+  pinned truncation.
+- The decode test is now `decode_refuses_an_over_cap_vector_of_distinct_tags`,
+  at the new cap.
+
+**Gates.**
+- Both CI failures pass unchanged.
+- The full Rust SDK suite with CI's features: 870 pass.
+- The unit suite: 6,050 pass.
+- 62 capability, nRPC, RPC, serve, gang, island, aggregator, sensing,
+  cross-language, dataforts and blob integration binaries: 395 pass.
+- Clippy, strict and all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- fmt.
+
+#### cubic review of PR #1210 at `b952241ec`: thirteen comments, all fixed
+
+The three P1s each have a witness, and each witness was confirmed RED with
+its fix reverted.
+
+1. **A sink calling `stats()` could deadlock.** Every audit-emitting path
+   (`emit_audit`, `sweep_expired_now`, the expiry task) held the sink
+   slot's read guard across `record`, and `stats()` re-reads that slot.
+   With a `set_audit_sink` writer queued between the two reads, parking_lot's
+   fair lock parks the re-entrant read behind the writer, which waits on
+   the outer read.
+   - **Fix:** clone the sink `Arc` out and drop the guard before
+     `record`. The `FoldAuditSink` doc now states what `record` may call.
+   - Witness: `a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock`
+     (the sink queues the writer itself, then reads `stats()`, under a
+     10 s deadline).
+2. **A registered service could be missing from the self-fold.**
+   - `index_self_with_local_services` ran outside `announce_mu`, so an
+     announce could interleave and replace the self-index with a set that
+     lacked the service.
+   - A self-apply that lost the merge to a newer self entry
+     (`Ok(Rejected)`) was taken for success, so `serve_rpc` registered a
+     service whose `nrpc:` tag never landed.
+   - **Fix:** the self-index takes `announce_mu`, and a `Rejected`
+     self-apply is an error, so the registration rolls back.
+   - Witness:
+     `a_service_whose_self_index_loses_to_a_newer_self_entry_rolls_back`.
+   - **Tried and reverted:** drawing announce versions above the held self
+     entry's generation, so a restored fold could never out-rank local
+     announces. It broke `capability_auth_call_path` and
+     `capability_auth_conformance`. Their documented version-space
+     contract injects restrictive policies at version 100 and above so the
+     auto-self-index (v1) and the spawned re-announce (v2) cannot
+     supersede them. Nothing in production restores a capability fold, and
+     intake drops self-origin announcements, so a newer self entry is test
+     or operator state. The contract stands.
+3. **The blob-heat refusal ran after intake side effects** (the dedup
+   cache, TOFU pin, `peer_subnets`, routes, forward).
+   - **Fix:** a `blob_heat_over_cap` preflight right after decode, before
+     the first side effect. The later filter keeps the same rule for its
+     chain-heat strip.
+   - Witness: `a_blob_heat_flood_is_refused_before_any_intake_side_effect`
+     (no pin, no dedup entry, nothing folded; exactly the cap is processed
+     normally).
+
+The other ten:
+
+- **Idle sweeps never advanced the wheel cursor**, so an idle fold's probe
+  range grew toward the whole ring and passed live lap-ahead nodes on every
+  sweep.
+  - **Fix:** the cursor is an `AtomicU64`, and a probe that finds nothing
+    due advances it (`fetch_max`) to the current slot. No current-lap node
+    can sit in an earlier slot without being due.
+  - Witness: `an_idle_probe_advances_the_cursor`, RED-checked.
+- **Dictionary use counts were `u32`, saturating.** They are `u64`, exact
+  for any reachable occurrence count. Witness: `use_counts_stay_exact_past_u32`.
+- **The capped tag decoder allocated before checking length.**
+  `BoundedTag` checks the borrowed `&str` first. The existing boundary
+  witnesses cover behavior.
+- **Sensing `extract_declarers` allocated a `String` per tag under the
+  fold read lock.** It now collects `TagStr` handles there and converts
+  after the lock is released. The public `DeclaredProvider::tags` type is
+  unchanged.
+- **The legacy-JSON `FoldStats` test** now removes all seven later fields,
+  not two.
+- **Docs and CLI:**
+  - a stale `assign_from_tag_strs` doc;
+  - a per-call `format!` in the CLI's `observe` (now a borrowed compare;
+    `concat!` cannot take a `const`);
+  - `interned_tags` corrected to `interned`;
+  - "Tag cap raised" moved under Slice 6;
+  - the migration note now says 8,192.
+
+**Gates.**
+- The unit suite: 6,055 pass.
+- Clippy, strict in three configurations and all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- `cargo check --workspace --all-targets`.
+- fmt.
+
+#### Review of PR #1210 at `c2eab8372`: nine items
+
+Six fixed (1, 2, 5, 6, 8, 9). The five behavior fixes each have a witness
+confirmed RED with its fix reverted; item 9 is a cosmetic string fix with
+no witness. Two (3, 4) were already closed by `c2eab8372`. One (7) is
+recorded as a residual risk.
+
+A follow-up cubic pass found `restore` still rehydrated and cloned every
+snapshot row before the capacity check, so a snapshot from a much larger
+fold was fully materialized just to be refused. It now stops at the first
+row past the fold's capacity (the smaller of the expiry wheel's limit and
+the new `FoldIndex::entry_capacity`, the capability index's slot limit).
+Witness: `an_oversized_restore_is_refused_before_materializing_the_snapshot`
+counts rehydrated rows (capacity + 1, not the whole snapshot).
+
+1. **A node with more than 256 hot blobs was refused whole by every
+   peer.** The receive side refuses an announcement over
+   `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` whole, but nothing on the send side
+   kept a node under the cap.
+   - **Fix:** the blob-heat paths keep the hottest 256 (ties broken by tag
+     text). The shared announce check (`check_augmented_announceable`, now
+     used by `announce_attempt` and the self-index) refuses an over-cap
+     published set locally.
+   - Witnesses: `trim_blob_heat_tags_keeps_the_hottest_up_to_the_cap` and
+     `a_node_with_more_hot_blobs_than_the_cap_still_announces`.
+2. **`TagDictionary::check` was quadratic under both write locks**:
+   ~1.7×10⁸ comparisons at 8,192 tags.
+   - **Fix:** a hash set for the new tags, and a count map plus a set for
+     the replacement arithmetic, built only when a payload brings new tags.
+     The warm refresh still returns before allocating.
+   - Witness: `linear_check_matches_the_pairwise_oracle` pins the decision
+     to the old algorithm at the budget boundary.
+3. **A graceful candidacy release that timed out leaked its tag.**
+   Already fixed in `c2eab8372` (the retrying withdraw).
+4. **The holders lock was held while blocking on `announce_mu`.**
+   Already fixed in `c2eab8372` (`announce_mu` is taken first).
+5. **`announce_attempt` took a `Rejected` self-apply for success**,
+   committing the baseline and the emission while the self-fold held
+   another entry.
+   - **Fix:** it is refused with nothing committed, as the self-index
+     already was. No production path writes a newer self entry. The
+     `capability_auth_*` suites, which inject one, still pass.
+   - Witness: `an_announce_that_loses_to_a_newer_self_entry_commits_nothing`.
+6. **A rolled-back `serve_rpc` could briefly publish a phantom `nrpc:`
+   tag.** The registry insert ran before `announce_mu` was taken, and the
+   rollback ran after it was released.
+   - **Fix:** insert, self-index and rollback run under one hold.
+     `index_self_with_local_services` takes the held guard as a parameter.
+   - Witness: `a_service_reaches_the_registry_only_under_the_announce_lock`.
+7. **One identity can exhaust the fold-wide tag budget.** Under the owner
+   ruling (no eviction, fail closed) this is intended. See Risks.
+8. **The expiry wheel had no node limit.** Only the capability fold's slot
+   table bounded entries, so another fold kind could schedule a node at
+   the `u32::MAX` sentinel.
+   - **Fix:** the wheel has a limit. `Fold::apply` refuses a new entry
+     (`IndexFull`) before any mutation, a Replace reuses its node, and
+     `restore` refuses a state that would not fit before clearing.
+   - Witness: `a_full_expiry_wheel_refuses_a_new_entry_before_any_change`.
+9. **Two `println!` strings in `fold_scale_report`** had lost their
+   escapes. Fixed.
+
 ### Slice 7: bitmap buckets (Track B2) — held
 
 Not authorized until Track B2's decisions (entry-level identity, ordering,
 slot reclamation) are written into this plan and re-reviewed.
+Decisions reviewed: `roaring` and entry-slot identity are approved.
+Implementation stays gated on Slice 6's acceptance.
 
 Proof, once authorized:
 
@@ -1988,38 +2755,239 @@ Proof, once authorized:
 - Slice 4's permanent comparison witness stays green.
 - Retained index bytes drop against a separate B1+B2 target.
 
-### Slice 8: time-ordered expiry (Track A2) — held, conditional
+#### Slice 7 evidence packet (implemented; awaiting acceptance)
 
-Built only if Slice 0's `capability_fold_sweep/steady` at 1M entries, or a
-profile of a production-sized fold, shows the twice-a-second empty walk
-costs more than the wheel's invariant is worth. Otherwise this slice is
-dropped.
+Implemented under the B2 decisions and the owner's B2 wording and
+invariants, with the owner's go-ahead (2026-10-07). Slice 6 is not yet
+formally accepted.
 
-Delivers the per-second buckets with ceiling placement (or the explicitly
-chosen partial-bucket alternative) and one active placement per key,
-maintained by apply, evict, restore and the sweep.
+**What landed.**
 
-Proof:
+- **`roaring` 0.11.5**, a direct dependency of the core crate with
+  `default-features = false, features = ["std"]`. The nightly `simd`
+  feature is off: `cargo tree -e features -i roaring` shows no `simd`.
+  - All eight tracked lockfiles that resolve `net-mesh` were refreshed.
+    Each gains exactly `roaring`, `bytemuck` and `byteorder`; the root
+    lockfile already had the last two.
+  - The wire crate's host and `wasm32-unknown-unknown` graphs have no
+    `roaring` edge. `roaring` with these features builds for
+    `wasm32-unknown-unknown`. The bitmaps are receiver-local and never
+    serialized to the wire.
+- **`SlotTable`** (`fold/capability.rs`): one dense `u32` slot per indexed
+  `(class, node)` entry.
+  - `slot_of` uses a keyed hasher (`foldhash`), because `class_hash` is
+    publisher-chosen. `key_of` maps a slot back to its key.
+  - Freed slots go on a free list and are reused before the table grows.
+    The slot space is bounded by the PEAK live entry count; nothing is
+    compacted.
+  - It ends at `limit` (`u32::MAX` positions) and never wraps. An Insert
+    with no slot available is refused in `admit` (before the dictionary)
+    as the new `PayloadRejection::IndexFull`, counted as a capacity
+    refusal. Restore preflights the row count.
+- **Buckets are `RoaringBitmap`s of slots** in `by_tag`, `by_synthetic`,
+  `by_region` and `by_state`.
+  - `on_remove` clears every raw, synthetic, region and state bit of the
+    entry, then releases the slot, all under the index write lock. A
+    reused slot inherits nothing.
+  - Identity is the entry, so a class-A tag and a class-B tag of one node
+    never combine.
+- **The resolver works on bitmaps.**
+  - AND is `&=` seeded from the smallest set; OR is `|=`. A single
+    constraint borrows its bucket.
+  - The class predicate filters by the slot's key.
+  - `CandidateKeys` exposes `keys()` (slot order) and `len()`. Every
+    node-returning consumer still sorts and deduplicates explicitly, at
+    `capability_bridge.rs` 566, 1549, 1779 and 1976, unchanged.
+- **The permanent set-equivalence oracle is kept.**
+  `resolve_candidate_keys_pre_slice4` now computes on key sets read out
+  of the buckets, sharing no set algebra with the bitmap resolver.
+  - A second, fully independent oracle, `brute_force`, scans every
+    entry's payload with the same synthetic derivation.
+  - Both are asserted on all 720 filter combinations in both arrival
+    orders.
+- The capability-index `BuildU64TupleHasher` alias had no users left and
+  is removed. `fold_id_hasher_is_a_real_mixer` keeps the remaining
+  alias's check.
+- **`CapabilityIndexInner::memory_breakdown()` → `IndexMemory`.** Bucket
+  maps, sets and owned key strings are reported separately from the slot
+  table, the free list, and occupied, capacity and free slot counts. The
+  reporter prints it, so a bucket saving cannot hide bookkeeping.
 
-- `steady` drops from a full-map walk to microseconds, and `mass_expiry`
-  holds Slice 2's number or better.
-- The `sum(bucket sizes) == entries.len()` assertion holds after every
-  mutation path in tests, and at every lock release inside a multi-chunk
-  sweep, not only at its end.
-- New witness `multi_chunk_drain_keeps_placement_invariant`: one due bucket
-  larger than `SWEEP_CHUNK_SIZE`; assert the exact-sum invariant between
-  chunks, and that undrained keys remain in their bucket.
-- New witnesses:
-  - `partial_second_deadline_is_never_lost`: a deadline at x.75 s and a
-    sweep at x.5 s; the entry expires by the stated lag.
-  - `refresh_before_old_deadline_moves_placement`: one slot before the
-    refresh, one slot after, in the new bucket.
-  - `evicted_entry_leaves_no_slot`.
-  - `first_sweep_after_restore_evicts_exactly_elapsed`.
-  - `idle_sweep_touches_no_live_entry`.
-  - `sweep_cost_is_independent_of_live_entry_count`: two folds, 1k and
-    100k live entries, the same 100 expired; the visit counter is equal.
-- Refresh bursts and long TTLs are exercised against the same invariant.
+**Measured** (`fold_scale_report`, same machine; the Slice 6 numbers are
+from `37a0331c7`, re-run here):
+
+| measure | Slice 6 | Slice 7 |
+|---|---|---|
+| index buckets, B/entry, 100k (target ≤ 333, 60% under 832) | 832 | **12** |
+| index buckets, B/entry, 1M (target ≤ 512, 60% under 1,280) | 1,280 | **10** |
+| slot table, B/entry, 100k / 1M (new bookkeeping) | – | 64 / 78 |
+| buckets + slots, B/entry, 100k / 1M | 832 / 1,280 | 76 / 88 |
+| retained, B/entry, 100k | 2,184 | **1,431** |
+| retained, B/entry, 1M | 3,066 | **1,875** |
+| warm index-equivalent refresh, allocations (gate) | 0 | **0** |
+| evict, allocations per call | 0.00 | 0.01 (8 per 1,000) |
+| mixed: refresh apply p50 / p99 | 18.0 / 45.0 µs | 14.1 / 45.6 µs |
+| mixed: selective query p50 / p99 | 5.6 / 207 µs | 4.8 / 168 µs |
+| mixed: broad query p50 (~500k matches) | 15.75 ms | **17.68 ms** |
+| mixed: sweep tick p50 | 828 µs | 607 µs |
+
+- **The broad-query regression is real.** Slice 7 measured 17.68, 17.58
+  and 17.37 ms over three runs, about +11%. That is about 4 ns per match
+  over 500k matches: bitmap iteration plus a slot-to-key lookup per
+  match. It is the trade for −98% bucket memory. The baseline is one run
+  of 39 samples.
+- **Evict allocations.** A removal that shrinks a bitmap container below
+  its conversion threshold reallocates it, and the eviction path now
+  shows 8 allocations per 1,000 evictions. Only the warm refresh is
+  gated.
+- **Not run:** the Criterion `net` bench's `capability_fold_query` rows.
+
+**Witnesses**, all in `fold/capability.rs` tests:
+
+- `cross_class_split_predicate_does_not_match`: the plan's witness, plus
+  the `tags_all` / `tags_any` split.
+- `output_order_independent_of_arrival`: opposite arrival orders, churn
+  (evict and re-add) and a restore, with an identical, sorted
+  `find_nodes_matching` output and identical resolver key sets.
+- `reused_slot_inherits_no_membership`: a slot freed by eviction, expiry
+  or restore, reused by a different class and publisher. The raw,
+  synthetic, region and state buckets are all clean.
+- `slot_space_tracks_the_peak_and_reuses_before_growth`: 1,000 entries
+  shrink to 100, giving 100 occupied / 1,000 capacity / 900 free. Fifty
+  more reuse slots: 150 / 1,000 / 850.
+- `exhausted_slot_space_refuses_an_insert_and_never_wraps`: `IndexFull`
+  with nothing admitted, a Replace at the limit succeeds, and a freed
+  slot makes room.
+- `resolve_candidate_keys_matches_pre_slice4_resolver`: Slice 4's
+  permanent oracle plus the payload scan.
+- **RED-checked:**
+  - keeping a state bit on removal fails the reuse witness;
+  - node-keyed slots fail the class split;
+  - growing instead of reusing fails the reuse and peak witnesses;
+  - dropping the exhaustion check fails the exhaustion witness;
+  - an AND that skips a set fails the oracle.
+
+**Gates.** All of these pass:
+- the unit suite, 6,050 tests;
+- 53 capability, nRPC, RPC, gang, island, aggregator, sensing and
+  cross-language integration binaries, 360 tests;
+- `cargo check --workspace --all-targets`;
+- clippy, strict in three configurations and all-targets;
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`;
+- fmt.
+
+**Release migration note, in addition to Slice 6's:**
+- `PayloadRejection` gains `IndexFull`, so an exhaustive `match` needs
+  an arm.
+- `CapabilityIndexInner` and the new `IndexMemory` are re-exported from
+  `fold`.
+- `roaring` is a new dependency.
+
+### Slice 8: time-ordered expiry (Track A2) — delivered
+
+**Why it was built.** The condition was met. After the branch review fixes
+the steady 1M sweep cost **8.7 ms** every 500 ms tick and found nothing.
+Getting there had also taken an offset-resume over a recreated iterator,
+the traversal this plan rules out (see Risks). That was the segmented walk
+from "Branch review fixes", and Slice 8 removes it.
+
+**What changed from Track A2's draft shape.** The invariants are the plan's.
+The container is not `BTreeMap<u64, HashSet<Key>>`.
+
+- **A hashed timing wheel instead of a bucket map** (`fold/wheel.rs`).
+  - Time is cut into 125 ms slots in a 4,096-position ring (one lap is
+    512 s).
+  - Each position heads an intrusive doubly linked list of nodes. The
+    nodes live in one slab, recycled through a free list.
+  - Each `FoldEntry` holds its node's handle (`expiry_node`).
+  - Why not the draft shape: a refresh moves its key to a later bucket,
+    and a bucket that is new or must grow allocates. That breaks Slice 3's
+    gate (zero allocations on a warm index-equivalent refresh) for
+    whichever refresh lands first in a bucket. A wheel refresh only
+    relinks its node.
+- **Partial-bucket draining, not ceiling placement.** This is the
+  alternative the track allows, chosen explicitly.
+  - A node sits in the slot of its exact deadline. A sweep visits every
+    slot from the cursor through the current one and evicts exactly the
+    nodes with `expires_at <= now`.
+  - Not-yet-due nodes in the current slot stay, and so do nodes a lap
+    ahead.
+  - Expiry stays exact, as with the full walk. Ceiling placement would
+    have let an entry outlive its deadline by up to a slot plus a sweep
+    interval, which a reservation lease should not.
+- **One active placement per key, exactly as specified.**
+  - Insert schedules the node, Replace reschedules the same node, and
+    `evict_node`, restore's duplicate unwind and the sweep unschedule it.
+    Restore clears the wheel with the state and schedules every restored
+    entry.
+  - `wheel.len() == entries.len()` is `debug_assert`ed after every
+    mutation path. Each sweep chunk takes keys out of the wheel and
+    removes their entries in one write-locked critical section, so the
+    invariant also holds at every lock release.
+- **The sweep never walks the primary map.**
+  - A read-locked probe visits only the slots since the previous sweep.
+    An idle sweep stops there, without the write lock.
+  - A due sweep drains in `SWEEP_CHUNK_SIZE` chunks, each under its own
+    `state → index` write acquisition.
+  - The segmented walk, `collect_expired_segment`, `evict_chunk` and the
+    resume arithmetic are gone.
+
+**Measured** (`fold_scale_report`, same machine as "Branch review fixes"):
+
+| measure | before Slice 8 | Slice 8 |
+|---|---|---|
+| steady sweep, 1M | 8.7 ms (1M visited) | **0.00 ms (0 visited)** |
+| steady sweep, 100k | 0.62 ms | 0.00 ms |
+| mass 10%, 1M | 0.99 s | 0.91 s (Slice 2: 0.91 s) |
+| whole fleet, 1M | 12.1 s | 10.5 s |
+| warm index-equivalent refresh, allocations | 0 | **0** (gate holds) |
+| cold insert, allocations per call | — | 1.07 (slab growth, amortized) |
+| retained B/entry, 100k / 1M | 3,233 / 4,124 | 3,317 / 4,199 |
+
+The memory cost is about 80 B/entry. That is the wheel node (key,
+deadline, links), the entry's handle, and the slab `Vec`'s growth headroom.
+A sweep's visit count is the due entries plus one probe hit
+(`yielded / entry` 0.10 at 10% expired, against 1.00 before).
+
+**Witnesses** (fold unit tests unless noted). The plan's names are kept
+where the test is the one named:
+
+- `multi_chunk_drain_keeps_placement_invariant`: a due set of
+  2 × `SWEEP_CHUNK_SIZE` + 100. After each chunk it checks the full index
+  (one node per entry, each with its entry's key and deadline) and that
+  undrained keys stay resident and scheduled.
+- `partial_slot_deadline_is_never_lost` (wheel unit). This is the plan's
+  `partial_second_deadline_is_never_lost` at slot granularity: a deadline
+  at 0.75 of a slot, swept at its half, stays, and is taken at its
+  deadline.
+- `refresh_before_old_deadline_moves_placement`, `evicted_entry_leaves_no_slot`,
+  `first_sweep_after_restore_evicts_exactly_elapsed`,
+  `idle_sweep_touches_no_live_entry`.
+- `sweep_cost_is_independent_of_live_entry_count`. It uses 1k against 10k
+  live entries, not the plan's 100k, to keep a debug-build unit test fast.
+  The visit count is equal either way.
+- Wheel units: `lap_ahead_node_survives_its_shared_position`,
+  `take_due_resumes_across_calls`, `reschedule_moves_the_one_placement`
+  (same handle, no second node), `a_sweep_a_lap_late_takes_everything_due`,
+  `freed_nodes_are_reused`.
+- Checked RED with the fix reverted:
+  - dropping the Replace reschedule fails the refresh witness;
+  - dropping the eviction unschedule fails the eviction witness;
+  - an inexact due check fails both partial-slot witnesses.
+- `take_due_resumes_across_calls` also caught a real bug during
+  development. `max` was compared with `out`'s total length rather than
+  what the call took, so a caller that accumulates looped forever. The
+  sweep clears its buffer per chunk, so it was never exposed in
+  production.
+
+**Changed counters.** `sweep_yielded` now counts wheel nodes visited, not
+primary-map entries. An idle sweep reports 0. `sweep_walks` still counts
+one per sweep. Tests that pinned the old walk's costs
+(`sweep_metrics_count_walks_and_visited_entries`,
+`fold_stats_carry_the_sweep_counters`) pin the new ones.
+`sweep_rechecks_entries_refreshed_or_removed_after_collection` is gone with
+the collection walk it tested: a refresh now moves its node under the
+apply's write lock, so there is no stale candidate left to re-check.
 
 ## Risks
 
@@ -2040,8 +3008,17 @@ Proof:
   exactly the entries whose TTL elapsed.
 - **The interner's budget is breached by publisher churn** (if B1 is built).
   The aggregate budget covers historical publishers by construction, and
-  the churn footprint run measures it. A gauge (`FoldStats::interned_tags`
+  the churn footprint run measures it. A gauge (`FoldStats::interned`
   and retained bytes) shows it to operators. The gauge is not the bound.
+- **One identity can exhaust the tag budget (accepted residual).** The
+  budget is per fold, not per publisher. One identity announcing under
+  ~122 class hashes × 8,192 distinct tags fills the default 1M tags.
+  After that, every payload bringing a new tag is refused (fail closed)
+  until entries expire or are evicted. Refreshes carrying only
+  already-known tags still land. The owner ruling chose no eviction and
+  no per-publisher quota, so this is intended. The signal is
+  `budget_rejections` with the offending publisher in the audit record.
+  A per-identity quota is the follow-up if it is ever seen in practice.
 - **The `KeyHasher` change breaks an out-of-tree `FoldKind`.** Fallback:
   confirm `FoldKind` is crate-private, or ship the change with a release
   note.

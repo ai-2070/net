@@ -175,7 +175,7 @@ impl TagMatcher {
     /// built without the `regex` Cargo feature; same contract as
     /// [`Fold::aggregate`]. Call [`Self::validate`] up front if the
     /// matcher came from an untrusted source.
-    pub fn matches_any(&self, tags: &[String]) -> bool {
+    pub fn matches_any<S: AsRef<str>>(&self, tags: &[S]) -> bool {
         self.compile().matches_any(tags)
     }
 
@@ -270,8 +270,8 @@ enum CompiledMatcher<'a> {
 }
 
 impl CompiledMatcher<'_> {
-    fn matches_any(&self, tags: &[String]) -> bool {
-        tags.iter().any(|t| self.matches_one(t))
+    fn matches_any<T: AsRef<str>>(&self, tags: &[T]) -> bool {
+        tags.iter().any(|t| self.matches_one(t.as_ref()))
     }
 
     fn matches_one(&self, raw: &str) -> bool {
@@ -892,7 +892,7 @@ mod tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
-                tags: tags.iter().map(|s| (*s).to_string()).collect(),
+                tags: tags.iter().map(|s| (*s).into()).collect(),
                 hardware: None,
                 state,
                 region: region.map(|s| s.to_string()),

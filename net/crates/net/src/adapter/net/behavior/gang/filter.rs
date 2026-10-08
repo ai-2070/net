@@ -61,10 +61,9 @@ pub fn candidate_hosts_for(
             //    iteration order), but the resulting host count must
             //    not change.
             let hosts = candidates
-                .as_set()
-                .iter()
-                .filter(|key| state.entries.contains_key(*key))
-                .map(|(_class, node)| *node);
+                .keys()
+                .filter(|key| state.entries.contains_key(key))
+                .map(|(_class, node)| node);
             if filter.limit > 0 {
                 hosts.take(filter.limit).collect()
             } else {
@@ -261,7 +260,7 @@ mod tests {
         };
         let membership = CapabilityMembership {
             class_hash: class,
-            tags: tags.into_iter().map(String::from).collect(),
+            tags: tags.into_iter().map(Into::into).collect(),
             hardware: None,
             state,
             region: region.map(String::from),

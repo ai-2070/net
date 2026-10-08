@@ -43,9 +43,12 @@ fn observe(mesh: &net_sdk::Mesh) -> Vec<Advertisement> {
                 result.push(Advertisement {
                     provider: *provider,
                     descriptor: ToolDescriptor::from_capability(&cap, &membership.metadata),
+                    // Compared without building the tag string: no
+                    // allocation per `observe` call.
                     metadata_service: membership
                         .tags
-                        .contains(&format!("nrpc:{TOOL_METADATA_FETCH_SERVICE}")),
+                        .iter()
+                        .any(|t| t.strip_prefix("nrpc:") == Some(TOOL_METADATA_FETCH_SERVICE)),
                 });
             }
         }

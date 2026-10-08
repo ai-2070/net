@@ -306,7 +306,7 @@ mod tests {
     ) {
         let membership = CapabilityMembership {
             class_hash: 0x67_70_75, // "gpu" — any stable class id
-            tags,
+            tags: tags.into_iter().map(Into::into).collect(),
             hardware: None,
             state: NodeState::Idle,
             region,

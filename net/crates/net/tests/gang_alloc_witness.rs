@@ -138,7 +138,7 @@ fn fixture(
         }
         let membership = CapabilityMembership {
             class_hash: 0x67_70_75,
-            tags,
+            tags: tags.into_iter().map(Into::into).collect(),
             hardware: None,
             state: NodeState::Idle,
             region: Some("us-east".into()),

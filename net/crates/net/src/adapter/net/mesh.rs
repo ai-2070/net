@@ -270,6 +270,14 @@ const DATAGRAM_SEND_DEADLINE: Duration = Duration::from_secs(5);
 /// that packaging defect, and it protects only this one lock.
 const ANNOUNCE_LOCK_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Attempts a replica-candidacy withdraw makes when the announce lock is
+/// busy, each waiting up to [`ANNOUNCE_LOCK_DEADLINE`], before it reports
+/// the tag as not withdrawn.
+const CANDIDACY_WITHDRAW_ATTEMPTS: u32 = 3;
+
+/// Pause between those attempts.
+const CANDIDACY_WITHDRAW_BACKOFF: Duration = Duration::from_secs(1);
+
 /// How often the bounded acquire retries the fast path. Short enough that a lost
 /// wakeup costs a caller milliseconds rather than the whole deadline, long enough
 /// that an ordinary contended acquire still parks rather than spins.
@@ -24118,7 +24126,7 @@ impl MeshNode {
     /// entry point — see the constant for why a `timeout` around the future
     /// cannot supply this bound, and §18.0g for the lost wakeup it was traced
     /// to.
-    fn lock_announce_mu(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    pub(super) fn lock_announce_mu(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
         let acquired = self.lock_announce_mu_within(ANNOUNCE_LOCK_DEADLINE);
         if acquired.is_none() {
             tracing::error!(
@@ -41559,6 +41567,19 @@ impl MeshNode {
             return;
         };
 
+        // A blob-heat flood past the per-announce cap is refused whole HERE,
+        // before any side effect of this function: the dedup cache, the
+        // TOFU pin, the `peer_subnets` binding, route install and the
+        // forward (cubic, PR #1210). The later filter keeps the same rule
+        // for the chain-heat strip it also performs.
+        if from_node != ctx.local_node_id && Self::blob_heat_over_cap(&ann.capabilities) {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "capability: blob-heat tags over the per-announce cap; refused whole"
+            );
+            return;
+        }
+
         // Direct peers may only announce their own caps. Forwarded
         // announcements (hop_count > 0) are relayed through a peer
         // that isn't the origin, so we skip the check in that path
@@ -41882,8 +41903,12 @@ impl MeshNode {
         // skip the filter — we trust our own emit path. `ann` is
         // already `mut` at the outer binding (the inbound-metadata
         // reserved-key strip needed it), so no re-binding required.
-        if from_node != ctx.local_node_id {
-            Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
+        if from_node != ctx.local_node_id
+            && !Self::filter_unauthorized_heat_tags(&mut ann.capabilities)
+        {
+            // A blob-heat flood past the per-announce cap: refused whole,
+            // never silently thinned to an arbitrary subset.
+            return;
         }
         // OA-1: verify the announcement's owner cert (if any) at
         // the ingest boundary — the OUTER announcement signature is
@@ -41930,14 +41955,35 @@ impl MeshNode {
         ctx.ack_ranges_peer_cache.remove(&ann.node_id);
     }
 
+    /// Whether `caps` carries more than `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE`
+    /// blob-heat tags, which refuses the announcement whole.
+    fn blob_heat_over_cap(caps: &crate::adapter::net::behavior::capability::CapabilitySet) -> bool {
+        caps.tags
+            .iter()
+            .filter(|tag| {
+                matches!(tag, Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count()
+            > MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE
+    }
+
     /// Drop every `heat:<hex>=...` reserved tag from `caps` whose
     /// `<hex>` is not matched by an accompanying `causal:<hex>*`
     /// tag in the same set. This enforces "you can only annotate
     /// heat for chains you advertise as holding," closing the
     /// inbound-heat-tag forge surface.
+    ///
+    /// Returns `false`, changing nothing, when `caps` carries more than
+    /// `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags: the caller refuses
+    /// that announcement whole rather than keep an arbitrary subset (Slice
+    /// 6 review defect 3).
     fn filter_unauthorized_heat_tags(
         caps: &mut crate::adapter::net::behavior::capability::CapabilitySet,
-    ) {
+    ) -> bool {
+        if Self::blob_heat_over_cap(caps) {
+            return false;
+        }
         // Collect every hex this peer claims via causal: tags.
         let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tag in &caps.tags {
@@ -41952,31 +41998,21 @@ impl MeshNode {
                 }
             }
         }
-        // Per-announce cap on `heat:blob:*` tags. Blob-heat is
-        // intentionally not gated by a `causal:` claim (the blob
-        // is content-addressed, so a forged hash just produces a
-        // useless prefetch attempt). But the gravity migration
-        // controller consumes the *rate* via
-        // `should_migrate_blob_to`, so a peer spraying thousands
-        // of `heat:blob:<random>=1.0` tags would force every
-        // healthy node to attempt that many prefetches. The cap
-        // bounds the amplification: at most
-        // `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags
-        // survive the filter per inbound announcement.
-        let mut blob_heat_budget: usize = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE;
+        // Per-announce cap on `heat:blob:*` tags, enforced above by
+        // refusing the whole announcement. Blob-heat is intentionally not
+        // gated by a `causal:` claim (the blob is content-addressed, so a
+        // forged hash just produces a useless prefetch attempt). But the
+        // gravity migration controller consumes the *rate* via
+        // `should_migrate_blob_to`, so a peer spraying thousands of
+        // `heat:blob:<random>=1.0` tags would force every healthy node to
+        // attempt that many prefetches. The cap bounds the amplification;
+        // over it, nothing of the announcement is taken.
         caps.tags.retain(|tag| match tag {
             Tag::Reserved { prefix, body } if prefix == "heat:" => {
-                // Blob-heat tags (body shape `blob:<hex64>=<rate>`)
-                // ride a separate trust model: the blob is
-                // content-addressed, so a forged claim just causes
-                // a useless prefetch attempt at worst (no data
-                // corruption, no traffic redirection). Allow up
-                // to the per-announce cap; drop the overflow.
+                // Blob-heat tags (body shape `blob:<hex64>=<rate>`) ride a
+                // separate trust model and are kept: their count is within
+                // the cap (checked above).
                 if body.starts_with("blob:") {
-                    if blob_heat_budget == 0 {
-                        return false;
-                    }
-                    blob_heat_budget -= 1;
                     return true;
                 }
                 // Chain-heat shape: `<hex>=<rate>`. Hex is everything
@@ -41987,6 +42023,7 @@ impl MeshNode {
             }
             _ => true,
         });
+        true
     }
 
     /// Fan an already-serialized capability announcement out to every
@@ -44719,6 +44756,13 @@ impl MeshNode {
     where
         K: super::behavior::fold::FoldKind,
     {
+        // Payload limits first, before a generation is consumed: a
+        // receiver would refuse the advertisement whole.
+        K::validate(&payload).map_err(|reason| {
+            AdapterError::Connection(format!(
+                "fold: payload refused before publish, nothing was sent: {reason}"
+            ))
+        })?;
         let gen = self.next_fold_generation(K::KIND_ID, counter_class);
         let meta = super::behavior::fold::EnvelopeMeta {
             announced_at: super::current_timestamp_micros(),
@@ -44983,9 +45027,27 @@ impl MeshNode {
     /// to be open-cone), this sync self-index becomes the
     /// cold-start hole that re-opens it — extend the merged
     /// `CapabilitySet` here in lockstep.
+    ///
+    /// Returns an error, and changes nothing, when the announcement the
+    /// registration implies would be refused: over the per-advertisement
+    /// tag caps as published or as self-indexed, or refused by this
+    /// node's own fold (its tag budget). The caller must then roll the
+    /// registration back, so a service is never registered without the
+    /// folded tag protected dispatch requires.
     #[cfg(feature = "cortex")]
-    pub(crate) fn index_self_with_local_services(&self) {
+    pub(crate) fn index_self_with_local_services(
+        &self,
+        _announce_guard: &parking_lot::MutexGuard<'_, ()>,
+    ) -> Result<(), AdapterError> {
+        // Serialized with every announce (cubic, PR #1210): the caller holds
+        // `announce_mu`, so the service snapshot taken here and the version
+        // drawn below cannot interleave with an announce that read the
+        // registry earlier but draws a higher version later and so
+        // replaces this self-index with a set that lacks the service.
         let baseline = self.user_caps_snapshot();
+        // The registration must fit what the next announce would install,
+        // published and self-indexed, not only this narrower self-index set.
+        self.check_announceable(&baseline)?;
         // Self-fold: ALL locally registered services regardless of visibility, so
         // `has_local_capability` admits owner-scoped services too (§2.4a). This
         // set is local-only and never reaches the wire.
@@ -45027,7 +45089,25 @@ impl MeshNode {
         };
         let fold_ann =
             super::behavior::fold::capability_bridge::translate_announcement(&ann, verified_owner);
-        let _ = self.capability_fold.apply(fold_ann);
+        match self.capability_fold.apply(fold_ann) {
+            Ok(super::behavior::fold::ApplyOutcome::Rejected) => {
+                // The fold kept a newer self entry: this one, carrying the
+                // just-registered service, did not land, so the caller rolls
+                // the registration back (cubic, PR #1210). A newer self entry
+                // is never a peer's: intake drops self-origin announcements.
+                return Err(AdapterError::Connection(
+                    "self-index lost to a newer self entry in this node's own \
+                     capability fold"
+                        .to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(AdapterError::Connection(format!(
+                    "self-index refused by this node's own capability fold: {e}"
+                )));
+            }
+        }
         // Review-9: post-apply floor recheck (see the dispatch
         // path) — self-index is held to the identical ordering
         // guarantees.
@@ -45041,6 +45121,7 @@ impl MeshNode {
                 owner,
             );
         }
+        Ok(())
     }
 
     /// Announce this node's capabilities to every directly-connected
@@ -45185,6 +45266,306 @@ impl MeshNode {
             .await
     }
 
+    /// The PUBLIC capability set announced for `caps`: `caps` augmented
+    /// with every automatic tag (public `nrpc:` services, tools,
+    /// transport and NAT tags), plus the reflex snapshot taken with the
+    /// NAT class. Pure apart from short reads of registration and
+    /// traversal state: nothing is stored. Extracted from
+    /// `announce_attempt` so a caller can check, before committing a
+    /// registration or a baseline, the exact set that would be announced.
+    fn augment_public_caps(&self, caps: CapabilitySet) -> (CapabilitySet, Option<SocketAddr>) {
+        // OA3-4b1 confidentiality projection: ONLY `Public` services
+        // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
+        // Owner-scoped services are emitted solely as an encrypted
+        // owner-audience announcement and must never appear in the clear.
+        // Registration visibility is AUTHORITATIVE over baseline residue: a
+        // caller that pre-tagged (or reused an old baseline containing) an
+        // owner-scoped `nrpc:<svc>` would otherwise leak it — strip those exact
+        // tags from the plaintext set too (Kyra OA3 closure).
+        #[cfg(feature = "cortex")]
+        let caps = if self.rpc_local_services.is_empty() {
+            caps
+        } else {
+            let mut merged = caps;
+            for svc in self.rpc_local_services.public_snapshot() {
+                // Phase A.5.N.2: tags is HashSet<Tag>; insert via builder so
+                // the parsed-tag form lands and dedupes against existing tags.
+                merged = merged.add_tag(format!("nrpc:{}", svc.as_str()));
+            }
+            // Registration visibility is AUTHORITATIVE over baseline residue: a
+            // caller that pre-tagged (or reused an old baseline containing) a
+            // private `nrpc:<svc>` would otherwise leak it. Strip every
+            // owner-scoped AND granted tag from the plaintext set (OA3-4b1 /
+            // OA3-4b2 confidentiality).
+            //
+            // §30 — DECIDED, not overlooked: this suppression is keyed on
+            // the CURRENTLY-REGISTERED private set, so it is not sticky.
+            // Drop the `ServeHandle` and the next re-announce ships an
+            // operator's own `nrpc:<svc>` baseline tag in the clear again.
+            //
+            // That asymmetry is deliberate. The tag is in the plaintext set
+            // only because the OPERATOR put it in `user_caps` — merged
+            // `nrpc:` tags are never written back into the baseline
+            // (`announce_from_baseline` snapshots the caller's set BEFORE
+            // the merge), so the only way one is present is explicit
+            // intent to advertise. A private registration temporarily
+            // overrides that intent; ending the registration restores it.
+            // Making suppression permanent would mean a process that once
+            // served `X` privately could never advertise `X` publicly
+            // again without a restart, which is a worse and far more
+            // surprising failure.
+            //
+            // What this is NOT: a leak of a service the operator never
+            // asked to advertise. Those tags come from the registry, not
+            // the baseline, and disappear with the registration.
+            for svc in self
+                .rpc_local_services
+                .owner_scoped_snapshot()
+                .into_iter()
+                .chain(self.rpc_local_services.granted_snapshot())
+            {
+                merged = merged.remove_tag(&format!("nrpc:{}", svc.as_str()));
+            }
+            merged
+        };
+
+        // Merge AI-tool registrations on top of the `nrpc:` tags.
+        // For every tool the SDK's `serve_tool` registered, this
+        // appends:
+        //   - an `ai-tool:<name>` capability tag, so
+        //     `find_nodes_for_tag_prefix("ai-tool:")` discovers
+        //     this host;
+        //   - the typed `ToolCapability` itself (added via
+        //     `CapabilitySet::add_tool`), so the typed views aggregate
+        //     a `Vec<ToolCapability>` across peers in the fold;
+        //   - the description / streaming / tags metadata keys via
+        //     `CapabilitySet::metadata`, mirroring the existing
+        //     `input_schema` / `output_schema` convention so peers
+        //     without the `tool` feature still receive the data and
+        //     just ignore the unknown keys.
+        //
+        // Tool registrations are local to this node, just like
+        // `rpc_local_services`. Drop on the SDK's `ServeHandle`
+        // removes from the registry; the next `announce_capabilities`
+        // reflects the smaller set.
+        #[cfg(feature = "tool")]
+        let caps = if self.tool_registry.is_empty() {
+            caps
+        } else {
+            use crate::adapter::net::behavior::ToolCapability;
+            use crate::adapter::net::cortex::tool::{
+                description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
+                tags_metadata_key,
+            };
+            let snapshot = self.tool_registry.snapshot();
+            // Reconstruct ToolCapability values from each descriptor's
+            // wire-cheap fields; schemas stay in metadata (the fold
+            // has its own schema-too-large branch) so the typed-cap
+            // payload doesn't bloat.
+            let tools_to_add: Vec<ToolCapability> = snapshot
+                .iter()
+                .map(|descriptor| {
+                    let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
+                        .with_version(&descriptor.version)
+                        .with_estimated_time(descriptor.estimated_time_ms)
+                        .with_stateless(descriptor.stateless);
+                    if let Some(ref schema) = descriptor.input_schema {
+                        cap = cap.with_input_schema(schema.clone());
+                    }
+                    if let Some(ref schema) = descriptor.output_schema {
+                        cap = cap.with_output_schema(schema.clone());
+                    }
+                    for req in &descriptor.requires {
+                        cap = cap.requires(req.clone());
+                    }
+                    cap
+                })
+                .collect();
+            // Single set_tools call; O(N) total instead of the
+            // O(N²) chain of per-tool add_tool invocations.
+            let mut merged = caps.add_tools(tools_to_add);
+            for descriptor in snapshot.iter() {
+                merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
+                // Description + streaming + tags ride the metadata
+                // extensibility hook (same convention input/output
+                // schemas already use). Pre-tool peers receive these
+                // keys and ignore them — no wire-breaking change.
+                if let Some(ref desc) = descriptor.description {
+                    merged = merged
+                        .with_metadata(description_metadata_key(&descriptor.tool_id), desc.clone());
+                }
+                if descriptor.streaming {
+                    merged = merged.with_metadata(
+                        streaming_metadata_key(&descriptor.tool_id),
+                        "1".to_string(),
+                    );
+                }
+                if !descriptor.tags.is_empty() {
+                    merged = merged.with_metadata(
+                        tags_metadata_key(&descriptor.tool_id),
+                        descriptor.tags.join(","),
+                    );
+                }
+                // Pricing terms (net.pricing.terms@1 canonical JSON) ride
+                // the same hook — paid capability = metadata + invocation
+                // policy, not a different kind of tool. The substrate
+                // never parses the value.
+                if let Some(ref terms) = descriptor.pricing_terms {
+                    merged = merged.with_metadata(
+                        pricing_terms_metadata_key(&descriptor.tool_id),
+                        terms.clone(),
+                    );
+                }
+            }
+            merged
+        };
+
+        // STREAM_ACK_BATCHING R-5: advertise transport support for
+        // positive SACK-range ACKs — same auto-augment pattern as the
+        // `nrpc:` / `ai-tool:` tags above. Config-gated so operators
+        // can turn the feature off wire-wide (compliant peers then
+        // never emit ranges to us, and we never emit to anyone).
+        let caps = if self.config.enable_stream_ack_ranges {
+            caps.add_tag(ACK_RANGES_CAPABILITY_TAG.to_string())
+        } else {
+            caps
+        };
+
+        // Stage 5 ruling 4: advertise that this node's stream
+        // receive path reassembles leaf fragment groups, so a
+        // peer may send an over-cap stream event to us instead
+        // of refusing it typed.
+        //
+        // NOT config-gated, and that is deliberate: the RTC
+        // ingress reassembles unconditionally (there is no knob
+        // that turns `reassemble_rtc_fragments` off), so a flag
+        // here would let an operator withdraw a claim that is
+        // still true and cost peers a capability this node does
+        // in fact have. The `webrtc` cfg IS the condition —
+        // without it there is no RTC ingress and nothing
+        // reassembles.
+        #[cfg(feature = "webrtc")]
+        let caps = caps.add_tag(super::behavior::capability::FRAGMENT_REASSEMBLY_TAG.to_string());
+
+        // Stage 4a §11 tags. `transport:rtc` is how a peer
+        // learns it can take a DataChannel with us — the
+        // classifier reads it and returns `PairAction::Ice`
+        // instead of planning a punch. `rtc-anchor` says this
+        // node serves the bootstrap endpoint its
+        // `rtc_bootstrap` field names. `leaf` is Stage 5's to
+        // emit; Stage 4 only reads it.
+        #[cfg(feature = "webrtc")]
+        let caps = match self.config.rtc.as_ref() {
+            Some(rtc) => {
+                let caps = caps.add_tag(RTC_TRANSPORT_TAG.to_string());
+                if rtc.serve_bootstrap {
+                    caps.add_tag(RTC_ANCHOR_TAG.to_string())
+                } else {
+                    caps
+                }
+            }
+            None => caps,
+        };
+
+        // Piggyback the current NAT classification as a `nat:*`
+        // capability tag so peers can filter-match on NAT type,
+        // and the reflex address on the dedicated announcement
+        // field so peers have a direct-connect candidate without a
+        // separate discovery round-trip. Both are feature-gated on
+        // `nat-traversal` — callers compiled without the feature
+        // emit announcements identical to the pre-traversal format.
+        //
+        // The two reads happen under `traversal_publish_mu` so
+        // the announcement always carries a consistent (class,
+        // reflex) pair. Without the mutex, a concurrent
+        // set/clear/commit could interleave between our reads
+        // and let us publish a torn state — e.g., the new
+        // override's reflex paired with the pre-override NAT
+        // class. The lock is held only for the two atomic reads,
+        // not across the signing or network send.
+        #[cfg(feature = "nat-traversal")]
+        let (caps, reflex_snapshot) = {
+            use super::traversal::classify::NatClass;
+            let _g = self.traversal_publish_mu.lock();
+            let class =
+                NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
+            let reflex = self
+                .reflex_addr
+                .load_full()
+                .or_else(|| self.direct_hint.load_full())
+                .map(|arc| *arc);
+            // Strip any prior `nat:*` tags before adding the fresh
+            // one so a reclassification doesn't leave a stale tag
+            // behind when the class transitions. Phase A.5.N.2:
+            // `caps.tags` is `HashSet<Tag>` — `nat:*` tags parse
+            // as `Tag::Legacy`, so we render to wire form for
+            // prefix matching.
+            let mut next = caps;
+            next.tags.retain(|t| !t.to_string().starts_with("nat:"));
+            let next = next.add_tag(class.tag().to_string());
+            (next, reflex)
+        };
+        #[cfg(not(feature = "nat-traversal"))]
+        let reflex_snapshot: Option<SocketAddr> = None;
+        (caps, reflex_snapshot)
+    }
+
+    /// The self-fold set for an augmented public set: `public` plus the
+    /// owner-scoped and granted `nrpc:` services, which reach only this
+    /// node's own fold. The same construction `announce_attempt` uses.
+    fn self_fold_caps(&self, public: &CapabilitySet) -> CapabilitySet {
+        #[cfg(feature = "cortex")]
+        {
+            let mut caps = public.clone();
+            for svc in self
+                .rpc_local_services
+                .owner_scoped_snapshot()
+                .iter()
+                .chain(self.rpc_local_services.granted_snapshot().iter())
+            {
+                caps = caps.add_tag(format!("nrpc:{}", svc.as_str()));
+            }
+            caps
+        }
+        #[cfg(not(feature = "cortex"))]
+        {
+            public.clone()
+        }
+    }
+
+    /// Whether announcing `base` fits the per-advertisement tag caps,
+    /// both as published (the augmented public set) and as self-indexed
+    /// (with private services). Checked before anything is committed.
+    fn check_announceable(&self, base: &CapabilitySet) -> Result<(), AdapterError> {
+        let (public, _) = self.augment_public_caps(base.clone());
+        self.check_augmented_announceable(&public)
+    }
+
+    /// [`Self::check_announceable`] for an already augmented public set.
+    fn check_augmented_announceable(&self, public: &CapabilitySet) -> Result<(), AdapterError> {
+        let fits = |caps: &CapabilitySet, what: &str| {
+            super::behavior::fold::capability_bridge::validate_capability_set_tags(caps).map_err(
+                |reason| {
+                    AdapterError::Connection(format!(
+                        "announce: {what} capability set refused, nothing was changed: {reason}"
+                    ))
+                },
+            )
+        };
+        fits(public, "published")?;
+        // Peers refuse an announcement over the blob-heat cap whole, so
+        // publishing one would silently drop this node from every peer's
+        // fold. The blob-heat paths trim to the cap; anything else that
+        // gets here learns now.
+        if Self::blob_heat_over_cap(public) {
+            return Err(AdapterError::Connection(format!(
+                "announce: published capability set refused, nothing was changed: more \
+                 than {MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE} blob-heat tags"
+            )));
+        }
+        fits(&self.self_fold_caps(public), "self-indexed")
+    }
+
     /// The corrective loop shared by every announce entry point. `start_mode`
     /// is `Routine` for an ordinary announce and `SecurityCorrective` for a
     /// caller that has ALREADY had a send refused — the deferred flush, whose
@@ -45246,12 +45627,14 @@ impl MeshNode {
             // baseline lets subsequent `announce_chain` /
             // `withdraw_chain` calls layer mutations on top without
             // re-augmenting the nrpc / nat tags that follow.
-            let caps = match new_baseline {
-                Some(caps) => {
-                    *self.user_caps.write() = Some(caps.clone());
-                    caps
-                }
-                None => self.user_caps.read().clone().unwrap_or_default(),
+            //
+            // A new baseline is NOT adopted here. It is committed only after
+            // the whole announcement has been checked and this node's own
+            // fold has accepted it (below), so a refused announce leaves the
+            // previous baseline in place for re-announces and keep-alives.
+            let (caps, adopt_baseline) = match new_baseline {
+                Some(caps) => (caps.clone(), Some(caps)),
+                None => (self.user_caps.read().clone().unwrap_or_default(), None),
             };
             // Merge nRPC service registrations as `nrpc:<service>` tags.
             // Other nodes' capability indexes pick these up, letting
@@ -45274,242 +45657,9 @@ impl MeshNode {
             #[cfg(not(feature = "cortex"))]
             let exposure_revocation_generation = 0u64;
 
-            // OA3-4b1 confidentiality projection: ONLY `Public` services
-            // contribute an `nrpc:` tag to this (plaintext, broadcast) set.
-            // Owner-scoped services are emitted solely as an encrypted
-            // owner-audience announcement and must never appear in the clear.
-            // Registration visibility is AUTHORITATIVE over baseline residue: a
-            // caller that pre-tagged (or reused an old baseline containing) an
-            // owner-scoped `nrpc:<svc>` would otherwise leak it — strip those exact
-            // tags from the plaintext set too (Kyra OA3 closure).
-            #[cfg(feature = "cortex")]
-            let caps = if self.rpc_local_services.is_empty() {
-                caps
-            } else {
-                let mut merged = caps;
-                for svc in self.rpc_local_services.public_snapshot() {
-                    // Phase A.5.N.2: tags is HashSet<Tag>; insert via builder so
-                    // the parsed-tag form lands and dedupes against existing tags.
-                    merged = merged.add_tag(format!("nrpc:{}", svc.as_str()));
-                }
-                // Registration visibility is AUTHORITATIVE over baseline residue: a
-                // caller that pre-tagged (or reused an old baseline containing) a
-                // private `nrpc:<svc>` would otherwise leak it. Strip every
-                // owner-scoped AND granted tag from the plaintext set (OA3-4b1 /
-                // OA3-4b2 confidentiality).
-                //
-                // §30 — DECIDED, not overlooked: this suppression is keyed on
-                // the CURRENTLY-REGISTERED private set, so it is not sticky.
-                // Drop the `ServeHandle` and the next re-announce ships an
-                // operator's own `nrpc:<svc>` baseline tag in the clear again.
-                //
-                // That asymmetry is deliberate. The tag is in the plaintext set
-                // only because the OPERATOR put it in `user_caps` — merged
-                // `nrpc:` tags are never written back into the baseline
-                // (`announce_from_baseline` snapshots the caller's set BEFORE
-                // the merge), so the only way one is present is explicit
-                // intent to advertise. A private registration temporarily
-                // overrides that intent; ending the registration restores it.
-                // Making suppression permanent would mean a process that once
-                // served `X` privately could never advertise `X` publicly
-                // again without a restart, which is a worse and far more
-                // surprising failure.
-                //
-                // What this is NOT: a leak of a service the operator never
-                // asked to advertise. Those tags come from the registry, not
-                // the baseline, and disappear with the registration.
-                for svc in self
-                    .rpc_local_services
-                    .owner_scoped_snapshot()
-                    .into_iter()
-                    .chain(self.rpc_local_services.granted_snapshot())
-                {
-                    merged = merged.remove_tag(&format!("nrpc:{}", svc.as_str()));
-                }
-                merged
-            };
-
-            // Merge AI-tool registrations on top of the `nrpc:` tags.
-            // For every tool the SDK's `serve_tool` registered, this
-            // appends:
-            //   - an `ai-tool:<name>` capability tag, so
-            //     `find_nodes_for_tag_prefix("ai-tool:")` discovers
-            //     this host;
-            //   - the typed `ToolCapability` itself (added via
-            //     `CapabilitySet::add_tool`), so the typed views aggregate
-            //     a `Vec<ToolCapability>` across peers in the fold;
-            //   - the description / streaming / tags metadata keys via
-            //     `CapabilitySet::metadata`, mirroring the existing
-            //     `input_schema` / `output_schema` convention so peers
-            //     without the `tool` feature still receive the data and
-            //     just ignore the unknown keys.
-            //
-            // Tool registrations are local to this node, just like
-            // `rpc_local_services`. Drop on the SDK's `ServeHandle`
-            // removes from the registry; the next `announce_capabilities`
-            // reflects the smaller set.
-            #[cfg(feature = "tool")]
-            let caps = if self.tool_registry.is_empty() {
-                caps
-            } else {
-                use crate::adapter::net::behavior::ToolCapability;
-                use crate::adapter::net::cortex::tool::{
-                    description_metadata_key, pricing_terms_metadata_key, streaming_metadata_key,
-                    tags_metadata_key,
-                };
-                let snapshot = self.tool_registry.snapshot();
-                // Reconstruct ToolCapability values from each descriptor's
-                // wire-cheap fields; schemas stay in metadata (the fold
-                // has its own schema-too-large branch) so the typed-cap
-                // payload doesn't bloat.
-                let tools_to_add: Vec<ToolCapability> = snapshot
-                    .iter()
-                    .map(|descriptor| {
-                        let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
-                            .with_version(&descriptor.version)
-                            .with_estimated_time(descriptor.estimated_time_ms)
-                            .with_stateless(descriptor.stateless);
-                        if let Some(ref schema) = descriptor.input_schema {
-                            cap = cap.with_input_schema(schema.clone());
-                        }
-                        if let Some(ref schema) = descriptor.output_schema {
-                            cap = cap.with_output_schema(schema.clone());
-                        }
-                        for req in &descriptor.requires {
-                            cap = cap.requires(req.clone());
-                        }
-                        cap
-                    })
-                    .collect();
-                // Single set_tools call; O(N) total instead of the
-                // O(N²) chain of per-tool add_tool invocations.
-                let mut merged = caps.add_tools(tools_to_add);
-                for descriptor in snapshot.iter() {
-                    merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
-                    // Description + streaming + tags ride the metadata
-                    // extensibility hook (same convention input/output
-                    // schemas already use). Pre-tool peers receive these
-                    // keys and ignore them — no wire-breaking change.
-                    if let Some(ref desc) = descriptor.description {
-                        merged = merged.with_metadata(
-                            description_metadata_key(&descriptor.tool_id),
-                            desc.clone(),
-                        );
-                    }
-                    if descriptor.streaming {
-                        merged = merged.with_metadata(
-                            streaming_metadata_key(&descriptor.tool_id),
-                            "1".to_string(),
-                        );
-                    }
-                    if !descriptor.tags.is_empty() {
-                        merged = merged.with_metadata(
-                            tags_metadata_key(&descriptor.tool_id),
-                            descriptor.tags.join(","),
-                        );
-                    }
-                    // Pricing terms (net.pricing.terms@1 canonical JSON) ride
-                    // the same hook — paid capability = metadata + invocation
-                    // policy, not a different kind of tool. The substrate
-                    // never parses the value.
-                    if let Some(ref terms) = descriptor.pricing_terms {
-                        merged = merged.with_metadata(
-                            pricing_terms_metadata_key(&descriptor.tool_id),
-                            terms.clone(),
-                        );
-                    }
-                }
-                merged
-            };
-
-            // STREAM_ACK_BATCHING R-5: advertise transport support for
-            // positive SACK-range ACKs — same auto-augment pattern as the
-            // `nrpc:` / `ai-tool:` tags above. Config-gated so operators
-            // can turn the feature off wire-wide (compliant peers then
-            // never emit ranges to us, and we never emit to anyone).
-            let caps = if self.config.enable_stream_ack_ranges {
-                caps.add_tag(ACK_RANGES_CAPABILITY_TAG.to_string())
-            } else {
-                caps
-            };
-
-            // Stage 5 ruling 4: advertise that this node's stream
-            // receive path reassembles leaf fragment groups, so a
-            // peer may send an over-cap stream event to us instead
-            // of refusing it typed.
-            //
-            // NOT config-gated, and that is deliberate: the RTC
-            // ingress reassembles unconditionally (there is no knob
-            // that turns `reassemble_rtc_fragments` off), so a flag
-            // here would let an operator withdraw a claim that is
-            // still true and cost peers a capability this node does
-            // in fact have. The `webrtc` cfg IS the condition —
-            // without it there is no RTC ingress and nothing
-            // reassembles.
-            #[cfg(feature = "webrtc")]
-            let caps =
-                caps.add_tag(super::behavior::capability::FRAGMENT_REASSEMBLY_TAG.to_string());
-
-            // Stage 4a §11 tags. `transport:rtc` is how a peer
-            // learns it can take a DataChannel with us — the
-            // classifier reads it and returns `PairAction::Ice`
-            // instead of planning a punch. `rtc-anchor` says this
-            // node serves the bootstrap endpoint its
-            // `rtc_bootstrap` field names. `leaf` is Stage 5's to
-            // emit; Stage 4 only reads it.
-            #[cfg(feature = "webrtc")]
-            let caps = match self.config.rtc.as_ref() {
-                Some(rtc) => {
-                    let caps = caps.add_tag(RTC_TRANSPORT_TAG.to_string());
-                    if rtc.serve_bootstrap {
-                        caps.add_tag(RTC_ANCHOR_TAG.to_string())
-                    } else {
-                        caps
-                    }
-                }
-                None => caps,
-            };
-
-            let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Piggyback the current NAT classification as a `nat:*`
-            // capability tag so peers can filter-match on NAT type,
-            // and the reflex address on the dedicated announcement
-            // field so peers have a direct-connect candidate without a
-            // separate discovery round-trip. Both are feature-gated on
-            // `nat-traversal` — callers compiled without the feature
-            // emit announcements identical to the pre-traversal format.
-            //
-            // The two reads happen under `traversal_publish_mu` so
-            // the announcement always carries a consistent (class,
-            // reflex) pair. Without the mutex, a concurrent
-            // set/clear/commit could interleave between our reads
-            // and let us publish a torn state — e.g., the new
-            // override's reflex paired with the pre-override NAT
-            // class. The lock is held only for the two atomic reads,
-            // not across the signing or network send.
-            #[cfg(feature = "nat-traversal")]
-            let (caps, reflex_snapshot) = {
-                use super::traversal::classify::NatClass;
-                let _g = self.traversal_publish_mu.lock();
-                let class =
-                    NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
-                let reflex = self
-                    .reflex_addr
-                    .load_full()
-                    .or_else(|| self.direct_hint.load_full())
-                    .map(|arc| *arc);
-                // Strip any prior `nat:*` tags before adding the fresh
-                // one so a reclassification doesn't leave a stale tag
-                // behind when the class transitions. Phase A.5.N.2:
-                // `caps.tags` is `HashSet<Tag>` — `nat:*` tags parse
-                // as `Tag::Legacy`, so we render to wire form for
-                // prefix matching.
-                let mut next = caps;
-                next.tags.retain(|t| !t.to_string().starts_with("nat:"));
-                let next = next.add_tag(class.tag().to_string());
-                (next, reflex)
-            };
+            let (caps, reflex_snapshot) = self.augment_public_caps(caps);
+            #[cfg(not(feature = "nat-traversal"))]
+            let _ = reflex_snapshot;
 
             // Push the fully-merged capability set into the proximity
             // graph so origin pingwaves — the heartbeat tick AND the
@@ -45525,7 +45675,17 @@ impl MeshNode {
             // Proximity pingwaves piggyback the CURRENT capability summary and
             // ride to peers, so they carry the PUBLIC set only (never an
             // owner-scoped tag).
-            self.proximity_graph.set_local_capabilities(caps.clone());
+            // The per-advertisement tag caps, on both sets this announce
+            // would install: the augmented public set (registered services
+            // and tools, transport and NAT tags) and the self-fold set (plus
+            // owner-scoped and granted services). Checked before anything is
+            // committed: no baseline adopted, no version consumed, nothing
+            // published locally or to peers.
+            self.check_augmented_announceable(&caps)?;
+
+            let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+            // Committed with the baseline, after the self-fold accepts.
+            let pingwave_caps = caps.clone();
 
             // The PUBLIC broadcast announcement — the ONLY object every plaintext
             // send path reads (`local_announcement`). Owner-scoped `nrpc:` tags
@@ -45697,7 +45857,35 @@ impl MeshNode {
                 &self_ann,
                 verified_owner,
             );
-            let _ = self.capability_fold.apply(fold_ann);
+            // This node's own fold must accept the announcement before
+            // anything is committed. The caps were checked above, so a refusal
+            // here is the fold's tag budget, full of peers' tags. Nothing is
+            // committed: the baseline, the pingwave summary and the published
+            // emission stay as they were. (The announce version counter has
+            // moved; a skipped version is harmless to receivers.) Losing the
+            // merge to a newer self entry is a refusal too: committing would
+            // publish one set while this node's own fold holds another (PR
+            // #1210 review).
+            match self.capability_fold.apply(fold_ann) {
+                Ok(super::behavior::fold::ApplyOutcome::Rejected) => {
+                    return Err(AdapterError::Connection(
+                        "announce: lost to a newer self entry in this node's own \
+                         capability fold, nothing was published"
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(AdapterError::Connection(format!(
+                        "announce: refused by this node's own capability fold, nothing was \
+                         published: {e}"
+                    )));
+                }
+            }
+            if let Some(baseline) = adopt_baseline {
+                *self.user_caps.write() = Some(baseline);
+            }
+            self.proximity_graph.set_local_capabilities(pingwave_caps);
             // Review-9: post-apply floor recheck (see the dispatch
             // path).
             if let Some(owner) = &verified_owner {
@@ -46151,6 +46339,44 @@ impl MeshNode {
         }
     }
 
+    /// Keep at most `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags in
+    /// `caps`: the hottest, ties broken by tag text so the choice is
+    /// deterministic. Peers refuse an announcement over the cap WHOLE
+    /// (`blob_heat_over_cap`), so a node tracking more hot blobs than
+    /// the cap advertises its hottest instead of disappearing from every
+    /// peer's fold (PR #1210 review).
+    #[cfg(feature = "dataforts")]
+    fn trim_blob_heat_tags(caps: &mut CapabilitySet) {
+        let rate_of = |body: &str| -> f64 {
+            body.rsplit_once('=')
+                .and_then(|(_, r)| r.parse::<f64>().ok())
+                .filter(|r| r.is_finite())
+                .unwrap_or(0.0)
+        };
+        let mut heat: Vec<(f64, Tag)> = caps
+            .tags
+            .iter()
+            .filter_map(|tag| match tag {
+                Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:") =>
+                {
+                    Some((rate_of(body), tag.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if heat.len() <= MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE {
+            return;
+        }
+        heat.sort_by(|(ra, ta), (rb, tb)| {
+            rb.total_cmp(ra)
+                .then_with(|| ta.to_string().cmp(&tb.to_string()))
+        });
+        for (_, tag) in heat.drain(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE..) {
+            caps.tags.remove(&tag);
+        }
+    }
+
     /// Read the current user-supplied baseline, defaulting to an
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
@@ -46329,13 +46555,21 @@ impl MeshNode {
         holder: u64,
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
-        self.replica_candidate_holders
-            .lock()
-            .entry(*channel_id)
-            .or_default()
-            .insert(holder);
-        if self.advertises_replica_candidate(channel_id) {
-            return Ok(());
+        {
+            // Register and check under ONE holders-lock hold. A release
+            // removes the tag from the baseline under this same lock (see
+            // `drop_candidate_tag_if_unclaimed`), so either it sees this
+            // claim and keeps the tag, or its removal is already committed
+            // here and this claim re-announces. Checked outside the lock,
+            // a release could decide "no claimant", this claim could still
+            // see the tag in the not-yet-committed baseline and skip
+            // announcing, and the release's commit would then drop a live
+            // claim's tag.
+            let mut holders = self.replica_candidate_holders.lock();
+            holders.entry(*channel_id).or_default().insert(holder);
+            if self.advertises_replica_candidate(channel_id) {
+                return Ok(());
+            }
         }
         self.announce_replica_candidate(channel_id).await
     }
@@ -46346,28 +46580,132 @@ impl MeshNode {
         holder: u64,
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
-        if !self.release_candidate_holder(holder, channel_id) {
-            return Ok(());
-        }
-        self.withdraw_replica_candidate(channel_id).await
+        self.release_replica_candidate_with(
+            holder,
+            channel_id,
+            ANNOUNCE_LOCK_DEADLINE,
+            CANDIDACY_WITHDRAW_ATTEMPTS,
+            CANDIDACY_WITHDRAW_BACKOFF,
+        )
+        .await
     }
 
-    /// The synchronous [`Self::release_replica_candidate`], for a teardown
-    /// that can't await (a replication runtime aborted rather than shut
-    /// down). Edits the capability baseline without announcing; the caller
-    /// re-announces if it can.
-    pub(crate) fn release_replica_candidate_sync(
+    /// [`Self::release_replica_candidate`] with the lock deadline and the
+    /// retry schedule supplied, so a witness can drive a busy announce
+    /// lock without waiting out the production deadline.
+    pub(crate) async fn release_replica_candidate_with(
         &self,
         holder: u64,
         channel_id: &[u8; 32],
-    ) -> CandidateRelease {
-        if !self.release_candidate_holder(holder, channel_id) {
-            return CandidateRelease::StillClaimed;
+        lock_within: Duration,
+        attempts: u32,
+        backoff: Duration,
+    ) -> Result<(), AdapterError> {
+        // Under `baseline_rmw`, so the baseline edit cannot interleave
+        // with a snapshot-based announce whose later commit would restore
+        // the tag.
+        let first = {
+            let _rmw = self.baseline_rmw.lock().await;
+            self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id, lock_within)
+        };
+        match first {
+            CandidateRelease::Removed => self.reannounce_current_capabilities().await,
+            CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => Ok(()),
+            // The holder is already dropped but the tag is still in the
+            // baseline: keep trying, as the unclaimed withdraw, instead of
+            // leaving a stale tag behind (cubic, PR #1210).
+            CandidateRelease::LockUnavailable => {
+                self.withdraw_unclaimed_replica_candidate_with(
+                    channel_id,
+                    lock_within,
+                    attempts,
+                    backoff,
+                )
+                .await
+            }
         }
-        let tag = Self::replica_candidate_tag(channel_id);
-        let Some(_announce_guard) = self.lock_announce_mu() else {
+    }
+
+    /// Withdraw `channel_id`'s candidate tag if no resolver claims it: the
+    /// async path for a release that could not take the announce lock (the
+    /// synchronous one, or a graceful one that timed out). Same atomic step
+    /// as [`Self::release_replica_candidate`], retried on a busy lock.
+    pub(crate) async fn withdraw_unclaimed_replica_candidate(
+        &self,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        self.withdraw_unclaimed_replica_candidate_with(
+            channel_id,
+            ANNOUNCE_LOCK_DEADLINE,
+            CANDIDACY_WITHDRAW_ATTEMPTS,
+            CANDIDACY_WITHDRAW_BACKOFF,
+        )
+        .await
+    }
+
+    /// [`Self::withdraw_unclaimed_replica_candidate`] with the lock deadline
+    /// and the retry schedule supplied.
+    pub(crate) async fn withdraw_unclaimed_replica_candidate_with(
+        &self,
+        channel_id: &[u8; 32],
+        lock_within: Duration,
+        attempts: u32,
+        backoff: Duration,
+    ) -> Result<(), AdapterError> {
+        for attempt in 0..attempts.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(backoff).await;
+            }
+            let outcome = {
+                let _rmw = self.baseline_rmw.lock().await;
+                self.drop_candidate_tag_if_unclaimed(None, channel_id, lock_within)
+            };
+            match outcome {
+                CandidateRelease::Removed => return self.reannounce_current_capabilities().await,
+                CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => return Ok(()),
+                CandidateRelease::LockUnavailable => {}
+            }
+        }
+        Err(AdapterError::Connection(format!(
+            "replication: the announce lock was not obtainable in {attempts} attempts of \
+             {lock_within:?}; replica candidacy was not withdrawn"
+        )))
+    }
+
+    /// The one atomic step every candidacy release takes: under the
+    /// holders lock, drop `holder` (if given), and only if no claimant is
+    /// left, remove `channel_id`'s tag from the committed baseline before
+    /// the lock is released. A claim registers and checks the baseline
+    /// under the same lock (`claim_replica_candidate`), so a release can
+    /// never remove a tag a live claim believes is advertised. The caller
+    /// holds `baseline_rmw` (or its `try_lock`), so no snapshot-based
+    /// announce is in flight to restore the tag; on `Removed` it publishes.
+    ///
+    /// `announce_mu` is taken (or timed out) BEFORE the holders lock, so a
+    /// busy announce never stalls claims behind this release. The holder is
+    /// dropped even when the lock times out (`LockUnavailable`): the tag is
+    /// then still in the baseline, for the caller to withdraw.
+    fn drop_candidate_tag_if_unclaimed(
+        &self,
+        holder: Option<u64>,
+        channel_id: &[u8; 32],
+        lock_within: Duration,
+    ) -> CandidateRelease {
+        let announce_guard = self.lock_announce_mu_within(lock_within);
+        let mut holders = self.replica_candidate_holders.lock();
+        if let Some(set) = holders.get_mut(channel_id) {
+            if let Some(holder) = holder {
+                set.remove(&holder);
+            }
+            if !set.is_empty() {
+                return CandidateRelease::StillClaimed;
+            }
+            holders.remove(channel_id);
+        }
+        let Some(_announce_guard) = announce_guard else {
             return CandidateRelease::LockUnavailable;
         };
+        let tag = Self::replica_candidate_tag(channel_id);
         let mut caps = self.user_caps.write();
         let Some(caps) = caps.as_mut() else {
             return CandidateRelease::NotAdvertised;
@@ -46379,6 +46717,28 @@ impl MeshNode {
         } else {
             CandidateRelease::NotAdvertised
         }
+    }
+
+    /// The synchronous [`Self::release_replica_candidate`], for a teardown
+    /// that can't await (a replication runtime aborted rather than shut
+    /// down). Edits the capability baseline without announcing; the caller
+    /// re-announces if it can.
+    pub(crate) fn release_replica_candidate_sync(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> CandidateRelease {
+        // Can't await `baseline_rmw` here. When a snapshot-based announce
+        // holds it, editing the baseline now would be undone by that
+        // announce's commit, so drop only the holder and defer the tag to
+        // the async path (`LockUnavailable`).
+        let Ok(_rmw) = self.baseline_rmw.try_lock() else {
+            if !self.release_candidate_holder(holder, channel_id) {
+                return CandidateRelease::StillClaimed;
+            }
+            return CandidateRelease::LockUnavailable;
+        };
+        self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id, ANNOUNCE_LOCK_DEADLINE)
     }
 
     /// Record `holder`'s claim on `channel_id`'s candidate tag without
@@ -46393,14 +46753,6 @@ impl MeshNode {
             .entry(*channel_id)
             .or_default()
             .insert(holder);
-    }
-
-    /// Whether no resolver currently claims `channel_id`'s candidate tag.
-    pub(crate) fn replica_candidate_unclaimed(&self, channel_id: &[u8; 32]) -> bool {
-        !self
-            .replica_candidate_holders
-            .lock()
-            .contains_key(channel_id)
     }
 
     /// Remove `holder` from `channel_id`'s claimants; `true` when no
@@ -46429,7 +46781,7 @@ impl MeshNode {
         let mut nodes: Vec<u64> = self.capability_fold.with_state(|state| {
             let mut seen = std::collections::BTreeSet::new();
             for entry in state.entries.values() {
-                if entry.payload.tags.contains(&tag) {
+                if entry.payload.tags.iter().any(|t| *t == tag) {
                     seen.insert(entry.node_id);
                 }
             }
@@ -46563,6 +46915,7 @@ impl MeshNode {
         let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_blob_heat_tags(&mut snapshot, &hash, replacement);
+        Self::trim_blob_heat_tags(&mut snapshot);
         self.announce_capabilities(snapshot).await
     }
 
@@ -46608,6 +46961,7 @@ impl MeshNode {
             };
             Self::replace_blob_heat_tags(&mut snapshot, hash, replacement);
         }
+        Self::trim_blob_heat_tags(&mut snapshot);
         self.announce_capabilities(snapshot).await
     }
 }
@@ -48106,7 +48460,7 @@ impl MeshNode {
     /// guards. Shared by [`Self::find_nodes_by_filter_scoped`] and
     /// [`Self::find_best_node_scoped`] so list and single-winner
     /// discovery cannot drift on subnet membership.
-    fn same_subnet_resolver(&self) -> impl Fn(u64, &[String]) -> bool {
+    fn same_subnet_resolver(&self) -> impl Fn(u64, &[super::behavior::fold::TagStr]) -> bool {
         let my_subnet = self.local_subnet;
         let local_node_id = self.node_id;
         let policy = self.local_subnet_policy.clone();
@@ -53176,6 +53530,503 @@ mod fold_publisher_helpers_tests {
         )
     }
 
+    /// PR #1210 review: a node tracking more hot blobs than the per-announce
+    /// cap used to publish them all, and every peer refused the whole
+    /// announcement (`blob_heat_over_cap`), dropping the node from their
+    /// folds. The blob-heat paths now trim to the hottest; any other path
+    /// that tries to publish over the cap is refused locally.
+    #[cfg(feature = "dataforts")]
+    #[tokio::test]
+    async fn a_node_with_more_hot_blobs_than_the_cap_still_announces() {
+        let node = build_node_for_test().await;
+        let updates: Vec<([u8; 32], Option<f64>)> = (0..MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 50)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                (h, Some(0.5))
+            })
+            .collect();
+        node.announce_blob_heat_batch(&updates)
+            .await
+            .expect("batch announce");
+        let mut h = [0xFFu8; 32];
+        h[0] = 0xEE;
+        node.announce_blob_heat(h, 0.9)
+            .await
+            .expect("single announce");
+
+        let published = node.user_caps_snapshot();
+        assert!(
+            !MeshNode::blob_heat_over_cap(&published),
+            "a peer would refuse this announcement whole"
+        );
+        assert!(
+            published
+                .tags
+                .iter()
+                .any(|t| MeshNode::is_blob_heat_for(t, &MeshNode::blob_hex(&h))),
+            "the hottest blob is kept"
+        );
+
+        let mut over = published.clone();
+        for i in 0..2u8 {
+            over.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{:064x}=0.10", 0xABCD_0000u64 + i as u64),
+            });
+        }
+        assert!(MeshNode::blob_heat_over_cap(&over));
+        assert!(
+            node.announce_capabilities(over).await.is_err(),
+            "publishing over the cap is refused locally"
+        );
+        assert_eq!(
+            node.user_caps_snapshot().tags,
+            published.tags,
+            "baseline unchanged"
+        );
+    }
+
+    /// Replica candidacy: a release decides "no claimant left" and removes
+    /// the tag from the committed baseline in ONE step under the holders
+    /// lock, and a claim registers and checks under that same lock. So a
+    /// release never removes a tag a live claim believes is advertised:
+    /// either it sees the claim and keeps the tag, or the removal is
+    /// already committed when the claim checks, and the claim re-announces
+    /// (the race behind `redex_replication_e2e::reopening_a_channel_never_drops_its_candidacy`).
+    #[tokio::test]
+    async fn candidacy_release_and_claim_are_atomic() {
+        let node = build_node_for_test().await;
+        let ch = [7u8; 32];
+        node.claim_replica_candidate(1, &ch).await.expect("claim A");
+        assert!(node.advertises_replica_candidate(&ch));
+
+        // A second claimant registered: the first's release keeps the tag.
+        node.register_replica_candidate_holder(2, &ch);
+        node.release_replica_candidate(1, &ch)
+            .await
+            .expect("release A");
+        assert!(
+            node.advertises_replica_candidate(&ch),
+            "a live claim keeps the tag"
+        );
+
+        // The last claimant's release has removed the tag from the
+        // committed baseline by the time it returns from its decision.
+        assert!(matches!(
+            node.release_replica_candidate_sync(2, &ch),
+            CandidateRelease::Removed
+        ));
+        assert!(!node.advertises_replica_candidate(&ch), "committed at once");
+
+        // A claim arriving after the removal sees it and re-announces.
+        node.claim_replica_candidate(3, &ch).await.expect("claim C");
+        assert!(node.advertises_replica_candidate(&ch), "re-announced");
+
+        // With `baseline_rmw` held (a snapshot-based announce in flight),
+        // the sync release drops only its holder and defers the tag.
+        let rmw = node.baseline_rmw.lock().await;
+        assert!(matches!(
+            node.release_replica_candidate_sync(3, &ch),
+            CandidateRelease::LockUnavailable
+        ));
+        assert!(
+            node.advertises_replica_candidate(&ch),
+            "deferred, not edited"
+        );
+        drop(rmw);
+        node.withdraw_unclaimed_replica_candidate(&ch)
+            .await
+            .expect("deferred withdraw");
+        assert!(!node.advertises_replica_candidate(&ch));
+    }
+
+    /// A graceful candidacy release that finds the announce lock busy
+    /// keeps trying, instead of leaving the tag in the baseline after its
+    /// holder is gone (cubic, PR #1210).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_behind_a_busy_announce_lock_still_withdraws() {
+        let node = build_node_for_test().await;
+        let ch = [9u8; 32];
+        node.claim_replica_candidate(1, &ch).await.expect("claim");
+        assert!(node.advertises_replica_candidate(&ch));
+
+        let (held, released) = {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let node = Arc::clone(&node);
+            let holder = std::thread::spawn(move || {
+                let guard = node.lock_announce_mu_within(Duration::from_secs(5));
+                assert!(guard.is_some(), "the test holds the announce lock");
+                let _ = held_tx.send(());
+                std::thread::sleep(Duration::from_millis(300));
+                drop(guard);
+            });
+            (held_rx, holder)
+        };
+        held.recv().expect("lock held");
+
+        // Each attempt waits 20 ms for the lock; the first ones time out
+        // while the thread holds it, a later one succeeds.
+        node.release_replica_candidate_with(
+            1,
+            &ch,
+            Duration::from_millis(20),
+            100,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("withdrawn after retrying");
+        released.join().expect("holder thread");
+        assert!(
+            !node.advertises_replica_candidate(&ch),
+            "the tag left the baseline once the lock was free"
+        );
+    }
+
+    /// A public handler for the registration tests below.
+    #[cfg(feature = "cortex")]
+    struct NoopRpc;
+    #[cfg(feature = "cortex")]
+    #[async_trait::async_trait]
+    impl crate::adapter::net::cortex::rpc::RpcHandler for NoopRpc {
+        async fn call(
+            &self,
+            _ctx: crate::adapter::net::cortex::rpc::RpcContext,
+        ) -> Result<
+            crate::adapter::net::cortex::rpc::RpcResponsePayload,
+            crate::adapter::net::cortex::rpc::RpcHandlerError,
+        > {
+            Ok(crate::adapter::net::cortex::rpc::RpcResponsePayload {
+                status: crate::adapter::net::cortex::rpc::RpcStatus::Ok,
+                headers: vec![],
+                body: bytes::Bytes::new(),
+            })
+        }
+    }
+
+    /// A capability set of `n` distinct plain tags.
+    fn tag_set(prefix: &str, n: usize) -> CapabilitySet {
+        let mut caps = CapabilitySet::new();
+        for i in 0..n {
+            caps = caps.add_tag(format!("{prefix}{i}"));
+        }
+        caps
+    }
+
+    /// How many automatic tags an announce adds to an empty baseline now.
+    fn augmentation(node: &MeshNode) -> usize {
+        node.augment_public_caps(CapabilitySet::new()).0.tags.len()
+    }
+
+    /// What a refused announce must not have touched.
+    fn announce_state(node: &MeshNode) -> (usize, u64, Option<u64>, Vec<String>) {
+        let self_tags = node.capability_fold.with_state(|s| {
+            let mut tags: Vec<String> = s
+                .keys_for(node.node_id)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|k| s.get(k))
+                .flat_map(|e| e.payload.tags.iter().map(|t| t.to_string()))
+                .collect();
+            tags.sort();
+            tags
+        });
+        (
+            node.user_caps_snapshot().tags.len(),
+            node.capability_version.load(Ordering::Relaxed),
+            node.local_emission.load_full().map(|e| e.public.version),
+            self_tags,
+        )
+    }
+
+    /// Review defect 1 at `50a8c60d4`: the caller's set fits the caps, but
+    /// the automatic tags push the published set over. The announce is
+    /// refused and changes nothing: the previous baseline stays (so the
+    /// keep-alive does not re-send the refused one), no version is
+    /// consumed, the self-fold and the published emission are untouched.
+    #[tokio::test]
+    async fn a_refused_augmented_announce_changes_nothing() {
+        use super::super::behavior::fold::MAX_CAPABILITY_TAGS;
+        let node = build_node_for_test().await;
+        node.announce_capabilities(tag_set("ok-", 3))
+            .await
+            .expect("a small baseline announces");
+        let before = announce_state(&node);
+        assert_eq!(before.0, 3);
+
+        let extra = augmentation(&node);
+        assert!(extra >= 1, "this node adds automatic tags ({extra})");
+        // Fits by itself; over the cap once augmented.
+        let base = tag_set("big-", MAX_CAPABILITY_TAGS + 1 - extra);
+        assert!(base.tags.len() <= MAX_CAPABILITY_TAGS);
+        let err = node
+            .announce_capabilities(base)
+            .await
+            .expect_err("over the cap once augmented");
+        assert!(err.to_string().contains("published"), "{err}");
+        assert_eq!(announce_state(&node), before, "nothing changed");
+
+        // The surviving baseline still announces.
+        node.reannounce_current_capabilities()
+            .await
+            .expect("the previous baseline is intact");
+    }
+
+    /// Review defect 2 at `50a8c60d4`: a service whose `nrpc:` tag would
+    /// make the announcement unacceptable is refused at registration and
+    /// rolled back (registry entry and inbound dispatcher), instead of
+    /// registering a handler whose folded tag the self-fold rejected.
+    #[cfg(feature = "cortex")]
+    #[tokio::test]
+    async fn serve_rpc_rolls_back_a_service_whose_tag_cannot_be_announced() {
+        use super::super::behavior::fold::MAX_CAPABILITY_TAGS;
+        use super::super::mesh_rpc::ServeError;
+        let node = build_node_for_test().await;
+        let full = MAX_CAPABILITY_TAGS - augmentation(&node);
+        node.announce_capabilities(tag_set("t-", full))
+            .await
+            .expect("exactly at the cap once augmented");
+
+        match node.serve_rpc("over", Arc::new(NoopRpc)) {
+            Err(ServeError::CapabilityRefused(_)) => {}
+            Err(e) => panic!("expected CapabilityRefused, got {e}"),
+            Ok(_) => panic!("expected CapabilityRefused, got a handle"),
+        }
+        assert!(
+            !node
+                .rpc_local_services
+                .all_snapshot()
+                .iter()
+                .any(|s| s == "over"),
+            "registry entry rolled back"
+        );
+        // The inbound dispatcher was rolled back too: retrying is refused
+        // for the same reason, not as a duplicate registration.
+        assert!(matches!(
+            node.serve_rpc("over", Arc::new(NoopRpc)),
+            Err(ServeError::CapabilityRefused(_))
+        ));
+
+        // With room made, the same service registers.
+        node.announce_capabilities(tag_set("t-", full - 1))
+            .await
+            .expect("smaller baseline");
+        let _handle = node.serve_rpc("over", Arc::new(NoopRpc)).expect("fits now");
+        node.capability_fold.with_state(|s| {
+            let tags = s.keys_for(node.node_id).expect("self entry");
+            assert!(tags.iter().filter_map(|k| s.get(k)).any(|e| e
+                .payload
+                .tags
+                .iter()
+                .any(|t| *t == "nrpc:over")));
+        });
+    }
+
+    /// cubic, PR #1210: a self-index that loses the merge to a newer self
+    /// entry (`Ok(Rejected)`) used to be taken for success, registering a
+    /// service whose `nrpc:` tag never reached the self-fold, which
+    /// protected dispatch requires. It is now an error, and the
+    /// registration rolls back.
+    #[cfg(feature = "cortex")]
+    #[tokio::test]
+    async fn a_service_whose_self_index_loses_to_a_newer_self_entry_rolls_back() {
+        use super::super::mesh_rpc::ServeError;
+        let node = build_node_for_test().await;
+        let newer = CapabilityAnnouncement::new(
+            node.node_id,
+            node.identity.entity_id().clone(),
+            1_000_000,
+            CapabilitySet::new().add_tag("newer"),
+        );
+        node.capability_fold
+            .apply(
+                super::super::behavior::fold::capability_bridge::translate_announcement(
+                    &newer, None,
+                ),
+            )
+            .expect("a newer self entry");
+
+        match node.serve_rpc("lost", Arc::new(NoopRpc)) {
+            Err(ServeError::CapabilityRefused(_)) => {}
+            Err(e) => panic!("expected CapabilityRefused, got {e}"),
+            Ok(_) => panic!("registered a service whose tag did not land"),
+        }
+        assert!(
+            !node
+                .rpc_local_services
+                .all_snapshot()
+                .iter()
+                .any(|s| s == "lost"),
+            "registry entry rolled back"
+        );
+        node.capability_fold.with_state(|s| {
+            let entry = s.get(&(0, node.node_id)).expect("self entry");
+            assert_eq!(entry.generation, 1_000_000, "the newer entry stands");
+        });
+    }
+
+    /// PR #1210 review: `serve_rpc` inserted the service into the registry
+    /// BEFORE taking `announce_mu` for the self-index, and rolled a refused
+    /// one back after releasing it, so a concurrent announce could read the
+    /// doomed service and publish its `nrpc:` tag. Insert, self-index and
+    /// rollback now share one lock hold: while another holder has the lock,
+    /// the registry does not show the service.
+    #[cfg(feature = "cortex")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_reaches_the_registry_only_under_the_announce_lock() {
+        let node = build_node_for_test().await;
+        let listed = |node: &MeshNode| {
+            node.rpc_local_services
+                .all_snapshot()
+                .iter()
+                .any(|s| s == "guarded")
+        };
+        let held = node.announce_mu.lock();
+        let serving = {
+            let node = node.clone();
+            tokio::task::spawn_blocking(move || {
+                node.serve_rpc("guarded", Arc::new(NoopRpc))
+                    .map_err(|e| e.to_string())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !listed(&node),
+            "the service is visible to announces before the lock is held"
+        );
+        drop(held);
+        let _handle = serving.await.expect("join").expect("serve");
+        assert!(listed(&node));
+    }
+
+    /// PR #1210 review: an announce that loses the self-fold merge to a
+    /// newer self entry (`Ok(Rejected)`) used to commit anyway, adopting
+    /// its baseline and publishing a set this node's own fold does not
+    /// hold. It is now refused with nothing committed.
+    #[tokio::test]
+    async fn an_announce_that_loses_to_a_newer_self_entry_commits_nothing() {
+        let node = build_node_for_test().await;
+        node.announce_capabilities(CapabilitySet::new().add_tag("before"))
+            .await
+            .expect("first announce");
+        let emission_before = node.local_emission.load_full();
+        let newer = CapabilityAnnouncement::new(
+            node.node_id,
+            node.identity.entity_id().clone(),
+            1_000_000,
+            CapabilitySet::new().add_tag("newer"),
+        );
+        node.capability_fold
+            .apply(
+                super::super::behavior::fold::capability_bridge::translate_announcement(
+                    &newer, None,
+                ),
+            )
+            .expect("a newer self entry");
+
+        assert!(
+            node.announce_capabilities(CapabilitySet::new().add_tag("after"))
+                .await
+                .is_err(),
+            "lost the merge, so the announce is refused"
+        );
+        assert!(node.user_caps_snapshot().has_tag("before"), "baseline kept");
+        assert!(!node.user_caps_snapshot().has_tag("after"));
+        let emission_after = node.local_emission.load_full();
+        assert!(
+            match (&emission_before, &emission_after) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            },
+            "the published emission is unchanged"
+        );
+    }
+
+    /// Review defect 2, announce side: owner-scoped services reach only
+    /// the self-fold, so the published set can fit while the self-indexed
+    /// one does not. The announce is refused, with nothing changed, instead
+    /// of publishing while the self-fold silently drops the service.
+    #[cfg(feature = "cortex")]
+    #[tokio::test]
+    async fn an_announce_whose_private_services_overflow_the_self_fold_is_refused() {
+        use super::super::behavior::fold::MAX_CAPABILITY_TAGS;
+        use crate::adapter::net::org_admission_gate::CapabilityVisibility;
+        let node = build_node_for_test().await;
+        node.announce_capabilities(tag_set("ok-", 2))
+            .await
+            .expect("small baseline");
+        let before = announce_state(&node);
+
+        node.rpc_local_services_arc().insert(
+            "private-svc".to_string(),
+            999,
+            CapabilityVisibility::OwnerScoped,
+        );
+        let full = MAX_CAPABILITY_TAGS - augmentation(&node);
+        let err = node
+            .announce_capabilities(tag_set("t-", full))
+            .await
+            .expect_err("the published set fits; the self-indexed one does not");
+        assert!(err.to_string().contains("self-indexed"), "{err}");
+        assert_eq!(announce_state(&node), before, "nothing changed");
+    }
+
+    /// Slice 6: a local producer gets a meaningful refusal for an
+    /// advertisement every receiver would drop, and the refusal changes
+    /// nothing locally: no baseline adopted, no generation consumed.
+    #[tokio::test]
+    async fn local_publish_refuses_an_over_cap_advertisement() {
+        use super::super::behavior::fold::{CapabilityMembership, FoldKind, MAX_CAPABILITY_TAGS};
+        let node = build_node_for_test().await;
+
+        let mut caps = CapabilitySet::new();
+        for i in 0..=MAX_CAPABILITY_TAGS {
+            caps = caps.add_tag(format!("t{i}"));
+        }
+        let err = node
+            .announce_capabilities(caps)
+            .await
+            .expect_err("257 tags are refused");
+        assert!(err.to_string().contains("over the cap"), "{err}");
+        assert!(
+            node.user_caps_snapshot().tags.is_empty(),
+            "the refused set did not become the baseline"
+        );
+
+        let long = CapabilitySet::new().add_tag("x".repeat(257));
+        assert!(node.announce_capabilities(long).await.is_err());
+
+        let membership = CapabilityMembership {
+            class_hash: 0xC1,
+            tags: (0..=MAX_CAPABILITY_TAGS)
+                .map(|i| format!("t{i}").into())
+                .collect(),
+            hardware: None,
+            state: super::super::behavior::fold::NodeState::Idle,
+            region: None,
+            price_quote: None,
+            reflex_addr: None,
+            noise_pubkey: None,
+            rtc_bootstrap: None,
+            rtc_addr: None,
+            rtc_stun_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            owner: None,
+        };
+        assert!(node
+            .publish_capability_membership(membership)
+            .await
+            .is_err());
+        assert_eq!(
+            node.next_fold_generation(super::super::behavior::fold::CapabilityFold::KIND_ID, 0xC1),
+            1,
+            "the refusal consumed no generation"
+        );
+    }
+
     #[tokio::test]
     async fn next_fold_generation_first_call_returns_one() {
         // Wire format reserves gen=0 as the "uninitialized"
@@ -56309,6 +57160,51 @@ mod chain_helper_tests {
             .any(|t| MeshNode::is_blob_heat_for(t, &hex)));
     }
 
+    /// PR #1210 review: peers refuse an announcement over the blob-heat
+    /// cap whole, so the sender trims to the cap, keeping the hottest.
+    /// Other tags are untouched.
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn trim_blob_heat_tags_keeps_the_hottest_up_to_the_cap() {
+        let mut caps = CapabilitySet::default().add_tag("gpu");
+        let over = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 44;
+        for i in 0..over {
+            caps.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{i:064x}={:.2}", (i % 100) as f64 / 100.0),
+            });
+        }
+        let mut trimmed = caps.clone();
+        MeshNode::trim_blob_heat_tags(&mut trimmed);
+        assert!(!MeshNode::blob_heat_over_cap(&trimmed));
+        assert_eq!(trimmed.tags.len(), MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1);
+        assert!(trimmed.has_tag("gpu"), "non-heat tags untouched");
+        let rate = |t: &Tag| match t {
+            Tag::Reserved { body, .. } => body.rsplit_once('=').unwrap().1.parse::<f64>().unwrap(),
+            _ => f64::NAN,
+        };
+        let kept_min = trimmed
+            .tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Reserved { .. }))
+            .map(rate)
+            .fold(f64::INFINITY, f64::min);
+        let dropped_max = caps
+            .tags
+            .difference(&trimmed.tags)
+            .map(rate)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(kept_min >= dropped_max, "{kept_min} < {dropped_max}");
+
+        // Deterministic, and a no-op at the cap.
+        let mut again = caps.clone();
+        MeshNode::trim_blob_heat_tags(&mut again);
+        assert_eq!(again.tags, trimmed.tags);
+        let before = trimmed.tags.clone();
+        MeshNode::trim_blob_heat_tags(&mut trimmed);
+        assert_eq!(trimmed.tags, before);
+    }
+
     fn causal_tag(body: impl Into<String>) -> Tag {
         Tag::Reserved {
             prefix: "causal:".to_string(),
@@ -56470,7 +57366,7 @@ mod chain_helper_tests {
             body: "industrial".to_string(),
         });
 
-        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+        assert!(MeshNode::filter_unauthorized_heat_tags(&mut caps));
 
         // Owned heat tag survives; forged one is gone.
         let surviving_heat: Vec<_> = caps
@@ -56502,46 +57398,43 @@ mod chain_helper_tests {
     /// attempt).
     #[cfg(feature = "dataforts")]
     #[test]
-    fn filter_unauthorized_heat_tags_caps_blob_heat_flood_per_announce() {
-        let mut caps = CapabilitySet::default();
-        // Stuff in 2× the cap of distinct blob-heat tags.
-        let flood = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE * 2;
-        for i in 0..flood {
-            let mut hash = [0u8; 32];
-            // Pack the index into bytes 0..8 so each hash is
-            // distinct without needing a hash function.
-            hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let hex = MeshNode::blob_hex(&hash);
-            caps.tags.insert(Tag::Reserved {
-                prefix: "heat:".to_string(),
-                body: format!("blob:{hex}=1.00"),
-            });
-        }
-        // Sanity: every distinct tag landed in the HashSet.
-        let pre_filter = caps
-            .tags
-            .iter()
-            .filter(|t| {
-                matches!(t, Tag::Reserved { prefix, body }
-                if prefix == "heat:" && body.starts_with("blob:"))
-            })
-            .count();
-        assert_eq!(pre_filter, flood);
+    fn filter_unauthorized_heat_tags_refuses_a_blob_heat_flood_whole() {
+        let blob_heat = |caps: &CapabilitySet| {
+            caps.tags
+                .iter()
+                .filter(|t| {
+                    matches!(t, Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:"))
+                })
+                .count()
+        };
+        let flooded = |n: usize| {
+            let mut caps = CapabilitySet::default();
+            for i in 0..n {
+                let mut hash = [0u8; 32];
+                // Pack the index into bytes 0..8 so each hash is
+                // distinct without needing a hash function.
+                hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                let hex = MeshNode::blob_hex(&hash);
+                caps.tags.insert(Tag::Reserved {
+                    prefix: "heat:".to_string(),
+                    body: format!("blob:{hex}=1.00"),
+                });
+            }
+            assert_eq!(blob_heat(&caps), n, "every distinct tag landed");
+            caps
+        };
 
-        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+        // Exactly at the cap: kept whole.
+        let mut at_cap = flooded(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE);
+        assert!(MeshNode::filter_unauthorized_heat_tags(&mut at_cap));
+        assert_eq!(blob_heat(&at_cap), MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE);
 
-        let post_filter = caps
-            .tags
-            .iter()
-            .filter(|t| {
-                matches!(t, Tag::Reserved { prefix, body }
-                if prefix == "heat:" && body.starts_with("blob:"))
-            })
-            .count();
-        assert_eq!(
-            post_filter, MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE,
-            "filter must drop blob-heat tags past the per-announce cap"
-        );
+        // One over: refused whole, untouched, never thinned to a subset
+        // (Slice 6 review defect 3).
+        let mut over = flooded(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1);
+        assert!(!MeshNode::filter_unauthorized_heat_tags(&mut over));
+        assert_eq!(blob_heat(&over), MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1);
     }
 }
 
@@ -64732,6 +65625,56 @@ mod identity_readiness_tests {
             Err(IdentityProofReject::NoChallenge),
             "a consumed challenge is not reusable, whoever presents it"
         );
+    }
+
+    /// cubic, PR #1210: a blob-heat flood past the per-announce cap is
+    /// refused before ANY side effect of the inbound handler, not after
+    /// the TOFU pin, the dedup cache and the forward already ran. The same
+    /// announcement at exactly the cap is processed normally.
+    #[tokio::test]
+    async fn a_blob_heat_flood_is_refused_before_any_intake_side_effect() {
+        use super::super::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        let (node, _root) = publisher().await;
+        let ctx = node.dispatch_ctx();
+        let announce = |n_blob: usize, version: u64| {
+            let peer_key = EntityKeypair::generate();
+            let peer = peer_key.node_id();
+            install_incarnation(&node, peer, 0xB10B + version);
+            let mut caps = CapabilitySet::new();
+            for i in 0..n_blob {
+                caps.tags.insert(Tag::Reserved {
+                    prefix: "heat:".to_string(),
+                    body: format!("blob:{i:064x}=1.00"),
+                });
+            }
+            let mut ann =
+                CapabilityAnnouncement::new(peer, peer_key.entity_id().clone(), version, caps)
+                    .with_ttl(300);
+            ann.sign(&peer_key);
+            MeshNode::handle_capability_announcement(&ann.to_bytes(), peer, &ctx);
+            (peer, version)
+        };
+
+        let (over, v) = announce(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1, 1);
+        assert!(node.peer_entity_ids.get(&over).is_none(), "no TOFU pin");
+        assert!(
+            !node.seen_announcements.contains_key(&(over, v, true)),
+            "no dedup-cache entry"
+        );
+        assert!(
+            node.capability_fold
+                .with_state(|s| s.keys_for(over).is_none()),
+            "nothing folded"
+        );
+
+        let (at_cap, _) = announce(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE, 2);
+        assert!(
+            node.peer_entity_ids.get(&at_cap).is_some(),
+            "at the cap the announcement is processed (control)"
+        );
+        assert!(node
+            .capability_fold
+            .with_state(|s| s.keys_for(at_cap).is_some()));
     }
 
     /// A signed, hop-0 capability announcement PINS, and deliberately

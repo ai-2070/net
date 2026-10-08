@@ -72,6 +72,25 @@ pub struct FoldStats {
     /// means the sweep is re-walking entries.
     #[serde(default)]
     pub sweep_yielded: u64,
+    /// Distinct values in the fold's admission dictionary (canonical
+    /// tags, for the capability fold; 0 for folds without one).
+    #[serde(default)]
+    pub interned: u64,
+    /// UTF-8 bytes of those values: what the admission budget counts.
+    #[serde(default)]
+    pub interned_bytes: u64,
+    /// Estimated dictionary overhead beyond `interned_bytes` (table,
+    /// allocation headers). Reported separately; not budget-counted.
+    #[serde(default)]
+    pub interned_overhead_bytes: u64,
+    /// Announcements refused whole for a payload limit (tag count or
+    /// length). Also counted in `applies_rejected`.
+    #[serde(default)]
+    pub limit_rejections: u64,
+    /// Announcements refused whole for the admission budget. Also
+    /// counted in `applies_rejected`.
+    #[serde(default)]
+    pub budget_rejections: u64,
     /// Whether an [`super::FoldAuditSink`] is currently installed
     /// on the fold. Diagnostic — operators trying to figure
     /// out why their audit trail is empty want a quick
@@ -127,6 +146,16 @@ pub struct FoldMetrics {
     /// live and expired alike: the sweep's entry-visit cost. One walk
     /// yields every entry once.
     sweep_yielded: AtomicU64,
+    /// Announcements refused for a payload limit.
+    limit_rejections: AtomicU64,
+    /// Announcements refused for the admission budget.
+    budget_rejections: AtomicU64,
+    /// The index's admission storage counters, published under the
+    /// index lock after every operation that changes them, so
+    /// [`super::Fold::stats`] reads them without taking any fold lock.
+    admission_interned: AtomicU64,
+    admission_interned_bytes: AtomicU64,
+    admission_overhead_bytes: AtomicU64,
 }
 
 impl FoldMetrics {
@@ -192,6 +221,39 @@ impl FoldMetrics {
     pub(super) fn on_sweep_walk(&self, yielded: u64) {
         self.sweep_walks.fetch_add(1, Ordering::Relaxed);
         self.sweep_yielded.fetch_add(yielded, Ordering::Relaxed);
+    }
+
+    /// Count an announcement refused for a payload limit.
+    #[inline]
+    pub(super) fn on_limit_reject(&self) {
+        self.limit_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an announcement refused for the admission budget.
+    #[inline]
+    pub(super) fn on_budget_reject(&self) {
+        self.budget_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish the index's admission counters. Called with the index
+    /// lock held, after the operation that changed them.
+    #[inline]
+    pub(super) fn set_admission(&self, stats: super::state::AdmissionStats) {
+        self.admission_interned
+            .store(stats.interned, Ordering::Relaxed);
+        self.admission_interned_bytes
+            .store(stats.interned_bytes, Ordering::Relaxed);
+        self.admission_overhead_bytes
+            .store(stats.overhead_bytes, Ordering::Relaxed);
+    }
+
+    /// The admission counters last published under the index lock.
+    pub fn admission(&self) -> super::state::AdmissionStats {
+        super::state::AdmissionStats {
+            interned: self.admission_interned.load(Ordering::Relaxed),
+            interned_bytes: self.admission_interned_bytes.load(Ordering::Relaxed),
+            overhead_bytes: self.admission_overhead_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Bump the query counter. Called by
@@ -267,6 +329,16 @@ impl FoldMetrics {
     /// Snapshot-restored count since start.
     pub fn snapshots_restored(&self) -> u64 {
         self.snapshots_restored.load(Ordering::Relaxed)
+    }
+
+    /// Announcements refused for a payload limit since start.
+    pub fn limit_rejections(&self) -> u64 {
+        self.limit_rejections.load(Ordering::Relaxed)
+    }
+
+    /// Announcements refused for the admission budget since start.
+    pub fn budget_rejections(&self) -> u64 {
+        self.budget_rejections.load(Ordering::Relaxed)
     }
 
     /// Expiry-sweep candidate walks since start.

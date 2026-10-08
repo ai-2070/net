@@ -23,12 +23,18 @@
 //! dispatch time gates the publisher claim; the key shape gates
 //! which entries that publisher may write.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{FoldIndex, FoldState, FxU64Hasher, NodeId};
+use roaring::RoaringBitmap;
+
+use super::state::{AdmissionStats, FoldIndex, FoldState, NodeId, PayloadRejection};
+use super::tag_dictionary::{validate_capability_tags, TagBudget, TagDictionary};
+use super::tag_str::TagStr;
 use super::FoldKind;
 
 /// Coarse-grained node state for capability matching. The
@@ -84,7 +90,14 @@ pub struct CapabilityMembership {
     /// (e.g. `"hardware.gpu"`, `"hardware.gpu.vram_gb=80"`,
     /// `"causal:<hex>"`). See the module doc on tag
     /// representation.
-    pub tags: Vec<String>,
+    ///
+    /// [`TagStr`] handles, which serialize exactly as `String`s (the wire
+    /// form and signature transcript are unchanged). Once stored in a
+    /// fold, each one shares its text with every other entry carrying
+    /// the same tag. At most [`super::MAX_CAPABILITY_TAGS`] tags of at
+    /// most [`super::MAX_CAPABILITY_TAG_LEN`] UTF-8 bytes each: a fold
+    /// refuses a larger advertisement whole.
+    pub tags: Vec<TagStr>,
     /// Optional hardware projection for fast filtering.
     pub hardware: Option<HardwareSummary>,
     /// Current state — the load-bearing filter for the
@@ -348,21 +361,28 @@ pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 /// store. `Composite` queries pick the most selective indexed
 /// dimension and filter the others in-memory.
 ///
-/// **PERF_AUDIT §4.6** — the inner `HashSet<(u64, NodeId)>` candidate
-/// sets use `BuildU64TupleHasher` (private to this module), a fast
-/// multiplicative mixer for
-/// `(u64, u64)` keys. Pre-fix these used the std SipHash default,
-/// which paid ~15-25 ns of mixing per insert/contains/remove on keys
-/// that are already xxh3-hashed identity bytes (so collision
-/// resistance is already there at construction; SipHash's DoS
-/// resistance adds zero protection). The outer `HashMap<String, _>` /
-/// `HashMap<NodeState, _>` keep the default hasher: tag / region
-/// strings come from publishers and the SipHash protection is
-/// legitimately relevant there.
+/// **Buckets are bitmaps over entry slots** (CAPABILITY_FOLD_SCALE_PLAN.md
+/// Slice 7). Every indexed `(class, node)` entry holds one dense `u32`
+/// slot (`SlotTable`); a bucket is the [`RoaringBitmap`] of the slots
+/// carrying its tag / synthetic key / region / state. Identity is the
+/// ENTRY, not the node: a tag in class A and a tag in class B of one node
+/// sit in two slots, so a predicate never combines them. AND / OR are
+/// bitmap operations; slots map back to keys through the table. The
+/// outer maps keep a keyed hasher: tag and region strings are
+/// publisher-chosen.
 #[derive(Debug, Default)]
 pub struct CapabilityIndexInner {
-    /// tag → set of (class, node) keys carrying that tag.
-    by_tag: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    /// tag → slots of the entries carrying that tag. Keyed by the
+    /// canonical [`TagStr`], so a bucket shares its tag's one allocation
+    /// with every entry instead of owning a copy; looked up by `&str`.
+    by_tag: HashMap<TagStr, RoaringBitmap>,
+    /// One dense slot per indexed entry. See [`SlotTable`].
+    slots: SlotTable,
+    /// One canonical [`TagStr`] per distinct published tag, with
+    /// fold-owned use counts and the fold's tag budget
+    /// (CAPABILITY_FOLD_SCALE_PLAN.md Slice 6). Synthetic keys are not in
+    /// it: they live in `by_synthetic`, a separate namespace.
+    dictionary: TagDictionary,
     /// Index-only synthetic tag (`model:`/`tool:`/`gpu:`) → set of
     /// (class, node) keys. Kept in a SEPARATE map from `by_tag` so a
     /// raw published tag string can never collide with a synthetic
@@ -372,64 +392,334 @@ pub struct CapabilityIndexInner {
     /// `require_models` query it lacks the real bundle for. The bulk
     /// model/tool/gpu axes (`tag_groups_all`) resolve against this
     /// map only — see [`group_union`].
-    by_synthetic: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
-    /// region → set of (class, node) keys.
-    by_region: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
-    /// state → set of (class, node) keys.
-    by_state: HashMap<NodeState, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
+    by_synthetic: HashMap<String, RoaringBitmap>,
+    /// region → slots of the entries in that region.
+    by_region: HashMap<String, RoaringBitmap>,
+    /// state → slots of the entries in that state.
+    by_state: HashMap<NodeState, RoaringBitmap>,
     /// Reused buffer for building synthetic tag keys, so deriving them
     /// on insert and remove allocates nothing once it has grown.
     scratch: String,
 }
 
-/// Fast multiplicative `(u64, u64)` mixer for the inverted-index
-/// candidate sets. Per PERF_AUDIT §4.6 — see [`CapabilityIndexInner`]
-/// for the threat-model rationale (keys come from already-verified
-/// announcements; SipHash DoS resistance is irrelevant).
-///
-/// `Hash for (u64, u64)` is `write_u64(self.0); write_u64(self.1);`,
-/// so [`FxU64Hasher`]'s `write_u64` step mixes the pair correctly in
-/// 2 multiplications, and its byte fallback covers a future change to
-/// the tuple's hash impl. Nothing about the mixer is arity-specific —
-/// this alias and `state::BuildU64Hasher` differ only in which keys
-/// they are pointed at, so they share one implementation rather than
-/// two copies that can drift apart.
-pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<FxU64Hasher>;
-
-/// Add `key` to the bucket for `bucket`, allocating the bucket's
-/// owned `String` only when the bucket is new. Steady state, the bucket
-/// exists and nothing is allocated.
-fn bucket_insert(
-    map: &mut HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
-    bucket: &str,
-    key: (u64, NodeId),
-) {
-    if let Some(set) = map.get_mut(bucket) {
-        set.insert(key);
+/// Add `slot` to the bucket for `bucket`, allocating the bucket's
+/// owned `String` only when the bucket is new.
+fn bucket_insert(map: &mut HashMap<String, RoaringBitmap>, bucket: &str, slot: u32) {
+    if let Some(bits) = map.get_mut(bucket) {
+        bits.insert(slot);
     } else {
-        map.entry(bucket.to_owned()).or_default().insert(key);
+        map.entry(bucket.to_owned()).or_default().insert(slot);
     }
 }
 
-/// Remove `key` from the bucket for `bucket`, dropping the bucket when
+/// Remove `slot` from the bucket for `bucket`, dropping the bucket when
 /// it empties.
-fn bucket_remove(
-    map: &mut HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
-    bucket: &str,
-    key: &(u64, NodeId),
-) {
-    if let Some(set) = map.get_mut(bucket) {
-        set.remove(key);
-        if set.is_empty() {
+fn bucket_remove(map: &mut HashMap<String, RoaringBitmap>, bucket: &str, slot: u32) {
+    if let Some(bits) = map.get_mut(bucket) {
+        bits.remove(slot);
+        if bits.is_empty() {
             map.remove(bucket);
+        }
+    }
+}
+
+/// One dense `u32` slot per indexed `(class, node)` entry, the identity
+/// the bucket bitmaps are over.
+///
+/// - A slot is acquired when an entry is indexed and released when it is
+///   un-indexed; released slots go on a free list and are **reused before
+///   the table grows**. So the slot space is bounded by the PEAK number
+///   of live entries, not the current one: after 1,000 entries shrink to
+///   100, the table can hold 1,000 positions with 900 free. Nothing is
+///   compacted.
+/// - A slot is released only after every bucket bit of its entry is
+///   cleared (`on_remove` clears raw, synthetic, region and state bits
+///   under the index write lock), so a reused slot inherits nothing.
+/// - The slot space ends at [`SlotTable::limit`] (`u32::MAX` positions by
+///   default): acquisition beyond it fails, it never wraps. `admit`
+///   refuses an Insert when no slot is available.
+#[derive(Debug)]
+pub(crate) struct SlotTable {
+    /// Keyed hasher: `class_hash` is publisher-chosen.
+    slot_of: HashMap<(u64, NodeId), u32, foldhash::fast::RandomState>,
+    key_of: Vec<Option<(u64, NodeId)>>,
+    free: Vec<u32>,
+    limit: usize,
+}
+
+impl Default for SlotTable {
+    fn default() -> Self {
+        Self {
+            slot_of: HashMap::default(),
+            key_of: Vec::new(),
+            free: Vec::new(),
+            limit: u32::MAX as usize,
+        }
+    }
+}
+
+impl SlotTable {
+    /// Whether a new entry can get a slot.
+    fn can_acquire(&self) -> bool {
+        !self.free.is_empty() || self.key_of.len() < self.limit
+    }
+
+    /// The slot of `key`, assigning one (free list first) if it has none.
+    /// `None` only when the slot space is exhausted.
+    fn acquire(&mut self, key: (u64, NodeId)) -> Option<u32> {
+        if let Some(&slot) = self.slot_of.get(&key) {
+            return Some(slot);
+        }
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                if self.key_of.len() >= self.limit {
+                    return None;
+                }
+                let slot = u32::try_from(self.key_of.len()).ok()?;
+                self.key_of.push(None);
+                slot
+            }
+        };
+        self.key_of[slot as usize] = Some(key);
+        self.slot_of.insert(key, slot);
+        Some(slot)
+    }
+
+    fn get(&self, key: &(u64, NodeId)) -> Option<u32> {
+        self.slot_of.get(key).copied()
+    }
+
+    /// Release `key`'s slot to the free list.
+    fn release(&mut self, key: &(u64, NodeId)) {
+        if let Some(slot) = self.slot_of.remove(key) {
+            self.key_of[slot as usize] = None;
+            self.free.push(slot);
+        }
+    }
+
+    /// The key holding `slot`, if occupied.
+    fn key(&self, slot: u32) -> Option<(u64, NodeId)> {
+        self.key_of.get(slot as usize).copied().flatten()
+    }
+
+    fn clear(&mut self) {
+        self.slot_of.clear();
+        self.key_of.clear();
+        self.free.clear();
+    }
+
+    /// Every occupied slot, optionally only those of `class`.
+    fn occupied(&self, class: Option<u64>) -> RoaringBitmap {
+        let slots = self.key_of.iter().enumerate().filter_map(|(slot, key)| {
+            key.filter(|k| class.is_none_or(|c| k.0 == c))
+                .map(|_| slot as u32)
+        });
+        RoaringBitmap::from_sorted_iter(slots).unwrap_or_default()
+    }
+
+    fn occupied_len(&self) -> usize {
+        self.slot_of.len()
+    }
+
+    /// Set the slot-space limit, for exhaustion tests.
+    #[cfg(test)]
+    pub(crate) fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(u32::MAX as usize);
+    }
+}
+
+impl CapabilityIndexInner {
+    /// An empty index whose tag dictionary enforces `budget` instead of
+    /// [`TagBudget::default`]. Pass to
+    /// [`Fold::with_sweep_interval_and_index`](super::Fold::with_sweep_interval_and_index)
+    /// for a deployment that needs more distinct tags.
+    pub fn with_tag_budget(budget: TagBudget) -> Self {
+        Self {
+            dictionary: TagDictionary::with_budget(budget),
+            ..Self::default()
+        }
+    }
+
+    /// The tag dictionary, for tests.
+    #[cfg(test)]
+    pub(crate) fn dictionary(&self) -> &TagDictionary {
+        &self.dictionary
+    }
+
+    /// Estimated heap bytes of this index, split so a change to one part
+    /// cannot hide in another (CAPABILITY_FOLD_SCALE_PLAN.md Slice 7).
+    /// Estimates from table capacities and set sizes, not a measurement:
+    /// the reporter's counting allocator gives the measured totals.
+    pub fn memory_breakdown(&self) -> IndexMemory {
+        let mut mem = IndexMemory::default();
+        let outer = |cap: usize, slot: usize| table_bytes(cap, slot) as u64;
+        mem.bucket_maps = outer(
+            self.by_tag.capacity(),
+            std::mem::size_of::<(TagStr, IndexBucket)>(),
+        ) + outer(
+            self.by_synthetic.capacity(),
+            std::mem::size_of::<(String, IndexBucket)>(),
+        ) + outer(
+            self.by_region.capacity(),
+            std::mem::size_of::<(String, IndexBucket)>(),
+        ) + outer(
+            self.by_state.capacity(),
+            std::mem::size_of::<(NodeState, IndexBucket)>(),
+        );
+        mem.bucket_key_strings = self
+            .by_synthetic
+            .keys()
+            .chain(self.by_region.keys())
+            .map(|k| k.capacity() as u64)
+            .sum();
+        let buckets = self
+            .by_tag
+            .values()
+            .chain(self.by_synthetic.values())
+            .chain(self.by_region.values())
+            .chain(self.by_state.values());
+        for bucket in buckets {
+            mem.buckets += 1;
+            mem.memberships += bucket_len(bucket) as u64;
+            mem.bucket_sets += bucket_heap_bytes(bucket) as u64;
+        }
+        self.slot_memory(&mut mem);
+        mem
+    }
+}
+
+/// One inverted-index bucket: the slots carrying one tag / synthetic
+/// key / region / state.
+type IndexBucket = RoaringBitmap;
+
+fn bucket_len(bucket: &IndexBucket) -> usize {
+    bucket.len() as usize
+}
+
+/// A bitmap's container payload, by its serialized size, which tracks the
+/// in-memory containers (2 bytes per member in an array container, 8 KiB
+/// per bitmap container, runs for run containers) plus each container's
+/// header. The `Vec` slack around the containers is not counted.
+fn bucket_heap_bytes(bucket: &IndexBucket) -> usize {
+    bucket.serialized_size()
+}
+
+impl CapabilityIndexInner {
+    fn slot_memory(&self, mem: &mut IndexMemory) {
+        let slots = &self.slots;
+        mem.slot_table = (table_bytes(
+            slots.slot_of.capacity(),
+            std::mem::size_of::<((u64, NodeId), u32)>(),
+        ) + slots.key_of.capacity()
+            * std::mem::size_of::<Option<(u64, NodeId)>>()) as u64;
+        mem.free_list = (slots.free.capacity() * std::mem::size_of::<u32>()) as u64;
+        mem.occupied_slots = slots.occupied_len() as u64;
+        mem.slot_capacity = slots.key_of.len() as u64;
+        mem.free_slots = slots.free.len() as u64;
+    }
+
+    /// The slot table, for tests.
+    #[cfg(test)]
+    pub(crate) fn slots_mut(&mut self) -> &mut SlotTable {
+        &mut self.slots
+    }
+
+    /// `key`'s slot, for tests.
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, key: &(u64, NodeId)) -> Option<u32> {
+        self.slots.get(key)
+    }
+
+    /// The keys in `bits`, for tests and oracles.
+    #[cfg(test)]
+    fn keys_of(&self, bits: &RoaringBitmap) -> HashSet<(u64, NodeId)> {
+        bits.iter()
+            .filter_map(|slot| self.slots.key(slot))
+            .collect()
+    }
+}
+
+/// Estimated heap bytes of a hashbrown table of `capacity` with
+/// `slot`-byte slots: power-of-two buckets at 7/8 load from 8 up, one
+/// control byte per bucket plus a 16-byte trailing group.
+fn table_bytes(capacity: usize, slot: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        (capacity + 1).next_power_of_two()
+    } else {
+        (capacity * 8 / 7).next_power_of_two()
+    };
+    (buckets * slot).next_multiple_of(16) + buckets + 16
+}
+
+/// [`CapabilityIndexInner::memory_breakdown`]'s result. Bucket bytes are
+/// the inverted index itself; slot bytes are the bookkeeping that maps
+/// bucket members to keys (zero while buckets hold keys directly).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexMemory {
+    /// Buckets across the raw-tag, synthetic, region and state maps.
+    pub buckets: u64,
+    /// Bucket memberships: one per (bucket, entry) pair.
+    pub memberships: u64,
+    /// The four outer maps' tables.
+    pub bucket_maps: u64,
+    /// The bucket sets themselves.
+    pub bucket_sets: u64,
+    /// Owned key strings of the synthetic and region maps (raw-tag keys
+    /// share the tag dictionary's allocation and are not counted).
+    pub bucket_key_strings: u64,
+    /// Slot table: key-to-slot map and slot-to-key vector.
+    pub slot_table: u64,
+    /// Free-slot list.
+    pub free_list: u64,
+    /// Occupied slots.
+    pub occupied_slots: u64,
+    /// Allocated slot positions (occupied plus free).
+    pub slot_capacity: u64,
+    /// Free slots awaiting reuse.
+    pub free_slots: u64,
+}
+
+impl IndexMemory {
+    /// Everything the inverted index costs: maps, sets and key strings.
+    pub fn bucket_total(&self) -> u64 {
+        self.bucket_maps + self.bucket_sets + self.bucket_key_strings
+    }
+}
+
+/// [`bucket_insert`] for the raw-tag map: a new bucket takes a clone of
+/// the canonical handle (a refcount bump, no copy of the text).
+fn tag_bucket_insert(map: &mut HashMap<TagStr, RoaringBitmap>, tag: &TagStr, slot: u32) {
+    if let Some(bits) = map.get_mut(tag.as_str()) {
+        bits.insert(slot);
+    } else {
+        map.entry(tag.clone()).or_default().insert(slot);
+    }
+}
+
+/// [`bucket_remove`] for the raw-tag map.
+fn tag_bucket_remove(map: &mut HashMap<TagStr, RoaringBitmap>, tag: &str, slot: u32) {
+    if let Some(bits) = map.get_mut(tag) {
+        bits.remove(slot);
+        if bits.is_empty() {
+            map.remove(tag);
         }
     }
 }
 
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
+        // `admit` refused the Insert if no slot was available, and a
+        // Replace re-indexes into the slot its `on_remove` just freed.
+        let Some(slot) = self.slots.acquire(*key) else {
+            debug_assert!(false, "no slot for an admitted entry");
+            return;
+        };
         for tag in &payload.tags {
-            bucket_insert(&mut self.by_tag, tag, *key);
+            tag_bucket_insert(&mut self.by_tag, tag, slot);
         }
         // Index-only synthetic tags (model:/tool:/gpu:) live in
         // their own `by_synthetic` map so the model / tool / gpu
@@ -438,38 +728,46 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         // the same string. Derived here at insert, never per query.
         let mut scratch = std::mem::take(&mut self.scratch);
         for_each_synthetic_index_tag(payload, &mut scratch, |tag| {
-            bucket_insert(&mut self.by_synthetic, tag, *key);
+            bucket_insert(&mut self.by_synthetic, tag, slot);
         });
         self.scratch = scratch;
         if let Some(region) = &payload.region {
-            bucket_insert(&mut self.by_region, region, *key);
+            bucket_insert(&mut self.by_region, region, slot);
         }
-        self.by_state.entry(payload.state).or_default().insert(*key);
+        self.by_state.entry(payload.state).or_default().insert(slot);
     }
 
     fn on_remove(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
+        let Some(slot) = self.slots.get(key) else {
+            return;
+        };
         for tag in &payload.tags {
-            bucket_remove(&mut self.by_tag, tag, key);
+            tag_bucket_remove(&mut self.by_tag, tag, slot);
         }
         // Mirror the synthetic tags added in `on_insert`. Derived
         // from the same payload, so the set is identical.
         let mut scratch = std::mem::take(&mut self.scratch);
         for_each_synthetic_index_tag(payload, &mut scratch, |tag| {
-            bucket_remove(&mut self.by_synthetic, tag, key);
+            bucket_remove(&mut self.by_synthetic, tag, slot);
         });
         self.scratch = scratch;
         if let Some(region) = &payload.region {
-            bucket_remove(&mut self.by_region, region, key);
+            bucket_remove(&mut self.by_region, region, slot);
         }
-        if let Some(set) = self.by_state.get_mut(&payload.state) {
-            set.remove(key);
-            if set.is_empty() {
+        if let Some(bits) = self.by_state.get_mut(&payload.state) {
+            bits.remove(slot);
+            if bits.is_empty() {
                 self.by_state.remove(&payload.state);
             }
         }
+        // Every bit of this entry is cleared above, so the slot goes back
+        // to the free list clean: its next holder inherits nothing.
+        self.slots.release(key);
     }
 
     fn clear(&mut self) {
+        self.dictionary.clear();
+        self.slots.clear();
         self.by_tag.clear();
         self.by_synthetic.clear();
         self.by_region.clear();
@@ -503,6 +801,54 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
             && old.region == new.region
             && old.tags == new.tags
             && old.hardware == new.hardware
+    }
+
+    /// Canonicalize the incoming tags through the dictionary, net of the
+    /// outgoing payload's release. See [`TagDictionary::admit`].
+    fn admit(
+        &mut self,
+        incoming: &mut CapabilityMembership,
+        outgoing: Option<&CapabilityMembership>,
+    ) -> Result<(), PayloadRejection> {
+        // An Insert needs a fresh slot; a Replace reuses its own. Checked
+        // first, so a refusal leaves the dictionary untouched.
+        if outgoing.is_none() && !self.slots.can_acquire() {
+            return Err(PayloadRejection::IndexFull {
+                slots: self.slots.limit,
+            });
+        }
+        self.dictionary
+            .admit(&mut incoming.tags, outgoing.map(|p| p.tags.as_slice()))
+    }
+
+    fn release(&mut self, payload: &CapabilityMembership) {
+        self.dictionary.release(&payload.tags);
+    }
+
+    fn preflight_restore(
+        &self,
+        payloads: &[&CapabilityMembership],
+    ) -> Result<(), PayloadRejection> {
+        if payloads.len() > self.slots.limit {
+            return Err(PayloadRejection::IndexFull {
+                slots: self.slots.limit,
+            });
+        }
+        self.dictionary
+            .preflight(payloads.iter().map(|p| p.tags.as_slice()))
+    }
+
+    fn entry_capacity(&self) -> usize {
+        self.slots.limit
+    }
+
+    fn admission_stats(&self) -> AdmissionStats {
+        let stats = self.dictionary.stats();
+        AdmissionStats {
+            interned: stats.tags,
+            interned_bytes: stats.bytes,
+            overhead_bytes: stats.overhead_bytes,
+        }
     }
 }
 
@@ -645,6 +991,13 @@ impl FoldKind for CapabilityFold {
     /// hasher). Pinned by `capability_fold_primary_map_hasher_is_keyed`.
     type KeyHasher = foldhash::fast::RandomState;
 
+    /// The per-advertisement tag caps (CAPABILITY_FOLD_SCALE_PLAN.md
+    /// Slice 6): at most [`super::MAX_CAPABILITY_TAGS`] tags, duplicates
+    /// counted, of at most [`super::MAX_CAPABILITY_TAG_LEN`] UTF-8 bytes.
+    fn validate(payload: &Self::Payload) -> Result<(), PayloadRejection> {
+        validate_capability_tags(&payload.tags)
+    }
+
     fn key_for(node_id: NodeId, payload: &Self::Payload) -> Self::Key {
         (payload.class_hash, node_id)
     }
@@ -665,175 +1018,191 @@ impl FoldKind for CapabilityFold {
                 .filter(|((c, _), _)| *c == class)
                 .map(|(k, e)| (*k, e.payload.clone()))
                 .collect(),
-            CapabilityQuery::HasAllTags(tags) => resolve_keys_all_tags(index, &tags)
-                .into_iter()
-                .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-                .collect(),
+            CapabilityQuery::HasAllTags(tags) => {
+                materialize(state, index, &resolve_keys_all_tags(index, &tags))
+            }
             CapabilityQuery::HasAnyTag(tags) => {
-                let mut seen: HashSet<(u64, NodeId)> = HashSet::new();
+                let mut any = RoaringBitmap::new();
                 for tag in &tags {
-                    if let Some(keys) = index.by_tag.get(tag) {
-                        seen.extend(keys.iter().copied());
+                    if let Some(bits) = index.by_tag.get(tag.as_str()) {
+                        any |= bits;
                     }
                 }
-                seen.into_iter()
-                    .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-                    .collect()
+                materialize(state, index, &any)
             }
-            CapabilityQuery::InState(s) => index
-                .by_state
-                .get(&s)
-                .into_iter()
-                .flat_map(|set| set.iter().copied())
-                .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-                .collect(),
-            CapabilityQuery::InRegion(r) => index
-                .by_region
-                .get(&r)
-                .into_iter()
-                .flat_map(|set| set.iter().copied())
-                .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-                .collect(),
+            CapabilityQuery::InState(s) => match index.by_state.get(&s) {
+                Some(bits) => materialize(state, index, bits),
+                None => Vec::new(),
+            },
+            CapabilityQuery::InRegion(r) => match index.by_region.get(&r) {
+                Some(bits) => materialize(state, index, bits),
+                None => Vec::new(),
+            },
             CapabilityQuery::Composite(filter) => composite_query(state, index, &filter),
         }
     }
 }
 
-/// Resolve the set of keys that carry EVERY tag in `tags`.
-/// Uses the inverted-tag index: pick the smallest tag-bucket
-/// as the candidate set, then retain only candidates present
-/// in every subsequent bucket. Empty `tags` returns every key
-/// (matches the `tags_all = []` "no constraint" convention).
-fn resolve_keys_all_tags(
+/// The matches for the entries whose slots are in `bits`: each slot
+/// mapped to its key, then its live entry (an index slot with no live
+/// entry behind it is dropped), payload cloned.
+fn materialize(
+    state: &FoldState<CapabilityFold>,
     index: &CapabilityIndexInner,
-    tags: &[String],
-) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
-    if tags.is_empty() {
-        // No tag constraint → every indexed key. Use the by_state
-        // index as a proxy: every entry is indexed under exactly
-        // one state, which gives the full key set without walking
-        // by_tag.
-        return index
-            .by_state
-            .values()
-            .flat_map(|set| set.iter().copied())
-            .collect();
-    }
-    // Pick the most-selective tag bucket as the candidate set.
-    let mut tags_by_selectivity: Vec<&String> = tags.iter().collect();
-    tags_by_selectivity.sort_by_key(|t| index.by_tag.get(*t).map(|s| s.len()).unwrap_or(0));
+    bits: &RoaringBitmap,
+) -> Vec<CapabilityMatch> {
+    bits.iter()
+        .filter_map(|slot| index.slots.key(slot))
+        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
+        .collect()
+}
 
-    let Some(first) = tags_by_selectivity.first() else {
-        return HashSet::default();
-    };
-    let Some(initial) = index.by_tag.get(*first) else {
-        // First tag has no entries → intersection is empty.
-        return HashSet::default();
-    };
-    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> =
-        initial.iter().copied().collect();
-    for tag in tags_by_selectivity.iter().skip(1) {
-        let Some(bucket) = index.by_tag.get(*tag) else {
-            return HashSet::default();
-        };
-        candidates.retain(|k| bucket.contains(k));
-        if candidates.is_empty() {
+/// The slots of the entries that carry EVERY tag in `tags`: the
+/// intersection of their raw-tag buckets, seeded from the smallest.
+/// Empty `tags` returns every indexed entry (the `tags_all = []` "no
+/// constraint" convention).
+fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> RoaringBitmap {
+    if tags.is_empty() {
+        return index.slots.occupied(None);
+    }
+    let mut buckets: Vec<&RoaringBitmap> = Vec::with_capacity(tags.len());
+    for tag in tags {
+        match index.by_tag.get(tag.as_str()) {
+            Some(bits) => buckets.push(bits),
+            None => return RoaringBitmap::new(),
+        }
+    }
+    buckets.sort_by_key(|bits| bits.len());
+    let mut out = buckets[0].clone();
+    for bits in &buckets[1..] {
+        out &= *bits;
+        if out.is_empty() {
             break;
         }
     }
-    candidates
+    out
 }
 
-/// Borrow-or-own candidate set returned by
-/// [`resolve_candidate_keys`]. A single-constraint filter resolves
-/// to exactly one index bucket, and that bucket IS the answer —
-/// returning it borrowed skips cloning every candidate key into a
-/// fresh owned set (alloc + rehash of M keys; the dominant cost of
-/// a high-cardinality single-tag discovery query). Composite
-/// filters still materialize an owned, tightened set.
-pub(crate) enum CandidateKeys<'a> {
-    /// The filter constrained exactly one indexed dimension —
-    /// the bucket is borrowed from the index untouched.
-    Borrowed(&'a HashSet<(u64, NodeId), BuildU64TupleHasher>),
-    /// Composite (or empty-result) filter — materialized set.
-    Owned(HashSet<(u64, NodeId), BuildU64TupleHasher>),
+/// Candidate set returned by [`resolve_candidate_keys`]: a bitmap of
+/// entry slots, borrowed from the index when one bucket IS the answer
+/// (a single-constraint filter: no copy at all) or owned when it had to
+/// be combined, plus the slot table that maps slots back to keys.
+///
+/// Iteration order is slot order, which is arrival order, not `NodeId`
+/// order. Every consumer that returns nodes sorts and deduplicates
+/// explicitly (CAPABILITY_FOLD_SCALE_PLAN.md B2 decision 2).
+pub(crate) struct CandidateKeys<'a> {
+    bits: Bits<'a>,
+    slots: &'a SlotTable,
 }
 
-impl CandidateKeys<'_> {
-    /// The resolved key set, regardless of arm.
-    pub(crate) fn as_set(&self) -> &HashSet<(u64, NodeId), BuildU64TupleHasher> {
+enum Bits<'a> {
+    Borrowed(&'a RoaringBitmap),
+    Owned(RoaringBitmap),
+}
+
+impl Bits<'_> {
+    fn get(&self) -> &RoaringBitmap {
         match self {
-            Self::Borrowed(s) => s,
-            Self::Owned(s) => s,
+            Self::Borrowed(bits) => bits,
+            Self::Owned(bits) => bits,
+        }
+    }
+
+    fn into_owned(self) -> RoaringBitmap {
+        match self {
+            Self::Borrowed(bits) => bits.clone(),
+            Self::Owned(bits) => bits,
         }
     }
 }
 
-/// Resolve the set of `(class, node)` keys a
-/// [`CapabilityFilter`] selects on its *indexed* axes — tags,
-/// state, region, class. Chooses the most-selective indexed
-/// dimension as the seed, then tightens with the rest in memory.
-/// Single-constraint filters return the index bucket borrowed
-/// (see [`CandidateKeys`]); composite filters materialize.
+impl<'a> CandidateKeys<'a> {
+    fn new(index: &'a CapabilityIndexInner, bits: Bits<'a>) -> Self {
+        Self {
+            bits,
+            slots: &index.slots,
+        }
+    }
+
+    fn empty(index: &'a CapabilityIndexInner) -> Self {
+        Self::new(index, Bits::Owned(RoaringBitmap::new()))
+    }
+
+    /// Number of candidate entries.
+    pub(crate) fn len(&self) -> usize {
+        self.bits.get().len() as usize
+    }
+
+    /// The candidate `(class, node)` keys, in slot order.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = (u64, NodeId)> + '_ {
+        self.bits
+            .get()
+            .iter()
+            .filter_map(|slot| self.slots.key(slot))
+    }
+
+    /// The candidate keys as a set, for tests.
+    #[cfg(test)]
+    pub(crate) fn key_set(&self) -> HashSet<(u64, NodeId)> {
+        self.keys().collect()
+    }
+
+    /// Whether the set is an index bucket borrowed as is, for tests.
+    #[cfg(test)]
+    pub(crate) fn is_borrowed(&self) -> bool {
+        matches!(self.bits, Bits::Borrowed(_))
+    }
+}
+
+/// Resolve the `(class, node)` keys a [`CapabilityFilter`] selects on
+/// its *indexed* axes (tags, synthetic groups, state, region, class) as
+/// a bitmap of entry slots.
 ///
-/// Does NOT clone any payload, and does NOT apply `filter.limit`
-/// or non-indexed predicates (hardware / model / tool). Callers
-/// that only need keys — or that post-filter against borrowed
-/// payloads — use this directly via
-/// [`Fold::with_state_and_index`]; [`composite_query`] layers the
-/// payload materialization + limit on top for the
-/// `Vec<CapabilityMatch>` query path.
+/// - Single-constraint filters return the index bucket borrowed: the
+///   bucket already IS the answer, so nothing is copied.
+/// - Otherwise every indexed constraint is a bucket (borrowed) or a
+///   union (an owned OR, for a multi-tag group or `tags_any`); the result
+///   is their AND, seeded from the smallest. A class predicate (not
+///   indexed) filters the result by the slot's key.
+///
+/// Does NOT clone any payload, and does NOT apply `filter.limit` or the
+/// non-indexed predicates (hardware / model / tool). Callers that only
+/// need keys, or that post-filter against borrowed payloads, use this
+/// via [`Fold::with_state_and_index`]; [`composite_query`] layers payload
+/// materialization and the limit on top.
 pub(crate) fn resolve_candidate_keys<'a>(
-    state: &FoldState<CapabilityFold>,
+    _state: &FoldState<CapabilityFold>,
     index: &'a CapabilityIndexInner,
     filter: &CapabilityFilter,
 ) -> CandidateKeys<'a> {
     // Single-constraint fast path (2026-06-11 service-discovery
-    // follow-up): when the filter constrains exactly one indexed
-    // dimension and nothing else would tighten the seed, the index
-    // bucket already IS the final candidate set. Borrow it instead
-    // of cloning every key into an owned set — and, for the state /
-    // region shapes, instead of also running the general path's
-    // redundant self-retain against the very bucket it seeded from.
-    // `tags_all` resolves against `by_tag` only (synthetic model /
-    // tool / gpu axes ride `tag_groups_all` → `by_synthetic`), so
-    // borrowing the raw-tag bucket cannot leak a synthetic match.
+    // follow-up): the index bucket already IS the final candidate set.
+    // `tags_all` resolves against `by_tag` only (synthetic model / tool /
+    // gpu axes ride `tag_groups_all` → `by_synthetic`), so borrowing the
+    // raw-tag bucket cannot leak a synthetic match.
     if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
-        match (&filter.tags_all[..], filter.state, &filter.region) {
-            ([tag], None, None) => {
-                return match index.by_tag.get(tag) {
-                    Some(bucket) => CandidateKeys::Borrowed(bucket),
-                    None => CandidateKeys::Owned(HashSet::default()),
-                };
-            }
-            ([], Some(state_filter), None) => {
-                return match index.by_state.get(&state_filter) {
-                    Some(bucket) => CandidateKeys::Borrowed(bucket),
-                    None => CandidateKeys::Owned(HashSet::default()),
-                };
-            }
-            ([], None, Some(region)) => {
-                return match index.by_region.get(region) {
-                    Some(bucket) => CandidateKeys::Borrowed(bucket),
-                    None => CandidateKeys::Owned(HashSet::default()),
-                };
-            }
-            _ => {}
+        let only = match (&filter.tags_all[..], filter.state, &filter.region) {
+            ([tag], None, None) => Some(index.by_tag.get(tag.as_str())),
+            ([], Some(state_filter), None) => Some(index.by_state.get(&state_filter)),
+            ([], None, Some(region)) => Some(index.by_region.get(region)),
+            _ => None,
+        };
+        if let Some(bucket) = only {
+            return match bucket {
+                Some(bits) => CandidateKeys::new(index, Bits::Borrowed(bits)),
+                None => CandidateKeys::empty(index),
+            };
         }
     }
 
-    // General path (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 4). Every
-    // indexed constraint becomes a key set: a borrowed index bucket
-    // wherever one exists (each `tags_all` tag, a single-tag group, the
-    // state, the region, a single `tags_any` tag), an owned union only
-    // for a multi-tag group or multi-tag `tags_any`. The smallest set
-    // seeds; the result is the seed's keys that every other set holds,
-    // collected once. Nothing is cloned and then narrowed.
-    let mut sets: Vec<KeySet<'a>> = Vec::new();
+    // General path. A missing bucket for any AND-ed constraint empties the
+    // result at once.
+    let mut sets: Vec<Bits<'a>> = Vec::new();
     for tag in &filter.tags_all {
-        match index.by_tag.get(tag) {
-            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
-            None => return CandidateKeys::Owned(HashSet::default()),
+        match index.by_tag.get(tag.as_str()) {
+            Some(bits) => sets.push(Bits::Borrowed(bits)),
+            None => return CandidateKeys::empty(index),
         }
     }
     // Empty groups carry no constraint and are skipped.
@@ -842,189 +1211,154 @@ pub(crate) fn resolve_candidate_keys<'a>(
             // Synthetic axes resolve against `by_synthetic` only; see
             // `group_union`.
             match index.by_synthetic.get(tag) {
-                Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
-                None => return CandidateKeys::Owned(HashSet::default()),
+                Some(bits) => sets.push(Bits::Borrowed(bits)),
+                None => return CandidateKeys::empty(index),
             }
         } else {
             let union = group_union(index, group);
             if union.is_empty() {
-                return CandidateKeys::Owned(HashSet::default());
+                return CandidateKeys::empty(index);
             }
-            sets.push(KeySet::Owned(union));
+            sets.push(Bits::Owned(union));
         }
     }
     if let Some(state_filter) = filter.state {
         match index.by_state.get(&state_filter) {
-            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
-            None => return CandidateKeys::Owned(HashSet::default()),
+            Some(bits) => sets.push(Bits::Borrowed(bits)),
+            None => return CandidateKeys::empty(index),
         }
     }
     if let Some(region) = &filter.region {
         match index.by_region.get(region) {
-            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
-            None => return CandidateKeys::Owned(HashSet::default()),
+            Some(bits) => sets.push(Bits::Borrowed(bits)),
+            None => return CandidateKeys::empty(index),
         }
     }
     if let [tag] = &filter.tags_any[..] {
-        match index.by_tag.get(tag) {
-            Some(bucket) => sets.push(KeySet::Borrowed(bucket)),
-            None => return CandidateKeys::Owned(HashSet::default()),
+        match index.by_tag.get(tag.as_str()) {
+            Some(bits) => sets.push(Bits::Borrowed(bits)),
+            None => return CandidateKeys::empty(index),
         }
     } else if !filter.tags_any.is_empty() {
-        let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
+        let mut union = RoaringBitmap::new();
         for tag in &filter.tags_any {
-            if let Some(bucket) = index.by_tag.get(tag) {
-                union.extend(bucket.iter().copied());
+            if let Some(bits) = index.by_tag.get(tag.as_str()) {
+                union |= bits;
             }
         }
         if union.is_empty() {
-            return CandidateKeys::Owned(HashSet::default());
+            return CandidateKeys::empty(index);
         }
-        sets.push(KeySet::Owned(union));
+        sets.push(Bits::Owned(union));
     }
 
     let Some(class) = filter.class else {
-        // Exactly one set constraint and no class predicate: that set
-        // IS the answer. Return it as is, borrowed when it is an index
-        // bucket, instead of copying it.
+        if sets.is_empty() {
+            // No constraint at all: every indexed entry.
+            return CandidateKeys::new(index, Bits::Owned(index.slots.occupied(None)));
+        }
         if sets.len() == 1 {
+            // One set constraint and no class predicate: that set IS the
+            // answer, borrowed when it is an index bucket.
             if let Some(only) = sets.pop() {
-                return match only {
-                    KeySet::Borrowed(bucket) => CandidateKeys::Borrowed(bucket),
-                    KeySet::Owned(set) => CandidateKeys::Owned(set),
-                };
+                return CandidateKeys::new(index, only);
             }
         }
-        if sets.is_empty() {
-            // No constraint at all: every key.
-            return CandidateKeys::Owned(state.entries.keys().copied().collect());
-        }
-        return CandidateKeys::Owned(intersect(sets, |_| true));
+        return CandidateKeys::new(index, Bits::Owned(intersect(sets)));
     };
     if sets.is_empty() {
-        // Only a class predicate: a class scan.
-        return CandidateKeys::Owned(
-            state
-                .entries
-                .keys()
-                .filter(|(c, _)| *c == class)
-                .copied()
-                .collect(),
-        );
+        // Only a class predicate: the class's occupied slots.
+        return CandidateKeys::new(index, Bits::Owned(index.slots.occupied(Some(class))));
     }
-    CandidateKeys::Owned(intersect(sets, |k| k.0 == class))
+    let both = intersect(sets);
+    let of_class = both
+        .iter()
+        .filter(|&slot| index.slots.key(slot).is_some_and(|k| k.0 == class));
+    CandidateKeys::new(
+        index,
+        Bits::Owned(RoaringBitmap::from_sorted_iter(of_class).unwrap_or_default()),
+    )
 }
 
-/// The keys of the smallest set in `sets` that every other set holds
-/// and `keep` accepts. `sets` must be non-empty. The output is sized
-/// for the seed up front: collecting through a filter loses the size
-/// hint, and regrowing a set of up to M keys costs more than reserving
-/// it once.
-fn intersect(
-    mut sets: Vec<KeySet<'_>>,
-    keep: impl Fn(&(u64, NodeId)) -> bool,
-) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
-    let Some(seed_at) = (0..sets.len()).min_by_key(|&i| sets[i].set().len()) else {
-        return HashSet::default();
+/// The AND of `sets`, seeded from the smallest. `sets` must be non-empty.
+fn intersect(mut sets: Vec<Bits<'_>>) -> RoaringBitmap {
+    let Some(seed_at) = (0..sets.len()).min_by_key(|&i| sets[i].get().len()) else {
+        return RoaringBitmap::new();
     };
-    let seed = sets.swap_remove(seed_at);
-    let mut out =
-        HashSet::with_capacity_and_hasher(seed.set().len(), BuildU64TupleHasher::default());
-    out.extend(
-        seed.set()
-            .iter()
-            .filter(|k| keep(k) && sets.iter().all(|other| other.set().contains(*k)))
-            .copied(),
-    );
-    out
-}
-
-/// One indexed constraint of a [`CapabilityFilter`], as the key set a
-/// candidate must belong to: a borrowed index bucket, or a union built
-/// for a multi-tag group.
-enum KeySet<'a> {
-    Borrowed(&'a HashSet<(u64, NodeId), BuildU64TupleHasher>),
-    Owned(HashSet<(u64, NodeId), BuildU64TupleHasher>),
-}
-
-impl KeySet<'_> {
-    fn set(&self) -> &HashSet<(u64, NodeId), BuildU64TupleHasher> {
-        match self {
-            Self::Borrowed(s) => s,
-            Self::Owned(s) => s,
+    let mut out = sets.swap_remove(seed_at).into_owned();
+    for other in &sets {
+        if out.is_empty() {
+            break;
         }
+        out &= other.get();
     }
+    out
 }
 
 /// The resolver before Slice 4: clone the seed, then `retain` through
 /// every other constraint. Kept as the oracle for
-/// `resolve_candidate_keys_matches_pre_slice4_resolver`.
+/// `resolve_candidate_keys_matches_pre_slice4_resolver`. Since Slice 7 it
+/// works on KEY sets read out of the buckets (`keys_of`), not on the
+/// bitmaps, so it shares no set algebra with the resolver it checks.
 #[cfg(test)]
-fn resolve_candidate_keys_pre_slice4<'a>(
+fn resolve_candidate_keys_pre_slice4(
     state: &FoldState<CapabilityFold>,
-    index: &'a CapabilityIndexInner,
+    index: &CapabilityIndexInner,
     filter: &CapabilityFilter,
-) -> CandidateKeys<'a> {
-    // Single-constraint fast path (2026-06-11 service-discovery
-    // follow-up): when the filter constrains exactly one indexed
-    // dimension and nothing else would tighten the seed, the index
-    // bucket already IS the final candidate set. Borrow it instead
-    // of cloning every key into an owned set — and, for the state /
-    // region shapes, instead of also running the general path's
-    // redundant self-retain against the very bucket it seeded from.
-    // `tags_all` resolves against `by_tag` only (synthetic model /
-    // tool / gpu axes ride `tag_groups_all` → `by_synthetic`), so
-    // borrowing the raw-tag bucket cannot leak a synthetic match.
+) -> HashSet<(u64, NodeId)> {
+    type Keys = HashSet<(u64, NodeId)>;
+    let tag_keys = |tag: &str| index.by_tag.get(tag).map(|b| index.keys_of(b));
+    let state_keys = |s: &NodeState| index.by_state.get(s).map(|b| index.keys_of(b));
+    let region_keys = |r: &str| index.by_region.get(r).map(|b| index.keys_of(b));
+    let group_keys = |group: &[String]| -> Keys {
+        let mut union = Keys::new();
+        for tag in group {
+            if let Some(bits) = index.by_synthetic.get(tag) {
+                union.extend(index.keys_of(bits));
+            }
+        }
+        union
+    };
+
     if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
         match (&filter.tags_all[..], filter.state, &filter.region) {
-            ([tag], None, None) => {
-                return match index.by_tag.get(tag) {
-                    Some(bucket) => CandidateKeys::Borrowed(bucket),
-                    None => CandidateKeys::Owned(HashSet::default()),
-                };
-            }
-            ([], Some(state_filter), None) => {
-                return match index.by_state.get(&state_filter) {
-                    Some(bucket) => CandidateKeys::Borrowed(bucket),
-                    None => CandidateKeys::Owned(HashSet::default()),
-                };
-            }
-            ([], None, Some(region)) => {
-                return match index.by_region.get(region) {
-                    Some(bucket) => CandidateKeys::Borrowed(bucket),
-                    None => CandidateKeys::Owned(HashSet::default()),
-                };
-            }
+            ([tag], None, None) => return tag_keys(tag).unwrap_or_default(),
+            ([], Some(state_filter), None) => return state_keys(&state_filter).unwrap_or_default(),
+            ([], None, Some(region)) => return region_keys(region).unwrap_or_default(),
             _ => {}
         }
     }
 
-    // Each group's union (OR within a group) is needed both to seed
-    // (when no `tags_all` is present) and to tighten further down.
-    // `group_unions` holds the ones that still need to be applied as
-    // retain filters; the seed branch may consume one of them.
-    let mut group_unions: Vec<HashSet<(u64, NodeId), BuildU64TupleHasher>> = Vec::new();
+    let mut group_unions: Vec<Keys> = Vec::new();
+    let build_group_unions = || -> Vec<Keys> {
+        filter
+            .tag_groups_all
+            .iter()
+            .filter(|g| !g.is_empty())
+            .map(|g| group_keys(g))
+            .collect()
+    };
 
-    // Seed candidate set: prefer tags_all (typically most
-    // selective), then the most-selective tag group, then state,
-    // then region, then class scan as fallback.
-    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> = if !filter.tags_all.is_empty()
-    {
-        let seed = resolve_keys_all_tags(index, &filter.tags_all);
-        // Only materialize the group unions if the seed left
-        // something to filter — when `tags_all` selects nothing the
-        // result is already empty, so building them is wasted work.
+    let mut candidates: Keys = if !filter.tags_all.is_empty() {
+        let mut seed: Option<Keys> = None;
+        for tag in &filter.tags_all {
+            let bucket = tag_keys(tag).unwrap_or_default();
+            seed = Some(match seed {
+                None => bucket,
+                Some(mut acc) => {
+                    acc.retain(|k| bucket.contains(k));
+                    acc
+                }
+            });
+        }
+        let seed = seed.unwrap_or_default();
         if !seed.is_empty() {
-            group_unions = build_group_unions(index, &filter.tag_groups_all);
+            group_unions = build_group_unions();
         }
         seed
     } else {
-        group_unions = build_group_unions(index, &filter.tag_groups_all);
+        group_unions = build_group_unions();
         if !group_unions.is_empty() {
-            // Seed from the smallest group union, removing it so the
-            // retain pass below doesn't re-scan it.
-            // Non-empty (checked above), so min_by_key yields Some;
-            // the `unwrap_or(0)` is just a panic-free fallback.
             let smallest = group_unions
                 .iter()
                 .enumerate()
@@ -1033,13 +1367,9 @@ fn resolve_candidate_keys_pre_slice4<'a>(
                 .unwrap_or(0);
             group_unions.swap_remove(smallest)
         } else if let Some(state_filter) = filter.state {
-            index
-                .by_state
-                .get(&state_filter)
-                .cloned()
-                .unwrap_or_default()
+            state_keys(&state_filter).unwrap_or_default()
         } else if let Some(region) = &filter.region {
-            index.by_region.get(region).cloned().unwrap_or_default()
+            region_keys(region).unwrap_or_default()
         } else if let Some(class) = filter.class {
             state
                 .entries
@@ -1048,78 +1378,36 @@ fn resolve_candidate_keys_pre_slice4<'a>(
                 .copied()
                 .collect()
         } else {
-            // No selective predicate → every key.
             state.entries.keys().copied().collect()
         }
     };
 
-    // Tighten with remaining predicates.
     if let Some(class) = filter.class {
         candidates.retain(|(c, _)| *c == class);
     }
     if let Some(state_filter) = filter.state {
-        if let Some(bucket) = index.by_state.get(&state_filter) {
-            candidates.retain(|k| bucket.contains(k));
-        } else {
-            candidates.clear();
-        }
+        let bucket = state_keys(&state_filter).unwrap_or_default();
+        candidates.retain(|k| bucket.contains(k));
     }
     if let Some(region) = &filter.region {
-        if let Some(bucket) = index.by_region.get(region) {
-            candidates.retain(|k| bucket.contains(k));
-        } else {
-            candidates.clear();
-        }
+        let bucket = region_keys(region).unwrap_or_default();
+        candidates.retain(|k| bucket.contains(k));
     }
     if !filter.tags_any.is_empty() {
-        // Keep only candidates that carry at least one of the
-        // tags_any list. Build the union of those tag buckets
-        // once, then `retain`. Same PERF_AUDIT §4.6 fast mixer as
-        // the other `(u64, NodeId)` intermediates in this resolver.
-        let mut tags_any_union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
+        let mut any = Keys::new();
         for tag in &filter.tags_any {
-            if let Some(bucket) = index.by_tag.get(tag) {
-                tags_any_union.extend(bucket.iter().copied());
-            }
+            any.extend(tag_keys(tag).unwrap_or_default());
         }
-        candidates.retain(|k| tags_any_union.contains(k));
+        candidates.retain(|k| any.contains(k));
     }
-
-    // AND across groups, OR within each group: a candidate must
-    // appear in every remaining group's union (the seed group, if
-    // any, was already consumed above).
     for union in &group_unions {
         candidates.retain(|k| union.contains(k));
-        if candidates.is_empty() {
-            break;
-        }
     }
-
-    // No tags_all re-check needed: when `tags_all` is non-empty it
-    // is always the seed (the first branch above), so `candidates`
-    // already equals its intersection and every retain since has
-    // only narrowed it.
-    CandidateKeys::Owned(candidates)
+    candidates
 }
 
-/// Materialize the union for each non-empty group in
-/// `tag_groups_all` (OR within a group). Empty groups carry no
-/// constraint, so they're skipped rather than producing an empty
-/// union that would wrongly clear every candidate.
-#[cfg(test)]
-fn build_group_unions(
-    index: &CapabilityIndexInner,
-    groups: &[Vec<String>],
-) -> Vec<HashSet<(u64, NodeId), BuildU64TupleHasher>> {
-    groups
-        .iter()
-        .filter(|g| !g.is_empty())
-        .map(|g| group_union(index, g))
-        .collect()
-}
-
-/// Union of the `(class, node)` keys carrying at least one tag in
-/// `group` — the OR-within-a-group half of `tag_groups_all`.
+/// Union of the slots carrying at least one tag in `group`, the
+/// OR-within-a-group half of `tag_groups_all`.
 ///
 /// Resolves against `by_synthetic`, NOT `by_tag`: every
 /// `tag_groups_all` entry is an index-only synthetic key
@@ -1127,14 +1415,11 @@ fn build_group_unions(
 /// `derive_synthetic_index_tags`. Reading the synthetic map keeps a
 /// raw published tag of the same string from satisfying a model /
 /// tool / gpu axis it has no real bundle / hardware for.
-fn group_union(
-    index: &CapabilityIndexInner,
-    group: &[String],
-) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
-    let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
+fn group_union(index: &CapabilityIndexInner, group: &[String]) -> RoaringBitmap {
+    let mut union = RoaringBitmap::new();
     for tag in group {
-        if let Some(bucket) = index.by_synthetic.get(tag) {
-            union.extend(bucket.iter().copied());
+        if let Some(bits) = index.by_synthetic.get(tag) {
+            union |= bits;
         }
     }
     union
@@ -1160,9 +1445,8 @@ fn composite_query(
     // just to drop it on the next line. With `take` before
     // `collect`, the clone runs exactly `limit` times.
     let it = candidates
-        .as_set()
-        .iter()
-        .filter_map(|&k| state.entries.get(&k).map(|e| (k, e.payload.clone())));
+        .keys()
+        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())));
     if filter.limit > 0 {
         it.take(filter.limit).collect()
     } else {
@@ -1244,15 +1528,15 @@ fn tags_union_for(state: &FoldState<CapabilityFold>, node_id: NodeId) -> Vec<Str
     let Some(keys) = state.keys_for(node_id) else {
         return Vec::new();
     };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for key in keys {
         if let Some(entry) = state.entries.get(key) {
             for tag in &entry.payload.tags {
-                seen.insert(tag.clone());
+                seen.insert(tag.as_str());
             }
         }
     }
-    seen.into_iter().collect()
+    seen.into_iter().map(str::to_owned).collect()
 }
 
 /// Return `node_id`'s last-advertised reflex `SocketAddr`, or
@@ -1334,7 +1618,7 @@ mod tests {
             }
             CapabilityMembership {
                 class_hash: class,
-                tags,
+                tags: tags.into_iter().map(Into::into).collect(),
                 hardware: (!i.is_multiple_of(3)).then(|| HardwareSummary {
                     gpu_vendor: Some(if i.is_multiple_of(2) { "nvidia" } else { "amd" }.into()),
                     gpu_count: 1,
@@ -1397,7 +1681,7 @@ mod tests {
         let tags_any: [&[&str]; 3] = [&[], &["b1"], &["b1", "cross"]];
         let classes = [None, Some(0x100), Some(0x200)];
         let to_vec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let sorted = |keys: &HashSet<(u64, NodeId), BuildU64TupleHasher>| {
+        let sorted = |keys: &HashSet<(u64, NodeId)>| {
             let mut v: Vec<_> = keys.iter().copied().collect();
             v.sort_unstable();
             v
@@ -1424,15 +1708,18 @@ mod tests {
                                 for fold in [&forward, &reverse] {
                                     fold.with_state_and_index(|state, index| {
                                         let new = sorted(
-                                            resolve_candidate_keys(state, index, &filter).as_set(),
+                                            &resolve_candidate_keys(state, index, &filter)
+                                                .key_set(),
                                         );
-                                        let old = sorted(
-                                            resolve_candidate_keys_pre_slice4(
-                                                state, index, &filter,
-                                            )
-                                            .as_set(),
-                                        );
+                                        let old = sorted(&resolve_candidate_keys_pre_slice4(
+                                            state, index, &filter,
+                                        ));
                                         assert_eq!(new, old, "resolvers differ for {filter:?}");
+                                        let scan = sorted(&brute_force(state, &filter));
+                                        assert_eq!(
+                                            new, scan,
+                                            "resolver differs from a payload scan for {filter:?}"
+                                        );
                                         results.push(new);
                                     });
                                 }
@@ -1510,7 +1797,7 @@ mod tests {
             for hw in &hardware {
                 let payload = CapabilityMembership {
                     class_hash: 0,
-                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    tags: tags.iter().map(|t| t.to_string().into()).collect(),
                     hardware: hw.clone(),
                     state: NodeState::Idle,
                     region: None,
@@ -1578,7 +1865,7 @@ mod tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
-                tags: tags.into_iter().map(String::from).collect(),
+                tags: tags.into_iter().map(Into::into).collect(),
                 hardware: None,
                 state,
                 region: region.map(String::from),
@@ -2174,7 +2461,7 @@ mod tests {
 
         fold.with_state_and_index(|state, index| {
             let nodes = |keys: &CandidateKeys<'_>| -> Vec<NodeId> {
-                let mut v: Vec<NodeId> = keys.as_set().iter().map(|&(_, n)| n).collect();
+                let mut v: Vec<NodeId> = keys.keys().map(|(_, n)| n).collect();
                 v.sort_unstable();
                 v
             };
@@ -2186,7 +2473,7 @@ mod tests {
             };
             let got = resolve_candidate_keys(state, index, &tag_only);
             assert!(
-                matches!(got, CandidateKeys::Borrowed(_)),
+                got.is_borrowed(),
                 "single-tag filter must borrow the index bucket"
             );
             assert_eq!(nodes(&got), vec![0xA, 0xB]);
@@ -2197,7 +2484,7 @@ mod tests {
                 ..CapabilityFilter::default()
             };
             let got = resolve_candidate_keys(state, index, &state_only);
-            assert!(matches!(got, CandidateKeys::Borrowed(_)));
+            assert!(got.is_borrowed());
             assert_eq!(nodes(&got), vec![0xA, 0xC]);
 
             // Single region → Borrowed.
@@ -2206,7 +2493,7 @@ mod tests {
                 ..CapabilityFilter::default()
             };
             let got = resolve_candidate_keys(state, index, &region_only);
-            assert!(matches!(got, CandidateKeys::Borrowed(_)));
+            assert!(got.is_borrowed());
             assert_eq!(nodes(&got), vec![0xA, 0xC]);
 
             // Unknown single tag → provably empty (Owned default,
@@ -2216,8 +2503,8 @@ mod tests {
                 ..CapabilityFilter::default()
             };
             let got = resolve_candidate_keys(state, index, &missing);
-            assert!(matches!(got, CandidateKeys::Owned(_)));
-            assert!(got.as_set().is_empty());
+            assert!(!got.is_borrowed());
+            assert_eq!(got.len(), 0);
 
             // Composite (tag + state) → Owned: the general path
             // must still materialize and intersect.
@@ -2228,7 +2515,7 @@ mod tests {
             };
             let got = resolve_candidate_keys(state, index, &composite);
             assert!(
-                matches!(got, CandidateKeys::Owned(_)),
+                !got.is_borrowed(),
                 "composite filter must materialize a tightened set"
             );
             assert_eq!(nodes(&got), vec![0xA]);
@@ -2619,5 +2906,391 @@ mod tests {
         let outcome = registry.dispatch(&bytes, kp.entity_id()).expect("dispatch");
         assert_eq!(outcome, ApplyOutcome::Inserted);
         assert_eq!(fold.stats().entries, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 7: bitmap buckets over entry slots.
+    // ---------------------------------------------------------------
+
+    /// The keys a filter selects, by scanning every entry's payload: no
+    /// index, no buckets. Synthetic keys come from the same derivation the
+    /// index uses. The independent oracle for the bitmap resolver.
+    fn brute_force(
+        state: &FoldState<CapabilityFold>,
+        filter: &CapabilityFilter,
+    ) -> HashSet<(u64, NodeId)> {
+        let mut out = HashSet::new();
+        let mut scratch = String::new();
+        for (key, entry) in &state.entries {
+            let p = &entry.payload;
+            let has = |t: &str| p.tags.iter().any(|x| *x == t);
+            if !filter.tags_all.iter().all(|t| has(t)) {
+                continue;
+            }
+            let mut synthetic: Vec<String> = Vec::new();
+            for_each_synthetic_index_tag(p, &mut scratch, |t| synthetic.push(t.to_owned()));
+            if !filter
+                .tag_groups_all
+                .iter()
+                .filter(|g| !g.is_empty())
+                .all(|g| g.iter().any(|t| synthetic.contains(t)))
+            {
+                continue;
+            }
+            if filter.state.is_some_and(|st| p.state != st) {
+                continue;
+            }
+            if filter
+                .region
+                .as_ref()
+                .is_some_and(|r| p.region.as_ref() != Some(r))
+            {
+                continue;
+            }
+            if !filter.tags_any.is_empty() && !filter.tags_any.iter().any(|t| has(t)) {
+                continue;
+            }
+            if filter.class.is_some_and(|c| key.0 != c) {
+                continue;
+            }
+            out.insert(*key);
+        }
+        out
+    }
+
+    fn placeholder(
+        class: u64,
+        node: NodeId,
+        generation: u64,
+        ttl_secs: Option<u32>,
+        tags: &[&str],
+        state: NodeState,
+        region: Option<&str>,
+    ) -> SignedAnnouncement<CapabilityMembership> {
+        let mut ann = sign_cap(
+            &EntityKeypair::generate(),
+            node,
+            generation,
+            class,
+            tags.to_vec(),
+            state,
+            region,
+        );
+        ann.ttl_secs = ttl_secs;
+        ann
+    }
+
+    fn filter_tags(tags: &[&str]) -> CapabilityFilter {
+        CapabilityFilter {
+            tags_all: tags.iter().map(|t| t.to_string()).collect(),
+            ..CapabilityFilter::default()
+        }
+    }
+
+    fn resolved(fold: &Fold<CapabilityFold>, filter: &CapabilityFilter) -> Vec<(u64, NodeId)> {
+        fold.with_state_and_index(|state, index| {
+            let mut keys: Vec<_> = resolve_candidate_keys(state, index, filter)
+                .keys()
+                .collect();
+            keys.sort_unstable();
+            keys
+        })
+    }
+
+    /// Bitmap identity is the (class, node) ENTRY: class A of node N
+    /// carries `alpha`, class B carries `beta`, and a query for both
+    /// matches nothing, though the node carries both tags.
+    #[test]
+    fn cross_class_split_predicate_does_not_match() {
+        let fold = new_fold();
+        let n: NodeId = 0x77;
+        fold.apply(placeholder(
+            0xA,
+            n,
+            1,
+            None,
+            &["alpha"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("class A");
+        fold.apply(placeholder(
+            0xB,
+            n,
+            1,
+            None,
+            &["beta"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("class B");
+        assert!(resolved(&fold, &filter_tags(&["alpha", "beta"])).is_empty());
+        assert_eq!(resolved(&fold, &filter_tags(&["alpha"])), vec![(0xA, n)]);
+        // The same split across the OR-ed `tags_any` and the AND-ed
+        // `tags_all` still evaluates per entry.
+        let mixed = CapabilityFilter {
+            tags_all: vec!["alpha".into()],
+            tags_any: vec!["beta".into()],
+            ..CapabilityFilter::default()
+        };
+        assert!(resolved(&fold, &mixed).is_empty());
+    }
+
+    /// The same population applied in opposite orders, then churned and
+    /// restored, yields identical node lists from the public API and
+    /// identical resolver key sets, although slot (and so bitmap) order
+    /// follows arrival.
+    #[test]
+    fn output_order_independent_of_arrival() {
+        use crate::adapter::net::behavior::capability::CapabilityFilter as LegacyFilter;
+        let build = |order: &mut dyn Iterator<Item = u64>| {
+            let fold = new_fold();
+            for i in order {
+                let tags: Vec<String> = vec![format!("t{}", i % 5), "common".into()];
+                let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                fold.apply(placeholder(
+                    1,
+                    0x1000 + i,
+                    1,
+                    None,
+                    &refs,
+                    NodeState::Idle,
+                    None,
+                ))
+                .expect("apply");
+            }
+            // Churn: evict every third, re-add half of them under new ids.
+            for i in (0..200u64).step_by(3) {
+                fold.evict_node(0x1000 + i, "churn");
+                if i % 2 == 0 {
+                    fold.apply(placeholder(
+                        1,
+                        0x9000 + i,
+                        1,
+                        None,
+                        &["common", "t9"],
+                        NodeState::Busy,
+                        None,
+                    ))
+                    .expect("re-add");
+                }
+            }
+            let restored = new_fold();
+            restored.restore(fold.snapshot(), false).expect("restore");
+            restored
+        };
+        let forward = build(&mut (0..200));
+        let reverse = build(&mut (0..200).rev());
+
+        let legacy = LegacyFilter {
+            require_tags: vec!["common".into()],
+            ..LegacyFilter::default()
+        };
+        let a = super::super::capability_bridge::find_nodes_matching(&forward, &legacy);
+        let b = super::super::capability_bridge::find_nodes_matching(&reverse, &legacy);
+        assert!(!a.is_empty());
+        assert_eq!(a, b, "public node list");
+        assert!(a.windows(2).all(|w| w[0] < w[1]), "sorted and deduplicated");
+        for filter in [
+            filter_tags(&["t3"]),
+            filter_tags(&["t9"]),
+            filter_tags(&["common", "t1"]),
+        ] {
+            assert_eq!(
+                resolved(&forward, &filter),
+                resolved(&reverse, &filter),
+                "{filter:?}"
+            );
+        }
+    }
+
+    /// A freed slot is reused for a different class and publisher and
+    /// inherits none of the old entry's raw, synthetic, region or state
+    /// memberships, whether the old entry left by eviction, expiry or a
+    /// restore.
+    #[test]
+    fn reused_slot_inherits_no_membership() {
+        let old_tags = ["old-tag", "software.model.0.id=oldm"];
+        let check_clean = |fold: &Fold<CapabilityFold>, new_key: (u64, NodeId)| {
+            assert!(resolved(fold, &filter_tags(&["old-tag"])).is_empty(), "raw");
+            let synthetic = CapabilityFilter {
+                tag_groups_all: vec![vec!["model:oldm".into()]],
+                ..CapabilityFilter::default()
+            };
+            assert!(resolved(fold, &synthetic).is_empty(), "synthetic");
+            let region = CapabilityFilter {
+                region: Some("old-region".into()),
+                ..CapabilityFilter::default()
+            };
+            assert!(resolved(fold, &region).is_empty(), "region");
+            let busy = CapabilityFilter {
+                state: Some(NodeState::Busy),
+                ..CapabilityFilter::default()
+            };
+            assert!(resolved(fold, &busy).is_empty(), "state");
+            assert_eq!(resolved(fold, &filter_tags(&["new-tag"])), vec![new_key]);
+        };
+
+        // Eviction.
+        let fold = new_fold();
+        fold.apply(placeholder(
+            1,
+            0xA,
+            1,
+            None,
+            &old_tags,
+            NodeState::Busy,
+            Some("old-region"),
+        ))
+        .expect("old");
+        let old_slot = fold.with_state_and_index(|_, i| i.slot_of(&(1, 0xA)));
+        fold.evict_node(0xA, "test");
+        fold.apply(placeholder(
+            2,
+            0xB,
+            1,
+            None,
+            &["new-tag"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("new");
+        assert_eq!(
+            fold.with_state_and_index(|_, i| i.slot_of(&(2, 0xB))),
+            old_slot,
+            "the freed slot is reused"
+        );
+        check_clean(&fold, (2, 0xB));
+
+        // Expiry.
+        let fold = new_fold();
+        fold.apply(placeholder(
+            1,
+            0xA,
+            1,
+            Some(0),
+            &old_tags,
+            NodeState::Busy,
+            Some("old-region"),
+        ))
+        .expect("old");
+        let old_slot = fold.with_state_and_index(|_, i| i.slot_of(&(1, 0xA)));
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(fold.sweep_expired_now(), 1);
+        fold.apply(placeholder(
+            2,
+            0xB,
+            1,
+            None,
+            &["new-tag"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("new");
+        assert_eq!(
+            fold.with_state_and_index(|_, i| i.slot_of(&(2, 0xB))),
+            old_slot
+        );
+        check_clean(&fold, (2, 0xB));
+
+        // Restore over a fold whose slots held other entries.
+        let fold = new_fold();
+        fold.apply(placeholder(
+            1,
+            0xA,
+            1,
+            None,
+            &old_tags,
+            NodeState::Busy,
+            Some("old-region"),
+        ))
+        .expect("old");
+        let source = new_fold();
+        source
+            .apply(placeholder(
+                2,
+                0xB,
+                1,
+                None,
+                &["new-tag"],
+                NodeState::Idle,
+                None,
+            ))
+            .expect("new");
+        fold.restore(source.snapshot(), true).expect("restore");
+        check_clean(&fold, (2, 0xB));
+    }
+
+    /// The slot space is bounded by the PEAK live entry count: freed
+    /// slots are reused before the table grows, and nothing compacts.
+    #[test]
+    fn slot_space_tracks_the_peak_and_reuses_before_growth() {
+        let fold = new_fold();
+        for i in 0..1000u64 {
+            fold.apply(placeholder(1, i, 1, None, &["t"], NodeState::Idle, None))
+                .expect("apply");
+        }
+        for i in 0..900u64 {
+            fold.evict_node(i, "shrink");
+        }
+        let mem = fold.with_state_and_index(|_, i| i.memory_breakdown());
+        assert_eq!(
+            (mem.occupied_slots, mem.slot_capacity, mem.free_slots),
+            (100, 1000, 900),
+            "occupied, capacity and free reported distinctly"
+        );
+        for i in 5000..5050u64 {
+            fold.apply(placeholder(1, i, 1, None, &["t"], NodeState::Idle, None))
+                .expect("apply");
+        }
+        let mem = fold.with_state_and_index(|_, i| i.memory_breakdown());
+        assert_eq!(
+            (mem.occupied_slots, mem.slot_capacity, mem.free_slots),
+            (150, 1000, 850),
+            "reused, not grown"
+        );
+    }
+
+    /// An exhausted slot space refuses a new entry whole (no wrap, nothing
+    /// changed); a Replace keeps its slot and still succeeds; a freed slot
+    /// makes room again.
+    #[test]
+    fn exhausted_slot_space_refuses_an_insert_and_never_wraps() {
+        let fold = new_fold();
+        {
+            // Two slots only.
+            let mut index = fold.index.write();
+            index.slots_mut().set_limit(2);
+        }
+        fold.apply(placeholder(1, 0xA, 1, None, &["a"], NodeState::Idle, None))
+            .expect("first");
+        fold.apply(placeholder(1, 0xB, 1, None, &["b"], NodeState::Idle, None))
+            .expect("second");
+        match fold.apply(placeholder(1, 0xC, 1, None, &["c"], NodeState::Idle, None)) {
+            Err(super::super::FoldError::PayloadRejected {
+                reason: super::super::PayloadRejection::IndexFull { slots: 2 },
+                ..
+            }) => {}
+            other => panic!("expected IndexFull, got {other:?}"),
+        }
+        fold.with_state_and_index(|state, index| {
+            assert_eq!(state.len(), 2);
+            assert!(
+                index.dictionary().canonical("c").is_none(),
+                "nothing admitted"
+            );
+        });
+        assert_eq!(fold.stats().budget_rejections, 1);
+
+        // A Replace reuses its own slot even at the limit.
+        assert_eq!(
+            fold.apply(placeholder(1, 0xA, 2, None, &["a2"], NodeState::Busy, None))
+                .expect("replace at the limit"),
+            ApplyOutcome::Replaced
+        );
+        fold.evict_node(0xB, "room");
+        fold.apply(placeholder(1, 0xC, 1, None, &["c"], NodeState::Idle, None))
+            .expect("room again");
+        assert_eq!(resolved(&fold, &filter_tags(&["c"])), vec![(1, 0xC)]);
     }
 }

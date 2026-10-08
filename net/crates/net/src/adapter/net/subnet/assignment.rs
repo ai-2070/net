@@ -229,14 +229,16 @@ impl SubnetPolicy {
     /// assignment — see contract point 1 on [`SubnetPolicy`], where
     /// same-level rules are later-rule-wins — and is what makes
     /// [`Self::can_assign_non_global`] exact rather than approximate.
-    pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
+    pub fn assign_from_rendered_tags<S: AsRef<str>>(&self, tags: &[S]) -> SubnetId {
         self.assign_from_tag_strs(tags)
     }
 
     /// The ONE rule-evaluation body, generic over the string view so
     /// both entry points reach it without a second copy of the logic:
-    /// the fold path holds `&[String]`, and [`Self::assign`] holds
-    /// `&[Cow<'_, str>]` (PERF_AUDIT_2026_08_04_SUBNET_PATHS §2).
+    /// the fold path ([`Self::assign_from_rendered_tags`], called with the
+    /// capability fold's `&[TagStr]` by scoped discovery) and
+    /// [`Self::assign`], which holds `&[Cow<'_, str>]`
+    /// (PERF_AUDIT_2026_08_04_SUBNET_PATHS §2).
     ///
     /// Allocation-free — it borrows the winner out of `tags` and writes
     /// only into a `[u8; 4]`.

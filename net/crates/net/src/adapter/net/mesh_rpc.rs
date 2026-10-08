@@ -4440,6 +4440,48 @@ fn fire_unary_cancel_outcome(
 // ============================================================================
 
 impl MeshNode {
+    /// Publish a just-registered service: insert it into the local-service
+    /// registry and refresh the self-index. If the self-index refuses (the
+    /// service's tag would make the announcement unacceptable), roll the
+    /// registration back, both the registry entry and the inbound
+    /// dispatcher, and fail. A handler is never left registered without the
+    /// folded tag that protected dispatch requires.
+    ///
+    /// Insert, self-index and rollback all run under ONE `announce_mu`
+    /// hold. Every announce reads the registry under that lock, so none can
+    /// observe a service that is about to be rolled back and publish its
+    /// `nrpc:` tag (PR #1210 review).
+    fn publish_local_service(
+        &self,
+        service: &str,
+        channel_hash: ChannelHash,
+        registration_id: u64,
+        visibility: crate::adapter::net::org_admission_gate::CapabilityVisibility,
+    ) -> Result<(), ServeError> {
+        let announce_guard = self.lock_announce_mu();
+        let indexed = match &announce_guard {
+            Some(guard) => {
+                self.rpc_local_services_arc().insert(
+                    service.to_string(),
+                    registration_id,
+                    visibility,
+                );
+                self.index_self_with_local_services(guard)
+            }
+            None => Err(AdapterError::Connection(
+                "self-index: the announce lock was not obtainable".to_string(),
+            )),
+        };
+        if let Err(e) = indexed {
+            self.rpc_local_services_arc()
+                .remove_if(service, registration_id);
+            let _ = self.unregister_rpc_inbound(channel_hash, registration_id);
+            drop(announce_guard);
+            return Err(ServeError::CapabilityRefused(e.to_string()));
+        }
+        Ok(())
+    }
+
     /// Register an nRPC handler for `service` on this node.
     ///
     /// Subscribes this node to `<service>.requests` (so the local
@@ -4885,9 +4927,7 @@ impl MeshNode {
         // emission projects correctly — an owner-scoped tag is excluded from the
         // plaintext broadcast, a public one is not.
         let visibility = mode.visibility();
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id, visibility);
-        self.index_self_with_local_services();
+        self.publish_local_service(service, channel_hash, registration_id, visibility)?;
 
         // E1.1: the immutable registration the bridge captures — ONE truth, the
         // provider policy captured WITH the handler (no name→policy side map, no
@@ -5536,9 +5576,7 @@ impl MeshNode {
             return Err(ServeError::AlreadyServing(service.to_string()));
         };
         let visibility = mode.visibility();
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id, visibility);
-        self.index_self_with_local_services();
+        self.publish_local_service(service, channel_hash, registration_id, visibility)?;
 
         // E1.1: the immutable registration the bridge captures — the exact
         // `serve_rpc_unary_impl` construction (one truth for admission mode +
@@ -6065,9 +6103,7 @@ impl MeshNode {
         // response-streaming paths already do this). The dispatcher
         // above only buffers into the mpsc; the bridge that drains it
         // is spawned LAST.
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id, visibility);
-        self.index_self_with_local_services();
+        self.publish_local_service(service, channel_hash, registration_id, visibility)?;
 
         // E1.1: the immutable registration the bridge captures — the exact
         // `serve_rpc_unary_impl` construction (one truth for admission mode +
@@ -6711,9 +6747,7 @@ impl MeshNode {
         // OA2-E0 (Kyra E0 review): publish + self-index BEFORE the
         // bridge is exposed (see serve_rpc_client_stream). The
         // dispatcher only buffers; the bridge drains it LAST.
-        self.rpc_local_services_arc()
-            .insert(service.to_string(), registration_id, visibility);
-        self.index_self_with_local_services();
+        self.publish_local_service(service, channel_hash, registration_id, visibility)?;
 
         // E1.1: the immutable registration the bridge captures — the exact
         // `serve_rpc_unary_impl` construction (contract 5, Stage 2 slice
@@ -8873,6 +8907,13 @@ impl MeshNode {
 /// Errors returned by [`MeshNode::serve_rpc`].
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    /// The service's `nrpc:` capability tag would make this node's
+    /// announcement unacceptable: over the per-advertisement tag caps, or
+    /// refused by this node's own capability fold. The registration was
+    /// rolled back; protected dispatch requires that folded tag, so the
+    /// handler could never have been reached.
+    #[error("service capability refused, registration rolled back: {0}")]
+    CapabilityRefused(String),
     /// The service name fails channel-name validation.
     #[error("invalid service name: {0}")]
     InvalidServiceName(String),
@@ -13446,7 +13487,7 @@ mod roster_fallback_tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: 0xD00D,
-                tags: vec!["nrpc:d".to_string()],
+                tags: vec!["nrpc:d".into()],
                 hardware: None,
                 state: NodeState::Idle,
                 region: None,

@@ -28,6 +28,13 @@ use super::AuditEvent;
 /// sink slows the apply (or expiry) path because the call sites
 /// invoke `record` synchronously under the fold's locks. Real
 /// implementations push to a channel and drain in a worker.
+///
+/// From `record`, a sink may read the fold's counters
+/// ([`super::Fold::metrics`] takes no lock; [`super::Fold::stats`] takes
+/// only a short read of the sink slot, which no emitting path holds while
+/// `record` runs). It must not call anything that takes the fold's state
+/// or index lock (`apply`, `query`, `with_state`, `snapshot`, ...), which
+/// the emitting operation still holds.
 pub trait FoldAuditSink: Send + Sync {
     /// Record one audit event. The implementor decides where
     /// the event goes; the fold runtime does not introspect

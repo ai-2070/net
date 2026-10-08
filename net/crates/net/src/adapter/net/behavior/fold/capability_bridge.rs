@@ -45,7 +45,7 @@ use super::state::FoldError;
 use super::state::FoldState;
 #[cfg(any(test, feature = "fixtures"))]
 use super::ApplyOutcome;
-use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
+use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement, TagStr};
 
 /// Translate the legacy
 /// [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
@@ -558,11 +558,10 @@ pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<Own
     let fold_filter = translate_filter(&legacy);
     fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
 
         // Phase 1 — which publishers advertise `tag` at all. Tag-filtered
         // by construction; ownership is NOT decided here.
-        let mut publishers: Vec<NodeId> = candidates.iter().map(|&(_, node)| node).collect();
+        let mut publishers: Vec<NodeId> = candidates.keys().map(|(_, node)| node).collect();
         publishers.sort_unstable();
         publishers.dedup();
 
@@ -613,6 +612,36 @@ pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<Own
         }
         out
     })
+}
+
+/// The per-advertisement tag caps ([`super::MAX_CAPABILITY_TAGS`],
+/// [`super::MAX_CAPABILITY_TAG_LEN`]) applied to a [`CapabilitySet`]
+/// before it is announced, measuring each tag in its rendered wire form,
+/// so a local publisher is refused with a reason instead of every
+/// receiver dropping the advertisement. Renders into one reused buffer.
+pub(crate) fn validate_capability_set_tags(
+    caps: &super::super::capability::CapabilitySet,
+) -> Result<(), super::PayloadRejection> {
+    use super::{PayloadRejection, MAX_CAPABILITY_TAGS, MAX_CAPABILITY_TAG_LEN};
+    if caps.tags.len() > MAX_CAPABILITY_TAGS {
+        return Err(PayloadRejection::TooManyTags {
+            count: caps.tags.len(),
+            max: MAX_CAPABILITY_TAGS,
+        });
+    }
+    let mut rendered = String::new();
+    for (index, tag) in caps.tags.iter().enumerate() {
+        rendered.clear();
+        let _ = std::fmt::Write::write_fmt(&mut rendered, format_args!("{tag}"));
+        if rendered.len() > MAX_CAPABILITY_TAG_LEN {
+            return Err(PayloadRejection::TagTooLong {
+                index,
+                len: rendered.len(),
+                max: MAX_CAPABILITY_TAG_LEN,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Retract ownership projections a rising revocation floor just
@@ -1375,12 +1404,12 @@ pub fn effective_ttl_secs(ann: &CapabilityAnnouncement) -> u32 {
 fn project_tags<'a>(
     tags: impl IntoIterator<Item = &'a super::super::tag::Tag>,
 ) -> (
-    Vec<String>,
+    Vec<TagStr>,
     Option<String>,
     super::super::capability::HardwareCapabilities,
 ) {
     let tags = tags.into_iter();
-    let mut rendered: Vec<String> = Vec::with_capacity(tags.size_hint().0);
+    let mut rendered: Vec<TagStr> = Vec::with_capacity(tags.size_hint().0);
     let mut region: Option<String> = None;
     let mut hardware_tags: Vec<super::super::tag::Tag> = Vec::new();
     let mut scratch = String::new();
@@ -1392,7 +1421,7 @@ fn project_tags<'a>(
                 region = Some(r.to_owned());
             }
         }
-        rendered.push(scratch.as_str().to_owned());
+        rendered.push(TagStr::from(scratch.as_str()));
         if matches!(
             tag.axis_key_ref(),
             Some((super::super::tag::TaxonomyAxis::Hardware, _))
@@ -1527,9 +1556,8 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
     // every match before the caller can discard it.
     let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
         let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
+        for key in candidates.keys() {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
@@ -1714,7 +1742,7 @@ pub fn find_nodes_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: &ScopeFilter<'_>,
-    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    same_subnet_lookup: impl Fn(NodeId, &[TagStr]) -> bool,
 ) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
     // Borrow-and-filter, same as `find_nodes_matching`: resolve
@@ -1749,9 +1777,8 @@ pub fn find_nodes_matching_scoped(
     let prepared = PreparedScope::new(scope);
     let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
         let mut acc: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
+        for key in candidates.keys() {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
@@ -1832,7 +1859,7 @@ pub(crate) fn best_node_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: &ScopeFilter<'_>,
-    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    same_subnet_lookup: impl Fn(NodeId, &[TagStr]) -> bool,
     score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
 ) -> Option<NodeId> {
     best_node_inner(fold, legacy, Some(scope), same_subnet_lookup, score)
@@ -1867,7 +1894,7 @@ fn best_node_inner(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: Option<&ScopeFilter<'_>>,
-    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    same_subnet_lookup: impl Fn(NodeId, &[TagStr]) -> bool,
     score: impl Fn(&super::super::capability::CapabilitySet) -> f32,
 ) -> Option<NodeId> {
     let mut best: Option<(NodeId, f32)> = None;
@@ -1935,7 +1962,7 @@ fn candidates_for_selection(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: Option<&ScopeFilter<'_>>,
-    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
+    same_subnet_lookup: impl Fn(NodeId, &[TagStr]) -> bool,
 ) -> Vec<(NodeId, super::super::capability::CapabilitySet)> {
     let fold_filter = translate_filter(legacy);
     // Same hoisting as `find_nodes_matching_scoped`: prepare the
@@ -1946,9 +1973,8 @@ fn candidates_for_selection(
     let prepared = scope.map(PreparedScope::new);
     fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let candidates = candidates.as_set();
         let mut admitted: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
+        for key in candidates.keys() {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
@@ -2021,7 +2047,7 @@ mod tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
-                tags: tags.into_iter().map(String::from).collect(),
+                tags: tags.into_iter().map(Into::into).collect(),
                 hardware,
                 state: NodeState::Idle,
                 region: None,
@@ -2065,7 +2091,7 @@ mod tests {
             EnvelopeMeta::default(),
             CapabilityMembership {
                 class_hash: class,
-                tags: tags.into_iter().map(String::from).collect(),
+                tags: tags.into_iter().map(Into::into).collect(),
                 hardware: None,
                 state: NodeState::Idle,
                 region: None,
@@ -3232,13 +3258,8 @@ mod tests {
             translated.payload.tags.len() > 5,
             "fixture renders several tags"
         );
-        for tag in &translated.payload.tags {
-            assert_eq!(
-                tag.capacity(),
-                tag.len(),
-                "tag {tag:?} carries spare capacity"
-            );
-        }
+        // Tags are `TagStr`s (`Arc<str>`), exact-length by construction:
+        // nothing to check per tag. The region is still a `String`.
         let region = translated.payload.region.as_ref().expect("a region");
         assert_eq!(
             region.capacity(),
@@ -3350,7 +3371,7 @@ mod tests {
         // SameSubnet lookup says BB is co-resident, AA isn't. The
         // closure now also receives the candidate's tags, borrowed from
         // the same snapshot that selected it.
-        let lookup = |nid: NodeId, _tags: &[String]| nid == 0xBB;
+        let lookup = |nid: NodeId, _tags: &[TagStr]| nid == 0xBB;
         let mut nodes =
             find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, lookup);
         nodes.sort();

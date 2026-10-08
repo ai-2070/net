@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
+use super::wheel::{Drain, ExpiryWheel};
 use super::wire::SignedAnnouncement;
 use super::FoldKind;
 
@@ -67,13 +68,11 @@ pub type NodeId = u64;
 /// different hasher. This is the same trade `rustc-hash` makes, and
 /// the same caveat applies.
 ///
-/// **One implementation, two aliases.** [`BuildU64Hasher`] here and
-/// `capability::BuildU64TupleHasher` both build this type; the
-/// arity lives in the alias names, not in the mixer, which only ever
-/// sees a sequence of `write_u64` calls. They were briefly two
-/// byte-identical copies — same constant, same fallback — which meant
-/// a correction to one (this note being the obvious candidate) would
-/// silently miss the other. Per-site rationale belongs on the aliases.
+/// **One implementation.** [`BuildU64Hasher`] is its alias. The
+/// capability index's `(u64, u64)` alias went with Slice 7, when its
+/// buckets became bitmaps over entry slots
+/// (CAPABILITY_FOLD_SCALE_PLAN.md). Per-site rationale belongs on the
+/// alias.
 #[derive(Default, Clone)]
 pub struct FxU64Hasher(u64);
 
@@ -159,6 +158,10 @@ pub struct FoldEntry<K: FoldKind> {
     /// The background expiry sweeper removes entries past this
     /// time.
     pub expires_at: Instant,
+    /// Handle of this entry's node in the fold's expiry wheel, keyed on
+    /// `expires_at`: the entry's one active expiry placement. Set when
+    /// the entry is installed; `wheel::NIL` before that.
+    pub(super) expiry_node: u32,
 }
 
 /// In-memory store backing a single [`Fold<K>`](super::Fold).
@@ -206,6 +209,11 @@ pub struct FoldState<K: FoldKind> {
     /// after it, or a cache keyed on `(node, rev)` could validate
     /// pre-restore contents against post-restore state.
     last_rev: u64,
+    /// Every entry's deadline, ordered by time, so the expiry sweep
+    /// visits only what is due (CAPABILITY_FOLD_SCALE_PLAN.md, Slice 8).
+    /// Holds exactly one node per entry: `wheel.len() == entries.len()`
+    /// whenever the state lock is released.
+    wheel: ExpiryWheel<K::Key>,
 }
 
 /// Above this many keys, a [`NodeRecord`] keeps a key → position map
@@ -402,7 +410,92 @@ impl<K: FoldKind> FoldState<K> {
             entries: HashMap::default(),
             by_node: HashMap::default(),
             last_rev: 0,
+            wheel: ExpiryWheel::new(Instant::now()),
         }
+    }
+
+    /// Schedule `entry` (about to be installed at `key`) in the expiry
+    /// wheel at its `expires_at`, recording the node on the entry.
+    pub(super) fn schedule(&mut self, key: &K::Key, entry: &mut FoldEntry<K>) {
+        entry.expiry_node = self.wheel.insert(key.clone(), entry.expires_at);
+    }
+
+    /// Whether a new entry can be scheduled, checked before an Insert
+    /// mutates anything. The expiry wheel addresses at most `u32::MAX`
+    /// nodes, which bounds every fold kind, not only the capability fold
+    /// its slot table already bounds (PR #1210 review).
+    pub(super) fn can_schedule(&self) -> bool {
+        self.wheel.has_room()
+    }
+
+    /// Most entries the expiry wheel can schedule at once.
+    pub(super) fn schedule_limit(&self) -> usize {
+        self.wheel.limit()
+    }
+
+    /// Lower the expiry wheel's node limit, so a test can reach it.
+    #[cfg(test)]
+    pub(crate) fn set_schedule_limit(&mut self, limit: usize) {
+        self.wheel.set_limit(limit);
+    }
+
+    /// Move an installed entry's expiry placement to `deadline`. Never
+    /// allocates, so a warm refresh stays allocation-free.
+    pub(super) fn reschedule(&mut self, node: u32, deadline: Instant) {
+        self.wheel.reschedule(node, deadline);
+    }
+
+    /// Drop an entry's expiry placement as the entry leaves `entries`.
+    pub(super) fn unschedule(&mut self, node: u32) {
+        self.wheel.remove(node);
+    }
+
+    /// Whether any entry is due at `now`, and how many wheel nodes the
+    /// check visited. Read-only, so the sweep can decide under the read
+    /// lock that there is nothing to do.
+    pub(super) fn probe_due(&self, now: Instant) -> (bool, usize) {
+        self.wheel.probe_due(now)
+    }
+
+    /// Unschedule up to `max` keys due at `now` onto `out`. The caller
+    /// removes the matching entries before releasing the write lock.
+    pub(super) fn take_due(&mut self, now: Instant, max: usize, out: &mut Vec<K::Key>) -> Drain {
+        self.wheel.take_due(now, max, out)
+    }
+
+    /// Scheduled keys: equal to [`Self::len`] whenever the state lock is
+    /// released.
+    pub(super) fn scheduled_len(&self) -> usize {
+        self.wheel.len()
+    }
+
+    /// Full check of the expiry index against `entries`: one node per
+    /// entry, each recording that entry's key and deadline, with
+    /// consistent lists. O(entries); for tests.
+    #[cfg(test)]
+    pub(crate) fn assert_expiry_index(&self) {
+        self.wheel.assert_consistent();
+        assert_eq!(self.wheel.len(), self.entries.len(), "one node per entry");
+        let mut nodes: HashMap<u32, (&K::Key, Instant)> = HashMap::new();
+        for (at, key, deadline) in self.wheel.scheduled() {
+            nodes.insert(at, (key, deadline));
+        }
+        for (key, entry) in &self.entries {
+            let Some(&(node_key, deadline)) = nodes.get(&entry.expiry_node) else {
+                panic!("entry {key:?} has no expiry node");
+            };
+            assert_eq!(node_key, key, "node key");
+            assert_eq!(deadline, entry.expires_at, "node deadline for {key:?}");
+        }
+    }
+
+    /// The ring position an entry's node is linked into, and the one its
+    /// deadline maps to now. For placement witnesses.
+    #[cfg(test)]
+    pub(crate) fn expiry_position(&self, key: &K::Key) -> Option<(u32, u32)> {
+        let entry = self.entries.get(key)?;
+        let linked = self.wheel.position_of_node(entry.expiry_node)?;
+        Some((linked, self.wheel.position_for(entry.expires_at)))
     }
 
     /// The keys `node` currently owns, if it owns any.
@@ -491,6 +584,7 @@ impl<K: FoldKind> FoldState<K> {
     /// revisions no earlier lookup has seen.
     pub(super) fn clear_for_restore(&mut self) {
         // Dropping the records retires their revision cells.
+        self.wheel.clear(Instant::now());
         self.entries.clear();
         self.by_node.clear();
     }
@@ -683,6 +777,48 @@ pub trait FoldIndex<K: FoldKind>: Send + Sync {
     fn index_payload_equivalent(_old: &K::Payload, _new: &K::Payload) -> bool {
         false
     }
+
+    /// Admit an accepted mutation's payload into any receiver-local
+    /// storage the index shares with entries (the capability fold's tag
+    /// dictionary). Called after merge decided Insert (`outgoing` is
+    /// `None`) or Replace (`outgoing` is the payload being replaced),
+    /// under the state + index write guards, before any other change.
+    ///
+    /// All-or-nothing: on `Err` nothing in the index and nothing in
+    /// `incoming` may have changed, and the fold refuses the apply. On
+    /// `Ok` the index may have rewritten `incoming` to share storage, and
+    /// has released `outgoing`'s share. Default: admit everything.
+    fn admit(
+        &mut self,
+        _incoming: &mut K::Payload,
+        _outgoing: Option<&K::Payload>,
+    ) -> Result<(), PayloadRejection> {
+        Ok(())
+    }
+
+    /// Release a stored payload's share of admission storage as its
+    /// entry leaves the fold by eviction, expiry or a restore unwind.
+    /// (A Replace releases through [`Self::admit`].) Default: nothing.
+    fn release(&mut self, _payload: &K::Payload) {}
+
+    /// Whether a restore installing exactly `payloads` (the effective
+    /// restored state) into an emptied index would be admitted. Called
+    /// before the live fold is touched. Default: yes.
+    fn preflight_restore(&self, _payloads: &[&K::Payload]) -> Result<(), PayloadRejection> {
+        Ok(())
+    }
+
+    /// Most entries the index can hold at once. A restore stops building
+    /// its rows past this, before cloning a snapshot it could never
+    /// install. Default: unbounded.
+    fn entry_capacity(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Admission storage counters. Default: zeros.
+    fn admission_stats(&self) -> AdmissionStats {
+        AdmissionStats::default()
+    }
 }
 
 /// Default no-op secondary index. Folds that don't need a
@@ -734,6 +870,96 @@ pub enum FoldError {
         /// Current entry count of the live fold.
         current_len: usize,
     },
+    /// The announcement's payload was refused whole: it broke a payload
+    /// limit ([`FoldKind::validate`]) or the fold's admission budget
+    /// ([`FoldIndex::admit`]). Nothing in the fold changed.
+    #[error("payload from publisher {node_id} refused: {reason}")]
+    PayloadRejected {
+        /// Publisher of the refused announcement.
+        node_id: NodeId,
+        /// Why.
+        reason: PayloadRejection,
+    },
+    /// A restore was refused before touching the live fold: a row of the
+    /// effective restored state broke a payload limit, or the state as a
+    /// whole does not fit the admission budget. The fold is unchanged.
+    #[error("restore refused, fold unchanged: {reason}")]
+    RestoreRefused {
+        /// Why.
+        reason: PayloadRejection,
+    },
+}
+
+/// Why a payload was refused whole. Typed so a caller (and the fold's
+/// counters) can tell a malformed advertisement from a full budget.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PayloadRejection {
+    /// More tags than the per-advertisement cap, duplicates counted.
+    #[error("{count} tags, over the cap of {max}")]
+    TooManyTags {
+        /// Tags carried.
+        count: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// A tag longer than the per-tag cap, in UTF-8 bytes.
+    #[error("tag {index} is {len} bytes, over the cap of {max}")]
+    TagTooLong {
+        /// Position of the first overlong tag.
+        index: usize,
+        /// Its length in UTF-8 bytes.
+        len: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// The fold has no slot left for a new entry: every one of `slots`
+    /// positions is occupied, in the secondary index's slot table or the
+    /// expiry wheel. Never wraps.
+    #[error("index full: all {slots} entry slots are occupied")]
+    IndexFull {
+        /// The slot-space size.
+        slots: usize,
+    },
+    /// Admitting the payload's new tags would exceed the fold's
+    /// canonical-tag budget, after counting what a replacement frees.
+    #[error(
+        "tag budget: {new_tags} new tags / {new_bytes} bytes would exceed \
+         {max_tags} tags / {max_bytes} bytes (live {live_tags} / {live_bytes})"
+    )]
+    TagBudget {
+        /// New distinct tags the payload brings.
+        new_tags: usize,
+        /// Their UTF-8 bytes.
+        new_bytes: usize,
+        /// Distinct tags held when refused.
+        live_tags: usize,
+        /// Bytes held when refused.
+        live_bytes: usize,
+        /// The budget's tag ceiling.
+        max_tags: usize,
+        /// The budget's byte ceiling.
+        max_bytes: usize,
+    },
+}
+
+impl PayloadRejection {
+    /// Whether this is a capacity refusal (the tag budget or the index's
+    /// slot space) rather than a size-limit one.
+    pub fn is_budget(&self) -> bool {
+        matches!(self, Self::TagBudget { .. } | Self::IndexFull { .. })
+    }
+}
+
+/// Counters an index's admission dictionary reports through
+/// [`FoldIndex::admission_stats`]. All zero for an index without one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionStats {
+    /// Distinct canonical values held (tags, for the capability fold).
+    pub interned: u64,
+    /// Bytes of those values: what the budget counts.
+    pub interned_bytes: u64,
+    /// Estimated overhead beyond those bytes, not counted by the budget.
+    pub overhead_bytes: u64,
 }
 
 #[cfg(test)]
