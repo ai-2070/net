@@ -45541,6 +45541,11 @@ impl MeshNode {
     /// (with private services). Checked before anything is committed.
     fn check_announceable(&self, base: &CapabilitySet) -> Result<(), AdapterError> {
         let (public, _) = self.augment_public_caps(base.clone());
+        self.check_augmented_announceable(&public)
+    }
+
+    /// [`Self::check_announceable`] for an already augmented public set.
+    fn check_augmented_announceable(&self, public: &CapabilitySet) -> Result<(), AdapterError> {
         let fits = |caps: &CapabilitySet, what: &str| {
             super::behavior::fold::capability_bridge::validate_capability_set_tags(caps).map_err(
                 |reason| {
@@ -45550,8 +45555,18 @@ impl MeshNode {
                 },
             )
         };
-        fits(&public, "published")?;
-        fits(&self.self_fold_caps(&public), "self-indexed")
+        fits(public, "published")?;
+        // Peers refuse an announcement over the blob-heat cap whole, so
+        // publishing one would silently drop this node from every peer's
+        // fold. The blob-heat paths trim to the cap; anything else that
+        // gets here learns now.
+        if Self::blob_heat_over_cap(public) {
+            return Err(AdapterError::Connection(format!(
+                "announce: published capability set refused, nothing was changed: more \
+                 than {MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE} blob-heat tags"
+            )));
+        }
+        fits(&self.self_fold_caps(public), "self-indexed")
     }
 
     /// The corrective loop shared by every announce entry point. `start_mode`
@@ -45669,18 +45684,7 @@ impl MeshNode {
             // owner-scoped and granted services). Checked before anything is
             // committed: no baseline adopted, no version consumed, nothing
             // published locally or to peers.
-            let fits = |set: &CapabilitySet, what: &str| {
-                super::behavior::fold::capability_bridge::validate_capability_set_tags(set).map_err(
-                    |reason| {
-                        AdapterError::Connection(format!(
-                            "announce: {what} capability set refused, nothing was changed: \
-                             {reason}"
-                        ))
-                    },
-                )
-            };
-            fits(&caps, "published")?;
-            fits(&self.self_fold_caps(&caps), "self-indexed")?;
+            self.check_augmented_announceable(&caps)?;
 
             let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
             // Committed with the baseline, after the self-fold accepts.
@@ -46325,6 +46329,44 @@ impl MeshNode {
         }
     }
 
+    /// Keep at most `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags in
+    /// `caps`: the hottest, ties broken by tag text so the choice is
+    /// deterministic. Peers refuse an announcement over the cap WHOLE
+    /// (`blob_heat_over_cap`), so a node tracking more hot blobs than
+    /// the cap advertises its hottest instead of disappearing from every
+    /// peer's fold (PR #1210 review).
+    #[cfg(feature = "dataforts")]
+    fn trim_blob_heat_tags(caps: &mut CapabilitySet) {
+        let rate_of = |body: &str| -> f64 {
+            body.rsplit_once('=')
+                .and_then(|(_, r)| r.parse::<f64>().ok())
+                .filter(|r| r.is_finite())
+                .unwrap_or(0.0)
+        };
+        let mut heat: Vec<(f64, Tag)> = caps
+            .tags
+            .iter()
+            .filter_map(|tag| match tag {
+                Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:") =>
+                {
+                    Some((rate_of(body), tag.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if heat.len() <= MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE {
+            return;
+        }
+        heat.sort_by(|(ra, ta), (rb, tb)| {
+            rb.total_cmp(ra)
+                .then_with(|| ta.to_string().cmp(&tb.to_string()))
+        });
+        for (_, tag) in heat.drain(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE..) {
+            caps.tags.remove(&tag);
+        }
+    }
+
     /// Read the current user-supplied baseline, defaulting to an
     /// empty `CapabilitySet` when no `announce_capabilities` has
     /// landed yet. Returns an owned snapshot — callers mutate the
@@ -46863,6 +46905,7 @@ impl MeshNode {
         let _rmw = self.baseline_rmw.lock().await;
         let mut snapshot = self.user_caps_snapshot();
         Self::replace_blob_heat_tags(&mut snapshot, &hash, replacement);
+        Self::trim_blob_heat_tags(&mut snapshot);
         self.announce_capabilities(snapshot).await
     }
 
@@ -46908,6 +46951,7 @@ impl MeshNode {
             };
             Self::replace_blob_heat_tags(&mut snapshot, hash, replacement);
         }
+        Self::trim_blob_heat_tags(&mut snapshot);
         self.announce_capabilities(snapshot).await
     }
 }
@@ -53476,6 +53520,63 @@ mod fold_publisher_helpers_tests {
         )
     }
 
+    /// PR #1210 review: a node tracking more hot blobs than the per-announce
+    /// cap used to publish them all, and every peer refused the whole
+    /// announcement (`blob_heat_over_cap`), dropping the node from their
+    /// folds. The blob-heat paths now trim to the hottest; any other path
+    /// that tries to publish over the cap is refused locally.
+    #[cfg(feature = "dataforts")]
+    #[tokio::test]
+    async fn a_node_with_more_hot_blobs_than_the_cap_still_announces() {
+        let node = build_node_for_test().await;
+        let updates: Vec<([u8; 32], Option<f64>)> = (0..MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 50)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                (h, Some(0.5))
+            })
+            .collect();
+        node.announce_blob_heat_batch(&updates)
+            .await
+            .expect("batch announce");
+        let mut h = [0xFFu8; 32];
+        h[0] = 0xEE;
+        node.announce_blob_heat(h, 0.9)
+            .await
+            .expect("single announce");
+
+        let published = node.user_caps_snapshot();
+        assert!(
+            !MeshNode::blob_heat_over_cap(&published),
+            "a peer would refuse this announcement whole"
+        );
+        assert!(
+            published
+                .tags
+                .iter()
+                .any(|t| MeshNode::is_blob_heat_for(t, &MeshNode::blob_hex(&h))),
+            "the hottest blob is kept"
+        );
+
+        let mut over = published.clone();
+        for i in 0..2u8 {
+            over.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{:064x}=0.10", 0xABCD_0000u64 + i as u64),
+            });
+        }
+        assert!(MeshNode::blob_heat_over_cap(&over));
+        assert!(
+            node.announce_capabilities(over).await.is_err(),
+            "publishing over the cap is refused locally"
+        );
+        assert_eq!(
+            node.user_caps_snapshot().tags,
+            published.tags,
+            "baseline unchanged"
+        );
+    }
+
     /// Replica candidacy: a release decides "no claimant left" and removes
     /// the tag from the committed baseline in ONE step under the holders
     /// lock, and a claim registers and checks under that same lock. So a
@@ -56970,6 +57071,51 @@ mod chain_helper_tests {
             .tags
             .iter()
             .any(|t| MeshNode::is_blob_heat_for(t, &hex)));
+    }
+
+    /// PR #1210 review: peers refuse an announcement over the blob-heat
+    /// cap whole, so the sender trims to the cap, keeping the hottest.
+    /// Other tags are untouched.
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn trim_blob_heat_tags_keeps_the_hottest_up_to_the_cap() {
+        let mut caps = CapabilitySet::default().add_tag("gpu");
+        let over = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 44;
+        for i in 0..over {
+            caps.tags.insert(Tag::Reserved {
+                prefix: "heat:".to_string(),
+                body: format!("blob:{i:064x}={:.2}", (i % 100) as f64 / 100.0),
+            });
+        }
+        let mut trimmed = caps.clone();
+        MeshNode::trim_blob_heat_tags(&mut trimmed);
+        assert!(!MeshNode::blob_heat_over_cap(&trimmed));
+        assert_eq!(trimmed.tags.len(), MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1);
+        assert!(trimmed.has_tag("gpu"), "non-heat tags untouched");
+        let rate = |t: &Tag| match t {
+            Tag::Reserved { body, .. } => body.rsplit_once('=').unwrap().1.parse::<f64>().unwrap(),
+            _ => f64::NAN,
+        };
+        let kept_min = trimmed
+            .tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Reserved { .. }))
+            .map(rate)
+            .fold(f64::INFINITY, f64::min);
+        let dropped_max = caps
+            .tags
+            .difference(&trimmed.tags)
+            .map(rate)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(kept_min >= dropped_max, "{kept_min} < {dropped_max}");
+
+        // Deterministic, and a no-op at the cap.
+        let mut again = caps.clone();
+        MeshNode::trim_blob_heat_tags(&mut again);
+        assert_eq!(again.tags, trimmed.tags);
+        let before = trimmed.tags.clone();
+        MeshNode::trim_blob_heat_tags(&mut trimmed);
+        assert_eq!(trimmed.tags, before);
     }
 
     fn causal_tag(body: impl Into<String>) -> Tag {
