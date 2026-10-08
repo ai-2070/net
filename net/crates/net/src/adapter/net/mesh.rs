@@ -45865,13 +45865,26 @@ impl MeshNode {
             // here is the fold's tag budget, full of peers' tags. Nothing is
             // committed: the baseline, the pingwave summary and the published
             // emission stay as they were. (The announce version counter has
-            // moved; a skipped version is harmless to receivers.)
-            self.capability_fold.apply(fold_ann).map_err(|e| {
-                AdapterError::Connection(format!(
-                    "announce: refused by this node's own capability fold, nothing was \
-                     published: {e}"
-                ))
-            })?;
+            // moved; a skipped version is harmless to receivers.) Losing the
+            // merge to a newer self entry is a refusal too: committing would
+            // publish one set while this node's own fold holds another (PR
+            // #1210 review).
+            match self.capability_fold.apply(fold_ann) {
+                Ok(super::behavior::fold::ApplyOutcome::Rejected) => {
+                    return Err(AdapterError::Connection(
+                        "announce: lost to a newer self entry in this node's own \
+                         capability fold, nothing was published"
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(AdapterError::Connection(format!(
+                        "announce: refused by this node's own capability fold, nothing was \
+                         published: {e}"
+                    )));
+                }
+            }
             if let Some(baseline) = adopt_baseline {
                 *self.user_caps.write() = Some(baseline);
             }
@@ -53853,6 +53866,49 @@ mod fold_publisher_helpers_tests {
             let entry = s.get(&(0, node.node_id)).expect("self entry");
             assert_eq!(entry.generation, 1_000_000, "the newer entry stands");
         });
+    }
+
+    /// PR #1210 review: an announce that loses the self-fold merge to a
+    /// newer self entry (`Ok(Rejected)`) used to commit anyway, adopting
+    /// its baseline and publishing a set this node's own fold does not
+    /// hold. It is now refused with nothing committed.
+    #[tokio::test]
+    async fn an_announce_that_loses_to_a_newer_self_entry_commits_nothing() {
+        let node = build_node_for_test().await;
+        node.announce_capabilities(CapabilitySet::new().add_tag("before"))
+            .await
+            .expect("first announce");
+        let emission_before = node.local_emission.load_full();
+        let newer = CapabilityAnnouncement::new(
+            node.node_id,
+            node.identity.entity_id().clone(),
+            1_000_000,
+            CapabilitySet::new().add_tag("newer"),
+        );
+        node.capability_fold
+            .apply(
+                super::super::behavior::fold::capability_bridge::translate_announcement(
+                    &newer, None,
+                ),
+            )
+            .expect("a newer self entry");
+
+        assert!(
+            node.announce_capabilities(CapabilitySet::new().add_tag("after"))
+                .await
+                .is_err(),
+            "lost the merge, so the announce is refused"
+        );
+        assert!(node.user_caps_snapshot().has_tag("before"), "baseline kept");
+        assert!(!node.user_caps_snapshot().has_tag("after"));
+        let emission_after = node.local_emission.load_full();
+        assert!(
+            match (&emission_before, &emission_after) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            },
+            "the published emission is unchanged"
+        );
     }
 
     /// Review defect 2, announce side: owner-scoped services reach only
