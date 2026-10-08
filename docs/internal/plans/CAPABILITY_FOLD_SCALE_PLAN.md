@@ -2679,8 +2679,18 @@ The other ten:
 
 #### Review of PR #1210 at `c2eab8372`: nine items
 
-Seven fixed, each with a witness confirmed RED with its fix reverted. Two
-were already closed by `c2eab8372`. One is recorded as a residual risk.
+Six fixed (1, 2, 5, 6, 8, 9). The five behavior fixes each have a witness
+confirmed RED with its fix reverted; item 9 is a cosmetic string fix with
+no witness. Two (3, 4) were already closed by `c2eab8372`. One (7) is
+recorded as a residual risk.
+
+A follow-up cubic pass found `restore` still rehydrated and cloned every
+snapshot row before the capacity check, so a snapshot from a much larger
+fold was fully materialized just to be refused. It now stops at the first
+row past the fold's capacity (the smaller of the expiry wheel's limit and
+the new `FoldIndex::entry_capacity`, the capability index's slot limit).
+Witness: `an_oversized_restore_is_refused_before_materializing_the_snapshot`
+counts rehydrated rows (capacity + 1, not the whole snapshot).
 
 1. **A node with more than 256 hot blobs was refused whole by every
    peer.** The receive side refuses an announcement over
