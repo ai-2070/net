@@ -2368,8 +2368,9 @@ fn fx_u64_hasher_byte_fallback_matches_its_documented_edges() {
 /// used to hold the slot's read guard across `record`; `stats()` reads the
 /// slot again, and parking_lot's fair lock parks that re-entrant read
 /// behind the queued writer, which waits for the outer read: a deadlock.
-/// The sink here queues the writer itself, from a second thread, and only
-/// then reads `stats()`; the apply runs under a deadline.
+/// The sink here queues the writer itself, from a second thread, waits
+/// until the writer is observably at the lock, and only then reads
+/// `stats()`; the apply runs under a deadline.
 #[test]
 fn a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock() {
     struct QueueWriterThenReadStats {
@@ -2384,12 +2385,26 @@ fn a_sink_reading_stats_with_a_queued_sink_writer_does_not_deadlock() {
             let Some(fold) = self.fold.get().and_then(std::sync::Weak::upgrade) else {
                 return;
             };
+            let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let writer = {
                 let fold = Arc::clone(&fold);
-                std::thread::spawn(move || fold.set_audit_sink(None))
+                let done = Arc::clone(&writer_done);
+                std::thread::spawn(move || {
+                    fold.set_audit_sink(None);
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
             };
-            // Let the writer reach the slot's lock and queue.
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Wait until the writer is DEFINITELY at the slot's lock, not
+            // for a guessed delay (cubic, PR #1210): parking_lot sets the
+            // writer bit as soon as a writer is waiting, even while readers
+            // still hold the lock, and a non-recursive `try_read` then
+            // fails. So the writer is queued (or holding, or done) once
+            // `try_read` fails or it has finished.
+            while !writer_done.load(std::sync::atomic::Ordering::SeqCst)
+                && fold.audit_sink.try_read().is_some()
+            {
+                std::thread::yield_now();
+            }
             let _ = fold.stats();
             let _ = writer.join();
         }

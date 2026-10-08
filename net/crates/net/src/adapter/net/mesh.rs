@@ -270,6 +270,14 @@ const DATAGRAM_SEND_DEADLINE: Duration = Duration::from_secs(5);
 /// that packaging defect, and it protects only this one lock.
 const ANNOUNCE_LOCK_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Attempts a replica-candidacy withdraw makes when the announce lock is
+/// busy, each waiting up to [`ANNOUNCE_LOCK_DEADLINE`], before it reports
+/// the tag as not withdrawn.
+const CANDIDACY_WITHDRAW_ATTEMPTS: u32 = 3;
+
+/// Pause between those attempts.
+const CANDIDACY_WITHDRAW_BACKOFF: Duration = Duration::from_secs(1);
+
 /// How often the bounded acquire retries the fast path. Short enough that a lost
 /// wakeup costs a caller milliseconds rather than the whole deadline, long enough
 /// that an ordinary contended acquire still parks rather than spins.
@@ -46520,37 +46528,96 @@ impl MeshNode {
         holder: u64,
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
+        self.release_replica_candidate_with(
+            holder,
+            channel_id,
+            ANNOUNCE_LOCK_DEADLINE,
+            CANDIDACY_WITHDRAW_ATTEMPTS,
+            CANDIDACY_WITHDRAW_BACKOFF,
+        )
+        .await
+    }
+
+    /// [`Self::release_replica_candidate`] with the lock deadline and the
+    /// retry schedule supplied, so a witness can drive a busy announce
+    /// lock without waiting out the production deadline.
+    pub(crate) async fn release_replica_candidate_with(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+        lock_within: Duration,
+        attempts: u32,
+        backoff: Duration,
+    ) -> Result<(), AdapterError> {
         // Under `baseline_rmw`, so the baseline edit cannot interleave
         // with a snapshot-based announce whose later commit would restore
         // the tag.
-        let _rmw = self.baseline_rmw.lock().await;
-        match self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id) {
+        let first = {
+            let _rmw = self.baseline_rmw.lock().await;
+            self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id, lock_within)
+        };
+        match first {
             CandidateRelease::Removed => self.reannounce_current_capabilities().await,
             CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => Ok(()),
-            CandidateRelease::LockUnavailable => Err(AdapterError::Connection(format!(
-                "replication: the announce lock was not obtainable within \
-                 {ANNOUNCE_LOCK_DEADLINE:?}; replica candidacy was not withdrawn"
-            ))),
+            // The holder is already dropped but the tag is still in the
+            // baseline: keep trying, as the unclaimed withdraw, instead of
+            // leaving a stale tag behind (cubic, PR #1210).
+            CandidateRelease::LockUnavailable => {
+                self.withdraw_unclaimed_replica_candidate_with(
+                    channel_id,
+                    lock_within,
+                    attempts,
+                    backoff,
+                )
+                .await
+            }
         }
     }
 
-    /// Withdraw `channel_id`'s candidate tag if no resolver claims it, the
-    /// async path for a release the synchronous one deferred. Same atomic
-    /// step as [`Self::release_replica_candidate`], with no holder to drop.
+    /// Withdraw `channel_id`'s candidate tag if no resolver claims it: the
+    /// async path for a release that could not take the announce lock (the
+    /// synchronous one, or a graceful one that timed out). Same atomic step
+    /// as [`Self::release_replica_candidate`], retried on a busy lock.
     pub(crate) async fn withdraw_unclaimed_replica_candidate(
         &self,
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
-        let _rmw = self.baseline_rmw.lock().await;
-        match self.drop_candidate_tag_if_unclaimed(None, channel_id) {
-            CandidateRelease::Removed => self.reannounce_current_capabilities().await,
-            CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => Ok(()),
-            CandidateRelease::LockUnavailable => Err(AdapterError::Connection(
-                "replication: the announce lock was not obtainable; replica candidacy was \
-                 not withdrawn"
-                    .to_string(),
-            )),
+        self.withdraw_unclaimed_replica_candidate_with(
+            channel_id,
+            ANNOUNCE_LOCK_DEADLINE,
+            CANDIDACY_WITHDRAW_ATTEMPTS,
+            CANDIDACY_WITHDRAW_BACKOFF,
+        )
+        .await
+    }
+
+    /// [`Self::withdraw_unclaimed_replica_candidate`] with the lock deadline
+    /// and the retry schedule supplied.
+    pub(crate) async fn withdraw_unclaimed_replica_candidate_with(
+        &self,
+        channel_id: &[u8; 32],
+        lock_within: Duration,
+        attempts: u32,
+        backoff: Duration,
+    ) -> Result<(), AdapterError> {
+        for attempt in 0..attempts.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(backoff).await;
+            }
+            let outcome = {
+                let _rmw = self.baseline_rmw.lock().await;
+                self.drop_candidate_tag_if_unclaimed(None, channel_id, lock_within)
+            };
+            match outcome {
+                CandidateRelease::Removed => return self.reannounce_current_capabilities().await,
+                CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => return Ok(()),
+                CandidateRelease::LockUnavailable => {}
+            }
         }
+        Err(AdapterError::Connection(format!(
+            "replication: the announce lock was not obtainable in {attempts} attempts of \
+             {lock_within:?}; replica candidacy was not withdrawn"
+        )))
     }
 
     /// The one atomic step every candidacy release takes: under the
@@ -46561,11 +46628,18 @@ impl MeshNode {
     /// never remove a tag a live claim believes is advertised. The caller
     /// holds `baseline_rmw` (or its `try_lock`), so no snapshot-based
     /// announce is in flight to restore the tag; on `Removed` it publishes.
+    ///
+    /// `announce_mu` is taken (or timed out) BEFORE the holders lock, so a
+    /// busy announce never stalls claims behind this release. The holder is
+    /// dropped even when the lock times out (`LockUnavailable`): the tag is
+    /// then still in the baseline, for the caller to withdraw.
     fn drop_candidate_tag_if_unclaimed(
         &self,
         holder: Option<u64>,
         channel_id: &[u8; 32],
+        lock_within: Duration,
     ) -> CandidateRelease {
+        let announce_guard = self.lock_announce_mu_within(lock_within);
         let mut holders = self.replica_candidate_holders.lock();
         if let Some(set) = holders.get_mut(channel_id) {
             if let Some(holder) = holder {
@@ -46576,10 +46650,10 @@ impl MeshNode {
             }
             holders.remove(channel_id);
         }
-        let tag = Self::replica_candidate_tag(channel_id);
-        let Some(_announce_guard) = self.lock_announce_mu() else {
+        let Some(_announce_guard) = announce_guard else {
             return CandidateRelease::LockUnavailable;
         };
+        let tag = Self::replica_candidate_tag(channel_id);
         let mut caps = self.user_caps.write();
         let Some(caps) = caps.as_mut() else {
             return CandidateRelease::NotAdvertised;
@@ -46612,7 +46686,7 @@ impl MeshNode {
             }
             return CandidateRelease::LockUnavailable;
         };
-        self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id)
+        self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id, ANNOUNCE_LOCK_DEADLINE)
     }
 
     /// Record `holder`'s claim on `channel_id`'s candidate tag without
@@ -53454,6 +53528,48 @@ mod fold_publisher_helpers_tests {
             .await
             .expect("deferred withdraw");
         assert!(!node.advertises_replica_candidate(&ch));
+    }
+
+    /// A graceful candidacy release that finds the announce lock busy
+    /// keeps trying, instead of leaving the tag in the baseline after its
+    /// holder is gone (cubic, PR #1210).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_behind_a_busy_announce_lock_still_withdraws() {
+        let node = build_node_for_test().await;
+        let ch = [9u8; 32];
+        node.claim_replica_candidate(1, &ch).await.expect("claim");
+        assert!(node.advertises_replica_candidate(&ch));
+
+        let (held, released) = {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let node = Arc::clone(&node);
+            let holder = std::thread::spawn(move || {
+                let guard = node.lock_announce_mu_within(Duration::from_secs(5));
+                assert!(guard.is_some(), "the test holds the announce lock");
+                let _ = held_tx.send(());
+                std::thread::sleep(Duration::from_millis(300));
+                drop(guard);
+            });
+            (held_rx, holder)
+        };
+        held.recv().expect("lock held");
+
+        // Each attempt waits 20 ms for the lock; the first ones time out
+        // while the thread holds it, a later one succeeds.
+        node.release_replica_candidate_with(
+            1,
+            &ch,
+            Duration::from_millis(20),
+            100,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("withdrawn after retrying");
+        released.join().expect("holder thread");
+        assert!(
+            !node.advertises_replica_candidate(&ch),
+            "the tag left the baseline once the lock was free"
+        );
     }
 
     /// A public handler for the registration tests below.
