@@ -31,7 +31,9 @@ use super::FoldKind;
 
 #[cfg(test)]
 thread_local! {
-    /// Rows `rehydrate_entry` has built on this thread, so a test can see
+    /// Invocations of `rehydrate_entry` on this thread (every snapshot row
+    /// walked, including rows skipped as expired or overwritten as key
+    /// duplicates), so a test can see
     /// how much of a snapshot a refused restore walked.
     pub(super) static REHYDRATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
