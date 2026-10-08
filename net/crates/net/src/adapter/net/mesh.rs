@@ -46495,13 +46495,21 @@ impl MeshNode {
         holder: u64,
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
-        self.replica_candidate_holders
-            .lock()
-            .entry(*channel_id)
-            .or_default()
-            .insert(holder);
-        if self.advertises_replica_candidate(channel_id) {
-            return Ok(());
+        {
+            // Register and check under ONE holders-lock hold. A release
+            // removes the tag from the baseline under this same lock (see
+            // `drop_candidate_tag_if_unclaimed`), so either it sees this
+            // claim and keeps the tag, or its removal is already committed
+            // here and this claim re-announces. Checked outside the lock,
+            // a release could decide "no claimant", this claim could still
+            // see the tag in the not-yet-committed baseline and skip
+            // announcing, and the release's commit would then drop a live
+            // claim's tag.
+            let mut holders = self.replica_candidate_holders.lock();
+            holders.entry(*channel_id).or_default().insert(holder);
+            if self.advertises_replica_candidate(channel_id) {
+                return Ok(());
+            }
         }
         self.announce_replica_candidate(channel_id).await
     }
@@ -46512,23 +46520,61 @@ impl MeshNode {
         holder: u64,
         channel_id: &[u8; 32],
     ) -> Result<(), AdapterError> {
-        if !self.release_candidate_holder(holder, channel_id) {
-            return Ok(());
+        // Under `baseline_rmw`, so the baseline edit cannot interleave
+        // with a snapshot-based announce whose later commit would restore
+        // the tag.
+        let _rmw = self.baseline_rmw.lock().await;
+        match self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id) {
+            CandidateRelease::Removed => self.reannounce_current_capabilities().await,
+            CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => Ok(()),
+            CandidateRelease::LockUnavailable => Err(AdapterError::Connection(format!(
+                "replication: the announce lock was not obtainable within \
+                 {ANNOUNCE_LOCK_DEADLINE:?}; replica candidacy was not withdrawn"
+            ))),
         }
-        self.withdraw_replica_candidate(channel_id).await
     }
 
-    /// The synchronous [`Self::release_replica_candidate`], for a teardown
-    /// that can't await (a replication runtime aborted rather than shut
-    /// down). Edits the capability baseline without announcing; the caller
-    /// re-announces if it can.
-    pub(crate) fn release_replica_candidate_sync(
+    /// Withdraw `channel_id`'s candidate tag if no resolver claims it, the
+    /// async path for a release the synchronous one deferred. Same atomic
+    /// step as [`Self::release_replica_candidate`], with no holder to drop.
+    pub(crate) async fn withdraw_unclaimed_replica_candidate(
         &self,
-        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> Result<(), AdapterError> {
+        let _rmw = self.baseline_rmw.lock().await;
+        match self.drop_candidate_tag_if_unclaimed(None, channel_id) {
+            CandidateRelease::Removed => self.reannounce_current_capabilities().await,
+            CandidateRelease::StillClaimed | CandidateRelease::NotAdvertised => Ok(()),
+            CandidateRelease::LockUnavailable => Err(AdapterError::Connection(
+                "replication: the announce lock was not obtainable; replica candidacy was \
+                 not withdrawn"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// The one atomic step every candidacy release takes: under the
+    /// holders lock, drop `holder` (if given), and only if no claimant is
+    /// left, remove `channel_id`'s tag from the committed baseline before
+    /// the lock is released. A claim registers and checks the baseline
+    /// under the same lock (`claim_replica_candidate`), so a release can
+    /// never remove a tag a live claim believes is advertised. The caller
+    /// holds `baseline_rmw` (or its `try_lock`), so no snapshot-based
+    /// announce is in flight to restore the tag; on `Removed` it publishes.
+    fn drop_candidate_tag_if_unclaimed(
+        &self,
+        holder: Option<u64>,
         channel_id: &[u8; 32],
     ) -> CandidateRelease {
-        if !self.release_candidate_holder(holder, channel_id) {
-            return CandidateRelease::StillClaimed;
+        let mut holders = self.replica_candidate_holders.lock();
+        if let Some(set) = holders.get_mut(channel_id) {
+            if let Some(holder) = holder {
+                set.remove(&holder);
+            }
+            if !set.is_empty() {
+                return CandidateRelease::StillClaimed;
+            }
+            holders.remove(channel_id);
         }
         let tag = Self::replica_candidate_tag(channel_id);
         let Some(_announce_guard) = self.lock_announce_mu() else {
@@ -46547,6 +46593,28 @@ impl MeshNode {
         }
     }
 
+    /// The synchronous [`Self::release_replica_candidate`], for a teardown
+    /// that can't await (a replication runtime aborted rather than shut
+    /// down). Edits the capability baseline without announcing; the caller
+    /// re-announces if it can.
+    pub(crate) fn release_replica_candidate_sync(
+        &self,
+        holder: u64,
+        channel_id: &[u8; 32],
+    ) -> CandidateRelease {
+        // Can't await `baseline_rmw` here. When a snapshot-based announce
+        // holds it, editing the baseline now would be undone by that
+        // announce's commit, so drop only the holder and defer the tag to
+        // the async path (`LockUnavailable`).
+        let Ok(_rmw) = self.baseline_rmw.try_lock() else {
+            if !self.release_candidate_holder(holder, channel_id) {
+                return CandidateRelease::StillClaimed;
+            }
+            return CandidateRelease::LockUnavailable;
+        };
+        self.drop_candidate_tag_if_unclaimed(Some(holder), channel_id)
+    }
+
     /// Record `holder`'s claim on `channel_id`'s candidate tag without
     /// announcing. A resolver registers at construction (inside
     /// `open_file`), before its runtime's first tick announces: a channel
@@ -46559,14 +46627,6 @@ impl MeshNode {
             .entry(*channel_id)
             .or_default()
             .insert(holder);
-    }
-
-    /// Whether no resolver currently claims `channel_id`'s candidate tag.
-    pub(crate) fn replica_candidate_unclaimed(&self, channel_id: &[u8; 32]) -> bool {
-        !self
-            .replica_candidate_holders
-            .lock()
-            .contains_key(channel_id)
     }
 
     /// Remove `holder` from `channel_id`'s claimants; `true` when no
@@ -53340,6 +53400,60 @@ mod fold_publisher_helpers_tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// Replica candidacy: a release decides "no claimant left" and removes
+    /// the tag from the committed baseline in ONE step under the holders
+    /// lock, and a claim registers and checks under that same lock. So a
+    /// release never removes a tag a live claim believes is advertised:
+    /// either it sees the claim and keeps the tag, or the removal is
+    /// already committed when the claim checks, and the claim re-announces
+    /// (the race behind `redex_replication_e2e::reopening_a_channel_never_drops_its_candidacy`).
+    #[tokio::test]
+    async fn candidacy_release_and_claim_are_atomic() {
+        let node = build_node_for_test().await;
+        let ch = [7u8; 32];
+        node.claim_replica_candidate(1, &ch).await.expect("claim A");
+        assert!(node.advertises_replica_candidate(&ch));
+
+        // A second claimant registered: the first's release keeps the tag.
+        node.register_replica_candidate_holder(2, &ch);
+        node.release_replica_candidate(1, &ch)
+            .await
+            .expect("release A");
+        assert!(
+            node.advertises_replica_candidate(&ch),
+            "a live claim keeps the tag"
+        );
+
+        // The last claimant's release has removed the tag from the
+        // committed baseline by the time it returns from its decision.
+        assert!(matches!(
+            node.release_replica_candidate_sync(2, &ch),
+            CandidateRelease::Removed
+        ));
+        assert!(!node.advertises_replica_candidate(&ch), "committed at once");
+
+        // A claim arriving after the removal sees it and re-announces.
+        node.claim_replica_candidate(3, &ch).await.expect("claim C");
+        assert!(node.advertises_replica_candidate(&ch), "re-announced");
+
+        // With `baseline_rmw` held (a snapshot-based announce in flight),
+        // the sync release drops only its holder and defers the tag.
+        let rmw = node.baseline_rmw.lock().await;
+        assert!(matches!(
+            node.release_replica_candidate_sync(3, &ch),
+            CandidateRelease::LockUnavailable
+        ));
+        assert!(
+            node.advertises_replica_candidate(&ch),
+            "deferred, not edited"
+        );
+        drop(rmw);
+        node.withdraw_unclaimed_replica_candidate(&ch)
+            .await
+            .expect("deferred withdraw");
+        assert!(!node.advertises_replica_candidate(&ch));
     }
 
     /// A public handler for the registration tests below.

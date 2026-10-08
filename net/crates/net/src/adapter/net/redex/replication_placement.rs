@@ -231,10 +231,10 @@ impl Drop for MeshReplicaPlacement {
             (CandidateRelease::LockUnavailable, Ok(rt)) => {
                 let mesh = self.mesh.clone();
                 rt.spawn(async move {
-                    if mesh.replica_candidate_unclaimed(&id) {
-                        if let Err(e) = mesh.withdraw_replica_candidate(&id).await {
-                            tracing::warn!(error = ?e, "replication: deferred candidacy withdraw failed");
-                        }
+                    // Atomic with any new claim: see
+                    // `MeshNode::withdraw_unclaimed_replica_candidate`.
+                    if let Err(e) = mesh.withdraw_unclaimed_replica_candidate(&id).await {
+                        tracing::warn!(error = ?e, "replication: deferred candidacy withdraw failed");
                     }
                 });
             }
