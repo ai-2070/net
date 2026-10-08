@@ -127,6 +127,8 @@ Bump to 0.42.0 and rebuild. If you use the fold types directly:
 
 ---
 
+Released 2026-10-08.
+
 ## License
 
 See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).
