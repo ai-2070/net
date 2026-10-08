@@ -1,0 +1,22 @@
+net/crates/net/benches/fold_scale_report.rs
+  s_b4293f9d895548::t_5b0a27f681f340 527,529-531
+docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md
+  s_b4293f9d895548::t_c917e987973206 3003-3011
+  s_b4293f9d895548::t_01422071502bba 2680-2730
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a1601d15ac9f112d17680af3b04951240df2a34a",
+  "prompts": {},
+  "sessions": {
+    "s_b4293f9d895548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a49f9cc-58d8-4a8f-9aac-096640090b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
