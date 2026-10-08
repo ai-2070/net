@@ -4,12 +4,12 @@ description: "Release notes for Net v0.42.0 — Back in Black — what shipped, 
 ---
 # Net v0.42 — "Back in Black"
 
-*AC/DC, 1980: same band as [v0.41](/docs/releases/release-v0.41-thunderstruck), leaner and harder. v0.41 made the capability fold hold a million-node fleet without stalling; v0.42 makes it fit in less than half the memory, and makes an idle expiry sweep do no work at all.*
+*AC/DC, 1980: same band as [v0.41](/docs/releases/release-v0.41-thunderstruck), leaner and harder. v0.41 made the capability fold hold a million-node fleet without stalling; v0.42 makes it fit in less than half the memory, and stops an idle expiry sweep from walking it.*
 
 ## What's in it
 
 - **The capability fold in half the memory.** At a million resident entries the fold now retains about 1.9 GB, down from 4.2 GB. Tags are interned once per fold, index buckets are bitmaps over entry slots, and expiry runs on a timing wheel.
-- **An idle expiry sweep costs nothing.** With nothing due, a sweep at 1M touched every entry twice a second (8.7 ms per tick). It now visits none.
+- **An idle expiry sweep no longer walks the fold.** With nothing due, a sweep at 1M touched every entry twice a second (8.7 ms per tick). It now visits no entry and never takes the write lock: it probes the expiry wheel's due slots under the read lock and returns.
 - **Oversized announcements are refused whole**, at every intake path and before they are sent: more than 8,192 tags, a tag longer than 256 bytes, or more than 256 blob-heat tags.
 - **Breaking, Rust only:** the fold's types and `ServeError` changed. See "Breaking changes".
 
@@ -19,7 +19,7 @@ description: "Release notes for Net v0.42.0 — Back in Black — what shipped, 
 
 Every node keeps a fold of what its peers announce, and every capability query, route choice and placement filter reads it. v0.41 fixed its speed at fleet scale and left memory at 4.2 GB per million entries, with the work that would cut it on hold. That work is this release: three changes, landed as Slices 6–8 of [`CAPABILITY_FOLD_SCALE_PLAN.md`](https://github.com/ai-2070/net/blob/master/docs/internal/plans/CAPABILITY_FOLD_SCALE_PLAN.md).
 
-- **Tags are interned.** A fleet announces the same few thousand tags millions of times. Each distinct tag is now stored once per fold, as a shared, immutable `TagStr`, and counted by a fold-owned dictionary. A reader's cloned handle never keeps a tag alive. Wire bytes, signatures and snapshots are unchanged: `TagStr` serializes exactly as `String`, and an old signature still verifies.
+- **Tags are interned.** A fleet announces the same few thousand tags millions of times. Each distinct tag is now stored once per fold, as a shared, immutable `TagStr`, and counted by a fold-owned dictionary. A reader's cloned handle does not keep a tag in the dictionary, though it keeps that tag's bytes allocated until it is dropped. Wire bytes, signatures and snapshots are unchanged: `TagStr` serializes exactly as `String`, and an old signature still verifies.
 - **Index buckets are bitmaps.** Each tag, region and state bucket held a hash set of `(class, node)` pairs. Each entry now gets a dense `u32` slot, and every bucket is a roaring bitmap of slots: an AND starts from the smallest bucket, an OR is a bitmap union. Freed slots are reused before the table grows, and a full slot table refuses an insert rather than wrapping.
 - **Expiry runs on a timing wheel.** Entries sit in 125 ms slots on a 4,096-slot ring. A sweep probes only the slots that came due since the last one, under the read lock, and returns without the write lock when nothing is due. A refresh relinks its node rather than allocating, so a refresh that changes nothing still makes no allocations (a test enforces it). Expiry is exactly as prompt as the full walk was.
 
@@ -78,7 +78,7 @@ Mixed fleets: a v0.41 node that announces over these limits is accepted by v0.41
 - **A replica's candidacy is no longer dropped when its channel reopens.** Closing and reopening a RedEX channel at once could withdraw the candidacy tag under a claim that had just registered, leaving the channel unadvertised. Release and claim now decide under one lock. A release that finds the announce lock busy retries the withdraw (3 attempts, 1 s apart) rather than leaving a stale tag. The race was on master before this release; the end-to-end test now passes 200 of 200 stress runs (it failed within 1–3).
 - **A service is registered, self-indexed and rolled back under one announce lock.** A concurrent announce could briefly publish the `nrpc:` tag of a service that was about to be refused.
 - **An announce that loses to a newer self-entry in the node's own fold is refused**, with nothing committed. It used to be treated as success.
-- **A refused announce changes nothing**: it no longer consumes a version or edits the baseline.
+- **A refused announce no longer edits the baseline**, and one refused by the tag limits no longer consumes a version. A refusal found only when the node's own fold applies the set (its tag budget, or a newer self-entry) still leaves a gap in announce versions, which receivers tolerate.
 - **An audit sink that reads `stats()` can no longer deadlock** the fold, during a refusal or with a sink replacement queued.
 - **Restore refuses an oversized snapshot before materializing it**, and every fold kind's expiry wheel has a node limit, so a fold that is full refuses a new entry before any mutation.
 
