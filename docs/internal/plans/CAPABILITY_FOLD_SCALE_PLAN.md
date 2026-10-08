@@ -1167,9 +1167,11 @@ valid.
   - The wire form, the signature transcript and the snapshot form are
     unchanged.
 - **Slice 6, capability tags (behavior):**
-  - A capability advertisement carrying more than 256 tags (duplicates
+  - A capability advertisement carrying more than 8,192 tags (duplicates
     counted), or any tag over 256 UTF-8 bytes, is refused whole by every
-    receiver. Local `announce_capabilities*` and `publish_fold` return an
+    receiver. (The first ruling said 256 tags; it was raised, see "Tag cap
+    raised".) An inbound announcement carrying more than 256 blob-heat
+    tags is now refused whole too, instead of being cut to 256. Local `announce_capabilities*` and `publish_fold` return an
     error instead of sending it.
   - A capability fold refuses, whole, an advertisement whose new distinct
     tags would exceed its tag budget (default 1,000,000 tags / 64 MiB of
@@ -1847,6 +1849,8 @@ permission to merge. Slice 7 starts only after Slice 6 is accepted. Slice
 **Rulings.**
 
 1. **Per-advertisement caps: 256 tags, 256 UTF-8 bytes per tag.**
+   *(Tag count superseded: raised to 8,192 on 2026-10-08, see "Tag cap
+   raised". The per-tag length and everything else below stand.)*
    - Count the original vector, duplicates included.
    - Content and order are preserved. Nothing is truncated, normalized or
      silently dropped.
@@ -2554,6 +2558,60 @@ Proof, once authorized:
   output.
 - Slice 4's permanent comparison witness stays green.
 - Retained index bytes drop against a separate B1+B2 target.
+
+#### Tag cap raised: 256 → 8,192 (2026-10-08)
+
+CI at `37a0331c7` and `c4d0c2c68` showed what ruling 1's 256-tag count
+costs. Two tests failed deterministically:
+
+- **`serve_rpc_reannounce_baseline`.** It registers 320 public services
+  on one node. Every public service adds an `nrpc:` tag, so the 257th
+  registration was refused with `CapabilityRefused`.
+- **`nrpc_tool_watch::tool_watch_overflow_drops_deltas_and_emits_resync`.**
+  It overflows a watch buffer with one announcement of 1,600 tools, about
+  6,400 tags. The fold refused it whole, so the expected Resync never
+  came.
+
+**Why 256 was too low.** A default tool contributes 4 tags (`tool_id`,
+`name`, `version`, `stateless`). It adds `ai-tool:` at announce time and
+an `nrpc:` tag when served, so a tool costs 5–7 tags. At 256, one node
+could advertise only ~40–50 tools or ~250 public services, which breaks
+tool-heavy nodes such as an MCP bridge. The ruling had sized the cap
+against the bench fixture's 31 tags.
+
+**Decision (owner, 2026-10-08):** raise the count.
+
+- `MAX_CAPABILITY_TAGS` is **8,192**: the smallest power of two that
+  admits the 6,400-tag flood test unchanged, about 1,600–2,000 tools per
+  node.
+- Everything else in ruling 1 stands: duplicates counted, whole
+  refusal, the same rule on every intake path, and 256 bytes per tag.
+  Together they bound one advertisement's tag data at 2 MiB.
+- The dictionary budget is unchanged.
+
+**One consequence, fixed in the same change.** Raising the count reopened
+part of review defect 3. An announcement with 257–8,192 blob-heat tags
+decoded again, and the live blob-heat amplification filter
+(`MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` = 256) silently cut it to 256.
+
+- `filter_unauthorized_heat_tags` now returns `false`, changing nothing,
+  when blob-heat tags exceed 256. Live intake refuses that announcement
+  whole.
+- Witness: `filter_unauthorized_heat_tags_refuses_a_blob_heat_flood_whole`
+  (exactly 256 kept; 257 refused untouched). It replaces the test that
+  pinned truncation.
+- The decode test is now `decode_refuses_an_over_cap_vector_of_distinct_tags`,
+  at the new cap.
+
+**Gates.**
+- Both CI failures pass unchanged.
+- The full Rust SDK suite with CI's features: 870 pass.
+- The unit suite: 6,050 pass.
+- 62 capability, nRPC, RPC, serve, gang, island, aggregator, sensing,
+  cross-language, dataforts and blob integration binaries: 395 pass.
+- Clippy, strict and all-targets.
+- `RUSTDOCFLAGS=-D warnings cargo doc --all-features`.
+- fmt.
 
 #### Slice 7 evidence packet (implemented; awaiting acceptance)
 

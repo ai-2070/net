@@ -1091,8 +1091,9 @@ pub struct CapabilitySet {
     /// ([`MAX_CAPABILITY_TAGS`](super::fold::MAX_CAPABILITY_TAGS) /
     /// [`MAX_CAPABILITY_TAG_LEN`](super::fold::MAX_CAPABILITY_TAG_LEN)) on
     /// the encoded vector itself, before the `HashSet` collapses
-    /// duplicates or any filter drops a tag: a wire vector of 257
-    /// identical tags, or one overlong tag, fails to decode whole.
+    /// duplicates or any filter drops a tag: a wire vector of one more
+    /// identical tag than the cap, or one overlong tag, fails to decode
+    /// whole.
     #[serde(
         default,
         serialize_with = "serialize_tags_sorted",
@@ -3438,28 +3439,31 @@ mod tests {
     }
 
     /// Review defect 3 at `50a8c60d4`: the per-advertisement caps govern
-    /// the encoded vector, not the set it collapses into. 257 identical
-    /// tags used to deduplicate to one and pass.
+    /// the encoded vector, not the set it collapses into. One identical
+    /// tag over the cap used to deduplicate to one and pass.
     #[test]
     fn decode_counts_duplicate_tags_against_the_cap() {
         use crate::adapter::net::behavior::fold::MAX_CAPABILITY_TAGS;
         let at_cap = vec!["same".to_string(); MAX_CAPABILITY_TAGS];
         let ann = CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&at_cap))
-            .expect("256 encoded tags decode");
+            .expect("exactly the cap of encoded tags decodes");
         assert_eq!(ann.capabilities.tags.len(), 1, "then deduplicate");
 
         let over = vec!["same".to_string(); MAX_CAPABILITY_TAGS + 1];
         assert!(
             CapabilityAnnouncement::from_bytes(&announcement_bytes_with_raw_tags(&over)).is_none(),
-            "257 identical encoded tags refuse the whole announcement"
+            "one identical encoded tag over the cap refuses the whole announcement"
         );
     }
 
-    /// 257 distinct blob-heat tags fail to decode whole. They used to
-    /// decode and be cut to an arbitrary 256 by the blob-heat filter.
+    /// One distinct tag over the cap fails to decode whole, before any
+    /// filter could thin it. (The blob-heat filter's own, smaller cap
+    /// refuses an announcement whole too: see
+    /// `filter_unauthorized_heat_tags_refuses_a_blob_heat_flood_whole`.)
     #[test]
-    fn decode_refuses_257_blob_heat_tags_instead_of_truncating() {
-        let tags: Vec<String> = (0..257)
+    fn decode_refuses_an_over_cap_vector_of_distinct_tags() {
+        use crate::adapter::net::behavior::fold::MAX_CAPABILITY_TAGS;
+        let tags: Vec<String> = (0..=MAX_CAPABILITY_TAGS)
             .map(|i| format!("heat:blob:{i:064x}=1.0"))
             .collect();
         assert!(

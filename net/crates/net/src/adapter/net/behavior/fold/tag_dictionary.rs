@@ -27,7 +27,14 @@ use super::tag_str::TagStr;
 
 /// Most tags one capability advertisement may carry, duplicates
 /// included.
-pub const MAX_CAPABILITY_TAGS: usize = 256;
+///
+/// 8,192, raised from the first ruling's 256: a tool contributes 4-7 tags
+/// (its `software.tool.<i>.*` encoding, `ai-tool:` and a served `nrpc:`
+/// tag), so 256 capped a node at ~40-50 tools or ~250 public services,
+/// which broke tool-heavy nodes (CAPABILITY_FOLD_SCALE_PLAN.md, "Tag cap
+/// raised"). With [`MAX_CAPABILITY_TAG_LEN`] this bounds one
+/// advertisement's tag data at 2 MiB.
+pub const MAX_CAPABILITY_TAGS: usize = 8192;
 
 /// Most UTF-8 bytes one capability tag may hold.
 pub const MAX_CAPABILITY_TAG_LEN: usize = 256;
@@ -325,8 +332,8 @@ mod tests {
         assert_eq!(
             validate_capability_tags(&over),
             Err(PayloadRejection::TooManyTags {
-                count: 257,
-                max: 256
+                count: MAX_CAPABILITY_TAGS + 1,
+                max: MAX_CAPABILITY_TAGS
             }),
             "duplicates count"
         );

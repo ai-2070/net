@@ -41882,8 +41882,12 @@ impl MeshNode {
         // skip the filter — we trust our own emit path. `ann` is
         // already `mut` at the outer binding (the inbound-metadata
         // reserved-key strip needed it), so no re-binding required.
-        if from_node != ctx.local_node_id {
-            Self::filter_unauthorized_heat_tags(&mut ann.capabilities);
+        if from_node != ctx.local_node_id
+            && !Self::filter_unauthorized_heat_tags(&mut ann.capabilities)
+        {
+            // A blob-heat flood past the per-announce cap: refused whole,
+            // never silently thinned to an arbitrary subset.
+            return;
         }
         // OA-1: verify the announcement's owner cert (if any) at
         // the ingest boundary — the OUTER announcement signature is
@@ -41935,9 +41939,25 @@ impl MeshNode {
     /// tag in the same set. This enforces "you can only annotate
     /// heat for chains you advertise as holding," closing the
     /// inbound-heat-tag forge surface.
+    ///
+    /// Returns `false`, changing nothing, when `caps` carries more than
+    /// `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags: the caller refuses
+    /// that announcement whole rather than keep an arbitrary subset (Slice
+    /// 6 review defect 3).
     fn filter_unauthorized_heat_tags(
         caps: &mut crate::adapter::net::behavior::capability::CapabilitySet,
-    ) {
+    ) -> bool {
+        let blob_heat = caps
+            .tags
+            .iter()
+            .filter(|tag| {
+                matches!(tag, Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:"))
+            })
+            .count();
+        if blob_heat > MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE {
+            return false;
+        }
         // Collect every hex this peer claims via causal: tags.
         let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tag in &caps.tags {
@@ -41952,31 +41972,21 @@ impl MeshNode {
                 }
             }
         }
-        // Per-announce cap on `heat:blob:*` tags. Blob-heat is
-        // intentionally not gated by a `causal:` claim (the blob
-        // is content-addressed, so a forged hash just produces a
-        // useless prefetch attempt). But the gravity migration
-        // controller consumes the *rate* via
-        // `should_migrate_blob_to`, so a peer spraying thousands
-        // of `heat:blob:<random>=1.0` tags would force every
-        // healthy node to attempt that many prefetches. The cap
-        // bounds the amplification: at most
-        // `MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE` blob-heat tags
-        // survive the filter per inbound announcement.
-        let mut blob_heat_budget: usize = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE;
+        // Per-announce cap on `heat:blob:*` tags, enforced above by
+        // refusing the whole announcement. Blob-heat is intentionally not
+        // gated by a `causal:` claim (the blob is content-addressed, so a
+        // forged hash just produces a useless prefetch attempt). But the
+        // gravity migration controller consumes the *rate* via
+        // `should_migrate_blob_to`, so a peer spraying thousands of
+        // `heat:blob:<random>=1.0` tags would force every healthy node to
+        // attempt that many prefetches. The cap bounds the amplification;
+        // over it, nothing of the announcement is taken.
         caps.tags.retain(|tag| match tag {
             Tag::Reserved { prefix, body } if prefix == "heat:" => {
-                // Blob-heat tags (body shape `blob:<hex64>=<rate>`)
-                // ride a separate trust model: the blob is
-                // content-addressed, so a forged claim just causes
-                // a useless prefetch attempt at worst (no data
-                // corruption, no traffic redirection). Allow up
-                // to the per-announce cap; drop the overflow.
+                // Blob-heat tags (body shape `blob:<hex64>=<rate>`) ride a
+                // separate trust model and are kept: their count is within
+                // the cap (checked above).
                 if body.starts_with("blob:") {
-                    if blob_heat_budget == 0 {
-                        return false;
-                    }
-                    blob_heat_budget -= 1;
                     return true;
                 }
                 // Chain-heat shape: `<hex>=<rate>`. Hex is everything
@@ -41987,6 +41997,7 @@ impl MeshNode {
             }
             _ => true,
         });
+        true
     }
 
     /// Fan an already-serialized capability announcement out to every
@@ -56806,7 +56817,7 @@ mod chain_helper_tests {
             body: "industrial".to_string(),
         });
 
-        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+        assert!(MeshNode::filter_unauthorized_heat_tags(&mut caps));
 
         // Owned heat tag survives; forged one is gone.
         let surviving_heat: Vec<_> = caps
@@ -56838,46 +56849,43 @@ mod chain_helper_tests {
     /// attempt).
     #[cfg(feature = "dataforts")]
     #[test]
-    fn filter_unauthorized_heat_tags_caps_blob_heat_flood_per_announce() {
-        let mut caps = CapabilitySet::default();
-        // Stuff in 2× the cap of distinct blob-heat tags.
-        let flood = MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE * 2;
-        for i in 0..flood {
-            let mut hash = [0u8; 32];
-            // Pack the index into bytes 0..8 so each hash is
-            // distinct without needing a hash function.
-            hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let hex = MeshNode::blob_hex(&hash);
-            caps.tags.insert(Tag::Reserved {
-                prefix: "heat:".to_string(),
-                body: format!("blob:{hex}=1.00"),
-            });
-        }
-        // Sanity: every distinct tag landed in the HashSet.
-        let pre_filter = caps
-            .tags
-            .iter()
-            .filter(|t| {
-                matches!(t, Tag::Reserved { prefix, body }
-                if prefix == "heat:" && body.starts_with("blob:"))
-            })
-            .count();
-        assert_eq!(pre_filter, flood);
+    fn filter_unauthorized_heat_tags_refuses_a_blob_heat_flood_whole() {
+        let blob_heat = |caps: &CapabilitySet| {
+            caps.tags
+                .iter()
+                .filter(|t| {
+                    matches!(t, Tag::Reserved { prefix, body }
+                    if prefix == "heat:" && body.starts_with("blob:"))
+                })
+                .count()
+        };
+        let flooded = |n: usize| {
+            let mut caps = CapabilitySet::default();
+            for i in 0..n {
+                let mut hash = [0u8; 32];
+                // Pack the index into bytes 0..8 so each hash is
+                // distinct without needing a hash function.
+                hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                let hex = MeshNode::blob_hex(&hash);
+                caps.tags.insert(Tag::Reserved {
+                    prefix: "heat:".to_string(),
+                    body: format!("blob:{hex}=1.00"),
+                });
+            }
+            assert_eq!(blob_heat(&caps), n, "every distinct tag landed");
+            caps
+        };
 
-        MeshNode::filter_unauthorized_heat_tags(&mut caps);
+        // Exactly at the cap: kept whole.
+        let mut at_cap = flooded(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE);
+        assert!(MeshNode::filter_unauthorized_heat_tags(&mut at_cap));
+        assert_eq!(blob_heat(&at_cap), MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE);
 
-        let post_filter = caps
-            .tags
-            .iter()
-            .filter(|t| {
-                matches!(t, Tag::Reserved { prefix, body }
-                if prefix == "heat:" && body.starts_with("blob:"))
-            })
-            .count();
-        assert_eq!(
-            post_filter, MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE,
-            "filter must drop blob-heat tags past the per-announce cap"
-        );
+        // One over: refused whole, untouched, never thinned to a subset
+        // (Slice 6 review defect 3).
+        let mut over = flooded(MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1);
+        assert!(!MeshNode::filter_unauthorized_heat_tags(&mut over));
+        assert_eq!(blob_heat(&over), MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE + 1);
     }
 }
 

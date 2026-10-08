@@ -287,10 +287,10 @@ fn tag_caps_apply_on_every_intake_path() {
             node_id: 0xB,
             reason:
                 PayloadRejection::TooManyTags {
-                    count: 257,
-                    max: 256,
+                    count,
+                    max: MAX_CAPABILITY_TAGS,
                 },
-        }) => {}
+        }) if count == MAX_CAPABILITY_TAGS + 1 => {}
         other => panic!("expected a too-many-tags refusal, got {other:?}"),
     }
 
@@ -319,7 +319,7 @@ fn tag_caps_apply_on_every_intake_path() {
         .expect("encode");
     assert!(registry.dispatch(&bytes, dispatcher.entity_id()).is_err());
 
-    // Legacy intake: an announcement translated with 257 tags.
+    // Legacy intake: an announcement translated with one tag over the cap.
     let mut caps = CapabilitySet::new();
     for tag in n_tags(MAX_CAPABILITY_TAGS + 1) {
         caps = caps.add_tag(tag);
