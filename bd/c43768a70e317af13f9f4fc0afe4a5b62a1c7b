@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/redex/replication_placement.rs
+  s_b4293f9d895548::t_b3f15ddac94e59 234-237
+net/crates/net/src/adapter/net/mesh.rs
+  s_b4293f9d895548::t_249045979c2aa9 46616,53405-53458
+  s_b4293f9d895548::t_b3f15ddac94e59 46498-46512,46523-46533,46537-46540,46542-46566,46569-46577,46596-46615
+  s_b4293f9d895548::t_d37545b375bf07 46617
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bdc43768a70e317af13f9f4fc0afe4a5b62a1c7b",
+  "prompts": {},
+  "sessions": {
+    "s_b4293f9d895548": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a49f9cc-58d8-4a8f-9aac-096640090b94",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
