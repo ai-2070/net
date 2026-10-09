@@ -1,0 +1,14 @@
+net/crates/net/Cargo.lock
+  h_64425bc75e3f3d 2550,2552,3967,3969,3972-3973,3979,3981,3989,3991,3997,4002,4004,4301-4309,5477-5489,5918,5920,5953,5955,5977,5979,6977,6979,6986,6988
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3ebc5d42370b0e84ea823761b39b6c3b0eb0bea7",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
