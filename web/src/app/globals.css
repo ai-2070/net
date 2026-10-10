@@ -800,3 +800,55 @@
     ui-monospace, monospace;
   line-height: 1.15;
 }
+
+/* games page */
+@utility hero-scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.18) 0px,
+    rgba(0, 0, 0, 0.18) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+@utility game-glow {
+  text-shadow:
+    0 0 18px rgba(196, 255, 61, 0.45),
+    0 0 48px rgba(196, 255, 61, 0.2);
+}
+@utility game-btn {
+  clip-path: polygon(
+    10px 0,
+    100% 0,
+    100% calc(100% - 10px),
+    calc(100% - 10px) 100%,
+    0 100%,
+    0 10px
+  );
+}
+@utility game-card {
+  clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 0 100%);
+}
+@keyframes demo-sweep {
+  0% {
+    transform: translateY(-100%);
+  }
+  100% {
+    transform: translateY(100%);
+  }
+}
+@utility animate-demo-sweep {
+  animation: demo-sweep 5s linear infinite;
+}
+@keyframes blink-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@utility animate-blink-soft {
+  animation: blink-soft 1.6s ease-in-out infinite;
+}
