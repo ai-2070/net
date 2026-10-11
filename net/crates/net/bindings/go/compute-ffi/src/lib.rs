@@ -283,8 +283,9 @@ pub extern "C" fn net_compute_free_cstring(s: *mut c_char) {
 ///   call — the compute runtime takes their `Arc` content via
 ///   `Box::from_raw` and re-boxes it into its own fields. Callers
 ///   MUST NOT free them after a successful call.
-/// - On failure (either input NULL), the pointers are left intact
-///   so the caller's deferred `_free` stays correct.
+/// - On failure (either input NULL, or a panic caught during
+///   construction in an unwind build), the pointers are left intact so
+///   the caller's `_free` on the NULL path stays correct.
 ///
 /// Returns a boxed `DaemonRuntimeHandle` — caller owns it and
 /// frees with [`net_compute_runtime_free`]. Returns NULL if any
@@ -298,23 +299,34 @@ pub extern "C" fn net_compute_runtime_new(
         if node_arc.is_null() || channel_configs_arc.is_null() {
             return std::ptr::null_mut();
         }
-        // Take ownership of the boxed Arcs — the caller's LDFLAGS
-        // expectation (paired `_free`) is handled by the fact that we
-        // document consumption in the docstring. Go callers release
-        // these pointers from their finalizer list after the call
-        // succeeds.
-        let node = unsafe { *Box::from_raw(node_arc) };
-        let cc = unsafe { *Box::from_raw(channel_configs_arc) };
+        // Clone the Arcs OUT of the boxes and consume the boxes only once
+        // construction has succeeded. Consuming them first meant a panic
+        // in construction (caught by `ffi_guard` in an unwind build)
+        // returned NULL with both inputs already freed — and Go's
+        // documented NULL path frees them again (SDK audit 2026-10-11).
+        // SAFETY: both pointers are non-null (checked above) and, per the
+        // contract, live boxed Arcs owned by the caller until we consume
+        // them below.
+        let node = unsafe { Arc::clone(&*node_arc) };
+        let cc = unsafe { Arc::clone(&*channel_configs_arc) };
 
         let sdk_mesh = SdkMesh::from_node_arc(node, cc, None);
         let sdk_rt = SdkDaemonRuntime::new(Arc::new(sdk_mesh));
 
         let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Box::into_raw(Box::new(DaemonRuntimeHandle {
+        let handle = Box::into_raw(Box::new(DaemonRuntimeHandle {
             inner: Arc::new(sdk_rt),
             factories: Arc::new(DashMap::new()),
             runtime_id,
-        }))
+        }));
+        // Success: the caller's boxes are consumed, as documented.
+        // SAFETY: same pointers as above, not yet freed; ownership passes
+        // to us on success.
+        unsafe {
+            drop(Box::from_raw(node_arc));
+            drop(Box::from_raw(channel_configs_arc));
+        }
+        handle
     })
 }
 

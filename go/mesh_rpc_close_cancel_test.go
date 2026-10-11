@@ -265,3 +265,68 @@ func TestServerHandleGate_RetireWaitsForInflightOps(t *testing.T) {
 		t.Fatal("enter after retire must refuse")
 	}
 }
+
+// SDK audit 2026-10-11: Split while a Recv was parked on the same call
+// blocked until that Recv returned — forever, on a quiet stream. It now
+// refuses at once and leaves the call usable.
+func TestDuplexSplitDoesNotParkBehindRecv(t *testing.T) {
+	a, b, cleanup := meshHandshakePair(t)
+	defer cleanup()
+	rpcA, err := NewMeshRpc(a)
+	if err != nil {
+		t.Fatalf("NewMeshRpc(a): %v", err)
+	}
+	defer rpcA.Close()
+	rpcB, err := NewMeshRpc(b)
+	if err != nil {
+		t.Fatalf("NewMeshRpc(b): %v", err)
+	}
+	defer rpcB.Close()
+
+	release := make(chan struct{})
+	serve, err := rpcB.ServeDuplex("audit.split.quiet", func(_ *RequestStreamRecv, _ *ResponseSinkSend) error {
+		<-release // never answers while the test runs
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ServeDuplex: %v", err)
+	}
+	defer serve.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	call, err := rpcA.CallDuplex(ctx, b.NodeID(), "audit.split.quiet", DuplexOptions{})
+	if err != nil {
+		t.Fatalf("CallDuplex: %v", err)
+	}
+	defer call.Close()
+
+	recvDone := make(chan error, 1)
+	go func() {
+		_, err := call.Recv()
+		recvDone <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // parked in native next
+
+	split := make(chan error, 1)
+	go func() {
+		_, _, err := call.Split()
+		split <- err
+	}()
+	select {
+	case err := <-split:
+		if !errors.Is(err, ErrSplitWhileReceiving) {
+			t.Fatalf("Split with a parked Recv returned %v, want ErrSplitWhileReceiving", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Split parked behind an in-flight Recv")
+	}
+	// The call is still usable: Close wakes the parked Recv.
+	call.Close()
+	select {
+	case <-recvDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not wake the parked Recv")
+	}
+}

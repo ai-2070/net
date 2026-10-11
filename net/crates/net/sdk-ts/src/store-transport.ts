@@ -163,6 +163,15 @@ export function meshStoreTransport(mesh: MeshNode, options: MeshStoreTransportOp
           if (!open) throw new Error('this store stream is closed');
           await mesh.sendWithRetry(stream, [Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)]);
         },
+        // Ends this handle's sends; the native stream is deliberately left
+        // open, here and in the transport's `close()`. Its id is derived from
+        // the label, so it is the same native stream the peer replies on —
+        // and a native close moves this side to a fresh stream epoch the peer
+        // does not follow: a region host restarted on the same node (the
+        // `world_acceptance` crash-and-restore case) could no longer hear
+        // its neighbours. The cost is bounded: one native stream per
+        // peer x label, reused by every reopen, released at node shutdown
+        // (SDK audit 2026-10-11).
         close: () => {
           open = false;
         },

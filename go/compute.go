@@ -123,9 +123,9 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 
 	handle := C.net_compute_runtime_new(nodeArc, ccArc)
 	if handle == nil {
-		// Constructor consumed the Arcs on success only. On a NULL
-		// return they'd still be intact — but we can't tell which
-		// input Rust faulted on, so we conservatively free both.
+		// The constructor consumes the Arcs on success only; a NULL
+		// return (including a panic caught mid-construction in an
+		// unwind build) leaves both intact, so they are ours to free.
 		C.net_mesh_arc_free(nodeArc)
 		C.net_mesh_channel_configs_arc_free(ccArc)
 		return nil, &DaemonError{Message: "failed to build runtime"}

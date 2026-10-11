@@ -734,6 +734,13 @@ var ErrRpcClosed = errors.New("net.MeshRpc: handle is closed")
 // release the handle.
 var ErrStreamDone = errors.New("net.RpcStream: stream is done")
 
+// ErrSplitWhileReceiving is returned by DuplexCall.Split when a Recv is
+// parked on the same call. The native side holds the stream across a
+// parked Recv, so Split used to block until that Recv returned — forever,
+// on a quiet stream. Split before handing the call to goroutines, or
+// stop the reader first (SDK audit 2026-10-11).
+var ErrSplitWhileReceiving = errors.New("net.DuplexCall: Split while a Recv is in flight")
+
 // ABIVersion returns the C-ABI version exported by the linked
 // `libnet_rpc`. Compare against `ExpectedABIVersion` at process
 // init to detect drift.
@@ -1859,6 +1866,12 @@ type DuplexCall struct {
 	guard       *streamHandleGuard
 	cancel      context.CancelFunc
 	watcherDone chan struct{}
+	// Split/Recv handshake (sequentially consistent atomics): Split raises
+	// splitting, then backs out if a Recv is in flight; a Recv counts
+	// itself in, then backs out if a Split has started. One of the two
+	// always sees the other, so Split never parks behind a Recv.
+	recvActive atomic.Int32
+	splitting  atomic.Bool
 }
 
 // CallDuplex opens a duplex call. ctx semantics same as
@@ -1963,6 +1976,11 @@ func (d *DuplexCall) FinishSending() error {
 // Recv blocks until the next response chunk arrives or the
 // stream terminates. Returns ErrStreamDone on clean end.
 func (d *DuplexCall) Recv() ([]byte, error) {
+	d.recvActive.Add(1)
+	defer d.recvActive.Add(-1)
+	if d.splitting.Load() {
+		return nil, ErrStreamDone // the call is being split into halves
+	}
 	if !d.guard.enter() {
 		return nil, ErrStreamDone
 	}
@@ -1996,11 +2014,17 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 // no-ops. CANCEL fires only when BOTH split halves drop without
 // a clean close.
 //
-// Split must not race a Recv on the same call: the native side holds
-// the stream lock across a parked Recv, so a concurrent Split blocks
-// until that Recv returns (Close / ctx cancel wake it). Split before
-// handing the call to goroutines.
+// Split does not wait for a Recv on the same call: with one in flight it
+// returns ErrSplitWhileReceiving and leaves the call usable (the native
+// side holds the stream across a parked Recv, so waiting could block
+// forever). A Recv that starts while a Split is under way returns
+// ErrStreamDone. Split before handing the call to goroutines.
 func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
+	d.splitting.Store(true)
+	if d.recvActive.Load() != 0 {
+		d.splitting.Store(false)
+		return nil, nil, ErrSplitWhileReceiving
+	}
 	// Split is the terminal op. enter() fails (ErrStreamDone) if
 	// Close/the watcher already requested teardown.
 	if !d.guard.enter() {
