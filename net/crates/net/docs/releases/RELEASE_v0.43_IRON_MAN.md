@@ -100,7 +100,7 @@ The listener behind every anchor's `/rtc/offer` and `/rtc/trickle`:
 
 ## Smaller changes
 
-- Deck commit (Go/C, Node, Python) commits the simulator's stored triple and requires its provenance stamp.
+- Deck commit (Go/C, Node, Python) commits the simulator's stored triple and requires its provenance stamp. `simulate()` stamps the proposal with the time it was created, not the time it was simulated, so a commit no longer fails `provenance_mismatch` when a millisecond passes between the two (#1238).
 - Dependency updates, including `serde_json`, `syn` and the web site's packages.
 
 ---
