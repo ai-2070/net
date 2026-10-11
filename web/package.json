@@ -120,7 +120,7 @@
     "@next/eslint-plugin-next": "16.4.0",
     "@tailwindcss/postcss": "4.3.3",
     "@tailwindcss/typography": "0.5.20",
-    "@tanstack/react-query-devtools": "5.104.1",
+    "@tanstack/react-query-devtools": "5.104.2",
     "@types/node": "24.19.2",
     "@types/prettier": "3.0.0",
     "@types/react": "19.3.0",
