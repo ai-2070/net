@@ -47,7 +47,7 @@ use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::operator::OperatorEnrollment as SdkOperatorEnrollment;
 use net_sdk::Identity as SdkIdentity;
 
-use crate::common::validate_ttl_seconds;
+use crate::common::{validate_ttl_seconds, validate_whole_in_u32};
 use crate::delegation::{entity_id_from_buffer, u64_arg, DelegationChain, RevocationRegistry};
 use crate::identity::Identity;
 use crate::NetMesh;
@@ -760,13 +760,22 @@ impl NetMesh {
         approver: Function<'_, JoinRequest, Either<Promise<bool>, bool>>,
         grant_ttl_seconds: f64,
         max_depth: Option<u8>,
-        approve_timeout_ms: Option<u32>,
+        approve_timeout_ms: Option<f64>,
     ) -> Result<PromiseRaw<'env, EnrollmentServeHandle>> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
         let ttl = Duration::from_secs(
             validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
         );
-        let budget = Duration::from_millis(u64::from(approve_timeout_ms.unwrap_or(300_000)));
+        // Validated as an f64: a `u32` parameter took `-1` as 4 294 967 295
+        // ms (~49.7 days of a stalled approver holding each join), and `0`
+        // timed out every approval — every device refused (code review
+        // 2026-10-11, NODE-2).
+        let budget = Duration::from_millis(match approve_timeout_ms {
+            None => 300_000,
+            Some(ms) => {
+                validate_whole_in_u32("approveTimeoutMs", ms, "milliseconds").map_err(enroll_err)?
+            }
+        });
         let tsfn: ApproverTsfn = approver.build_threadsafe_function().build()?;
         let tsfn = Arc::new(tsfn);
         let node = self.node_arc_clone()?;

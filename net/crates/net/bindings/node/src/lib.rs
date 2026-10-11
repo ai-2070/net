@@ -2256,6 +2256,10 @@ mod mesh_bindings {
         /// called on the JS thread, once per event, in delivery order.
         /// One subscription per stream id: a second one throws until the
         /// first is closed.
+        ///
+        /// Hold the returned subscription: when it is garbage-collected it
+        /// unregisters, exactly as `close()` does. The `@net-mesh/sdk`
+        /// `MeshNode` holds it for you until `close()`.
         #[napi]
         pub fn on_stream_data(
             &self,

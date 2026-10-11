@@ -1958,6 +1958,15 @@ mod mesh_bindings {
             approve_timeout_ms: Option<u64>,
         ) -> PyResult<crate::enrollment::PyEnrollmentServeHandle> {
             let depth = max_depth.unwrap_or(net_sdk::delegation::DEFAULT_DELEGATION_DEPTH);
+            // A zero budget times out every approval before the approver
+            // can answer: every device refused, silently (code review
+            // 2026-10-11, NODE-2 — the Node binding's twin).
+            let approve_timeout_ms = approve_timeout_ms.unwrap_or(300_000);
+            if approve_timeout_ms == 0 {
+                return Err(PyValueError::new_err(
+                    "approve_timeout_ms must be at least 1 (0 would deny every request)",
+                ));
+            }
             crate::enrollment::mesh_serve_enrollment(
                 self.node_arc_clone()?,
                 &self.runtime,
@@ -1965,7 +1974,7 @@ mod mesh_bindings {
                 std::time::Duration::from_secs(grant_ttl_seconds),
                 depth,
                 approver,
-                std::time::Duration::from_millis(approve_timeout_ms.unwrap_or(300_000)),
+                std::time::Duration::from_millis(approve_timeout_ms),
             )
         }
 

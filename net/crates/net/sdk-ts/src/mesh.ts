@@ -456,6 +456,14 @@ export interface StreamDataSubscription {
  */
 export class MeshNode {
   private native: NapiNetMesh;
+  /**
+   * Every live `onStreamData` subscription, held until `close()`. The
+   * native subscription unregisters when garbage-collected, so a caller
+   * that discarded the returned handle had delivery stop at an arbitrary
+   * GC (code review 2026-10-11, NODE-1). Held here, a subscription lives
+   * as long as this node — as it did before the native collector existed.
+   */
+  private readonly streamSubscriptions = new Set<unknown>();
 
   private constructor(native: NapiNetMesh) {
     this.native = native;
@@ -723,6 +731,9 @@ export class MeshNode {
    * rejection is fatal by default, either of which a remote peer's payload
    * could trigger. The error goes to `options.onError` if given, else to a
    * process warning, and delivery continues.
+   *
+   * The subscription lasts until `close()` or until this node is gone —
+   * discarding the returned handle does not end it.
    */
   onStreamData(
     streamId: bigint,
@@ -741,6 +752,7 @@ export class MeshNode {
         error => onError(error, data),
       );
     });
+    this.streamSubscriptions.add(native);
     return {
       get streamId() {
         return native.streamId;
@@ -748,7 +760,10 @@ export class MeshNode {
       get droppedEvents() {
         return native.droppedEvents;
       },
-      close: () => native.close(),
+      close: () => {
+        this.streamSubscriptions.delete(native);
+        return native.close();
+      },
     };
   }
 
@@ -1472,6 +1487,8 @@ export class MeshNode {
   /** Shutdown the mesh node. */
   async shutdown(): Promise<void> {
     await this.native.shutdown();
+    // Nothing is delivered past shutdown; let the subscriptions go.
+    this.streamSubscriptions.clear();
   }
 }
 

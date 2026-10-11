@@ -322,6 +322,21 @@ describe.skipIf(!HAS_ENROLLMENT)('enrollment', () => {
     }
   })
 
+  // Code review 2026-10-11 NODE-2: approveTimeoutMs was a raw u32 — `-1`
+  // became ~49.7 days and `0` denied every request.
+  it.each([-1, 0, 1.5, Number.NaN, 2 ** 32])('refuses approveTimeoutMs %s', async (ms) => {
+    const root = Identity.generate()
+    const opMesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
+    try {
+      const { op } = operator(root)
+      await expect(
+        Promise.resolve().then(() => opMesh.serveEnrollment(op, () => true, 3600, null, ms)),
+      ).rejects.toThrow(/approveTimeoutMs/)
+    } finally {
+      await opMesh.shutdown().catch(() => {})
+    }
+  })
+
   it('renews a grant over the mesh into a fresh chain', async () => {
     // A device joins, then renews its grant over the wire into a fresh one —
     // silent auto-renewal, no re-pairing.
