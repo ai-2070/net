@@ -1,0 +1,72 @@
+go/mesh.go
+  s_16bd53708deb14::t_9fd1390d66883b 504-519,561-566,628-630
+  s_16bd53708deb14::t_d3aeaf5542e051 489-503,631-632
+go/compute_register_race_test.go
+  s_16bd53708deb14::t_f7cbd5be8e230d 1-82
+go/meshos_test.go
+  s_16bd53708deb14::t_02db050bfc943a 315-331,341-346,354-356,363-365
+  s_16bd53708deb14::t_b07b45b1b0dc2a 357-362
+go/cortex.go
+  s_16bd53708deb14::t_b7c397f7e429dd 1338
+  s_16bd53708deb14::t_45409a72e2e9c1 1342,1357-1370
+  s_16bd53708deb14::t_5f20cb5af0b1f8 1371-1372
+net/crates/net/include/net_rpc.h
+  s_16bd53708deb14::t_c476e1f43325ed 1060-1064
+go/scheduler_test.go
+  s_16bd53708deb14::t_45409a72e2e9c1 5,182-200,218
+  s_16bd53708deb14::t_b7c397f7e429dd 177-181,201-217
+go/compute.go
+  s_16bd53708deb14::t_3ad860db4f2d82 294
+  s_16bd53708deb14::t_0f054a1bc59898 287-293,295
+  s_16bd53708deb14::t_5b010dcb7cbdb7 23,76-131,163,392-393,395,399-405
+  s_16bd53708deb14::t_c1173c37306938 145-148,150-153,155-162,164
+go/aggregator.go
+  s_16bd53708deb14::t_9fd1390d66883b 285-287,458-465
+  s_16bd53708deb14::t_1fcb89e6a8f686 279-284,466
+go/groups_test.go
+  s_16bd53708deb14::t_535d140bf318a6 18,20,434-554
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_16bd53708deb14::t_947e3c196352f5 4443-4472,6450-6458,7104-7112,7234-7242,7308-7309,7317-7320,7322
+go/mesh_rpc_construct_cancel_test.go
+  s_16bd53708deb14::t_244c6c109c98d1 1-4,12-68,74-77
+  s_16bd53708deb14::t_93bf478fb81c8f 5,69-73
+  s_16bd53708deb14::t_d2114030b72f0c 6-11
+net/crates/net/tests/integration_mesh_cancel.rs
+  s_16bd53708deb14::t_7843f570b1ef2f 437-483
+go/compute_dispatch.go
+  s_16bd53708deb14::t_0f054a1bc59898 186-224
+go/org.go
+  s_16bd53708deb14::t_d2d257addc2de9 849-853,855-856,861,868,888-892,894-895,899,906,924-928,930-931,935,942
+  s_16bd53708deb14::t_fbcd8ad7581c4f 738-750
+net/crates/net/bindings/go/meshos-ffi/src/lib.rs
+  s_16bd53708deb14::t_4c66dbf188b2e6 835-843,998-1006
+  s_16bd53708deb14::t_961c929a40c517 1140-1142,1295-1304,1307-1329
+go/mesh_rpc.go
+  s_16bd53708deb14::t_6d9be343839ded 1293-1295,1300-1301,1318,1361-1363,1368-1369,1385,1772-1774,1779-1780,1796,1960-1962,1967-1968,1985
+  s_16bd53708deb14::t_19ce39dc708e3e 1203-1238
+go/groups.go
+  s_16bd53708deb14::t_3ea95a125c4c47 323-330,333,339,503-510,513,519,672-679,682,688
+  s_16bd53708deb14::t_a2abeecde72f15 40-47
+go/mesh_shutdown_ctor_test.go
+  s_16bd53708deb14::t_6ee3e9dfef6d66 1-47
+net/crates/net/include/net_meshos.h
+  s_16bd53708deb14::t_c476e1f43325ed 359-361
+go/mesh_rpc_close_cancel_test.go
+  s_16bd53708deb14::t_7aa73ae0fed427 306,308,312-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e38d899142f2db24645f89945293b132aa95d42",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
