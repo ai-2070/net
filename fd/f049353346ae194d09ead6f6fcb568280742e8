@@ -1,0 +1,67 @@
+net/crates/net/bindings/node/src/blob.rs
+  s_ae82cd919caae2::t_a5b6cf5e418474 309-312,314-315
+go/capabilities_test.go
+  s_ae82cd919caae2::t_8dadc785535972 14
+  s_ae82cd919caae2::t_0f009994a90d05 11
+  s_ae82cd919caae2::t_c6eb288e230264 511-527
+  s_ae82cd919caae2::t_6b70173c523f08 501
+net/crates/net/bindings/python/tests/test_capabilities.py
+  s_ae82cd919caae2::t_8a17c3e12aa997 329-331
+net/crates/net/sdk-py/src/net_sdk/channel.py
+  s_ae82cd919caae2::t_7d760d11e69a5f 261-264
+net/crates/net/include/net_rpc.h
+  s_ae82cd919caae2::t_c74e657abe15e1 63
+net/crates/net/bindings/python/src/capabilities.rs
+  s_ae82cd919caae2::t_8a17c3e12aa997 577-582,585-586
+  s_ae82cd919caae2::t_bb2b8f7c9f93ba 583-584
+net/crates/net/bindings/node/src/enrollment.rs
+  s_ae82cd919caae2::t_148301e2bc9808 406-410,423,427-429,448,452-454,718,722-724
+  s_ae82cd919caae2::t_252d49edfef441 49
+net/crates/net/sdk-py/tests/test_channel_payloads.py
+  s_ae82cd919caae2::t_f664eab2e97314 314-326
+net/crates/net/bindings/python/tests/test_cross_lang_blob_describe.py
+  s_ae82cd919caae2::t_21e333eee5d968 81-92
+go/subnets_test.go
+  s_ae82cd919caae2::t_6b70173c523f08 245
+go/mesh_rpc.go
+  s_ae82cd919caae2::t_99942a6c374ff5 386
+  s_ae82cd919caae2::t_c74e657abe15e1 411-416,425-429,449-451,453,459-481,960-962,964
+net/crates/net/bindings/node/test/enrollment.test.ts
+  s_ae82cd919caae2::t_29b62952619bae 68-79
+net/crates/net/sdk-ts/test/typed_channel_filter.test.ts
+  s_ae82cd919caae2::t_c66cc95096e85d 43-84
+net/crates/net/bindings/python/src/blob.rs
+  s_ae82cd919caae2::t_a5b6cf5e418474 89-94,96-97
+net/crates/net/src/ffi/mesh.rs
+  s_ae82cd919caae2::t_6b70173c523f08 498
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_ae82cd919caae2::t_a5b6cf5e418474 2607-2609
+net/crates/net/bindings/node/src/delegation.rs
+  s_ae82cd919caae2::t_252d49edfef441 215,218-219,227
+go/mesh.go
+  s_ae82cd919caae2::t_6b70173c523f08 250-255
+go/mesh_rpc_errors_test.go
+  s_ae82cd919caae2::t_99942a6c374ff5 1-24
+net/crates/net/sdk-ts/src/channel.ts
+  s_ae82cd919caae2::t_7d760d11e69a5f 112-115,119-137,191,199
+net/crates/net/bindings/node/src/common.rs
+  s_ae82cd919caae2::t_148301e2bc9808 55-69,178-188
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_ae82cd919caae2::t_69d1a4e7f58111 2586,2594,2625
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fdf049353346ae194d09ead6f6fcb568280742e8",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
