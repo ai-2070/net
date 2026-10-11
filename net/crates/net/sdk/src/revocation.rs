@@ -22,7 +22,7 @@
 //! composes with a future mesh-published root-revocation layer, which would
 //! simply *write* into this same store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -57,6 +57,11 @@ pub enum RevocationStoreError {
 struct RevocationFile {
     #[serde(default)]
     floors: Vec<StoredFloor>,
+    /// Revoked SUBJECTS (lowercase hex entity ids): any chain naming one as a
+    /// link subject is refused. Omitted when empty, so a store without one
+    /// stays byte-identical to the pre-existing format.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_subjects: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,10 +71,21 @@ struct StoredFloor {
     generation: u32,
 }
 
-/// A snapshot of the machine-shared revocation floors (`issuer → generation`).
+/// A snapshot of the machine-shared revocation floors (`issuer → generation`)
+/// and revoked subjects.
+///
+/// The two answer different questions. A **floor** is per *issuer* and
+/// generation-scoped: it kills links that issuer signed below a generation,
+/// which is also how an entity rotates past its own outstanding grants and
+/// keeps working at the new generation. It never touches a link issued *to*
+/// that entity — so raising a device's floor left its own root-issued
+/// `root → device` grant valid. A **revoked subject** is the "this device is
+/// gone" record: any chain that names it as a link subject is refused,
+/// whatever generation signed the link (SDK audit 2026-10-11).
 #[derive(Debug, Clone, Default)]
 pub struct RevocationStore {
     floors: BTreeMap<[u8; 32], u32>,
+    subjects: BTreeSet<[u8; 32]>,
 }
 
 impl RevocationStore {
@@ -101,7 +117,16 @@ impl RevocationStore {
                         *e = f.generation;
                     }
                 }
-                Ok(Self { floors })
+                let mut subjects = BTreeSet::new();
+                for hex in &file.revoked_subjects {
+                    let key =
+                        decode_entity_hex(hex).map_err(|reason| RevocationStoreError::Corrupt {
+                            path: path.display().to_string(),
+                            reason,
+                        })?;
+                    subjects.insert(key);
+                }
+                Ok(Self { floors, subjects })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(RevocationStoreError::Io {
@@ -125,14 +150,37 @@ impl RevocationStore {
         }
     }
 
+    /// Whether `subject` has been revoked as a subject (see the type docs).
+    pub fn is_subject_revoked(&self, subject: &EntityId) -> bool {
+        self.subjects.contains(subject.as_bytes())
+    }
+
+    /// The revoked subjects.
+    pub fn revoked_subjects(&self) -> impl Iterator<Item = EntityId> + '_ {
+        self.subjects.iter().map(|b| EntityId::from_bytes(*b))
+    }
+
     /// Number of revoked issuers (testing/diagnostics).
     pub fn len(&self) -> usize {
         self.floors.len()
     }
 
-    /// Whether the store has no revocations.
+    /// Whether the store has no revocations (no floors and no revoked
+    /// subjects).
     pub fn is_empty(&self) -> bool {
-        self.floors.is_empty()
+        self.floors.is_empty() && self.subjects.is_empty()
+    }
+
+    /// Revoke `subject` outright: persist it to `path` (cross-process lock,
+    /// atomic rename) so every chain naming it as a link subject is refused.
+    /// Monotonic and idempotent; there is no un-revoke.
+    pub fn revoke_subject(
+        path: impl AsRef<Path>,
+        subject: &EntityId,
+    ) -> Result<(), RevocationStoreError> {
+        Self::mutate(path.as_ref(), |store| {
+            store.subjects.insert(*subject.as_bytes());
+        })
     }
 
     /// Revoke: raise `issuer`'s floor to at least `generation`, persisting to
@@ -144,7 +192,19 @@ impl RevocationStore {
         issuer: &EntityId,
         generation: u32,
     ) -> Result<u32, RevocationStoreError> {
-        let path = path.as_ref();
+        let mut new_floor = 0;
+        Self::mutate(path.as_ref(), |store| {
+            let entry = store.floors.entry(*issuer.as_bytes()).or_insert(0);
+            if generation > *entry {
+                *entry = generation;
+            }
+            new_floor = *entry;
+        })?;
+        Ok(new_floor)
+    }
+
+    /// Load → `change` → save atomically, all under the cross-process lock.
+    fn mutate(path: &Path, change: impl FnOnce(&mut Self)) -> Result<(), RevocationStoreError> {
         let io = |e: std::io::Error| RevocationStoreError::Io {
             path: path.display().to_string(),
             reason: e.to_string(),
@@ -171,16 +231,9 @@ impl RevocationStore {
             f
         };
 
-        // Load → raise the floor → save atomically, all under the lock.
         let mut store = Self::load(path)?;
-        let key = *issuer.as_bytes();
-        let entry = store.floors.entry(key).or_insert(0);
-        if generation > *entry {
-            *entry = generation;
-        }
-        let new_floor = *entry;
-        store.save_atomic(path)?;
-        Ok(new_floor)
+        change(&mut store);
+        store.save_atomic(path)
     }
 
     /// Persist atomically: write a sibling temp file (owner-only on Unix), fsync,
@@ -200,6 +253,7 @@ impl RevocationStore {
                     generation: *gen,
                 })
                 .collect(),
+            revoked_subjects: self.subjects.iter().map(|b| encode_entity_hex(b)).collect(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| RevocationStoreError::Io {
             path: path.display().to_string(),
@@ -313,6 +367,31 @@ mod tests {
         let reloaded = RevocationStore::load(&path).unwrap();
         assert_eq!(reloaded.floor(issuer.entity_id()), 1);
         assert_eq!(reloaded.len(), 1);
+    }
+
+    #[test]
+    fn revoked_subjects_round_trip_and_keep_floors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let a = Identity::generate();
+        let b = Identity::generate();
+        RevocationStore::revoke_below(&path, a.entity_id(), 3).unwrap();
+        // A store with no revoked subjects keeps the original file shape.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("revoked_subjects"), "{raw}");
+
+        RevocationStore::revoke_subject(&path, b.entity_id()).unwrap();
+        RevocationStore::revoke_subject(&path, b.entity_id()).unwrap(); // idempotent
+        let store = RevocationStore::load(&path).unwrap();
+        assert!(store.is_subject_revoked(b.entity_id()));
+        assert!(!store.is_subject_revoked(a.entity_id()));
+        assert_eq!(
+            store.floor(a.entity_id()),
+            3,
+            "floors survive the subject write"
+        );
+        assert_eq!(store.revoked_subjects().count(), 1);
+        assert!(!store.is_empty());
     }
 
     #[test]

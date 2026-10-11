@@ -313,6 +313,11 @@ impl OperatorEnrollment {
             return Err(OperatorError::NoOpRevocation);
         }
         RevocationStore::revoke_below(&self.revocation_path, device, generation)?;
+        // The floor kills links the device ISSUED; its own root-issued
+        // `root → device` grant has the root as issuer and survived it. The
+        // revoked-subject record is what refuses a chain naming the device
+        // itself (SDK audit 2026-10-11).
+        RevocationStore::revoke_subject(&self.revocation_path, device)?;
         DeviceRegistry::mark_revoked(&self.registry_path, device, now)?;
         Ok(())
     }
@@ -633,6 +638,11 @@ mod tests {
         assert!(gw_chain
             .verify(gateway.entity_id(), root.entity_id(), &enforced, 0)
             .is_err());
+        // And the device itself is recorded as a revoked SUBJECT, which is what
+        // refuses its own root-issued grant at a gate (SDK audit 2026-10-11).
+        assert!(RevocationStore::load(&op.revocation_path)
+            .unwrap()
+            .is_subject_revoked(device.entity_id()));
     }
 
     #[test]
