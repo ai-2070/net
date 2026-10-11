@@ -1,0 +1,32 @@
+net/crates/net/sdk/src/enrollment/service.rs
+  s_ae82cd919caae2::t_df0282055a65dc 28,318-324
+net/crates/net/sdk/tests/enrollment_org.rs
+  s_ae82cd919caae2::t_8ece757f5effbf 786-809
+net/crates/net/sdk/tests/enrollment_redeem.rs
+  s_ae82cd919caae2::t_4776b6a888037e 269-274,276-302,304-315,317-321
+  s_ae82cd919caae2::t_f062c8d4074dec 275,303,316
+  s_ae82cd919caae2::t_df0862141df3ba 268
+net/crates/net/sdk/src/enrollment/bundle.rs
+  s_ae82cd919caae2::t_df0282055a65dc 835-839
+net/crates/net/sdk/tests/enrollment_subnet.rs
+  s_ae82cd919caae2::t_4776b6a888037e 193-210
+  s_ae82cd919caae2::t_db813935795efd 190-192
+net/crates/net/sdk/src/org/floors.rs
+  s_ae82cd919caae2::t_8ece757f5effbf 21-25,166-167,335-338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8e69de62965fbca597e03bb1efa05886d988ad7f",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
