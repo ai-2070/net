@@ -1,0 +1,24 @@
+net/crates/net/bindings/python/tests/test_shutdown_while_blocked.py
+  s_16bd53708deb14::t_e6daedfc906c04 21-25,53,61-63,66
+net/crates/net/src/adapter/net/mesh.rs
+  s_16bd53708deb14::t_86721ddf3f5557 25442-25443
+  s_16bd53708deb14::t_2105fcd307d3c6 25436-25441,25444-25454
+net/crates/net/tests/integration_mesh_cancel.rs
+  s_16bd53708deb14::t_86721ddf3f5557 837-868
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "671f919795e512b89bd110696ddb1e2c9d1f0212",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
