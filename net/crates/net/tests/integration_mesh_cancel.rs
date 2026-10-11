@@ -834,3 +834,35 @@ async fn cancel_client_stream_consume_terminal_still_fires_the_wire_cancel() {
         )
         .expect("the provider handler task dropped without signalling");
 }
+
+/// cubic review of PR #1228: `accept` sat out its whole handshake budget
+/// (~15 s by default) after the node shut down, so a binding thread parked
+/// in it outlived the node. It now races the handshake against shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_wakes_a_parked_accept() {
+    use net::adapter::Adapter;
+    let node = build_node().await;
+    let accepting = {
+        let node = node.clone();
+        tokio::spawn(async move { node.accept(0xDEAD_BEEF).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !accepting.is_finished(),
+        "nobody handshakes: accept must be parked"
+    );
+    let started = std::time::Instant::now();
+    node.shutdown().await.expect("shutdown");
+    let result = tokio::time::timeout(Duration::from_secs(3), accepting)
+        .await
+        .expect("accept must return promptly once the node shuts down")
+        .expect("spawn task panicked");
+    assert!(result.is_err(), "a shut-down accept cannot succeed");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // An accept started after shutdown fails at once.
+    let late = tokio::time::timeout(Duration::from_secs(1), node.accept(0xDEAD_BEEF))
+        .await
+        .expect("an accept on a shut-down node returns at once");
+    assert!(late.is_err());
+}

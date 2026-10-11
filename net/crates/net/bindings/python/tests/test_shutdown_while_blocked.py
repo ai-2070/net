@@ -18,9 +18,11 @@ net = pytest.importorskip("net", reason="net wheel not built")
 
 PSK = "42" * 32
 
-#: Upper bound for a parked `accept` to return: the core handshake budget
-#: (3 retries x 5s) plus slack for a loaded CI runner.
-_ACCEPT_BUDGET_S = 30
+#: Upper bound for a parked `accept` to return after shutdown. Core
+#: `MeshNode::accept` races its handshake against node shutdown, so this is
+#: well under the ~15 s handshake budget it used to sit out (cubic review of
+#: PR #1228); the slack is for a loaded CI runner.
+_ACCEPT_RETURN_S = 5
 
 
 @pytest.mark.parametrize("via_exit", [False, True])
@@ -48,6 +50,7 @@ def test_shutdown_while_another_thread_blocks_in_accept(next_port, via_exit) -> 
     assert not returned.is_set(), "accept returned before shutdown; nothing was blocked"
     assert t.is_alive()
 
+    started = time.monotonic()
     if via_exit:
         assert mesh.__exit__(None, None, None) is False
     else:
@@ -55,12 +58,9 @@ def test_shutdown_while_another_thread_blocks_in_accept(next_port, via_exit) -> 
     assert repr(mesh) == "NetMesh(shutdown)"
     mesh.shutdown()  # idempotent
 
-    # The parked caller must come back after shutdown, not hang forever.
-    # NOTE: core `MeshNode::accept` does not observe shutdown today — it
-    # returns only when its handshake budget runs out (default
-    # `handshake_retries` 3 x `handshake_timeout` 5s = ~15s, not
-    # configurable from Python), so the bound is that budget plus slack
-    # rather than "promptly".
-    t.join(timeout=_ACCEPT_BUDGET_S)
+    # The parked caller must come back promptly after shutdown — not sit out
+    # the handshake budget, and not hang forever.
+    t.join(timeout=_ACCEPT_RETURN_S)
     assert not t.is_alive(), "accept stayed blocked after NetMesh.shutdown()"
     assert returned.is_set()
+    assert time.monotonic() - started < _ACCEPT_RETURN_S

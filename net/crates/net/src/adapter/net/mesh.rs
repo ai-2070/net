@@ -25433,7 +25433,25 @@ impl MeshNode {
         // `accept_in_flight` (so `start()` refuses) for that whole
         // time. See `try_handshake_responder`'s doc for why that is
         // the right trade and what to tune.
-        let (keys, handshake_hash, peer_endpoint) = self.handshake_responder(peer_node_id).await?;
+        //
+        // Raced against node shutdown: the responder otherwise sat out that
+        // whole budget (~15 s by default) after `shutdown()`, so a binding's
+        // thread blocked in `accept` outlived the node it was accepting for
+        // (cubic review of PR #1228). `enable` before the flag re-check, so a
+        // shutdown landing in between is never missed.
+        let shut_down =
+            || AdapterError::Connection("the node shut down while accept() was waiting".into());
+        let shutdown_signal = self.shutdown_notify.notified();
+        tokio::pin!(shutdown_signal);
+        shutdown_signal.as_mut().enable();
+        if self.shutdown.load(AtOrd::Acquire) {
+            return Err(shut_down());
+        }
+        let (keys, handshake_hash, peer_endpoint) = tokio::select! {
+            biased;
+            _ = &mut shutdown_signal => return Err(shut_down()),
+            responded = self.handshake_responder(peer_node_id) => responded?,
+        };
 
         // The responder side of a handshake is the SAME lifecycle
         // operation as the initiator side, so it runs through the same
