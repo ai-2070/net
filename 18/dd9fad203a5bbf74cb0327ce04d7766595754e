@@ -1,0 +1,36 @@
+net/crates/net/sdk-ts/src/deck.ts
+  s_ae82cd919caae2::t_808b52c88d7ffe 65
+  s_ae82cd919caae2::t_02c52b943c6407 262,415,622,692,817
+net/crates/net/sdk-ts/test/json_lossless.test.ts
+  s_ae82cd919caae2::t_019e4421b2d4a8 22
+  s_ae82cd919caae2::t_808b52c88d7ffe 1-21,23-32
+net/crates/net/sdk-ts/src/cortex.ts
+  s_ae82cd919caae2::t_137149a5adc275 482
+  s_ae82cd919caae2::t_b037997fdfdf20 126
+  s_ae82cd919caae2::t_f0fb2fd077b9c0 423,655,862
+net/crates/net/sdk-ts/src/watch-iter.ts
+  s_ae82cd919caae2::t_b037997fdfdf20 1-76
+net/crates/net/sdk-ts/src/index.ts
+  s_ae82cd919caae2::t_64b2598ae7c70f 111
+net/crates/net/sdk-ts/src/_internal.ts
+  s_ae82cd919caae2::t_02c52b943c6407 165-257,259-279
+  s_ae82cd919caae2::t_78ab489c2c5c32 258
+net/crates/net/sdk-ts/test/watch_iter.test.ts
+  s_ae82cd919caae2::t_9a752ce0f7c1fc 1-57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "18dd9fad203a5bbf74cb0327ce04d7766595754e",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
