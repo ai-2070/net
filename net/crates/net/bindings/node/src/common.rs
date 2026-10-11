@@ -57,6 +57,23 @@ pub(crate) fn bigint_u64(b: BigInt) -> Result<u64> {
 /// `-1` became a 136-year enrollment invite, `2 ** 32` one born
 /// expired, `1.5` silently `1` (SDK audit 2026-10-11). Pure, so it is
 /// testable without a Node host.
+/// The "no cap" stand-in for a `*TimeoutMs: 0` handler wait: about 30
+/// years, tokio's own far-future horizon. The previous sentinel,
+/// `u64::MAX / 1000` seconds (~584 million years), overflowed `Instant`
+/// arithmetic — `Instant::now() + timeout` panicked on the first
+/// invocation, Windows' `Instant` range being the tightest (cubic review of
+/// PR #1228).
+pub(crate) const UNCAPPED_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60 * 24 * 365 * 30);
+
+/// `now + timeout`, saturating at [`UNCAPPED_WAIT`] instead of panicking
+/// on overflow.
+pub(crate) fn deadline_after(timeout: std::time::Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + UNCAPPED_WAIT)
+}
+
 pub(crate) fn validate_ttl_seconds(name: &str, value: f64) -> std::result::Result<u64, String> {
     validate_whole_in_u32(name, value, "seconds")
 }

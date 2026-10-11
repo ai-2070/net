@@ -437,8 +437,25 @@ describe('unary handler timeout bounds the promise, not just the dispatch', () =
     const started = Date.now()
     await expect(
       clientRpc.call(server.nodeId(), 'live.never', Buffer.from('x'), { deadlineMs: 10_000 }),
-    ).rejects.toThrow()
+      // The handler timeout's own message, not just any failure (cubic
+      // review of PR #1228: a bare toThrow() passed on unrelated errors).
+    ).rejects.toThrow(/did not settle within 300 ms/)
     expect(Date.now() - started).toBeLessThan(5_000)
+    handle.close()
+  }, 30_000)
+})
+
+// cubic review of PR #1228: `handlerTimeoutMs: 0` ("no cap") was a
+// ~584-million-year duration, and `Instant::now() + timeout` overflowed —
+// the first invocation panicked inside the native handler bridge.
+describe('handlerTimeoutMs: 0 disables the cap without overflowing', () => {
+  it('serves a call with no handler timeout', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.nocap', async (req: Buffer) => req, 0)
+    const reply = await clientRpc.call(server.nodeId(), 'live.nocap', Buffer.from('ok'), {
+      deadlineMs: 10_000,
+    })
+    expect(Buffer.from(reply).toString()).toBe('ok')
     handle.close()
   }, 30_000)
 })

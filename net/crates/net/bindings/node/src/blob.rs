@@ -812,7 +812,7 @@ pub fn register_blob_adapter(
     // `0` disables the cap, as on every `serve*` verb; it used to fail
     // every adapter call at 0 ms (SDK audit 2026-10-11).
     let timeout = match timeout_ms {
-        Some(0) => Duration::from_secs(u64::MAX / 1000),
+        Some(0) => crate::common::UNCAPPED_WAIT,
         Some(ms) => Duration::from_millis(ms as u64),
         None => DEFAULT_JS_ADAPTER_TIMEOUT,
     };
@@ -921,7 +921,7 @@ where
     // 2*timeout. Without this an async adapter waiting on a slow
     // Promise after the TSFN stage already consumed most of the
     // budget would see effective `2*timeout`.
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = crate::common::deadline_after(timeout);
     let promise_step = tokio::time::timeout_at(deadline, rx).await;
     let promise = match promise_step {
         Ok(Ok(Ok(p))) => p,
@@ -1087,7 +1087,7 @@ pub fn register_async_blob_adapter(
     // `0` disables the cap, as on every `serve*` verb; it used to fail
     // every adapter call at 0 ms (SDK audit 2026-10-11).
     let timeout = match timeout_ms {
-        Some(0) => Duration::from_secs(u64::MAX / 1000),
+        Some(0) => crate::common::UNCAPPED_WAIT,
         Some(ms) => Duration::from_millis(ms as u64),
         None => DEFAULT_JS_ADAPTER_TIMEOUT,
     };
@@ -1356,8 +1356,11 @@ impl MeshBlobAdapter {
         let adapter = self.inner.clone();
         let blob = blob_ref.inner.clone();
         // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
-        let start_u = crate::common::bigint_u64(start)?;
-        let end_u = crate::common::bigint_u64(end)?;
+        // Through `blob_err`, so a bad bound carries the documented `blob:`
+        // discriminator like every other failure here (cubic review of PR
+        // #1228).
+        let start_u = crate::common::bigint_u64(start).map_err(|e| blob_err("fetch_range", e))?;
+        let end_u = crate::common::bigint_u64(end).map_err(|e| blob_err("fetch_range", e))?;
         let bytes = adapter
             .fetch_range(&blob, start_u..end_u)
             .await

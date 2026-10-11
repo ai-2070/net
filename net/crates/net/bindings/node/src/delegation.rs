@@ -215,6 +215,14 @@ impl DelegationChain {
         ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<DelegationChain> {
+        // Zero keeps its established `token: zero_ttl` discriminator; the
+        // validator's untagged message replaced it (cubic review of PR
+        // #1228). Every other invalid number is the validator's to refuse.
+        if ttl_seconds == 0.0 {
+            return Err(token_err_for(
+                ::net::adapter::net::identity::TokenError::ZeroTtl,
+            ));
+        }
         let ttl_seconds = crate::common::validate_ttl_seconds("ttlSeconds", ttl_seconds)
             .map_err(Error::from_reason)?;
         let root_sdk = root.to_sdk_identity();

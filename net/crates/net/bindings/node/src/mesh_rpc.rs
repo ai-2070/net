@@ -421,7 +421,7 @@ impl RpcHandler for NodeRpcHandler {
         //    alone never bounded anything, and a never-settling handler
         //    held its task and in-flight slot forever (SDK audit
         //    2026-10-11).
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -1706,7 +1706,7 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         }
         // Single deadline spans both TSFN dispatch and Promise
         // resolution — matches the duplex / client-streaming bridges.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -1804,7 +1804,7 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
         // Previously only the first phase was bounded — a hung JS
         // handler that returned a Promise that never resolved
         // would pin the Rust task for the full call lifetime.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -1916,7 +1916,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         // Single deadline spans both TSFN dispatch and Promise
         // resolution — see the equivalent comment in the
         // client-streaming bridge.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -2071,7 +2071,7 @@ impl MeshRpc {
     ) -> Result<ServeHandle> {
         let tsfn: RpcHandlerTsfn = handler.build_threadsafe_function().build()?;
         let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(0) => crate::common::UNCAPPED_WAIT,
             Some(ms) => Duration::from_millis(ms as u64),
             None => DEFAULT_HANDLER_TIMEOUT,
         };
@@ -2469,7 +2469,15 @@ impl MeshRpc {
                 let channel =
                     ::net::adapter::net::cortex::ObserverChannel::install(handle, move |evt| {
                         let js_evt = RpcCallEventJs::from(evt.as_ref());
-                        let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                        let status = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                        // The bounded TSFN is a second drop point after the
+                        // substrate channel; count it in the same counter so
+                        // `observerDroppedTotal` reports every lost event
+                        // (cubic review of PR #1228).
+                        if status == napi::Status::QueueFull {
+                            ::net::adapter::net::cortex::rpc_observer::OBSERVER_DROPPED_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     });
                 let obs: Arc<dyn RpcObserver> = Arc::new(channel);
                 self.node()?.set_rpc_observer(Some(obs));
