@@ -1268,7 +1268,11 @@ async function lockIdentity(entitySecretHex: string): Promise<(() => void) | nul
   const locks = (globalThis.navigator as { locks?: LockManager } | undefined)?.locks;
   const subtle = globalThis.crypto?.subtle;
   if (locks === undefined || subtle === undefined) return null;
-  const digest = new Uint8Array(await subtle.digest('SHA-256', new TextEncoder().encode(`net-mesh:identity:${entitySecretHex}`)));
+  // Lowercased: the secret parses case-insensitively, so "AB…" and "ab…" are
+  // one identity and must contend for one lock (code review 2026-10-11,
+  // BROWSER-3).
+  const canonical = entitySecretHex.toLowerCase();
+  const digest = new Uint8Array(await subtle.digest('SHA-256', new TextEncoder().encode(`net-mesh:identity:${canonical}`)));
   const name = `net-mesh:identity:${Array.from(digest.subarray(0, 16), b => b.toString(16).padStart(2, '0')).join('')}`;
   const acquired = await new Promise<(() => void) | 'busy'>((resolve, reject) => {
     let release!: () => void;

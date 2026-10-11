@@ -112,6 +112,19 @@ describe('connect', () => {
       await settle();
     });
 
+    // Code review 2026-10-11 BROWSER-3: the secret parses case-insensitively,
+    // so the lock name must not depend on its case.
+    it('treats an upper-case spelling of the secret as the same identity', async () => {
+      const lower = { entitySecretHex: 'ab'.repeat(32), noiseSecretHex: '32'.repeat(32) };
+      const upper = { ...lower, entitySecretHex: 'AB'.repeat(32) };
+      const first = await connect({ ...BASE, ...lower, wasm: fakeModule(new FakeNode()) });
+      await expect(connect({ ...BASE, ...upper, wasm: fakeModule(new FakeNode()) })).rejects.toMatchObject({
+        kind: 'identity',
+      });
+      first.close();
+      await settle();
+    });
+
     it('is skipped with lockIdentity: false, and never applies without a custodial identity', async () => {
       const a = await connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) });
       const b = await connect({ ...BASE, ...identity, lockIdentity: false, wasm: fakeModule(new FakeNode()) });

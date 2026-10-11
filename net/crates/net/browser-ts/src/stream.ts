@@ -243,7 +243,7 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   /** Listen for payloads. Returns a cancel handle. */
   onMessage(listener: (payload: Uint8Array) => void): () => void {
     this.listeners.add(listener);
-    const buffered = this.pending.splice(0, this.pending.length);
+    const buffered = this.drainPending();
     for (const payload of buffered) listener(payload);
     return () => {
       this.listeners.delete(listener);
@@ -253,7 +253,7 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array> {
     const queue: AsyncQueue<Uint8Array> = new AsyncQueue(() => this.queues.delete(queue));
     this.queues.add(queue);
-    const buffered = this.pending.splice(0, this.pending.length);
+    const buffered = this.drainPending();
     for (const payload of buffered) queue.push(payload);
     if (this.closed) queue.end();
     return queue;
@@ -293,6 +293,18 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
    * taken as an already-decoded payload, which is what a
    * host-supplied {@link LeafWasmStreamLike} may deliver.
    */
+  /**
+   * Hand the pre-consumer buffer over, emptying it — count included. The
+   * byte count stayed at the drained total, so after a consumer drained the
+   * buffer and detached, rebuffering tripped the byte cap almost at once
+   * and evicted all but the newest frame on nearly every arrival (code
+   * review 2026-10-11, BROWSER-1).
+   */
+  private drainPending(): Uint8Array[] {
+    this.pendingBytes = 0;
+    return this.pending.splice(0, this.pending.length);
+  }
+
   private receive(event: StreamCallbackPayload): void {
     const payload = this.decode(event);
     if (payload === null || this.closed) return;

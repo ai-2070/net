@@ -77,4 +77,32 @@ describe('LeafStream pre-consumer buffer', () => {
     expect(seen).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(stream.droppedBeforeConsumer).toBe(0);
   });
+
+  // Code review 2026-10-11 BROWSER-1: draining the buffer left the byte
+  // count at the drained total, so a stream that rebuffered after its
+  // consumer detached evicted nearly every frame.
+  it.each(['onMessage', 'asyncIterator'])(
+    'rebuffers in full after a %s drain and detach',
+    async (how) => {
+      const { stream, deliver } = fake();
+      const big = 256 * 1024;
+      const fill = Math.floor(LEAF_STREAM_PENDING_MAX_BYTES / big) - 1;
+      for (let i = 0; i < fill; i += 1) deliver(frame(i, big));
+      if (how === 'onMessage') {
+        const cancel = stream.onMessage(() => {});
+        cancel();
+      } else {
+        const it = stream[Symbol.asyncIterator]();
+        for (let i = 0; i < fill; i += 1) await it.next();
+        await it.return?.();
+      }
+      expect(stream.droppedBeforeConsumer).toBe(0);
+
+      for (let i = 0; i < fill; i += 1) deliver(frame(100 + i, big));
+      expect(stream.droppedBeforeConsumer).toBe(0);
+      const seen: number[] = [];
+      stream.onMessage((p) => seen.push(idOf(p)));
+      expect(seen.length).toBe(fill);
+    },
+  );
 });
