@@ -495,7 +495,7 @@ struct MeshNewConfig {
     /// capability index entries.
     capability_gc_interval_ms: Option<u64>,
     /// Reject unsigned capability announcements when `true`.
-    /// Defaults to the core's default (`false` in v1).
+    /// Defaults to the core's default (`true`).
     require_signed_capabilities: Option<bool>,
     /// 1–4 bytes, each 0–255. Leave unset for `SubnetId::GLOBAL`.
     subnet: Option<Vec<u32>>,

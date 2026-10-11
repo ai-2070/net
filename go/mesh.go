@@ -247,8 +247,12 @@ type MeshConfig struct {
 	// default.
 	CapabilityGCIntervalMs uint64 `json:"capability_gc_interval_ms,omitempty"`
 	// RequireSignedCapabilities rejects unsigned announcements when
-	// true. Leave nil/false for the core default (accept unsigned in v1).
-	RequireSignedCapabilities bool `json:"require_signed_capabilities,omitempty"`
+	// true. Leave nil for the core default, which is true (reject
+	// unsigned). A pointer for the same reason as AutoDirectUpgrade: a
+	// plain bool with omitempty could never send false, so a Go node
+	// could not accept legacy unsigned peers the way Node and Python can
+	// (SDK audit 2026-10-11).
+	RequireSignedCapabilities *bool `json:"require_signed_capabilities,omitempty"`
 
 	// SubnetExports is this provider's named-export map (SSDK §3.3): the
 	// provider-local labels ServeSubnetExported resolves against. A name is

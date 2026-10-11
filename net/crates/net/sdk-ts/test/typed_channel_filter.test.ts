@@ -40,3 +40,45 @@ describe('TypedChannel subscribe filter', () => {
     expect(JSON.parse(bus.filters[0]!)).toEqual({ path: '_channel', value: 'temps' });
   });
 });
+
+// SDK audit 2026-10-11: spreading a scalar published `{"_channel": …}`
+// and the subscriber got `{}`. Non-object events are wrapped as
+// `{ _value: x }`, the Python SDK's shape, and unwrapped on subscribe.
+describe('TypedChannel non-object events', () => {
+  function recordingBus() {
+    const payloads: string[] = [];
+    return {
+      payloads,
+      ingestFire: (p: string) => (payloads.push(p), true),
+      ingestRawBatch: (ps: string[]) => (payloads.push(...ps), ps.length),
+      poll: async () => ({
+        events: payloads.map((raw, i) => ({ id: String(i), raw })),
+        nextId: String(payloads.length),
+        hasMore: false,
+      }),
+    };
+  }
+
+  it('wraps scalars and arrays as _value, matching Python', () => {
+    const bus = recordingBus();
+    const ch = new TypedChannel<unknown>(bus as never, 'metrics/x');
+    ch.publish(42);
+    ch.publish([1, 2]);
+    ch.publish({ v: 1 });
+    expect(bus.payloads.map((p) => JSON.parse(p))).toEqual([
+      { _value: 42, _channel: 'metrics/x' },
+      { _value: [1, 2], _channel: 'metrics/x' },
+      { v: 1, _channel: 'metrics/x' },
+    ]);
+  });
+
+  it('hands the subscriber the value back', async () => {
+    const bus = recordingBus();
+    const ch = new TypedChannel<unknown>(bus as never, 'metrics/x');
+    ch.publish(42);
+    for await (const ev of ch.subscribe({ pollIntervalMs: 0 })) {
+      expect(ev).toBe(42);
+      break;
+    }
+  });
+});

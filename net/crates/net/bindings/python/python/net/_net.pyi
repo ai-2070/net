@@ -2604,8 +2604,9 @@ class BlobRef:
     @property
     def uri(self) -> str: ...
     @property
-    def hash(self) -> bytes:
-        """32-byte BLAKE3 content hash."""
+    def hash(self) -> Optional[bytes]:
+        """32-byte BLAKE3 content hash of a ``Small`` ref; ``None`` for a
+        chunked (manifest / tree) ref."""
         ...
     @property
     def size(self) -> int: ...

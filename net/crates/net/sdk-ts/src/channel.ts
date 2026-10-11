@@ -109,7 +109,30 @@ function stripChannelTag(data: unknown): unknown {
     return data;
   }
   const { [CHANNEL_TAG_KEY]: _tag, ...rest } = data as Record<string, unknown>;
+  // A scalar or array event travels as `{ _value: x }` (see
+  // `encodeChannelEvent`, Python's `_to_dict`): hand back `x`.
+  const keys = Object.keys(rest);
+  if (keys.length === 1 && keys[0] === VALUE_KEY) return rest[VALUE_KEY];
   return rest;
+}
+
+/** Where a non-object channel event travels; the Python SDK's key. */
+const VALUE_KEY = '_value';
+
+/**
+ * One channel event as its JSON payload. A plain object is spread and
+ * tagged; anything else (a number, string, boolean, `null`, an array)
+ * is wrapped as `{ _value: x }`, exactly as the Python SDK does.
+ * Spreading a scalar contributed nothing and an array gave index keys,
+ * so `publish(42)` stored `{"_channel": …}` and the subscriber got `{}`
+ * (SDK audit 2026-10-11).
+ */
+function encodeChannelEvent(event: unknown, channel: string): string {
+  const body =
+    typeof event === 'object' && event !== null && !Array.isArray(event)
+      ? { ...(event as object) }
+      : { [VALUE_KEY]: event };
+  return JSON.stringify({ ...body, [CHANNEL_TAG_KEY]: channel });
 }
 
 /**
@@ -165,11 +188,7 @@ export class TypedChannel<T> {
    * reached.
    */
   publish(event: T): boolean {
-    const payload = JSON.stringify({
-      ...event as object,
-      _channel: this.channelName,
-    });
-    return this.bus.ingestFire(payload);
+    return this.bus.ingestFire(encodeChannelEvent(event, this.channelName));
   }
 
   /**
@@ -177,12 +196,7 @@ export class TypedChannel<T> {
    * Returns the number of events successfully published.
    */
   publishBatch(events: T[]): number {
-    const payloads = events.map((event) =>
-      JSON.stringify({
-        ...event as object,
-        _channel: this.channelName,
-      })
-    );
+    const payloads = events.map((event) => encodeChannelEvent(event, this.channelName));
     return this.bus.ingestBatchFire(payloads);
   }
 

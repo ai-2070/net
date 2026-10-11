@@ -306,13 +306,13 @@ impl BlobRef {
         self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash. For Small (the only variant the Node
-    /// constructor produces today); v0.2 will surface chunked
-    /// manifests via a separate accessor.
+    /// 32-byte BLAKE3 content hash of a `Small` ref; `null` for a
+    /// chunked (`Manifest` / `Tree`) ref, which has no single content
+    /// hash. It used to be 32 zero bytes, collapsing every chunked blob
+    /// onto one cache key; C and Go refuse it (SDK audit 2026-10-11).
     #[napi(getter)]
-    pub fn hash(&self) -> Buffer {
-        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
-        Buffer::from(hash.to_vec())
+    pub fn hash(&self) -> Option<Buffer> {
+        self.inner.small_hash().map(|hash| Buffer::from(hash.to_vec()))
     }
 
     #[napi(getter)]

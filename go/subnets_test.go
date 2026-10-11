@@ -242,7 +242,7 @@ func TestMesh_AcceptsFullSecurityConfig(t *testing.T) {
 				Values: map[string]uint32{"prod": 1, "dev": 2},
 			}},
 		},
-		RequireSignedCapabilities: true,
+		RequireSignedCapabilities: &[]bool{true}[0],
 		CapabilityGCIntervalMs:    120_000,
 	})
 	if err != nil {

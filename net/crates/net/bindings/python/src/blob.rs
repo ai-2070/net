@@ -86,16 +86,15 @@ impl PyBlobRef {
         self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash of the content. Defined for the v0.15
-    /// `Small` variant; returns 32 zero bytes for `Manifest` /
-    /// `Tree` (chunked variants reference many hashes — use
-    /// `tree_root_hash` for `Tree`, or walk the manifest's chunk
-    /// list for `Manifest`). Callers should check `is_chunked`
-    /// first to know whether this getter is meaningful.
+    /// 32-byte BLAKE3 hash of the content for the `Small` variant;
+    /// `None` for `Manifest` / `Tree` (chunked variants reference many
+    /// hashes — use `tree_root_hash` for `Tree`, or walk the
+    /// manifest's chunk list for `Manifest`). It used to be 32 zero
+    /// bytes, which collapsed every chunked blob onto one cache key;
+    /// C and Go refuse it (SDK audit 2026-10-11).
     #[getter]
-    fn hash<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
-        PyBytes::new(py, &hash)
+    fn hash<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner.small_hash().map(|hash| PyBytes::new(py, hash))
     }
 
     #[getter]

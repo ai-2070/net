@@ -65,6 +65,18 @@ describe.skipIf(!HAS_ENROLLMENT)('enrollment', () => {
     expect(parsed.rootFingerprint()).toBe(binding.fingerprint(root.entityId))
   })
 
+  // SDK audit 2026-10-11: TTLs were napi-coerced u32s — `-1` minted a
+  // 136-year invite, `2 ** 32` one born expired, `1.5` became `1`.
+  it('refuses a TTL that is not a whole number of seconds in u32 range', async () => {
+    const { op } = operator()
+    for (const bad of [-1, 0, 1.5, 2 ** 32, Number.NaN, Infinity]) {
+      expect(() => op.invite('relay://rv', bad), String(bad)).toThrow(/^enrollment: ttlSeconds/)
+    }
+    const invite = op.invite('relay://rv', 300)
+    const req = JoinRequest.create(Identity.generate(), 'pc', [], invite)
+    await expect(op.approve(req, -1)).rejects.toThrow(/^enrollment: grantTtlSeconds/)
+  })
+
   it('signs and verifies a join request', () => {
     const { op } = operator()
     const invite = op.invite('relay://rv', 300)

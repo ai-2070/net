@@ -311,3 +311,16 @@ def test_publish_subscribe_round_trip_is_symmetric() -> None:
     ch.publish(Slotted("a1", 22.5))
 
     assert _parse_fn(ch)(bus.ingested[0]) == Slotted("a1", 22.5)
+
+
+def test_scalar_events_round_trip_through_value() -> None:
+    """SDK audit 2026-10-11: scalars publish as {"_value": x} (the TS SDK
+    now does too) and the default subscribe path hands x back."""
+    bus = _RecordingBus()
+    ch = TypedChannel(bus, "metrics/x")
+    ch.publish(42)
+    ch.publish([1, 2])
+    assert json.loads(bus.ingested[0]) == {"_value": 42, CHANNEL_TAG_KEY: "metrics/x"}
+    parse = _parse_fn(ch)
+    assert parse(bus.ingested[0]) == 42
+    assert parse(bus.ingested[1]) == [1, 2]

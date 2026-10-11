@@ -46,6 +46,7 @@ use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::operator::OperatorEnrollment as SdkOperatorEnrollment;
 use net_sdk::Identity as SdkIdentity;
 
+use crate::common::validate_ttl_seconds;
 use crate::delegation::{entity_id_from_buffer, u64_arg, DelegationChain, RevocationRegistry};
 use crate::identity::Identity;
 use crate::NetMesh;
@@ -402,12 +403,11 @@ impl OperatorEnrollment {
     /// a later `approve` can match a request to it. `rendezvous` is the
     /// transport locator devices dial (e.g. `NetMesh.rendezvousString()`).
     #[napi]
-    pub fn invite(&self, rendezvous: String, ttl_seconds: u32) -> InviteToken {
-        InviteToken {
-            inner: self
-                .inner
-                .invite(rendezvous, Duration::from_secs(u64::from(ttl_seconds))),
-        }
+    pub fn invite(&self, rendezvous: String, ttl_seconds: f64) -> Result<InviteToken> {
+        let ttl = validate_ttl_seconds("ttlSeconds", ttl_seconds).map_err(enroll_err)?;
+        Ok(InviteToken {
+            inner: self.inner.invite(rendezvous, Duration::from_secs(ttl)),
+        })
     }
 
     /// Approve an arriving request (auto — invite-as-authorization),
@@ -420,11 +420,13 @@ impl OperatorEnrollment {
     pub async fn approve(
         &self,
         request: &JoinRequest,
-        grant_ttl_seconds: u32,
+        grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<DelegationChain> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
-        let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
         let inner = self.inner.clone();
         let request = request.inner.clone();
         let enrollment = off_thread(move || inner.approve(&request, ttl, depth))
@@ -443,11 +445,13 @@ impl OperatorEnrollment {
     pub async fn handle_join_request(
         &self,
         request_bytes: Buffer,
-        grant_ttl_seconds: u32,
+        grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<Buffer> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
-        let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
         let inner = self.inner.clone();
         let bytes = request_bytes.as_ref().to_vec();
         let out = off_thread(move || inner.handle_join_request(&bytes, ttl, depth)).await?;
@@ -711,11 +715,13 @@ impl NetMesh {
     pub async fn serve_enrollment_auto(
         &self,
         operator: &OperatorEnrollment,
-        grant_ttl_seconds: u32,
+        grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<EnrollmentServeHandle> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
-        let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
         let mesh = mesh_over(self.node_arc_clone()?, None);
         let op = operator.arc();
         let enroll = mesh

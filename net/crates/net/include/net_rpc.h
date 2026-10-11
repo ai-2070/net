@@ -60,6 +60,7 @@
  *   transport        — wire-level failure (peer dropped, disconnect)
  *   codec_encode     — request body failed to encode
  *   codec_decode     — response body failed to decode
+ *   capability_denied — the target's capability gate refused the call
  *   cancelled        — call cancelled via net_rpc_cancel_call
  *
  * The Go binding's `parseRpcError` re-prefixes these with `nrpc:`

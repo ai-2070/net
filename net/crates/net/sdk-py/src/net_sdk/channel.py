@@ -258,6 +258,10 @@ class TypedChannel(Generic[T]):
             def parse_fn(raw: str) -> T:
                 data = json.loads(raw)
                 data.pop(CHANNEL_TAG_KEY, None)
+                # A scalar / list event travels as {"_value": x}
+                # (`_to_dict`); hand back x, as the TS SDK does.
+                if isinstance(data, dict) and data.keys() == {"_value"}:
+                    return data["_value"]  # type: ignore[no-any-return]
                 return data  # type: ignore[return-value]
 
         return TypedEventStream(self._bus, parse_fn, merged)

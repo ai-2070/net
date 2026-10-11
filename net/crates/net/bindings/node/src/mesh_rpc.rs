@@ -2583,7 +2583,7 @@ mod tests {
             cancel_token: None,
             request_headers: None,
         };
-        let inner = opts.into_inner()?;
+        let inner = opts.into_inner().expect("valid options");
         assert!(inner.deadline.is_some(), "deadline must be Some when set");
         assert_eq!(inner.stream_window_initial, Some(8));
         assert!(
@@ -2591,7 +2591,7 @@ mod tests {
             "no headers expected when None"
         );
 
-        let empty = CallOptions::default().into_inner()?;
+        let empty = CallOptions::default().into_inner().expect("valid options");
         assert!(empty.deadline.is_none());
         assert!(empty.stream_window_initial.is_none());
         assert!(empty.request_headers.is_empty());
@@ -2622,7 +2622,7 @@ mod tests {
                 },
             ]),
         };
-        let inner = opts.into_inner()?;
+        let inner = opts.into_inner().expect("valid options");
         assert_eq!(inner.request_headers.len(), 2);
         assert_eq!(inner.request_headers[0].0, "net-where");
         assert_eq!(inner.request_headers[0].1, b"json");

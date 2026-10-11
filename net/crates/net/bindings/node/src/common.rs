@@ -52,6 +52,21 @@ pub(crate) fn bigint_u64(b: BigInt) -> Result<u64> {
         .map_err(|msg| Error::from_reason(msg.to_string()))
 }
 
+/// A JS-number TTL in seconds, checked: a finite integer in
+/// `1..=u32::MAX`. Taking it as `u32` let napi's `ToUint32` wrap it —
+/// `-1` became a 136-year enrollment invite, `2 ** 32` one born
+/// expired, `1.5` silently `1` (SDK audit 2026-10-11). Pure, so it is
+/// testable without a Node host.
+pub(crate) fn validate_ttl_seconds(name: &str, value: f64) -> std::result::Result<u64, String> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(format!("{name} must be a whole number of seconds, got {value}"));
+    }
+    if value < 1.0 || value > f64::from(u32::MAX) {
+        return Err(format!("{name} must be in 1..={}, got {value}", u32::MAX));
+    }
+    Ok(value as u64)
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression tests for [`validate_bigint_u64_parts`] — the
@@ -159,5 +174,16 @@ mod tests {
         // Empty-slice (zero) and single-word paths are handled
         // separately above.
         assert!(validate_bigint_u64_parts(false, &[42, 0, 0]).is_err());
+    }
+
+    // SDK audit 2026-10-11: enrollment TTLs were napi-coerced u32s.
+    #[test]
+    fn ttl_seconds_rejects_what_tou_int32_would_wrap() {
+        use super::validate_ttl_seconds as v;
+        assert_eq!(v("ttl", 60.0), Ok(60));
+        assert_eq!(v("ttl", f64::from(u32::MAX)), Ok(u64::from(u32::MAX)));
+        for bad in [-1.0, 0.0, 1.5, 4_294_967_296.0, f64::NAN, f64::INFINITY] {
+            assert!(v("ttl", bad).is_err(), "{bad} must be refused");
+        }
     }
 }

@@ -212,9 +212,11 @@ impl DelegationChain {
         root: &Identity,
         machine: &Identity,
         gateway: &Identity,
-        ttl_seconds: u32,
+        ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<DelegationChain> {
+        let ttl_seconds = crate::common::validate_ttl_seconds("ttlSeconds", ttl_seconds)
+            .map_err(Error::from_reason)?;
         let root_sdk = root.to_sdk_identity();
         let machine_sdk = machine.to_sdk_identity();
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
@@ -222,7 +224,7 @@ impl DelegationChain {
             &root_sdk,
             &machine_sdk,
             gateway.entity_id_ref(),
-            Duration::from_secs(u64::from(ttl_seconds)),
+            Duration::from_secs(ttl_seconds),
             depth,
         )
         .map_err(token_err_for)?;

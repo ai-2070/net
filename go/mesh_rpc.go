@@ -383,6 +383,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/cgo"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -407,7 +408,12 @@ const (
 	RpcKindCodecEncode      RpcKind = "codec_encode"
 	RpcKindCodecDecode      RpcKind = "codec_decode"
 	RpcKindCapabilityDenied RpcKind = "capability_denied"
-	RpcKindUnknown          RpcKind = "unknown"
+	// RpcKindCancelled: the call was cancelled — by this caller's ctx
+	// (surfaced as ctx.Err() when ctx is done) or by a mesh-side cancel
+	// or teardown. Node and Python type it as RpcCancelledError; Go used
+	// to report it as Unknown (SDK audit 2026-10-11).
+	RpcKindCancelled RpcKind = "cancelled"
+	RpcKindUnknown   RpcKind = "unknown"
 )
 
 // RpcError is the typed error surfaced from any Call / CallService
@@ -416,6 +422,11 @@ const (
 type RpcError struct {
 	Kind    RpcKind
 	Message string
+	// Status is the handler's status code for a server_error (for
+	// example 0x0009, the org admission denial), parsed from the
+	// `status=0xNNNN` field; nil for every other kind. Node and Python
+	// expose the same value as `.status`.
+	Status *uint16
 }
 
 func (e *RpcError) Error() string {
@@ -435,12 +446,37 @@ func parseRpcError(raw string) *RpcError {
 	kind := RpcKind(strings.TrimSpace(raw[:colon]))
 	detail := strings.TrimSpace(raw[colon+1:])
 	switch kind {
-	case RpcKindNoRoute, RpcKindTimeout, RpcKindServerError,
+	case RpcKindServerError:
+		return &RpcError{Kind: kind, Message: detail, Status: parseServerStatus(detail)}
+	case RpcKindNoRoute, RpcKindTimeout,
 		RpcKindTransport, RpcKindCodecEncode, RpcKindCodecDecode,
-		RpcKindCapabilityDenied:
+		RpcKindCapabilityDenied, RpcKindCancelled:
 		return &RpcError{Kind: kind, Message: detail}
 	}
 	return &RpcError{Kind: RpcKindUnknown, Message: raw}
+}
+
+// parseServerStatus reads the `status=0xNNNN` field `format_rpc_error`
+// writes first in a server_error detail; nil when it is absent or
+// malformed.
+func parseServerStatus(detail string) *uint16 {
+	field, ok := strings.CutPrefix(detail, "status=")
+	if !ok {
+		return nil
+	}
+	if end := strings.IndexByte(field, ' '); end >= 0 {
+		field = field[:end]
+	}
+	hex, ok := strings.CutPrefix(field, "0x")
+	if !ok {
+		return nil
+	}
+	v, err := strconv.ParseUint(hex, 16, 16)
+	if err != nil {
+		return nil
+	}
+	status := uint16(v)
+	return &status
 }
 
 // =====================================================================
@@ -921,14 +957,11 @@ func readCancellableResult(
 	if err == nil {
 		return out, nil
 	}
-	// The Rust side emits "cancelled: call cancelled by caller"
-	// for our cancel-token path. parseRpcError tags those as
-	// kind=unknown (the canonical kind set doesn't include
-	// "cancelled" yet — adding it is a follow-up). Detect by
-	// substring and surface the user's ctx.Err() if it fired.
+	// A cancellation while the caller's ctx is done is that ctx firing:
+	// surface ctx.Err() so `errors.Is(err, context.Canceled)` works. A
+	// cancellation ctx did not cause stays RpcKindCancelled.
 	if ctx != nil && ctx.Err() != nil {
-		if rpcErr, ok := err.(*RpcError); ok &&
-			strings.Contains(rpcErr.Message, "cancelled by caller") {
+		if rpcErr, ok := err.(*RpcError); ok && rpcErr.Kind == RpcKindCancelled {
 			return nil, ctx.Err()
 		}
 	}

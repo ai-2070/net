@@ -8,8 +8,10 @@
 package net
 
 import (
+	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -496,7 +498,7 @@ func TestMeshConfig_AcceptsCapabilityKwargs(t *testing.T) {
 		BindAddr:                  addr,
 		PskHex:                    meshPsk,
 		CapabilityGCIntervalMs:    120_000,
-		RequireSignedCapabilities: true,
+		RequireSignedCapabilities: &[]bool{true}[0],
 	})
 	if err != nil {
 		t.Fatalf("new mesh with cap kwargs: %v", err)
@@ -504,5 +506,22 @@ func TestMeshConfig_AcceptsCapabilityKwargs(t *testing.T) {
 	defer m.Shutdown()
 	if m.NodeID() == 0 {
 		t.Fatal("node id unset")
+	}
+}
+
+// SDK audit 2026-10-11: a plain bool with omitempty could never send
+// false, so a Go node could not opt out of the core's signed-only default.
+func TestRequireSignedCapabilitiesFalseReachesTheConfig(t *testing.T) {
+	off := false
+	raw, err := json.Marshal(MeshConfig{RequireSignedCapabilities: &off})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"require_signed_capabilities":false`) {
+		t.Fatalf("false was dropped from the config: %s", raw)
+	}
+	raw, _ = json.Marshal(MeshConfig{})
+	if strings.Contains(string(raw), "require_signed_capabilities") {
+		t.Fatalf("unset must defer to the core default: %s", raw)
 	}
 }
