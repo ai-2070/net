@@ -4098,7 +4098,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       # This job's wheel enables features the *release* wheel did not,
       # so everything below could pass against a surface users cannot
@@ -4559,7 +4559,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -4629,7 +4629,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       # sdk-py is the pure-Python layer over the `net-mesh` bindings.
       # Its `tests/conftest.py` stubs the native `net` extension before
@@ -6157,7 +6157,7 @@ jobs:
       - name: Install Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.15"
       - name: Install mypy + pydantic
         run: python -m pip install --upgrade mypy "pydantic>=2,<3"
 
@@ -6485,7 +6485,7 @@ jobs:
       - name: Install Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.15"
       - name: Install mypy + pydantic
         run: python -m pip install --upgrade mypy "pydantic>=2,<3"
 
