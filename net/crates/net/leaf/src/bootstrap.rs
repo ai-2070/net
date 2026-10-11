@@ -601,9 +601,14 @@ pub enum ProbeOutcome {
     Answered,
     /// The probe ran and nothing came back inside its deadline.
     Unanswered,
-    /// The probe could not run: an empty or malformed address, or an
-    /// engine that would not build the probe. It observed nothing, so
-    /// it is never evidence either way.
+    /// The probe produced no evidence either way: it could not run (an
+    /// empty or malformed address, an engine that would not build the
+    /// probe, a connection failed before any candidate was gathered), OR
+    /// it ran and ended inconclusive — gathering completed with neither a
+    /// STUN answer nor a "no response" report (a host with no NAT, or an
+    /// engine that never fires `icecandidateerror`). Callers must not read
+    /// it as "did not run"; read it as "established nothing" (cubic review
+    /// of PR #1228).
     NotRun,
 }
 
@@ -642,7 +647,9 @@ pub fn probe_event_answers(event: &ProbeEvent) -> bool {
 /// connection the engine failed before gathering a single candidate is
 /// `NotRun`: nothing was sent, so silence is not evidence, and
 /// counting it `Unanswered` is how a browser that could not gather at
-/// all was told UDP is blocked. Everything else is `Unanswered`.
+/// all was told UDP is blocked. Gathering that completed with no answer
+/// and no "no response" report is `NotRun` too (inconclusive — see
+/// [`ProbeOutcome::NotRun`]). Everything else is `Unanswered`.
 pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
     if events.iter().any(probe_event_answers) {
         return ProbeOutcome::Answered;

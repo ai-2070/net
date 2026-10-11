@@ -1354,8 +1354,8 @@ impl IceProposal {
         guard.take();
         drop(guard);
         let action_for_commit = action;
-        let blast = match proposal.simulate().await {
-            Ok(sim) => sim.blast_radius().clone(),
+        let (blast, provenance) = match proposal.simulate().await {
+            Ok(sim) => (sim.blast_radius().clone(), sim.provenance()),
             Err(e) => return Err(deck_err_from(e)),
         };
         Ok(SimulatedIceProposal {
@@ -1363,6 +1363,7 @@ impl IceProposal {
             state: tokio::sync::Mutex::new(Some(SimulatedState {
                 action: action_for_commit,
                 blast,
+                provenance,
             })),
             issued_at_ms,
         })
@@ -1372,6 +1373,8 @@ impl IceProposal {
 struct SimulatedState {
     action: net::adapter::net::behavior::meshos::IceActionProposal,
     blast: net::adapter::net::behavior::meshos::BlastRadius,
+    /// The simulator's provenance stamp, required at commit.
+    provenance: [u8; 32],
 }
 
 /// A simulated ICE proposal. The only class exposing `commit`.
@@ -1447,9 +1450,9 @@ impl SimulatedIceProposal {
     #[napi]
     pub async fn commit(&self, signatures: Vec<OperatorSignatureJs>) -> Result<ChainCommitJs> {
         let mut guard = self.state.lock().await;
-        let (action, blast) = guard
+        let (action, blast, provenance) = guard
             .as_ref()
-            .map(|st| (st.action.clone(), st.blast.clone()))
+            .map(|st| (st.action.clone(), st.blast.clone(), st.provenance))
             .ok_or_else(|| {
                 deck_err(
                     "already_committed",
@@ -1477,7 +1480,9 @@ impl SimulatedIceProposal {
                 action,
                 self.issued_at_ms,
                 blast,
-            );
+                &provenance,
+            )
+            .map_err(deck_err_from)?;
         simulated
             .commit(&sigs)
             .await

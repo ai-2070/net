@@ -2086,6 +2086,9 @@ pub struct NetDeckSimulatedIceProposal {
     action: net::adapter::net::behavior::meshos::IceActionProposal,
     issued_at_ms: u64,
     blast: net::adapter::net::behavior::meshos::BlastRadius,
+    /// The simulator's provenance stamp, required to rebuild these parts
+    /// at commit (`SimulatedIceProposal::from_simulated_parts`).
+    provenance: [u8; 32],
     committed: bool,
 }
 
@@ -2145,8 +2148,8 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
         // `net_deck_ice_proposal_issued_at_ms` keeps returning
         // the pinned value.
         p.consumed = true;
-        let blast = match runtime().block_on(core_proposal.simulate()) {
-            Ok(sim) => sim.blast_radius().clone(),
+        let (blast, provenance) = match runtime().block_on(core_proposal.simulate()) {
+            Ok(sim) => (sim.blast_radius().clone(), sim.provenance()),
             Err(e) => {
                 set_last_error_from_sdk(&e);
                 return NET_DECK_ERR_CALL_FAILED;
@@ -2156,6 +2159,7 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
             action,
             issued_at_ms,
             blast,
+            provenance,
             committed: false,
         }));
         unsafe { *out = boxed };
@@ -2289,12 +2293,19 @@ pub extern "C" fn net_deck_simulated_commit(
         // issued_at_ms and blast radius — never a re-simulation
         // (SDK audit 2026-10-11).
         let simulated =
-            net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+            match net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
                 inner,
                 action,
                 s.issued_at_ms,
                 s.blast.clone(),
-            );
+                &s.provenance,
+            ) {
+                Ok(simulated) => simulated,
+                Err(e) => {
+                    set_last_error_from_sdk(&e);
+                    return NET_DECK_ERR_CALL_FAILED;
+                }
+            };
         let commit = runtime().block_on(async move { simulated.commit(&core_sigs).await });
         match commit {
             Ok(c) => {

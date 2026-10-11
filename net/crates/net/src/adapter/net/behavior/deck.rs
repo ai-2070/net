@@ -155,6 +155,16 @@ pub struct DeckError {
     pub message: String,
 }
 
+/// A random per-client provenance key; all zeroes if no randomness was
+/// available (simulation then refuses to run).
+fn fresh_provenance_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    if getrandom::fill(&mut key).is_err() {
+        key = [0u8; 32];
+    }
+    key
+}
+
 impl DeckError {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -526,6 +536,11 @@ pub struct DeckClient {
     /// produce its own counter and two siblings could emit
     /// colliding `commit_id`s for distinct commits.
     commit_seq: Arc<AtomicU64>,
+    /// Per-client secret keying the provenance stamp
+    /// [`SimulatedIceProposal::provenance`] carries, so
+    /// [`SimulatedIceProposal::from_simulated_parts`] accepts only parts
+    /// this client's simulator produced. Shared by clones.
+    provenance_key: Arc<[u8; 32]>,
     /// Optional operator-key registry. When present, every ICE
     /// commit verifies each [`OperatorSignature`] against the
     /// registered public key before publishing. When absent,
@@ -568,6 +583,7 @@ impl DeckClient {
             identity,
             config,
             commit_seq: Arc::new(AtomicU64::new(0)),
+            provenance_key: Arc::new(fresh_provenance_key()),
             operator_registry: None,
             mesh: None,
             aggregator: None,
@@ -1599,6 +1615,14 @@ impl<'a> IceProposal<'a> {
     /// type-state pattern enforces locked decision #4 at
     /// compile time.
     pub async fn simulate(self) -> Result<SimulatedIceProposal<'a>, IceError> {
+        if self.client.provenance_key.iter().all(|b| *b == 0) {
+            // No randomness at construction: a zero key would make every
+            // provenance stamp forgeable, so refuse to simulate at all.
+            return Err(IceError::new(
+                "provenance_unavailable",
+                "this DeckClient could not draw its provenance key",
+            ));
+        }
         let snap = self.client.snapshot_reader.read();
         let blast = simulate_ice_proposal(&snap, &self.action);
         Ok(SimulatedIceProposal {
@@ -1642,19 +1666,49 @@ impl<'a> SimulatedIceProposal<'a> {
     /// and a multi-signature commit could never verify (the signatures
     /// cover the original triple). Signature verification is unchanged —
     /// [`Self::commit`] still checks every signature against these parts.
+    ///
+    /// `provenance` must be the [`Self::provenance`] stamp of the original
+    /// simulation by THIS client: the parts are otherwise refused. Without
+    /// it any Rust caller could pair a real action with an arbitrary blast
+    /// radius and have operators approve a false preview — `commit`
+    /// verifies the signatures over the supplied radius but executes the
+    /// action without recomputing it (cubic review of PR #1228).
     #[doc(hidden)]
     pub fn from_simulated_parts(
         client: &'a DeckClient,
         action: IceActionProposal,
         issued_at_ms: u64,
         blast: BlastRadius,
-    ) -> Self {
-        Self {
+        provenance: &[u8; 32],
+    ) -> Result<Self, IceError> {
+        let rebuilt = Self {
             client,
             action,
             issued_at_ms,
             blast,
+        };
+        // `blake3::Hash`'s equality is constant-time.
+        if blake3::Hash::from(rebuilt.provenance()) != blake3::Hash::from(*provenance) {
+            return Err(IceError::new(
+                "provenance_mismatch",
+                "these parts were not produced by this client's simulator",
+            ));
         }
+        Ok(rebuilt)
+    }
+
+    /// The provenance stamp for this simulation: a keyed hash (the
+    /// client's secret) over exactly what operators sign —
+    /// `(action, issued_at_ms, blast_hash)`. A binding keeping the parts
+    /// across an FFI boundary keeps this too, for
+    /// [`Self::from_simulated_parts`].
+    pub fn provenance(&self) -> [u8; 32] {
+        let payload = super::meshos::ice_proposal_signing_payload(
+            &self.action,
+            self.issued_at_ms,
+            &self.blast_hash(),
+        );
+        *blake3::keyed_hash(&self.client.provenance_key, &payload).as_bytes()
     }
 
     /// Borrow the simulator's pre-execution preview.
@@ -2834,6 +2888,57 @@ mod tests {
             .await
             .expect_err("under-threshold commit should fail");
         assert_eq!(err.kind, "insufficient_signatures");
+        let _ = runtime.shutdown().await;
+    }
+
+    /// cubic review of PR #1228: `from_simulated_parts` let any caller
+    /// pair a real action with an arbitrary blast radius. It now requires
+    /// the simulator's provenance stamp from the same client.
+    #[tokio::test]
+    async fn rebuilt_simulated_parts_need_this_clients_provenance() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        let other = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let simulated = deck
+            .ice()
+            .freeze_cluster(Duration::from_secs(30))
+            .simulate()
+            .await
+            .expect("simulate");
+        let action = simulated.action().clone();
+        let issued = simulated.issued_at_ms();
+        let blast = simulated.blast_radius().clone();
+        let stamp = simulated.provenance();
+
+        assert!(SimulatedIceProposal::from_simulated_parts(
+            &deck,
+            action.clone(),
+            issued,
+            blast.clone(),
+            &stamp
+        )
+        .is_ok());
+
+        let mut forged = blast.clone();
+        forged.estimated_drain_delay = Some(Duration::from_secs(1));
+        let err = SimulatedIceProposal::from_simulated_parts(
+            &deck,
+            action.clone(),
+            issued,
+            forged,
+            &stamp,
+        )
+        .err()
+        .expect("a forged blast radius is refused");
+        assert_eq!(err.kind, "provenance_mismatch");
+
+        // Another client's simulator never produced these parts.
+        assert!(
+            SimulatedIceProposal::from_simulated_parts(&other, action, issued, blast, &stamp)
+                .is_err()
+        );
         let _ = runtime.shutdown().await;
     }
 

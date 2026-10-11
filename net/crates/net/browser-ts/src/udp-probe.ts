@@ -45,7 +45,12 @@ export type StunProbeOutcome =
   | { readonly type: 'stunError'; readonly code: number; readonly detail: string }
   /** Nothing came back inside the deadline. */
   | { readonly type: 'unanswered'; readonly detail: string }
-  /** The probe was not run — no address to aim at, or it was disabled. */
+  /**
+   * The probe established nothing either way: it was not run (no address
+   * to aim at, disabled, or the connection failed before gathering), or
+   * it ran and was inconclusive (gathering completed with neither an
+   * answer nor a "no response" report). Never evidence of blocked UDP.
+   */
   | { readonly type: 'notRun'; readonly reason: string }
   /** This engine could not run the probe at all. */
   | { readonly type: 'unsupported'; readonly detail: string };
@@ -93,8 +98,10 @@ export function probeEventAnswers(event: ProbeEvent): boolean {
  * event answers, `notRun` when the engine failed the connection before
  * gathering a single candidate (nothing was sent, so silence is not
  * evidence — measured: Firefox without a media permission on an
- * IPv6-only network with no IPv4 route), `unanswered` otherwise. The
- * Rust probe's `probe_verdict`, the same three answers.
+ * IPv6-only network with no IPv4 route) or when gathering completed with
+ * neither an answer nor a "no response" report (inconclusive),
+ * `unanswered` otherwise. The Rust probe's `probe_verdict`, the same
+ * three answers.
  */
 export function stunProbeVerdict(events: readonly ProbeEvent[]): 'answered' | 'unanswered' | 'notRun' {
   if (events.some(probeEventAnswers)) return 'answered';

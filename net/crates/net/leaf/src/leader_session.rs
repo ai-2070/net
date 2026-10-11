@@ -3641,14 +3641,16 @@ pub(crate) struct ProxyOrgCall {
 }
 
 impl ProxyOrgCall {
-    /// The retained handle for one proxied org call.
-    pub(crate) fn new(lifecycle: Lifecycle, call: u64, timeout_ms: Option<u32>) -> Self {
+    /// The retained handle for one proxied org call. `deadline_at_ms` is
+    /// the call's absolute deadline, stamped by the caller BEFORE the
+    /// opening request (see [`MeshSession::open_proxy_call`]).
+    pub(crate) fn new(lifecycle: Lifecycle, call: u64, deadline_at_ms: Option<f64>) -> Self {
         let generation = lifecycle.generation();
         Self {
             lifecycle,
             call,
             generation,
-            deadline_at_ms: timeout_ms.map(|ms| now_ms() + f64::from(ms)),
+            deadline_at_ms,
         }
     }
 
@@ -4310,13 +4312,19 @@ impl MeshSession {
         request: LeaderRequest,
         call: u64,
     ) -> Result<T, JsError> {
-        let timeout_ms = match &request {
-            LeaderRequest::OrgCall { timeout_ms, .. } => *timeout_ms,
+        // The deadline starts when the call does, not when its opening
+        // request returns: stamping it after the open added the time spent
+        // opening onto every later leg, so the call could stay pending past
+        // its advertised deadline (cubic review of PR #1228).
+        let deadline_at_ms = match &request {
+            LeaderRequest::OrgCall { timeout_ms, .. } => {
+                timeout_ms.map(|ms| now_ms() + f64::from(ms))
+            }
             _ => None,
         };
         match self.lifecycle.request(request).await {
             Ok(ProxyValue::Bytes(_)) => {
-                let proxy = ProxyOrgCall::new(self.lifecycle.clone(), call, timeout_ms);
+                let proxy = ProxyOrgCall::new(self.lifecycle.clone(), call, deadline_at_ms);
                 Ok(T::wrap(Rc::new(crate::wasm::OrgCall::proxied(proxy))))
             }
             Ok(_) => Err(JsError::new("org_call answered an unexpected value")),

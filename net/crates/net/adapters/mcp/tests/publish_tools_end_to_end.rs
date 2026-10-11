@@ -963,17 +963,21 @@ async fn two_publishers_on_one_node_merge_into_one_announcement() {
     // The second publication re-announces within the core's
     // `min_announce_interval` (10 s default), which coalesces and flushes
     // the merged set on the trailing edge — so allow for that window.
-    for tag in ["echo", "add"] {
-        let filter = CapabilityFilter::new().require_tag(tag);
-        assert!(
-            wait_until(
-                || caller.find_nodes(&filter).contains(&b_id),
-                Duration::from_secs(15),
-            )
-            .await,
-            "the merged announcement carries `{tag}` from both publications",
-        );
-    }
+    //
+    // Both tags in ONE filter: checked one at a time, `echo` could be seen
+    // on the first announcement and `add` on a later one even if no single
+    // announcement carried both (cubic review of PR #1228).
+    let filter = CapabilityFilter::new()
+        .require_tag("echo")
+        .require_tag("add");
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(15),
+        )
+        .await,
+        "one merged announcement carries the tags of both publications",
+    );
     let reply = call_retry(&caller, b_id, DESCRIBE_SERVICE, || {
         Bytes::from_static(b"{}")
     })
