@@ -65,6 +65,10 @@ _CONTROL_POLL_INTERVAL_MS = 10
 # handle's borrow lock.
 _NEXT_CONTROL_SLICE_MS = 50
 
+# Pause between `next_control` slices so a thread waiting for the borrow
+# lock gets it (see `next_control`). Small against the 50 ms slice.
+_LOCK_HANDOFF_S = 0.001
+
 # The native default grace period (`DEFAULT_GRACEFUL_SHUTDOWN`), and the
 # cadence at which `graceful_shutdown` checks whether the daemon left.
 _DEFAULT_GRACE_MS = 5000
@@ -391,6 +395,13 @@ class MeshOsDaemonHandleWrapper:
                 return ev  # type: ignore[return-value]
             if self._control_closed():
                 return None  # the runtime shut down: nothing will arrive
+            # Hand the borrow lock over before taking it again. A
+            # `threading.Lock` is not fair: re-acquiring straight after the
+            # release let this loop win every handoff on Linux, starving a
+            # `graceful_shutdown` waiting for the lock — so its `Shutdown`
+            # was never sent and this reader waited on it forever (sdk-py CI
+            # on PR #1228; Windows happened to hand over).
+            time.sleep(_LOCK_HANDOFF_S)
 
     def try_next_control(self) -> Optional[DaemonControl]:
         """Non-blocking variant of :meth:`next_control`."""
