@@ -96,3 +96,29 @@ func TestRegisterChannel_RejectsMalformedTokenRoot(t *testing.T) {
 		}
 	}
 }
+
+// SDK audit 2026-10-11: an empty, non-nil TokenRoots must reach core as
+// `[]` (token required, no trusted root: locked), as in Node, Python, C
+// and Rust. `omitempty` used to drop it, registering an OPEN channel.
+func TestChannelConfig_EmptyNonNilTokenRootsIsSent(t *testing.T) {
+	data, err := json.Marshal(ChannelConfig{Name: "ops/cmd", TokenRoots: []string{}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	roots, ok := got["token_roots"].([]any)
+	if !ok || len(roots) != 0 {
+		t.Fatalf("want token_roots: [] in %s", data)
+	}
+	if got["name"] != "ops/cmd" {
+		t.Fatalf("other fields must survive the custom marshal: %s", data)
+	}
+	// Pointer receivers marshal the same way.
+	ptr, err := json.Marshal(&ChannelConfig{Name: "ops/cmd", TokenRoots: []string{}})
+	if err != nil || string(ptr) != string(data) {
+		t.Fatalf("pointer marshal %s (%v) != %s", ptr, err, data)
+	}
+}

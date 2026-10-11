@@ -62,6 +62,7 @@ use std::ffi::{c_char, c_int, CString};
 use std::os::raw::c_float;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -506,6 +507,13 @@ struct CDaemonBridge {
     /// `None` for the v1 registration path, where the consumer owns
     /// the context's lifetime and this library never touches it.
     destroy: Option<MeshOsUserCtxDestroyFn>,
+    /// Set only once registration has SUCCEEDED. Until then the caller
+    /// still owns `user_ctx`: a bridge dropped on a failed registration
+    /// (SDK already shut down, registry refusal) must not run `destroy`,
+    /// or the caller's own failure-path release frees it a second time
+    /// (Go: a double `cgo.Handle.Delete`, which panics). SDK audit
+    /// 2026-10-11.
+    armed: Arc<AtomicBool>,
 }
 
 impl Drop for CDaemonBridge {
@@ -514,6 +522,9 @@ impl Drop for CDaemonBridge {
         // away — which is after the registry slot is gone AND after
         // every admitted callback has returned, because a callback
         // holds the bridge for its duration.
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(destroy) = self.destroy {
             // SAFETY: `destroy` is a C function pointer the consumer
             // supplied at registration and promised to keep valid for
@@ -988,11 +999,13 @@ fn register_with_vtable_inner(
         }
         clear_last_error_inner();
         let keypair = EntityKeypair::from_bytes(seed);
+        let armed = Arc::new(AtomicBool::new(false));
         let daemon = Box::new(CDaemonBridge {
             name: name.clone(),
             vtable,
             user_ctx: UserCtx(user_ctx),
             destroy,
+            armed: armed.clone(),
         });
         let guard = sdk_ref.inner.lock();
         let sdk_inner = match guard.as_ref() {
@@ -1004,6 +1017,10 @@ fn register_with_vtable_inner(
         };
         match sdk_inner.register_daemon(daemon, keypair) {
             Ok(handle) => {
+                // Ownership of `user_ctx` passes to the bridge only now.
+                // The SDK lock (`guard`) is still held, so no shutdown can
+                // drop the registered bridge before it is armed.
+                armed.store(true, Ordering::Release);
                 let daemon_id = handle.daemon_id();
                 let daemon_name = match CString::new(handle.daemon_name()) {
                     Ok(s) => s,
@@ -1769,6 +1786,7 @@ mod tests {
             vtable,
             user_ctx: UserCtx(user_ctx),
             destroy: None,
+            armed: Arc::new(AtomicBool::new(true)),
         };
         let event = CausalEvent {
             link: net::adapter::net::state::causal::CausalLink {
@@ -2028,6 +2046,8 @@ mod user_ctx_destructor_tests {
             vtable: vtable(),
             user_ctx: UserCtx(counter as *const AtomicUsize as *mut std::ffi::c_void),
             destroy,
+            // A registered bridge: registration armed it.
+            armed: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -2146,5 +2166,60 @@ mod user_ctx_destructor_tests {
             "NetMeshOsDaemonVtable must stay six function pointers wide; \
              growing it is an out-of-bounds read against older consumers"
         );
+    }
+
+    /// SDK audit 2026-10-11. A FAILED v2 registration leaves `user_ctx`
+    /// with the caller: the bridge built for it is dropped without
+    /// running `destroy`. Pre-fix the drop fired it, and the Go wrapper's
+    /// own failure-path `cgo.Handle.Delete()` then deleted the handle a
+    /// second time — a panic in the caller's goroutine.
+    #[test]
+    fn a_failed_registration_never_runs_the_destructor() {
+        let calls = AtomicUsize::new(0);
+        let ctx = &calls as *const AtomicUsize as *mut std::ffi::c_void;
+        let vt = vtable();
+        let register = |sdk: *mut NetMeshOsSdk, seed: [u8; 32]| {
+            let name = "fail-path";
+            let mut h: *mut NetMeshOsHandle = ptr::null_mut();
+            let status = net_meshos_register_daemon_with_vtable_v2(
+                sdk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                seed.as_ptr(),
+                &vt,
+                ctx,
+                Some(counting_destroy),
+                &mut h,
+            );
+            (status, h)
+        };
+
+        let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
+        // Same seed twice: the registry refuses the second.
+        let (ok, first) = register(sdk, [0x5A; 32]);
+        assert_eq!(ok, NET_MESHOS_OK);
+        let (dup, none) = register(sdk, [0x5A; 32]);
+        assert_ne!(dup, NET_MESHOS_OK);
+        assert!(none.is_null());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "refused: caller still owns ctx"
+        );
+
+        // After shutdown: refused before the registry is reached.
+        assert_eq!(net_meshos_sdk_shutdown(sdk), NET_MESHOS_OK);
+        let after = calls.load(Ordering::SeqCst);
+        let (gone, none) = register(sdk, [0x5B; 32]);
+        assert_eq!(gone, NET_MESHOS_ERR_ALREADY_SHUTDOWN);
+        assert!(none.is_null());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after,
+            "a registration refused at shutdown must not release the caller's ctx"
+        );
+        net_meshos_handle_free(first);
+        net_meshos_sdk_free(sdk);
     }
 }

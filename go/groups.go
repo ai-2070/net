@@ -320,6 +320,17 @@ func NewReplicaGroup(rt *DaemonRuntime, kind string, cfg ReplicaGroupConfig) (*R
 	lbBytes, lbPtr, lbLen := cKindBytes(string(strategyOrDefault(cfg.LBStrategy)))
 	autoSnap, maxLog := hostConfigFields(cfg.HostConfig)
 
+	// Hold the runtime's read lock across the native spawn, as every
+	// other DaemonRuntime method does: without it a concurrent Close
+	// (or the finalizer, when rt is otherwise unreachable) frees the
+	// runtime box mid-spawn (SDK audit 2026-10-11).
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	defer runtime.KeepAlive(rt)
+
 	var nativeHandle *C.net_compute_replica_group_t
 	var errOut *C.char
 	code := C.net_compute_replica_group_spawn(
@@ -487,6 +498,17 @@ func NewForkGroup(
 	lbBytes, lbPtr, lbLen := cKindBytes(string(strategyOrDefault(cfg.LBStrategy)))
 	autoSnap, maxLog := hostConfigFields(cfg.HostConfig)
 
+	// Hold the runtime's read lock across the native spawn, as every
+	// other DaemonRuntime method does: without it a concurrent Close
+	// (or the finalizer, when rt is otherwise unreachable) frees the
+	// runtime box mid-spawn (SDK audit 2026-10-11).
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	defer runtime.KeepAlive(rt)
+
 	var nativeHandle *C.net_compute_fork_group_t
 	var errOut *C.char
 	code := C.net_compute_fork_group_spawn(
@@ -642,6 +664,17 @@ func NewStandbyGroup(rt *DaemonRuntime, kind string, cfg StandbyGroupConfig) (*S
 	}
 	kindBytes, kindPtr, kindLen := cKindBytes(kind)
 	autoSnap, maxLog := hostConfigFields(cfg.HostConfig)
+
+	// Hold the runtime's read lock across the native spawn, as every
+	// other DaemonRuntime method does: without it a concurrent Close
+	// (or the finalizer, when rt is otherwise unreachable) frees the
+	// runtime box mid-spawn (SDK audit 2026-10-11).
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	defer runtime.KeepAlive(rt)
 
 	var nativeHandle *C.net_compute_standby_group_t
 	var errOut *C.char

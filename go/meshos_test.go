@@ -244,3 +244,43 @@ func TestHandleNilSafety(t *testing.T) {
 	// Free on nil should be a no-op (not panic).
 	h.Free()
 }
+
+// SDK audit 2026-10-11: a registration that fails AFTER the C call was
+// made (duplicate seed in the registry, or the SDK already shut down)
+// used to run the Rust-side user-ctx destructor — deleting the
+// cgo.Handle — and then the Go wrapper's own failure path deleted it
+// again, which panics ("misuse of an invalid Handle") in the caller.
+// Ownership now passes only on success.
+func TestRegisterDaemonWithCallbacksFailureDoesNotDoubleDeleteHandle(t *testing.T) {
+	sdk, err := StartMeshOsDaemonSdk(MeshOsConfig{
+		ThisNode:            1,
+		TickIntervalMs:      50,
+		EventQueueCapacity:  16,
+		ActionQueueCapacity: 16,
+		ControlCapacity:     16,
+	})
+	if err != nil {
+		t.Fatalf("StartMeshOsDaemonSdk: %v", err)
+	}
+	defer sdk.Free()
+
+	seed := make([]byte, 32)
+	seed[0] = 0x42
+	first, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "dup"}, seed)
+	if err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	defer first.Free()
+	if _, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "dup"}, seed); err == nil {
+		t.Fatal("a second registration under the same seed must fail")
+	}
+
+	if err := sdk.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	seed[0] = 0x43
+	if _, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "late"}, seed); err == nil {
+		t.Fatal("registration after Shutdown must fail")
+	}
+	// Reaching here without a panic is the assertion.
+}

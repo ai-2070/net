@@ -192,6 +192,16 @@ extern int net_rpc_call_client_stream(
     ClientStreamCallHandleC** out_handle,
     char** out_err
 );
+extern int net_rpc_call_client_stream_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint64_t cancel_token,
+    ClientStreamCallHandleC** out_handle,
+    char** out_err
+);
 extern int net_rpc_client_stream_send(
     ClientStreamCallHandleC* handle,
     const uint8_t* body_ptr, size_t body_len,
@@ -213,6 +223,17 @@ extern int net_rpc_call_duplex(
     uint64_t deadline_ms,
     uint32_t request_window,
     uint32_t stream_window,
+    DuplexCallHandleC** out_handle,
+    char** out_err
+);
+extern int net_rpc_call_duplex_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint32_t stream_window,
+    uint64_t cancel_token,
     DuplexCallHandleC** out_handle,
     char** out_err
 );
@@ -760,7 +781,7 @@ func (r *MeshRpc) Call(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installCancelWatcher(ctx, r)
+	cancelToken, inflight, stopWatcher := installCancelWatcher(ctx, r)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -768,6 +789,8 @@ func (r *MeshRpc) Call(
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_rpc_call(
 			h,
 			C.uint64_t(targetNodeID),
@@ -798,7 +821,7 @@ func (r *MeshRpc) CallService(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installCancelWatcher(ctx, r)
+	cancelToken, inflight, stopWatcher := installCancelWatcher(ctx, r)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -806,6 +829,8 @@ func (r *MeshRpc) CallService(
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_rpc_call_service(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -921,48 +946,30 @@ func readCancellableResult(
 // call runs in the non-cancellable fast path.
 //
 // ABI 0x0004: token reservation and cancel routing are scoped to
-// the mesh, so both calls go through `r.withHandle`. If the mesh
-// is closed before the watcher fires, the cancel is a quiet no-op.
-func installCancelWatcher(ctx context.Context, r *MeshRpc) (uint64, func()) {
+// the mesh. Reservation goes through `r.withHandle`; the cancel fires
+// through the returned inflightCancel, which the call arms with its
+// live handle (enter/leave) for the span it is inside native code. If
+// the call is not in flight, the cancel is remembered or dropped.
+func installCancelWatcher(ctx context.Context, r *MeshRpc) (uint64, *inflightCancel, func()) {
 	if ctx == nil || ctx.Done() == nil || r == nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	var token uint64
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
 		token = uint64(C.net_rpc_reserve_cancel_token(h))
 	}); err != nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	if token == 0 {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		select {
-		case <-ctx.Done():
-			// Re-acquire the read lock for the cancel call so a
-			// concurrent Close can't free the handle out from under
-			// us. ErrRpcClosed is a quiet drop — substrate's cancel
-			// is best-effort.
-			_ = r.withHandle(func(h *C.MeshRpcHandle) {
-				C.net_rpc_cancel_call(h, C.uint64_t(token))
-			})
-		case <-stop:
-		}
-	}()
-	return token, func() {
-		// Idempotent stop. The watcher exits on either branch of
-		// the select; closing `stop` is safe to call once.
-		select {
-		case <-stop:
-			// already closed
-		default:
-			close(stop)
-		}
-		<-done
-	}
+	// The cancel fires against the handle the call itself published while
+	// inside native code (see inflightCancel) — never via r.withHandle,
+	// which deadlocks against a queued Close.
+	ic := newInflightCancel(token, func(h unsafe.Pointer, t uint64) {
+		C.net_rpc_cancel_call((*C.MeshRpcHandle)(h), C.uint64_t(t))
+	})
+	return token, ic, ic.watchCtx(ctx.Done())
 }
 
 // =====================================================================
@@ -1016,6 +1023,12 @@ type streamHandleGuard struct {
 	state atomic.Int64
 	// free performs the actual FFI teardown; invoked exactly once.
 	free func()
+	// wake, when set, fires the call's substrate cancel token. The
+	// first requestFree runs it BEFORE waiting on in-flight ops: an op
+	// parked inside native code (Recv / Send / Finish) never returns on
+	// its own, so without the cancel the deferred free — and the CANCEL
+	// on the wire — never happened (SDK audit 2026-10-11).
+	wake func()
 }
 
 func newStreamHandleGuard(free func()) *streamHandleGuard {
@@ -1064,6 +1077,9 @@ func (g *streamHandleGuard) requestFree() {
 		if g.state.CompareAndSwap(s, s|1) {
 			if s>>1 == 0 { // no ops in flight
 				g.free()
+			} else if g.wake != nil {
+				// Wake the parked op; its leave() then runs the free.
+				g.wake()
 			}
 			return
 		}
@@ -1095,6 +1111,33 @@ func spawnCtxCancelWatcher(
 		close(watcherDone)
 	}()
 	return cancel, watcherDone
+}
+
+// reserveStreamCancel reserves a substrate cancel token for a streaming
+// call and returns it with the wake hook its streamHandleGuard fires on
+// teardown. Token 0 (closed MeshRpc / reservation failed) yields a nil
+// hook and the non-cancellable constructor path.
+//
+// The hook captures only `r`, never the call struct (finalizers stay
+// live). It takes r.mu with TryRLock: a MeshRpc whose own Close is
+// already queued is being torn down anyway, and blocking here behind it
+// is exactly the deadlock the unary path had.
+func (r *MeshRpc) reserveStreamCancel() (uint64, func()) {
+	var token uint64
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		token = uint64(C.net_rpc_reserve_cancel_token(h))
+	}); err != nil || token == 0 {
+		return 0, nil
+	}
+	return token, func() {
+		if !r.mu.TryRLock() {
+			return
+		}
+		defer r.mu.RUnlock()
+		if r.handle != nil {
+			C.net_rpc_cancel_call(r.handle, C.uint64_t(token))
+		}
+	}
 }
 
 // RpcStream is an open streaming RPC call. Recv blocks until the
@@ -1150,17 +1193,19 @@ func (r *MeshRpc) CallStreaming(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
+	cancelToken, wake := r.reserveStreamCancel()
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
-		code = C.net_rpc_call_streaming(
+		code = C.net_rpc_call_streaming_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.Window),
+			C.uint64_t(cancelToken),
 			&outStream,
 			&outErr,
 		)
@@ -1176,6 +1221,7 @@ func (r *MeshRpc) CallStreaming(
 		C.net_rpc_stream_close(handlePtr)
 		C.net_rpc_stream_free(handlePtr)
 	})
+	guard.wake = wake
 	stream := &RpcStream{
 		rpc:    r,
 		handle: outStream,
@@ -1210,6 +1256,7 @@ func (r *MeshRpc) CallServiceStreaming(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
+	cancelToken, wake := r.reserveStreamCancel()
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
@@ -1220,7 +1267,7 @@ func (r *MeshRpc) CallServiceStreaming(
 			cReq.ptr, cReq.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.Window),
-			C.uint64_t(0), // cancel_token=0 — ctx-watcher path
+			C.uint64_t(cancelToken),
 			&outStream,
 			&outErr,
 		)
@@ -1236,6 +1283,7 @@ func (r *MeshRpc) CallServiceStreaming(
 		C.net_rpc_stream_close(handlePtr)
 		C.net_rpc_stream_free(handlePtr)
 	})
+	guard.wake = wake
 	stream := &RpcStream{
 		rpc:    r,
 		handle: outStream,
@@ -1614,16 +1662,18 @@ func (r *MeshRpc) CallClientStream(
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
+	cancelToken, wake := r.reserveStreamCancel()
 	var outHandle *C.ClientStreamCallHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
-		code = C.net_rpc_call_client_stream(
+		code = C.net_rpc_call_client_stream_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
 			(*C.char)(cService.ptr), cService.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.RequestWindow),
+			C.uint64_t(cancelToken),
 			&outHandle,
 			&outErr,
 		)
@@ -1638,6 +1688,7 @@ func (r *MeshRpc) CallClientStream(
 	guard := newStreamHandleGuard(func() {
 		C.net_rpc_client_stream_free(handlePtr)
 	})
+	guard.wake = wake
 	call := &ClientStreamCall{
 		rpc:    r,
 		handle: outHandle,
@@ -1788,17 +1839,19 @@ func (r *MeshRpc) CallDuplex(
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
+	cancelToken, wake := r.reserveStreamCancel()
 	var outHandle *C.DuplexCallHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
-		code = C.net_rpc_call_duplex(
+		code = C.net_rpc_call_duplex_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
 			(*C.char)(cService.ptr), cService.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.RequestWindow),
 			C.uint32_t(opts.StreamWindow),
+			C.uint64_t(cancelToken),
 			&outHandle,
 			&outErr,
 		)
@@ -1813,6 +1866,7 @@ func (r *MeshRpc) CallDuplex(
 	guard := newStreamHandleGuard(func() {
 		C.net_rpc_duplex_free(handlePtr)
 	})
+	guard.wake = wake
 	call := &DuplexCall{
 		rpc:    r,
 		handle: outHandle,

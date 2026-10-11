@@ -356,6 +356,10 @@ typedef void (*NetMeshOsUserCtxDestroyFn)(void* user_ctx);
  * Identical to `net_meshos_register_daemon_with_vtable` except for
  * `destroy`, which may be NULL (making the two identical).
  *
+ * Ownership passes ONLY on success. On any non-OK return `destroy` is
+ * never called and the caller still owns `user_ctx`, so it must
+ * release the context itself.
+ *
  * # Why you probably want this
  *
  * Unregistering a daemon does not mean no callback can still arrive:

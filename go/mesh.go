@@ -405,6 +405,12 @@ type ChannelConfig struct {
 	// authorization when token enforcement is on and no roots are
 	// installed, so `RequireToken: true` on its own does not produce a
 	// token-gated channel — it produces a permanently closed one.
+	//
+	// A nil slice means "not set". A non-nil EMPTY slice is sent as
+	// `[]`, which core treats as token enforcement with no trusted
+	// roots — a locked channel, exactly as in every other binding. (A
+	// plain `omitempty` dropped it, so an empty roots list loaded from
+	// config registered an OPEN channel; see MarshalJSON.)
 	TokenRoots []string `json:"token_roots,omitempty"`
 
 	Priority   uint8  `json:"priority,omitempty"`
@@ -418,6 +424,21 @@ type ChannelConfig struct {
 	// announced caps miss this filter are rejected with
 	// `ErrChannelAuth`.
 	SubscribeCaps *CapabilityFilter `json:"subscribe_caps,omitempty"`
+}
+
+// MarshalJSON keeps `omitempty` for a nil TokenRoots but emits `[]` for
+// an empty non-nil one, so `TokenRoots: []string{}` fails closed (core's
+// `with_token_roots([])` requires a token and trusts no root) instead of
+// silently registering an unauthenticated channel (SDK audit 2026-10-11).
+func (c ChannelConfig) MarshalJSON() ([]byte, error) {
+	type plain ChannelConfig
+	if c.TokenRoots == nil || len(c.TokenRoots) > 0 {
+		return json.Marshal(plain(c))
+	}
+	return json.Marshal(struct {
+		plain
+		TokenRoots []string `json:"token_roots"`
+	}{plain: plain(c), TokenRoots: []string{}})
 }
 
 // PublishConfig mirrors the core `PublishConfig`.

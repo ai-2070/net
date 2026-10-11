@@ -650,7 +650,7 @@ func (c *OrgClient) CallBytes(ctx context.Context, service string, req []byte) (
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installOrgCancelWatcher(ctx, c)
+	cancelToken, inflight, stopWatcher := installOrgCancelWatcher(ctx, c)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -658,6 +658,8 @@ func (c *OrgClient) CallBytes(ctx context.Context, service string, req []byte) (
 	var outErr *C.char
 	var code C.int
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_org_call(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -688,7 +690,7 @@ func (c *OrgClient) CallExportedBytes(ctx context.Context, service string, req [
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installOrgCancelWatcher(ctx, c)
+	cancelToken, inflight, stopWatcher := installOrgCancelWatcher(ctx, c)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -696,6 +698,8 @@ func (c *OrgClient) CallExportedBytes(ctx context.Context, service string, req [
 	var outErr *C.char
 	var code C.int
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_org_call_exported(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -755,41 +759,25 @@ func readOrgCallResult(
 // installOrgCancelWatcher reserves a cancel token and spawns a goroutine that
 // fires net_org_cancel_call on ctx.Done(). Returns the token and an idempotent
 // stop. Mirrors mesh_rpc.go's installCancelWatcher.
-func installOrgCancelWatcher(ctx context.Context, c *OrgClient) (uint64, func()) {
+func installOrgCancelWatcher(ctx context.Context, c *OrgClient) (uint64, *inflightCancel, func()) {
 	if ctx == nil || ctx.Done() == nil || c == nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	var token uint64
 	if err := c.withHandle(func(h *C.NetOrgClient) {
 		token = uint64(C.net_org_reserve_cancel_token(h))
 	}); err != nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	if token == 0 {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		select {
-		case <-ctx.Done():
-			// Re-acquire the read lock so a concurrent Close can't free the
-			// handle out from under us. A closed handle is a quiet drop.
-			_ = c.withHandle(func(h *C.NetOrgClient) {
-				C.net_org_cancel_call(h, C.uint64_t(token))
-			})
-		case <-stop:
-		}
-	}()
-	return token, func() {
-		select {
-		case <-stop:
-		default:
-			close(stop)
-		}
-		<-done
-	}
+	// Fired against the handle the call publishes while inside native
+	// code, never via c.withHandle (which deadlocks against a queued Close).
+	ic := newInflightCancel(token, func(h unsafe.Pointer, t uint64) {
+		C.net_org_cancel_call((*C.NetOrgClient)(h), C.uint64_t(t))
+	})
+	return token, ic, ic.watchCtx(ctx.Done())
 }
 
 // OrgCall calls a protected service with JSON marshaling. Free function because

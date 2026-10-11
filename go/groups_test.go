@@ -405,3 +405,27 @@ func TestStandbyGroup_UnknownKindErrorsFactoryNotFound(t *testing.T) {
 		t.Errorf("Kind = %q, want factory-not-found", ge.Kind)
 	}
 }
+
+// SDK audit 2026-10-11: group constructors read `rt.handle` without
+// `rt.mu`, so a Close racing (or preceding) the native spawn handed a
+// freed runtime to Rust. They now hold the read lock across the call
+// and report a closed runtime like every other DaemonRuntime method.
+func TestGroups_ConstructorsOnClosedRuntimeReturnErrRuntimeShutDown(t *testing.T) {
+	rt, mesh := runtimeWithPeers(t, 4)
+	defer mesh.Shutdown()
+	rt.Close()
+
+	if _, err := NewReplicaGroup(rt, "noop", ReplicaGroupConfig{
+		ReplicaCount: 2, GroupSeed: seed(0x31),
+	}); !errors.Is(err, ErrRuntimeShutDown) {
+		t.Errorf("NewReplicaGroup on closed runtime: got %v, want ErrRuntimeShutDown", err)
+	}
+	if _, err := NewForkGroup(rt, "noop", 1, 1, ForkGroupConfig{ForkCount: 2}); !errors.Is(err, ErrRuntimeShutDown) {
+		t.Errorf("NewForkGroup on closed runtime: got %v, want ErrRuntimeShutDown", err)
+	}
+	if _, err := NewStandbyGroup(rt, "noop", StandbyGroupConfig{
+		MemberCount: 2, GroupSeed: seed(0x32),
+	}); !errors.Is(err, ErrRuntimeShutDown) {
+		t.Errorf("NewStandbyGroup on closed runtime: got %v, want ErrRuntimeShutDown", err)
+	}
+}
