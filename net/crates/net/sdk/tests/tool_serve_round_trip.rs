@@ -797,3 +797,68 @@ async fn a_priced_descriptor_is_refused_on_the_ungated_serve_path() {
 
     mesh.shutdown().await.ok();
 }
+
+/// SDK audit 2026-10-11: every `ToolEvent` went through the drop-on-full
+/// sink, so a handler outrunning a credit-gated caller lost events — and
+/// when the terminal `Result` was among them the stream still ended
+/// "cleanly" (no `missing_terminal` was synthesized: `seen_terminal` was
+/// already set). Events are now backpressured: all arrive, in order, and
+/// the stream ends with its `Result`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_tool_streaming_never_drops_events_under_a_slow_consumer() {
+    const DELTAS: usize = 2000; // > the 1024-chunk pump queue
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("burst_stream")
+        .description("Bursty streaming tool.")
+        .build();
+    let _handle = host
+        .serve_tool_streaming::<WebSearchReq, _, _, _>(descriptor, |_req| async move {
+            let mut events: Vec<ToolEvent> = (0..DELTAS)
+                .map(|i| ToolEvent::Delta {
+                    data: serde_json::json!({ "i": i }),
+                })
+                .collect();
+            events.push(ToolEvent::Result {
+                data: serde_json::json!({ "done": true }),
+            });
+            futures::stream::iter(events)
+        })
+        .expect("serve_tool_streaming");
+
+    let mut raw = net_sdk::mesh_rpc::CallOptions::default();
+    raw.stream_window_initial = Some(4); // credit-gated: the pump queue fills
+    let mut stream = caller
+        .call_streaming_typed::<WebSearchReq, ToolEvent>(
+            host.inner().node_id(),
+            "burst_stream",
+            &WebSearchReq { query: "x".into() },
+            CallOptionsTyped {
+                raw,
+                codec: Codec::Json,
+            },
+        )
+        .await
+        .expect("call_streaming_typed");
+    // Let the handler run far ahead of the consumer before reading.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut deltas = 0usize;
+    let mut last = None;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(20), stream.next())
+        .await
+        .expect("stream keeps flowing")
+    {
+        let event = item.expect("stream chunk");
+        if let ToolEvent::Delta { data } = &event {
+            assert_eq!(data["i"].as_u64(), Some(deltas as u64), "in order, no gaps");
+            deltas += 1;
+        }
+        last = Some(event);
+    }
+    assert_eq!(deltas, DELTAS, "every delta delivered");
+    assert!(
+        matches!(last, Some(ToolEvent::Result { .. })),
+        "the stream ends with its terminal Result: {last:?}"
+    );
+}

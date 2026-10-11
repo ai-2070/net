@@ -2094,7 +2094,8 @@ impl MigrationHandle {
                     // `start_migration_with`'s send-failure path)
                     // return `Err` to the caller *before* the wait
                     // loop can observe the None status, so they
-                    // don't trip this branch.
+                    // don't trip this branch; `cancel()` records its
+                    // failure before aborting, so it is caught above.
                     return Ok(());
                 }
             }
@@ -2182,12 +2183,35 @@ impl MigrationHandle {
     /// past `Cutover` cannot be undone cleanly because routing has
     /// already flipped.
     pub async fn cancel(&self) -> Result<(), DaemonError> {
-        let msg = self
+        // Record the abort BEFORE the orchestrator drops its record. The
+        // wait loop reads "record gone + no recorded failure" as success,
+        // and a local abort never comes back through the dispatcher's
+        // failure callback (the MigrationFailed it emits goes to the
+        // source and target, not to this node) — so without this a
+        // concurrent or later `wait()` on a clone reported an aborted
+        // migration as completed (SDK audit 2026-10-11).
+        self.runtime.inner.recent_failures.lock().insert(
+            self.origin_hash,
+            MigrationFailureReason::StateFailed("cancel requested".into()),
+        );
+        let msg = match self
             .runtime
             .inner
             .orchestrator
             .abort_migration(self.origin_hash, "cancel requested".into())
-            .map_err(DaemonError::Migration)?;
+        {
+            Ok(msg) => msg,
+            Err(e) => {
+                // Nothing was aborted (no record): don't leave a failure
+                // behind for a migration this call never touched.
+                self.runtime
+                    .inner
+                    .recent_failures
+                    .lock()
+                    .remove(&self.origin_hash);
+                return Err(DaemonError::Migration(e));
+            }
+        };
         // Best-effort notify — ignore send errors, the orchestrator
         // record is already gone on our side.
         let _ = self

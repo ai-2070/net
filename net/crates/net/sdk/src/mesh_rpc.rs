@@ -849,6 +849,25 @@ impl<Resp: Serialize> ResponseSinkTyped<Resp> {
         self.inner.send(bytes);
         Ok(())
     }
+
+    /// Backpressured [`Self::send`]: encode `value` and park until the
+    /// stream's pump has room, instead of dropping the chunk when the
+    /// queue is full (the caller withholds credit, or the handler outruns
+    /// the pump). Returns `Err` if encoding fails or the call has been torn
+    /// down (the chunk was not sent; stop producing).
+    ///
+    /// Use it for chunks that must not be lost silently — e.g. a stream's
+    /// terminal envelope.
+    pub async fn send_wait(&self, value: &Resp) -> std::result::Result<(), String> {
+        let bytes = self
+            .codec
+            .encode(value)
+            .map_err(|e| format!("typed streaming sink encode: {e}"))?;
+        self.inner
+            .send_wait(bytes)
+            .await
+            .map_err(|_| "typed streaming sink closed".to_string())
+    }
 }
 
 /// Typed counterpart of [`RpcStream`]. Auto-decodes each chunk to

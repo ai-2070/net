@@ -1511,3 +1511,54 @@ async fn captured_handle_spawns_from_non_runtime_thread() {
     join.join().expect("os thread joined");
     assert_eq!(rx.await.expect("oneshot recv"), 42);
 }
+
+/// SDK audit 2026-10-11: `cancel()` aborted the orchestrator record
+/// locally, but nothing recorded a failure on this node, and the wait
+/// loop reads "record gone + no recorded failure" as success — so a
+/// `wait()` on a clone of a cancelled handle returned `Ok(())`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_on_a_cancelled_migration_reports_failure_not_success() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    // Only the SOURCE runs its receive loop: the target never answers,
+    // so the migration stays in flight until cancelled.
+    source_rt.mesh().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let handle = source_rt
+        .spawn("counter", identity, DaemonHostConfig::default())
+        .await
+        .expect("spawn on source");
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+    let waiter = tokio::spawn(mig.clone().wait_with_timeout(Duration::from_secs(10)));
+    sleep(Duration::from_millis(150)).await;
+    mig.cancel().await.expect("cancel an in-flight migration");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("wait returns promptly after cancel")
+        .expect("join");
+    assert!(
+        matches!(outcome, Err(DaemonError::MigrationFailed(_))),
+        "a cancelled migration must not report success: {outcome:?}"
+    );
+}
