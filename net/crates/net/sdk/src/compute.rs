@@ -1078,7 +1078,11 @@ impl DaemonRuntime {
         }
         // Snapshot the ledger before the host goes: a stopped daemon's
         // subscriptions used to stay on publisher rosters until the session
-        // timed out.
+        // timed out. Under the membership lock, taken BEFORE the snapshot and
+        // the unregister: otherwise a subscribe for this daemon could join
+        // in between, fail to record (host gone) and leave the node on the
+        // roster (cubic review of PR #1228).
+        let membership = self.inner.membership.lock().await;
         let bindings = self
             .inner
             .registry
@@ -1089,9 +1093,8 @@ impl DaemonRuntime {
         match self.inner.registry.unregister(origin_hash) {
             Ok(_) => {
                 self.inner.factory_registry.remove(origin_hash);
-                if !bindings.is_empty() {
-                    teardown_subscriptions(self.inner.clone(), origin_hash, bindings).await;
-                }
+                leave_unheld_channels(&self.inner, origin_hash, bindings).await;
+                drop(membership);
                 Ok(())
             }
             Err(CoreDaemonError::NotFound(_)) if self.state() == State::ShuttingDown => Ok(()),
@@ -1234,6 +1237,10 @@ impl DaemonRuntime {
         token: Option<PermissionToken>,
     ) -> Result<(), DaemonError> {
         self.require_ready()?;
+        // Join + ledger record as one step against concurrent leaves — and
+        // the registration check inside it, so a concurrent `stop()` either
+        // finishes first (NotFound here) or waits for the record.
+        let _membership = self.inner.membership.lock().await;
         if !self.inner.registry.contains(origin_hash) {
             return Err(DaemonError::Core(CoreDaemonError::NotFound(origin_hash)));
         }
@@ -1241,8 +1248,6 @@ impl DaemonRuntime {
         // handing ownership to the mesh. The mesh call consumes the
         // token by value on the token-path.
         let token_bytes = token.as_ref().map(|t| t.to_bytes().to_vec());
-        // Join + ledger record as one step against concurrent leaves.
-        let _membership = self.inner.membership.lock().await;
         let result = match token {
             Some(tok) => {
                 self.inner
@@ -1891,10 +1896,16 @@ async fn teardown_subscriptions(
 ) {
     // Against a sibling's in-flight subscribe (see `Inner::membership`).
     let _membership = inner.membership.lock().await;
+    leave_unheld_channels(&inner, leaving, bindings).await;
+}
+
+/// [`teardown_subscriptions`]'s body, for a caller already holding
+/// `Inner::membership`.
+async fn leave_unheld_channels(inner: &Inner, leaving: u64, bindings: Vec<SubscriptionBinding>) {
     for sub in bindings {
         // Node-level membership: keep it while a co-located daemon still
         // holds the same subscription.
-        if subscription_held_elsewhere(&inner, leaving, sub.publisher, &sub.channel) {
+        if subscription_held_elsewhere(inner, leaving, sub.publisher, &sub.channel) {
             continue;
         }
         if let Err(e) = inner
@@ -2267,15 +2278,24 @@ impl MigrationHandle {
             .abort_migration(self.origin_hash, reason.into());
     }
 
-    /// Pop the most recent `MigrationFailureReason` the dispatcher
-    /// observed for this migration (if any). Consumed: subsequent
-    /// calls see `None` until the next failure arrives.
+    /// The most recent `MigrationFailureReason` the dispatcher observed
+    /// for this migration (if any).
+    ///
+    /// A TERMINAL reason is left in place: every clone of the handle that
+    /// waits must see it. Consuming it made only the first waiter observe
+    /// the failure — the rest read "record gone + no failure" as success
+    /// (cubic review of PR #1228). The next `start_migration_with` for this
+    /// origin clears it. A RETRIABLE reason is consumed, so exactly one
+    /// waiter re-initiates the attempt (and a stale retriable reason never
+    /// fails the attempt that replaces it).
     fn take_recent_failure(&self) -> Option<MigrationFailureReason> {
-        self.runtime
-            .inner
-            .recent_failures
-            .lock()
-            .remove(&self.origin_hash)
+        let mut failures = self.runtime.inner.recent_failures.lock();
+        let retriable = failures.get(&self.origin_hash)?.is_retriable();
+        if retriable {
+            failures.remove(&self.origin_hash)
+        } else {
+            failures.get(&self.origin_hash).cloned()
+        }
     }
 
     /// Request abort. The orchestrator emits a `MigrationFailed`

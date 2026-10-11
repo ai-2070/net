@@ -294,8 +294,10 @@ impl OperatorEnrollment {
 
     /// [`Self::revoke`] with an explicit floor `generation` and `now`.
     ///
-    /// Enforcement first: bump the [`RevocationStore`] floor (what a running
-    /// provider honors), then stamp `revoked_at` in the inventory for display.
+    /// Enforcement first: revoke the device as a SUBJECT in the
+    /// [`RevocationStore`] (what a running provider honors) — the maximal
+    /// floor, so it supersedes `generation` — then stamp `revoked_at` in the
+    /// inventory for display.
     /// A device absent from the inventory still gets its floor raised — the
     /// inventory stamp is best-effort metadata.
     ///
@@ -312,11 +314,12 @@ impl OperatorEnrollment {
         if generation == 0 {
             return Err(OperatorError::NoOpRevocation);
         }
-        RevocationStore::revoke_below(&self.revocation_path, device, generation)?;
-        // The floor kills links the device ISSUED; its own root-issued
-        // `root → device` grant has the root as issuer and survived it. The
-        // revoked-subject record is what refuses a chain naming the device
-        // itself (SDK audit 2026-10-11).
+        // One atomic write. A floor alone kills links the device ISSUED; its
+        // own root-issued `root → device` grant has the root as issuer and
+        // survived it (SDK audit 2026-10-11). The subject revocation refuses
+        // a chain naming the device itself AND is the maximal floor, so it
+        // supersedes `generation`. Two separate writes let a gate reload the
+        // floor-only state in between (cubic review of PR #1228).
         RevocationStore::revoke_subject(&self.revocation_path, device)?;
         DeviceRegistry::mark_revoked(&self.registry_path, device, now)?;
         Ok(())

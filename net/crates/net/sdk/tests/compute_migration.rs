@@ -1631,3 +1631,61 @@ async fn cancel_never_erases_or_overwrites_a_recorded_failure() {
         "a failed migration must not report success after cancel: {outcome:?}"
     );
 }
+
+/// cubic review of PR #1228: the wait loop CONSUMED the recorded failure,
+/// so only the first cloned handle to look saw it; every other clone read
+/// "record gone + no failure" and returned `Ok(())`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_cloned_waiter_sees_a_terminal_failure() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let handle = source_rt
+        .spawn("counter", identity, DaemonHostConfig::default())
+        .await
+        .expect("spawn on source");
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+    source_rt.inject_migration_failure(handle.origin_hash, MigrationFailureReason::FactoryNotFound);
+    mig.cancel()
+        .await
+        .expect("cancel aborts the in-flight record");
+
+    for i in 0..3 {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            mig.clone().wait_with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("wait returns promptly");
+        assert!(
+            matches!(
+                outcome,
+                Err(DaemonError::MigrationFailed(
+                    MigrationFailureReason::FactoryNotFound
+                ))
+            ),
+            "waiter #{i} must see the failure: {outcome:?}"
+        );
+    }
+}

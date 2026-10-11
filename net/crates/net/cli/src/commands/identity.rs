@@ -390,12 +390,16 @@ async fn run_fingerprint(
 async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
     let issuer = parse_entity_hex(&args.issuer)?;
     let path = resolve_revocation_store(args.revocation_store.as_deref())?;
-    let floor = net_sdk::revocation::RevocationStore::revoke_below(&path, &issuer, args.generation)
+    // `--subject` is ONE store write: the subject revocation is the maximal
+    // floor, so it also covers `--generation`. Two writes could leave the
+    // floor committed and the subject record not (cubic review of PR #1228).
+    let generation = if args.subject {
+        net_sdk::revocation::REVOKED_SUBJECT_FLOOR
+    } else {
+        args.generation
+    };
+    let floor = net_sdk::revocation::RevocationStore::revoke_below(&path, &issuer, generation)
         .map_err(|e| sdk(format!("revoke failed: {e}")))?;
-    if args.subject {
-        net_sdk::revocation::RevocationStore::revoke_subject(&path, &issuer)
-            .map_err(|e| sdk(format!("revoke subject failed: {e}")))?;
-    }
     let info = RevokeOutput {
         issuer_hex: hex::encode(issuer.as_bytes()),
         generation: args.generation,
