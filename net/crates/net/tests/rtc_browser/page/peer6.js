@@ -153,6 +153,10 @@ async function execute(step) {
       // three tabs from ever sharing one node id.
       if (step.entity_secret_hex) opts.entitySecretHex = step.entity_secret_hex;
       if (step.noise_secret_hex) opts.noiseSecretHex = step.noise_secret_hex;
+      // The harness runs several nodes with one identity in one tab on
+      // purpose; the per-identity Web Lock (SDK audit 2026-10-11) is not
+      // what these witnesses test, so they opt out as a page may.
+      if (opts.entitySecretHex !== undefined) opts.lockIdentity = false;
       if (step.stun) opts.iceServers = [{ urls: step.stun }];
       let node;
       try {

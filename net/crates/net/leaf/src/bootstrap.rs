@@ -587,9 +587,9 @@ pub enum ProbeEvent {
     /// nothing, so it did not run.
     ConnectionFailed,
     /// Gathering completed (the end-of-candidates signal). With no
-    /// answer and no "no response" error it is inconclusive: an engine
-    /// may suppress a reflexive candidate equal to a public host
-    /// address, so the endpoint can have answered invisibly.
+    /// answer and no "no response" error it is inconclusive only when a
+    /// host candidate carried a public address (an engine may suppress a
+    /// reflexive candidate equal to it); otherwise it is silence.
     GatheringComplete,
 }
 
@@ -664,18 +664,59 @@ pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
         return ProbeOutcome::NotRun;
     }
     // Completed with no answer and no "no response" report is
-    // inconclusive, not silence (SDK audit 2026-10-11): a host with no
-    // NAT would otherwise be typed `udp-blocked`.
+    // inconclusive ONLY when a host candidate carried a literal public
+    // address: an engine may suppress a reflexive candidate equal to it,
+    // so a host with no NAT could have been answered invisibly (SDK audit
+    // 2026-10-11). Behind NAT — a private, link-local or mDNS-obfuscated
+    // host — the srflx differs from every host address and is never
+    // suppressed, so its absence IS silence: that is exactly what blocked
+    // UDP looks like in Chromium, and reading it as inconclusive left a
+    // real UDP block untyped (browser matrix, PR #1228).
     let completed = events
         .iter()
         .any(|event| matches!(event, ProbeEvent::GatheringComplete));
     let reported_no_response = events.iter().any(
         |event| matches!(event, ProbeEvent::CandidateError(code) if *code >= STUN_NO_RESPONSE_CODE),
     );
-    if completed && !reported_no_response {
+    let public_host = events.iter().any(
+        |event| matches!(event, ProbeEvent::Candidate(line) if host_candidate_is_public(line)),
+    );
+    if completed && !reported_no_response && public_host {
         ProbeOutcome::NotRun
     } else {
         ProbeOutcome::Unanswered
+    }
+}
+
+/// Whether `line` is a `typ host` candidate whose address is a literal
+/// publicly routable IP: not private, loopback, link-local, CGNAT,
+/// unique-local or unspecified. An obfuscated (`.local`) address is not
+/// known public, so it is not.
+pub fn host_candidate_is_public(line: &str) -> bool {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if !tokens.windows(2).any(|pair| pair == ["typ", "host"]) {
+        return false;
+    }
+    let Some(Ok(addr)) = tokens.get(4).map(|t| t.parse::<std::net::IpAddr>()) else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || cgnat)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            let unique_local = (first & 0xfe00) == 0xfc00;
+            let link_local = (first & 0xffc0) == 0xfe80;
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
     }
 }
 
