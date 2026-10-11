@@ -1,0 +1,30 @@
+net/crates/net/browser-ts/test/stream-pending-bound.test.ts
+  s_16bd53708deb14::t_128d0a852cd645 80-107
+net/crates/net/browser-ts/src/node.ts
+  s_16bd53708deb14::t_6ba0a3cc8dd8f4 1271-1275
+net/crates/net/browser-ts/src/store/join.ts
+  s_16bd53708deb14::t_8e886028bcd0b6 245-252,276,287-295,316,805-808,811-812
+net/crates/net/browser-ts/test/node.test.ts
+  s_16bd53708deb14::t_e5240f9ffb1fd8 115-127
+net/crates/net/browser-ts/src/stream.ts
+  s_16bd53708deb14::t_18ea72cdf55a08 246,256,296-307
+net/crates/net/browser-ts/test/store/reconnect-stream.test.ts
+  s_16bd53708deb14::t_87c7b429f6d516 89-92,94-144
+  s_16bd53708deb14::t_b06698f7ca18f0 93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3ecf60c10e44566cb9e9e3db7922f4a7472eb051",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
