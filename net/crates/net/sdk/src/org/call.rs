@@ -173,16 +173,34 @@ const DEFAULT_LIFETIME_MS: u64 = 300_000;
 /// (never "none"); `cancel_token == 0` means uncancellable. Neither argument
 /// is an authorization input — they select no grant and no authority.
 fn streaming_options(intent: OrgProofIntent, deadline_ms: u64, cancel_token: u64) -> CallOptions {
-    let lifetime_ms = if deadline_ms == 0 {
+    protected_call_options(intent, deadline_ms, cancel_token)
+}
+
+/// A protected call's lifetime: `deadline_ms`, or [`DEFAULT_LIFETIME_MS`] for
+/// `0` — never "no deadline".
+fn protected_lifetime(deadline_ms: u64) -> Duration {
+    Duration::from_millis(if deadline_ms == 0 {
         DEFAULT_LIFETIME_MS
     } else {
         deadline_ms
-    };
+    })
+}
+
+/// Execution control → [`CallOptions`] for every protected call shape, unary
+/// and streaming alike. The unary seams used to set a deadline only for
+/// `deadline_ms > 0`, so `0` meant NO deadline there — a hung provider held
+/// the call (and a Go `net_org_call` thread) forever, while the streaming
+/// twin timed out after 300 s (SDK audit 2026-10-11).
+fn protected_call_options(
+    intent: OrgProofIntent,
+    deadline_ms: u64,
+    cancel_token: u64,
+) -> CallOptions {
     let mut opts = CallOptions {
         org_proof_intent: Some(intent),
         ..CallOptions::default()
     };
-    opts.deadline = Some(Instant::now() + Duration::from_millis(lifetime_ms));
+    opts.deadline = Some(Instant::now() + protected_lifetime(deadline_ms));
     if cancel_token != 0 {
         opts.cancel_token = Some(cancel_token);
     }
@@ -517,17 +535,8 @@ impl OrgClient {
             *self.selected.lock() = Some(provider.clone());
         }
 
-        let mut opts = CallOptions {
-            org_proof_intent: Some(intent),
-            ..CallOptions::default()
-        };
         // Execution control only — never an authority input.
-        if deadline_ms > 0 {
-            opts.deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
-        }
-        if cancel_token != 0 {
-            opts.cancel_token = Some(cancel_token);
-        }
+        let opts = protected_call_options(intent, deadline_ms, cancel_token);
 
         // The core call mints the call id, computes the canonical request
         // digest, signs the proof, appends exactly one admission header, and
@@ -615,17 +624,8 @@ impl OrgClient {
         let intent = self.plan_exported(service)?;
         let provider = intent.provider.clone();
 
-        let mut opts = CallOptions {
-            org_proof_intent: Some(intent),
-            ..CallOptions::default()
-        };
         // Execution control only — never an authority input.
-        if deadline_ms > 0 {
-            opts.deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
-        }
-        if cancel_token != 0 {
-            opts.cancel_token = Some(cancel_token);
-        }
+        let opts = protected_call_options(intent, deadline_ms, cancel_token);
 
         // One send, ever: the core call mints the call id, digests, signs,
         // pins the peer entity, and the facade never launches a second
@@ -1983,6 +1983,17 @@ fn admission_reason_of(e: &RpcError) -> Option<CoarseAdmissionReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SDK audit 2026-10-11: `0` is the 300 s facade default on EVERY
+    /// protected shape (the unary seams used to read it as "no deadline").
+    #[test]
+    fn a_zero_deadline_is_the_facade_default_never_unbounded() {
+        assert_eq!(
+            protected_lifetime(0),
+            Duration::from_millis(DEFAULT_LIFETIME_MS)
+        );
+        assert_eq!(protected_lifetime(1_500), Duration::from_millis(1_500));
+    }
 
     /// Exactly how the provider ships a denial: status `0x0009`, no headers,
     /// and a one-byte body carrying the coarse reason.

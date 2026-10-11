@@ -2691,3 +2691,37 @@ async fn a_full_anchor_refuses_an_offer_as_at_capacity() {
         "the refusal names the session count: {message}"
     );
 }
+
+/// SDK audit 2026-10-11: a request whose body never finishes arriving is
+/// cut off at the request deadline (`http_idle_timeout`). hyper's header
+/// timeout stopped at the headers, so a client could announce a body and
+/// dribble it forever — never reaching the size checks or the rate limiter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_never_finishes_is_cut_off_at_the_request_deadline() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.http_idle_timeout = Duration::from_millis(300);
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let stalled = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/rtc/offer")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, "2000")
+        .header(header::ORIGIN, ORIGIN)
+        .body(Body::from_stream(stalled))
+        .expect("request");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        router
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()
+            .oneshot("203.0.113.9:5000".parse::<std::net::SocketAddr>().unwrap())
+            .await
+            .expect("make service")
+            .oneshot(request),
+    )
+    .await
+    .expect("the request deadline must fire")
+    .expect("response");
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+}
