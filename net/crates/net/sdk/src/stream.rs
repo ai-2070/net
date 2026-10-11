@@ -169,6 +169,17 @@ impl Stream for EventStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => {
                 this.inflight = None;
+                // Back off on errors as on idle polls. A persistent error
+                // (bus down, shut down, a bad cursor) used to be re-polled
+                // immediately, so the idiomatic `while let Some(r) =
+                // stream.next().await` spun a core and hammered the
+                // adapter for the whole outage (SDK audit 2026-10-11). The
+                // next `poll_next` waits out this sleep first.
+                this.current_interval = this
+                    .current_interval
+                    .saturating_mul(2)
+                    .min(this.opts.max_backoff);
+                this.sleep = Some(Box::pin(tokio::time::sleep(this.current_interval)));
                 Poll::Ready(Some(Err(SdkError::from(e))))
             }
             Poll::Ready(Ok(response)) => {

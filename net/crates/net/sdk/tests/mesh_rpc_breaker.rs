@@ -409,3 +409,65 @@ fn breaker_error_flatten() {
         BreakerError::Inner(RpcError::Timeout { elapsed_ms: 99 }).into_rpc_error();
     assert!(matches!(inner, RpcError::Timeout { elapsed_ms: 99 }));
 }
+
+/// SDK audit 2026-10-11: a call admitted while Closed that finishes after
+/// the breaker moved on must not touch the bookkeeping. Pre-fix a slow
+/// stray failing during HalfOpen re-opened the breaker under the in-flight
+/// probe, whose success then closed it straight away.
+#[tokio::test]
+async fn a_stray_closed_call_does_not_disturb_half_open() {
+    let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        reset_after: Duration::from_millis(50),
+        ..CircuitBreakerConfig::default()
+    }));
+
+    // A slow call admitted while Closed; it fails much later.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let stray = {
+        let breaker = Arc::clone(&breaker);
+        tokio::spawn(async move {
+            breaker
+                .call(|| async move {
+                    let _ = release_rx.await;
+                    Err::<(), _>(RpcError::Timeout { elapsed_ms: 1 })
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Trip it with a fast failure, then let the cooldown pass.
+    let _ = breaker
+        .call(|| async { Err::<(), _>(RpcError::Timeout { elapsed_ms: 1 }) })
+        .await;
+    assert_eq!(breaker.state(), BreakerState::Open);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The probe is in flight when the stray finishes.
+    let (probe_go_tx, probe_go_rx) = tokio::sync::oneshot::channel::<()>();
+    let probe = {
+        let breaker = Arc::clone(&breaker);
+        tokio::spawn(async move {
+            breaker
+                .call(|| async move {
+                    let _ = probe_go_rx.await;
+                    Ok::<(), RpcError>(())
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(breaker.state(), BreakerState::HalfOpen);
+    let _ = release_tx.send(());
+    let _ = stray.await.unwrap();
+    assert_eq!(
+        breaker.state(),
+        BreakerState::HalfOpen,
+        "a stale Closed-admitted failure must not re-open a HalfOpen breaker"
+    );
+    let _ = probe_go_tx.send(());
+    probe.await.unwrap().expect("probe succeeds");
+    assert_eq!(breaker.state(), BreakerState::Closed);
+}

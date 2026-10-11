@@ -275,7 +275,7 @@ pub async fn fetch_blob(
         BlobRef::Manifest {
             chunks, total_size, ..
         } => {
-            let mut buf = BytesMut::with_capacity(*total_size as usize);
+            let mut buf = BytesMut::with_capacity(initial_blob_capacity(*total_size));
             for chunk in chunks {
                 let bytes = node.transfer_fetch_chunk(source, chunk.hash).await?;
                 buf.extend_from_slice(&bytes);
@@ -286,6 +286,16 @@ pub async fn fetch_blob(
             "BlobRef::Tree not supported by the transport wrapper".into(),
         )),
     }
+}
+
+/// Initial buffer for a manifest fetch. The manifest's `total_size` is a
+/// CLAIM until the chunks verify: reserving it up front let a fabricated
+/// manifest (up to the 16 GiB decode cap) abort the process before the first
+/// chunk-hash check could fail the fetch (SDK audit 2026-10-11). Reserve at
+/// most 8 MiB and let the buffer grow with verified chunks.
+fn initial_blob_capacity(total_size: u64) -> usize {
+    const MAX_UPFRONT: u64 = 8 * 1024 * 1024;
+    total_size.min(MAX_UPFRONT) as usize
 }
 
 /// Like [`fetch_blob`], but discovers the holder among connected peers
@@ -316,7 +326,7 @@ pub async fn fetch_blob_discovered(
         BlobRef::Manifest {
             chunks, total_size, ..
         } => {
-            let mut buf = BytesMut::with_capacity(*total_size as usize);
+            let mut buf = BytesMut::with_capacity(initial_blob_capacity(*total_size));
             for chunk in chunks {
                 let bytes = discovered(chunk.hash).await?;
                 buf.extend_from_slice(&bytes);
@@ -414,6 +424,15 @@ fn hex32(hash: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// SDK audit 2026-10-11: a manifest's claimed size is never reserved
+    /// wholesale before its chunks verify.
+    #[test]
+    fn blob_fetch_never_reserves_a_claimed_16_gib() {
+        assert_eq!(super::initial_blob_capacity(1024), 1024);
+        assert_eq!(super::initial_blob_capacity(16 << 30), 8 * 1024 * 1024);
+    }
+
     use super::*;
 
     #[test]

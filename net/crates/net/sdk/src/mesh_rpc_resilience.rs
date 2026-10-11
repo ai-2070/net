@@ -368,12 +368,13 @@ impl Mesh {
     /// Hedge across an explicit set of target node ids. The first
     /// element of `targets` is the primary (fired immediately);
     /// subsequent elements are hedges fired at `policy.delay * idx`.
-    /// Whichever call resolves first wins (Ok or Err). Losing
-    /// in-flight calls are dropped on the caller side.
+    /// The first call to SUCCEED wins; errors are collected while
+    /// any call is still in flight. Losing in-flight calls are
+    /// dropped on the caller side.
     ///
     /// Returns `RpcError::NoRoute` if `targets` is empty. If every
-    /// candidate fails, returns the LAST observed error (after
-    /// all hedges have been awaited).
+    /// candidate fails, returns the PRIMARY's error (the
+    /// lowest-indexed target), once all hedges have been awaited.
     pub async fn call_with_hedge_to(
         &self,
         targets: &[u64],
@@ -905,8 +906,15 @@ impl CircuitBreaker {
         _probe_guard.disarmed.set(true);
         let mut g = self.lock_inner();
         match (&outcome, admitted_as) {
+            // A call admitted while Closed counts only if the breaker is
+            // STILL Closed. A slow stray finishing during Open / HalfOpen
+            // used to push the cooldown back, or re-trip the breaker while a
+            // probe was in flight — whose success then closed it right
+            // after the fresh failure (SDK audit 2026-10-11).
             (Ok(_), Admission::Closed) => {
-                g.consecutive_failures = 0;
+                if g.state == BreakerState::Closed {
+                    g.consecutive_failures = 0;
+                }
             }
             (Ok(_), Admission::HalfOpenProbe) => {
                 g.probe_in_flight = false;
@@ -925,6 +933,7 @@ impl CircuitBreaker {
                 }
                 if counts {
                     match admission {
+                        Admission::Closed if g.state != BreakerState::Closed => {}
                         Admission::Closed => {
                             g.consecutive_failures = g.consecutive_failures.saturating_add(1);
                             if g.consecutive_failures >= self.config.failure_threshold.max(1) {

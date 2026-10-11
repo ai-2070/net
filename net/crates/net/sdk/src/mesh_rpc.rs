@@ -379,8 +379,8 @@ impl Mesh {
     /// Register a typed RPC handler on `service`. The handler
     /// receives a deserialized `Req` and returns either an `Ok(Resp)`
     /// (encoded as the response body) or an `Err(message)`
-    /// (surfaced as `RpcStatus::Internal` with the message as the
-    /// body).
+    /// (surfaced as `RpcStatus::Application(NRPC_TYPED_HANDLER_ERROR)`
+    /// — `0x8001` — with the message as the body).
     ///
     /// Codec is the [`Codec`] passed to the handler factory; the
     /// same codec must be used by the caller.
@@ -452,7 +452,7 @@ impl Mesh {
                 Default::default(),
             )
             .await
-            .map_err(|e| SdkError::Config(format!("call: {e}")))?;
+            .map_err(SdkError::Rpc)?;
         Ok(reply.body.to_vec())
     }
 
@@ -591,8 +591,7 @@ impl Mesh {
     /// `opts.codec`, opens the streaming call, returns an
     /// [`RpcStreamTyped<Resp>`] that decodes each chunk on the fly.
     /// Decode failures terminate the stream with a single
-    /// `RpcError::ServerError(Internal)` carrying the decode
-    /// diagnostic.
+    /// `RpcError::Codec` (decode direction) carrying the diagnostic.
     pub async fn call_streaming_typed<Req, Resp>(
         &self,
         target_node_id: u64,
