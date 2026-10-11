@@ -91,6 +91,11 @@
 //! * **Chromium on Linux (the CI gate)** — the NSS database Chromium
 //!   reads, `certutil -d sql:$HOME/.pki/nssdb -A`, removed on exit.
 //!   No dialog, no OS store.
+//! * **WebKit on Linux** — it trusts only the system store (GnuTLS), so
+//!   the run's CA goes there via `sudo -n update-ca-certificates`,
+//!   removed on exit — ONLY under the CI opt-in
+//!   `RTCB_WEBKIT_SYSTEM_TRUST=1` (an ephemeral runner). Without it the
+//!   leg is refused, never run untrusted.
 //! * **Chromium on Windows** — `--ignore-certificate-errors-spki-list`
 //!   carrying `base64(SHA-256(SubjectPublicKeyInfo))` of **this run's
 //!   leaf key**. That trusts exactly one public key, in one browser
@@ -974,6 +979,19 @@ const NSS_NICKNAME: &str = "net-mesh-stage4b-harness-ca";
 /// Firefox the NSS database inside its own launch profile.
 static NSS_STORE_OWED: AtomicBool = AtomicBool::new(false);
 
+/// Whether this process added the harness CA to the Linux SYSTEM store
+/// (the WebKit leg, CI opt-in only — see [`install_webkit_system_trust`])
+/// and so owes its removal on exit.
+static SYSTEM_STORE_OWED: AtomicBool = AtomicBool::new(false);
+
+/// The opt-in for [`install_webkit_system_trust`]. Set only by the CI
+/// workflow's WebKit step, on an ephemeral runner.
+const WEBKIT_SYSTEM_TRUST_ENV: &str = "RTCB_WEBKIT_SYSTEM_TRUST";
+
+/// Where the WebKit leg's CA copy goes; `update-ca-certificates` reads
+/// `.crt` files here.
+const SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/net-mesh-harness-ca.crt";
+
 /// How this run makes the browser trust the harness listener.
 struct Trust {
     /// What was actually done, printed and carried into the ledger's
@@ -987,8 +1005,9 @@ struct Trust {
 /// Make **this engine on this platform** trust the harness leaf, the
 /// narrowest way that raises no dialog on the user's desktop.
 ///
-/// Nothing here writes a platform trust store, on any platform and
-/// under any flag. Nothing about TLS is weakened by that:
+/// Nothing here writes a platform trust store, with ONE fenced exception:
+/// the Linux WebKit leg under the CI-only opt-in
+/// ([`install_webkit_system_trust`]). Nothing about TLS is weakened:
 /// verification stays on, and only this run's freshly minted leaf key
 /// is exempt from the unknown-issuer rejection.
 fn establish_trust(ca: &Ca, engine: Engine) -> Result<Trust, String> {
@@ -1001,9 +1020,12 @@ fn establish_trust(ca: &Ca, engine: Engine) -> Result<Trust, String> {
         // Chromium leg had already created prompted for its password
         // on inherited stdin and blocked until the job timed out.
         return match engine {
-            Engine::Chromium | Engine::Webkit => {
-                install_nss_store(ca).map(|how| Trust { how, pin: None })
-            }
+            Engine::Chromium => install_nss_store(ca).map(|how| Trust { how, pin: None }),
+            // Playwright's WebKit on Linux verifies through GnuTLS against
+            // the SYSTEM store; it never reads Chromium's NSS database, so
+            // seeding that left every WebKit page failing with
+            // "Unacceptable TLS certificate". See the function.
+            Engine::Webkit => install_webkit_system_trust(ca).map(|how| Trust { how, pin: None }),
             Engine::Firefox => Ok(Trust {
                 how: "Firefox's own NSS database inside the launch profile (cert9.db),                       seeded by the driver; Chromium's ~/.pki/nssdb is not touched"
                     .into(),
@@ -1123,6 +1145,76 @@ fn install_nss_store(ca: &Ca) -> Result<String, String> {
             String::from_utf8_lossy(&o.stderr)
         )),
         Err(e) => Err(format!("certutil (libnss3-tools) not runnable: {e}")),
+    }
+}
+
+/// The WebKit leg on Linux: add this run's CA to the SYSTEM store.
+///
+/// The one exception to "nothing here writes a platform trust store", and
+/// fenced accordingly: it runs only when [`WEBKIT_SYSTEM_TRUST_ENV`] is
+/// `1` — set by the CI workflow's WebKit step on an ephemeral runner, never
+/// by default — needs non-interactive `sudo` (so it cannot prompt anyone),
+/// and the entry is removed on exit. Verification stays fully on: the CA is
+/// this run's freshly minted one. Without the opt-in the leg is refused,
+/// not run untrusted: WebKit has no SPKI-pin flag and no profile-local
+/// store to seed instead.
+fn install_webkit_system_trust(ca: &Ca) -> Result<String, String> {
+    if std::env::var(WEBKIT_SYSTEM_TRUST_ENV).as_deref() != Ok("1") {
+        return Err(format!(
+            "WebKit on Linux trusts only the system certificate store (GnuTLS), not \
+             Chromium's NSS database. This harness writes the system store only when \
+             {WEBKIT_SYSTEM_TRUST_ENV}=1 — set by CI on an ephemeral runner — and \
+             it is not set here, so the WebKit leg is refused rather than run untrusted."
+        ));
+    }
+    let run = |args: &[&str]| -> Result<(), String> {
+        let out = Command::new("sudo")
+            .stdin(Stdio::null())
+            .arg("-n")
+            .args(args)
+            .output()
+            .map_err(|e| format!("sudo not runnable: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "sudo -n {} exited {:?}: {}",
+                args.join(" "),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    };
+    let pem = ca
+        .ca_pem_path
+        .to_str()
+        .ok_or_else(|| "the CA path is not UTF-8".to_string())?;
+    run(&["cp", pem, SYSTEM_CA_PATH])?;
+    SYSTEM_STORE_OWED.store(true, Ordering::SeqCst);
+    run(&["update-ca-certificates"])?;
+    Ok(format!(
+        "{SYSTEM_CA_PATH} + update-ca-certificates (the system store GnuTLS reads; \
+         CI opt-in {WEBKIT_SYSTEM_TRUST_ENV}=1; removed on exit)"
+    ))
+}
+
+/// Remove the system-store entry [`install_webkit_system_trust`] added,
+/// and nothing else.
+fn uninstall_system_store_if_owed() {
+    if !SYSTEM_STORE_OWED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    for args in [
+        &["rm", "-f", SYSTEM_CA_PATH][..],
+        &["update-ca-certificates", "--fresh"][..],
+    ] {
+        let _ = Command::new("sudo")
+            .stdin(Stdio::null())
+            .arg("-n")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1625,6 +1717,7 @@ async fn main() {
         }
     };
     uninstall_nss_store_if_owed();
+    uninstall_system_store_if_owed();
     std::process::exit(code);
 }
 
