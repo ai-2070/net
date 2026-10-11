@@ -1,0 +1,31 @@
+net/crates/net/browser-ts/test/store/reconnect-stream.test.ts
+  s_ae82cd919caae2::t_e609d86f73ff20 67
+  s_ae82cd919caae2::t_87c886cc94f507 1-66,68-89
+net/crates/net/leaf/src/leader_session.rs
+  s_ae82cd919caae2::t_5f105b0e4797e8 608-613,618,621-622,624-649,3636-3640,3645,3651,3672-3682,4313-4316,4319
+net/crates/net/browser-ts/test/store/owner.test.ts
+  s_ae82cd919caae2::t_1dba8689f7dadd 20-26,330-331,333,337-348,352
+net/crates/net/browser-ts/src/store/owner.ts
+  s_ae82cd919caae2::t_2188720d1299e2 77-86,1497-1499
+  s_ae82cd919caae2::t_18167302eb0f4f 1500-1501
+net/crates/net/browser-ts/src/store/join.ts
+  s_ae82cd919caae2::t_32fe8b77d2754d 784-791,793-799
+net/crates/net/browser-ts/README.md
+  s_ae82cd919caae2::t_f1351466618d40 586-594
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "243acf3b2597614aebd72d01ead602b9bfb9fcc9",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
