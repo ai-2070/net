@@ -826,8 +826,11 @@ async fn serve_tool_streaming_never_drops_events_under_a_slow_consumer() {
         })
         .expect("serve_tool_streaming");
 
-    let mut raw = net_sdk::mesh_rpc::CallOptions::default();
-    raw.stream_window_initial = Some(4); // credit-gated: the pump queue fills
+    // Credit-gated: the pump queue fills.
+    let raw = net_sdk::mesh_rpc::CallOptions {
+        stream_window_initial: Some(4),
+        ..Default::default()
+    };
     let mut stream = caller
         .call_streaming_typed::<WebSearchReq, ToolEvent>(
             host.inner().node_id(),
