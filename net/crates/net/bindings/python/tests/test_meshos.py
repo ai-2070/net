@@ -621,3 +621,47 @@ def test_wrapper_loops_end_on_sdk_shutdown() -> None:
     t.join(timeout=2)
     assert not t.is_alive(), "sync next_control() never returned after sdk.shutdown()"
     assert out == [None]
+
+
+def test_a_raw_handle_parked_in_next_control_receives_graceful_shutdown() -> None:
+    """cubic review of PR #1228: the raw handle's methods took `&mut self`,
+    so a thread parked in `next_control` held PyO3's mutable borrow and a
+    `graceful_shutdown` from another thread failed with a borrow error (and
+    the native one-shot consumed the handle before the grace period, so the
+    `Shutdown` event was unreachable anyway)."""
+    import threading
+    import time
+
+    with MeshOsDaemonSdk.start() as sdk:
+        handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
+        got: list = []
+        reader = threading.Thread(target=lambda: got.append(handle.next_control()), daemon=True)
+        reader.start()
+        time.sleep(0.2)  # parked in next_control
+        assert not got, "next_control returned before any event"
+        handle.graceful_shutdown(grace_ms=300)
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        assert got and got[0] is not None and got[0]["kind"] == "Shutdown", got
+        assert not handle.registered
+
+
+def test_graceful_shutdown_ends_early_when_the_daemon_closes() -> None:
+    import threading
+    import time
+
+    with MeshOsDaemonSdk.start() as sdk:
+        handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
+
+        def daemon() -> None:
+            ev = handle.next_control()
+            if ev is not None and ev["kind"] == "Shutdown":
+                handle.close()
+
+        t = threading.Thread(target=daemon, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        start = time.monotonic()
+        handle.graceful_shutdown(grace_ms=5000)
+        assert time.monotonic() - start < 2.0, "waited out the full grace period"
+        t.join(timeout=5)

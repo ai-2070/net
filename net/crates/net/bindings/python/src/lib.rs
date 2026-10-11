@@ -350,6 +350,10 @@ pub struct Net {
     // while `shutdown` waits for the write guard with the GIL held.
     bus: RwLock<Option<Arc<EventBus>>>,
     runtime: Arc<GuardedRuntime>,
+    /// Held (without the GIL) across a whole `shutdown`, so a concurrent
+    /// second call waits for the drain instead of finding the bus already
+    /// taken and returning at once (cubic review of PR #1228).
+    shutdown_gate: parking_lot::Mutex<()>,
 }
 
 impl Net {
@@ -702,6 +706,7 @@ impl Net {
         Ok(Net {
             bus: RwLock::new(Some(Arc::new(bus))),
             runtime,
+            shutdown_gate: parking_lot::Mutex::new(()),
         })
     }
 
@@ -892,12 +897,18 @@ impl Net {
         // the GIL for the (I/O-bound) shutdown itself. An in-flight
         // `poll` / `flush` may still hold an `Arc` clone, hence the
         // by-reference shutdown.
-        let bus = self.bus.write().take();
-        if let Some(bus) = bus {
-            py.detach(|| self.runtime.block_on(bus.shutdown_via_ref()))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
+        //
+        // The gate makes it a completion barrier: a second, concurrent
+        // shutdown waits here until the first has drained.
+        py.detach(|| {
+            let _gate = self.shutdown_gate.lock();
+            let bus = self.bus.write().take();
+            match bus {
+                Some(bus) => self.runtime.block_on(bus.shutdown_via_ref()),
+                None => Ok(()),
+            }
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -1367,6 +1378,11 @@ mod mesh_bindings {
         /// borrowed" whenever another thread was parked in a blocking
         /// `&self` call (SDK audit 2026-10-11). Calls clone the `Arc` out.
         node: parking_lot::RwLock<Option<Arc<MeshNode>>>,
+        /// Held (without the GIL) across a whole `shutdown`, so a concurrent
+        /// second call waits for the teardown instead of returning while the
+        /// first is still joining background tasks (cubic review of PR
+        /// #1228).
+        shutdown_gate: parking_lot::Mutex<()>,
         runtime: Arc<GuardedRuntime>,
         /// The immutable named-export map resolved at construction
         /// (SSDK §3.3) — the checked map this binding retains beside its
@@ -1721,6 +1737,7 @@ mod mesh_bindings {
 
             Ok(Self {
                 node: parking_lot::RwLock::new(Some(Arc::new(node))),
+                shutdown_gate: parking_lot::Mutex::new(()),
                 runtime,
                 #[cfg(feature = "org")]
                 subnet_exports: subnet_exports_map,
@@ -1947,6 +1964,12 @@ mod mesh_bindings {
         /// `serve_enrollment_auto`: a leaked invite lets its holder ask, never
         /// admits them. Serves enrollment only (no renewal). Same node
         /// requirements as `serve_enrollment_auto`.
+        ///
+        /// The timeout denies the request; it cannot stop a SYNCHRONOUS
+        /// approver already running (Python threads are not interruptible),
+        /// which keeps its worker thread until it returns and whose late
+        /// answer is ignored. An approver that prompts a human should be a
+        /// coroutine function — it is cancelled at the timeout.
         #[cfg(feature = "delegation")]
         #[pyo3(signature = (operator, approver, grant_ttl_seconds, max_depth=None, approve_timeout_ms=None))]
         fn serve_enrollment(
@@ -3469,16 +3492,18 @@ mod mesh_bindings {
             Ok(())
         }
 
-        /// Shutdown the mesh node. Idempotent — a second call is a no-op.
+        /// Shutdown the mesh node. Idempotent; a call concurrent with a
+        /// shutdown in progress returns once that shutdown has finished.
         fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-            let Some(node) = self.node.write().take() else {
-                return Ok(());
-            };
             // Joins every background task (seconds): GIL released.
-            let runtime = Arc::clone(&self.runtime);
-            py.detach(move || runtime.block_on(node.shutdown()))
-                .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))?;
-            Ok(())
+            py.detach(|| {
+                let _gate = self.shutdown_gate.lock();
+                let Some(node) = self.node.write().take() else {
+                    return Ok(());
+                };
+                self.runtime.block_on(node.shutdown())
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))
         }
 
         fn __repr__(&self) -> String {

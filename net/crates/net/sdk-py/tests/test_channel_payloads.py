@@ -324,3 +324,31 @@ def test_scalar_events_round_trip_through_value() -> None:
     parse = _parse_fn(ch)
     assert parse(bus.ingested[0]) == 42
     assert parse(bus.ingested[1]) == [1, 2]
+
+
+def test_an_object_with_only_a_value_key_keeps_its_shape() -> None:
+    """cubic review of PR #1228: `{"_value": 42}` published as an object
+    was unwrapped on subscribe as if it were the scalar envelope."""
+    bus = _RecordingBus()
+    ch = TypedChannel(bus, "metrics/x")
+    ch.publish({"_value": 42})
+    ch.publish_batch([{"_value": "s"}])
+    parse = _parse_fn(ch)
+    assert parse(bus.ingested[0]) == {"_value": 42}
+    assert parse(bus.ingested[1]) == {"_value": "s"}
+    # Scalars are unchanged on the wire.
+    ch.publish(7)
+    assert json.loads(bus.ingested[2]) == {"_value": 7, CHANNEL_TAG_KEY: "metrics/x"}
+
+
+def test_a_string_slots_declaration_is_one_slot() -> None:
+    """cubic review of PR #1228: `__slots__ = "value"` was iterated per
+    character and the event serialized as `{}`."""
+
+    class One:
+        __slots__ = "value"
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    assert _to_dict(One(5)) == {"value": 5}

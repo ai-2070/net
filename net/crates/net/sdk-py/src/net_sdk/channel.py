@@ -118,7 +118,13 @@ def _to_dict(event: Any) -> dict:
         # above; gather the declared slots instead of guessing.
         slots: dict[str, Any] = {}
         for cls in type(event).__mro__:
-            for slot in getattr(cls, "__slots__", ()):
+            declared = getattr(cls, "__slots__", ())
+            # `__slots__ = "name"` declares ONE slot; iterating the string
+            # walked it character by character and the event serialized as
+            # `{}` (cubic review of PR #1228).
+            if isinstance(declared, str):
+                declared = (declared,)
+            for slot in declared:
                 if slot not in slots and hasattr(event, slot):
                     slots[slot] = getattr(event, slot)
         return slots
@@ -128,6 +134,24 @@ def _to_dict(event: Any) -> dict:
             "pass a dict, a dataclass, a Pydantic model, or an object with "
             "__dict__/__slots__"
         )
+
+
+def _channel_payload(event: Any) -> dict:
+    """`_to_dict` for a channel publish, with the scalar envelope escaped.
+
+    A scalar / list event travels as `{"_value": x}` and the subscriber
+    unwraps any payload whose only key is `_value`. An OBJECT event whose
+    only key is `_value` would be unwrapped the same way and change type, so
+    it is wrapped once more; every subscriber's single unwrap then hands
+    back the original object (cubic review of PR #1228). Same rule as the
+    TS SDK's `encodeChannelEvent`.
+    """
+    data = _to_dict(event)
+    if data.keys() == {"_value"} and not (
+        isinstance(event, _JSON_SCALARS) or isinstance(event, (list, tuple))
+    ):
+        data = {"_value": data}
+    return data
 
 
 def _strip_channel_tag(raw: str) -> str:
@@ -205,7 +229,7 @@ class TypedChannel(Generic[T]):
         (the native `ingest_raw` result, which this used to discard and
         return `None`), and raises on ingestion failure.
         """
-        data = _to_dict(event)
+        data = _channel_payload(event)
         data[CHANNEL_TAG_KEY] = self._name
         result = self._bus.ingest_raw(json.dumps(data))
         return Receipt(shard_id=result.shard_id, timestamp=result.timestamp)
@@ -218,7 +242,7 @@ class TypedChannel(Generic[T]):
         """
         payloads = []
         for event in events:
-            data = _to_dict(event)
+            data = _channel_payload(event)
             data[CHANNEL_TAG_KEY] = self._name
             payloads.append(json.dumps(data))
         return self._bus.ingest_raw_batch(payloads)

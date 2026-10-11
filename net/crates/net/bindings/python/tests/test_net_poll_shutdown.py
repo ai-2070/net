@@ -42,7 +42,15 @@ def test_shutdown_while_another_thread_polls(op: str) -> None:
     for w in workers:
         w.start()
     time.sleep(0.05)
-    sd = threading.Thread(target=bus.shutdown, daemon=True)
+    shutdown_errors: list[BaseException] = []
+
+    def do_shutdown() -> None:
+        try:
+            bus.shutdown()
+        except BaseException as e:  # noqa: BLE001 - surfaced by the assert below
+            shutdown_errors.append(e)
+
+    sd = threading.Thread(target=do_shutdown, daemon=True)
     sd.start()
     sd.join(timeout=10)
     stop.set()
@@ -50,5 +58,6 @@ def test_shutdown_while_another_thread_polls(op: str) -> None:
     for w in workers:
         w.join(timeout=10)
         assert not w.is_alive(), op + " deadlocked against Net.shutdown"
+    assert not shutdown_errors, shutdown_errors
     assert not errors, errors
     assert repr(bus) == "Net(shutdown)"

@@ -1035,7 +1035,12 @@ pub struct PyRpcStream {
     /// Grants without borrowing the stream, so a grant from another
     /// thread reaches a stream parked in `__next__` (it used to be
     /// dropped — a permanent stall on an exhausted window).
-    grant: ::net::adapter::net::mesh_rpc::RpcStreamGrant,
+    ///
+    /// `None` once the stream is closed or terminal: the grant handle holds
+    /// an `Arc<MeshNode>`, so a retained finished stream kept the node (and
+    /// its `Drop` cleanup) alive after its owner released it (cubic review
+    /// of PR #1228).
+    grant: Arc<Mutex<Option<::net::adapter::net::mesh_rpc::RpcStreamGrant>>>,
     flow_controlled: bool,
 }
 
@@ -1054,7 +1059,7 @@ impl PyRpcStream {
             org_errors,
             closed: Arc::new(AtomicBool::new(false)),
             close_wake: Arc::new(tokio::sync::Notify::new()),
-            grant,
+            grant: Arc::new(Mutex::new(Some(grant))),
             flow_controlled,
         }
     }
@@ -1083,6 +1088,7 @@ impl PyRpcStream {
         let org_errors = self.org_errors;
         let closed = self.closed.clone();
         let close_wake = self.close_wake.clone();
+        let grant = self.grant.clone();
         let result = py.detach(|| {
             runtime.block_on(async move {
                 if closed.load(Ordering::Acquire) {
@@ -1137,12 +1143,14 @@ impl PyRpcStream {
                         // is unnecessary; the server already
                         // terminated us) and surface the error.
                         drop(stream);
+                        grant.lock().take();
                         Err(handle_error(org_errors, e))
                     }
                     None => {
                         // Clean EOF — drop the inner stream so the
                         // CANCEL-on-drop guard fires immediately.
                         drop(stream);
+                        grant.lock().take();
                         Ok(None)
                     }
                 }
@@ -1162,7 +1170,9 @@ impl PyRpcStream {
         }
         // The grant spawns its publish, so it needs this mesh's runtime.
         let _entered = self.runtime.enter();
-        self.grant.grant(n);
+        if let Some(grant) = self.grant.lock().as_ref() {
+            grant.grant(n);
+        }
     }
 
     /// `True` if the call set `stream_window_initial`.
@@ -1177,6 +1187,7 @@ impl PyRpcStream {
         self.closed.store(true, Ordering::Release);
         self.close_wake.notify_waiters();
         let _ = self.inner.lock().take();
+        let _ = self.grant.lock().take();
     }
 }
 
@@ -1463,7 +1474,16 @@ impl PyDuplexCall {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
-                let result = call.finish_sending().await;
+                // Raced against close(), like `send`: a REQUEST_END publish
+                // blocked on a slow peer left the caller parked after
+                // close() (cubic review of PR #1228).
+                let result = tokio::select! {
+                    r = call.finish_sending() => r,
+                    _ = closer.closed() => {
+                        drop(call);
+                        return Err(RpcError::new_err("finish_sending aborted by close()"));
+                    }
+                };
                 closer.put_back(&inner, call);
                 result.map_err(|e| handle_error(org_errors, e))
             })

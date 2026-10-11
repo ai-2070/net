@@ -993,7 +993,13 @@ class NetMesh:
         is passed to ``approver`` (sync or async) and admitted only on an
         explicit ``True``. A denial, raise or timeout (default 300 s) answers
         a coded rejection and does not burn the invite. Serves enrollment
-        only (no renewal). (Requires ``delegation``.)"""
+        only (no renewal). (Requires ``delegation``.)
+
+        ``approver`` may return a ``bool`` or any ``Awaitable[bool]``. The
+        timeout cannot stop a synchronous approver already running: it keeps
+        its worker thread until it returns, and its late answer is ignored.
+        Use a coroutine function for an approver that prompts a human — it
+        is cancelled at the timeout. ``approve_timeout_ms`` must be >= 1."""
         ...
     def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
         """Device-side renewal: refresh the grant carried by ``enrollment`` over
@@ -4039,9 +4045,37 @@ class AsyncMemoriesAdapter:
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[Memory]: ...
-    async def watch_memories(self, **kwargs: Any) -> AsyncMemoryWatchIter: ...
+    async def watch_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> AsyncMemoryWatchIter: ...
     async def snapshot_and_watch_memories(
-        self, **kwargs: Any
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> Tuple[List[Memory], AsyncMemoryWatchIter]: ...
 
 class AsyncTaskWatchIter:
@@ -4082,9 +4116,29 @@ class AsyncTasksAdapter:
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[Task]: ...
-    async def watch_tasks(self, **kwargs: Any) -> AsyncTaskWatchIter: ...
+    async def watch_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> AsyncTaskWatchIter: ...
     async def snapshot_and_watch_tasks(
-        self, **kwargs: Any
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> Tuple[List[Task], AsyncTaskWatchIter]: ...
 
 class AsyncRedexTailIter:
@@ -4866,7 +4920,11 @@ class CapabilityGateway:
         operator must not be invited to resolve an attempt it could not have
         paid for. Each row is ``{key: {caller_hex, provider_node, task_id},
         commitment, prepared?, quote_id?, quote_expires_at_ns?, state: {...},
-        updated_at_ns}``. The financially unresolved states (``unknown``,
+        updated_at_ns, generation: {seq, incarnation}, retained}``.
+        ``retained`` marks a superseded incarnation kept beside the live
+        attempt that replaced it; its ``generation`` object is what
+        :meth:`a2a_resolve_attempt` takes to close exactly that one. The
+        financially unresolved states (``unknown``,
         ``refused_exposed``, ``paid_unexecutable``, and a ``paid`` attempt
         never submitted) are exempt from retention and stay until
         :meth:`a2a_resolve_attempt` closes them."""
@@ -4913,7 +4971,14 @@ class CapabilityGateway:
         resolved against this caller's own rows — unambiguous until the same
         id names attempts on two providers, in which case the ``ValueError``
         lists the provider node ids to pass here. Raises ``ValueError`` if no
-        attempt carries ``task_id``."""
+        attempt carries ``task_id``.
+
+        ``generation`` names one incarnation *within* a complete key: the
+        row's own ``generation`` object from :meth:`a2a_attempts`, passed as
+        its JSON text (``'{"seq": ..., "incarnation": ...}'``). Omit it to
+        close the live attempt; pass it to close exactly that retained
+        incarnation (written to the archive only, never touching the live
+        one)."""
         ...
 
     def __repr__(self) -> str: ...

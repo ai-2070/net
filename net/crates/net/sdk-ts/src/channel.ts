@@ -128,10 +128,14 @@ const VALUE_KEY = '_value';
  * (SDK audit 2026-10-11).
  */
 function encodeChannelEvent(event: unknown, channel: string): string {
-  const body =
-    typeof event === 'object' && event !== null && !Array.isArray(event)
-      ? { ...(event as object) }
-      : { [VALUE_KEY]: event };
+  const isObject = typeof event === 'object' && event !== null && !Array.isArray(event);
+  // An OBJECT whose only key is `_value` would be unwrapped by every
+  // subscriber as if it were the scalar envelope, changing its type
+  // (`{ _value: 42 }` arrived as `42`). Wrap it once more: the subscriber's
+  // single unwrap hands back the original object (cubic review of PR
+  // #1228). Same rule as the Python SDK's `_channel_payload`.
+  const ambiguous = isObject && Object.keys(event as object).length === 1 && VALUE_KEY in (event as object);
+  const body = isObject && !ambiguous ? { ...(event as object) } : { [VALUE_KEY]: event };
   return JSON.stringify({ ...body, [CHANNEL_TAG_KEY]: channel });
 }
 

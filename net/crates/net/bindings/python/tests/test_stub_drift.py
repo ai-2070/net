@@ -217,7 +217,7 @@ def test_sampled_class_method_parameters_match(class_name: str) -> None:
     )
     mismatched: list[str] = []
     for fn in cls_node.body:
-        if not isinstance(fn, ast.FunctionDef):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if fn.name.startswith("__") and fn.name != "__init__":
             continue
@@ -258,7 +258,7 @@ def test_sampled_class_method_parameters_match(class_name: str) -> None:
     assert not mismatched, f"{class_name} stub parameters drift: {mismatched}"
 
 
-def _stub_params(fn: ast.FunctionDef) -> list[tuple[str, str]]:
+def _stub_params(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, str]]:
     args = fn.args
     P = inspect.Parameter
     return (
@@ -277,7 +277,7 @@ def test_module_function_parameters_match() -> None:
     tree = ast.parse(PYI_PATH.read_text())
     mismatched: list[str] = []
     for fn in tree.body:
-        if not isinstance(fn, ast.FunctionDef):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         runtime_fn = getattr(_net, fn.name, None)
         if runtime_fn is None:

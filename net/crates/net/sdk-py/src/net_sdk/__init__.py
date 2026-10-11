@@ -372,8 +372,18 @@ try:
         serve_org_duplex,
         serve_org_streaming,
     )
-except ImportError:  # pragma: no cover - minimal build
-    pass
+except ImportError as _org_err:
+    # Only "the wheel was built without `org`" is swallowed: the native
+    # `net` module then lacks the whole org surface (`OrgClient` included)
+    # and the failure is `from net import ...` naming `net`. Anything else —
+    # a wheel that HAS the org surface but is missing one symbol, or a
+    # failure inside `net_sdk.org` itself — is a broken org surface and
+    # must not silently remove the names from the package.
+    import net as _net_native
+
+    if _org_err.name != "net" or hasattr(_net_native, "OrgClient"):
+        raise
+    del _net_native
 else:
     __all__ += [
         "HANDLER_DROP_CONTRACT",

@@ -281,7 +281,21 @@ def test_live_renewal_over_the_mesh(tmp_path):
                 pass
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
+class _Answer:
+    """An awaitable that is not a coroutine object (cubic review of PR
+    #1228: `asyncio.run_coroutine_threadsafe` rejected it, so a valid
+    `Awaitable[bool]` approver failed closed)."""
+
+    def __init__(self, value: bool) -> None:
+        self.value = value
+
+    def __await__(self):
+        if False:  # pragma: no cover - makes this a generator
+            yield
+        return self.value
+
+
+@pytest.mark.parametrize("asynchronous", [False, True, "awaitable"])
 def test_live_approver_gated_enrollment(tmp_path, asynchronous):
     # SDK audit 2026-10-11: the approver-gated mode existed only in Rust, so
     # every Python operator ran auto-admit. A denial must refuse the device
@@ -306,9 +320,16 @@ def test_live_approver_gated_enrollment(tmp_path, asynchronous):
         seen.append(request.name)
         return admit["yes"]
 
-    handle = op_mesh.serve_enrollment(
-        op, async_approver if asynchronous else sync_approver, 3600
-    )
+    def awaitable_approver(request):
+        seen.append(request.name)
+        return _Answer(admit["yes"])
+
+    approver = {
+        False: sync_approver,
+        True: async_approver,
+        "awaitable": awaitable_approver,
+    }[asynchronous]
+    handle = op_mesh.serve_enrollment(op, approver, 3600)
     invite = op.invite(op_mesh.rendezvous_string(), 300).encode()
     device = net.Identity.generate()
     dev_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)

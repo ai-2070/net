@@ -72,6 +72,18 @@ describe('TypedChannel non-object events', () => {
     ]);
   });
 
+  // cubic review of PR #1228: an OBJECT whose only key is `_value` was
+  // unwrapped on subscribe as if it were the scalar envelope.
+  it('keeps an object whose only key is _value intact', async () => {
+    const bus = recordingBus();
+    const ch = new TypedChannel<unknown>(bus as never, 'metrics/x');
+    ch.publish({ _value: 42 });
+    for await (const ev of ch.subscribe({ pollIntervalMs: 0 })) {
+      expect(ev).toEqual({ _value: 42 });
+      break;
+    }
+  });
+
   it('hands the subscriber the value back', async () => {
     const bus = recordingBus();
     const ch = new TypedChannel<unknown>(bus as never, 'metrics/x');

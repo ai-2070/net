@@ -700,6 +700,31 @@ enum Answer {
     Pending(PendingAnswer),
 }
 
+/// `awaitable` as a coroutine object. The dispatcher hands it to
+/// `asyncio.run_coroutine_threadsafe`, which accepts only coroutines: an
+/// approver returning another `Awaitable[bool]` (a Future, a Task, an object
+/// with `__await__`) was rejected and the request failed closed (cubic review
+/// of PR #1228). Wrap those in `async def _(aw): return await aw`.
+fn as_coroutine<'py>(
+    py: Python<'py>,
+    awaitable: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let is_coro: bool = py
+        .import("asyncio")?
+        .call_method1("iscoroutine", (awaitable,))?
+        .extract()?;
+    if is_coro {
+        return Ok(awaitable.clone());
+    }
+    let helper = pyo3::types::PyModule::from_code(
+        py,
+        c"async def await_any(aw):\n    return await aw\n",
+        c"net_enrollment_await.py",
+        c"net_enrollment_await",
+    )?;
+    helper.getattr("await_any")?.call1((awaitable,))
+}
+
 /// Ask the Python approver about one request. Fails closed: anything but an
 /// explicit `True` (returned, or awaited from a coroutine) is a denial, which
 /// leaves the invite unburned. The call runs on a blocking thread, so a sync
@@ -711,7 +736,8 @@ async fn ask_py_approver(approver: Arc<Py<PyAny>>, request: JoinRequest) -> bool
             let result = approver.call1(py, (PyJoinRequest { inner: request },))?;
             let bound = result.bind(py);
             if bound.hasattr("__await__")? {
-                let fut = crate::async_bridge::dispatch_handler_coro(py, bound.clone())?;
+                let coro = as_coroutine(py, bound)?;
+                let fut = crate::async_bridge::dispatch_handler_coro(py, coro)?;
                 Ok(Answer::Pending(Box::pin(fut)))
             } else {
                 Ok(Answer::Now(bound.extract::<bool>().unwrap_or(false)))
