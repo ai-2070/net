@@ -496,15 +496,19 @@ class MeshNode:
 
     def list_tools(self) -> List[Any]:
         """Every AI tool published in this node's capability fold, as
-        ``ToolDescriptor``s. Same as ``net_sdk.tool.list_tools(node)``."""
+        ``ToolDescriptor``s. This is the ``MeshNode`` entry point:
+        the module-level ``net_sdk.tool.list_tools`` takes a native
+        ``net.NetMesh`` and raises ``TypeError`` for a ``MeshNode``."""
         from net_sdk import tool
 
         return tool.list_tools(self._native)
 
     def watch_tools(self, *, interval: Optional[float] = None) -> Any:
         """Async iterator of ``ToolListChange``s for this node's tool view.
-        Same as ``net_sdk.tool.watch_tools(node)``; see it for the
-        lifecycle (consume or cancel it so the watch is closed)."""
+        The ``MeshNode`` entry point (the module-level
+        ``net_sdk.tool.watch_tools`` takes a native ``net.NetMesh``); see
+        it for the lifecycle (consume or cancel it so the watch is
+        closed)."""
         from net_sdk import tool
 
         return tool.watch_tools(self._native, interval=interval)
