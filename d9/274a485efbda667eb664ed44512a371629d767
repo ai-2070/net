@@ -1,0 +1,19 @@
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_ae82cd919caae2::t_7b52f6f33e4a80 499-501,508-511
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d9274a485efbda667eb664ed44512a371629d767",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
