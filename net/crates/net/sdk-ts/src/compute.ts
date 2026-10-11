@@ -34,7 +34,7 @@ import {
   MigrationHandle as NapiMigrationHandle,
 } from '@net-mesh/core';
 
-import { getNapiMesh, setNapiRuntime } from './_internal.js';
+import { bindDaemonObject, getNapiMesh, setNapiRuntime } from './_internal.js';
 import { Identity } from './identity.js';
 import { MeshNode } from './mesh.js';
 
@@ -391,6 +391,16 @@ export interface MeshDaemon {
   optionalCapabilities?: import('./capabilities').CapabilitySet;
 }
 
+/** The {@link MeshDaemon} members native reads off a factory's result. */
+const MESH_DAEMON_KEYS = [
+  'name',
+  'process',
+  'snapshot',
+  'restore',
+  'requiredCapabilities',
+  'optionalCapabilities',
+] as const;
+
 /** A zero-arg function returning a {@link MeshDaemon} or a Promise of one. */
 export type DaemonFactory = () => MeshDaemon | Promise<MeshDaemon>;
 
@@ -738,27 +748,40 @@ export class DaemonRuntime {
    */
   registerFactory(kind: string, factory: DaemonFactory): void {
     try {
-      // Register on NAPI so the kind is tracked for migration
-      // targeting and so the `already registered` check there
-      // fires on duplicate calls before we mutate our own map.
-      // The NAPI side stores a TSFN of the factory but doesn't
-      // invoke it — the actual invocation happens on the TS side
-      // at `spawn` time (see `spawn` below).
-      // The cast is deliberate and narrow. `DaemonFactory` may return a
-      // Promise, and the native `registerFactory` parameter describes the
-      // synchronous daemon object its `FromNapiValue` would destructure —
-      // but nothing here destructures it, because the native side only
-      // records the kind. The actual factory invocation happens on the TS
-      // side in `spawn` below.
+      // Native invokes this factory itself whenever it reconstructs a
+      // daemon outside `spawn()` — a migration target and every
+      // ReplicaGroup / ForkGroup / StandbyGroup member — and then calls
+      // the methods it reads off the result through threadsafe functions
+      // with an `undefined` receiver. So hand it a synchronous adapter
+      // that returns a flat object of methods BOUND to the instance (and
+      // the capability declarations), never the raw user factory: a
+      // class-based daemon using `this` otherwise threw on every event on
+      // those paths (SDK audit 2026-10-11).
       //
-      // Casting to the parameter type rather than to `() => unknown` means a
-      // change to the native signature shows up here instead of being
-      // absorbed. Until the declaration was fixed that parameter named an
-      // undeclared type, so this call was checked against `any` and any
-      // shape at all would have passed.
+      // The native path is synchronous. An async factory still works for
+      // `spawn()` (awaited below); on the native path it now fails with a
+      // DaemonError naming the cause instead of an opaque decode error.
+      const nativeFactory = () => {
+        const instance = factory();
+        if (
+          instance !== null &&
+          typeof instance === 'object' &&
+          typeof (instance as { then?: unknown }).then === 'function'
+        ) {
+          throw new DaemonError(
+            `factory for kind '${kind}' returned a Promise: migration-in and ` +
+              'group spawn need a synchronous factory (async factories are ' +
+              'supported by spawn() only)',
+          );
+        }
+        return bindDaemonObject(instance as MeshDaemon, MESH_DAEMON_KEYS);
+      };
+      // Register on NAPI first so the duplicate-kind check there fires
+      // before we mutate our own map. The cast is narrow on purpose: a
+      // change to the native signature shows up here.
       this.inner.registerFactory(
         kind,
-        factory as unknown as Parameters<NapiDaemonRuntime['registerFactory']>[1],
+        nativeFactory as unknown as Parameters<NapiDaemonRuntime['registerFactory']>[1],
       );
       this.factories.set(kind, factory);
     } catch (e) {

@@ -84,7 +84,7 @@ export type ClaimOutcome = 'won' | 'lost';
 /** Selection policy for {@link MeshNode.matchIslands}. */
 export type SelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
-import { getNapiMesh, nativeOrgClientOf, setNapiMesh } from './_internal.js';
+import { getNapiMesh, nativeOrgClientOf, reportHandlerError, setNapiMesh } from './_internal.js';
 import type { OrgClient as SdkOrgClient } from './org/index.js';
 import type { OrgClient as NapiOrgClient } from '@net-mesh/core';
 import type { TypedOrgClient } from '@net-mesh/core/org';
@@ -704,10 +704,34 @@ export class MeshNode {
    * subscription per stream id; a second throws until the first is
    * closed. Pair with {@link streamIdFromLabel} to agree on an id with a
    * browser page.
+   *
+   * A `handler` that throws does NOT take the process down: the native
+   * callback would turn an escaping exception into a fatal
+   * `uncaughtException`, which a remote peer's payload could trigger. The
+   * error goes to `options.onError` if given, else to a process warning,
+   * and delivery continues.
    */
-  onStreamData(streamId: bigint, handler: (data: StreamData) => void): StreamDataSubscription {
+  onStreamData(
+    streamId: bigint,
+    handler: (data: StreamData) => void,
+    options?: { onError?: (error: unknown, data: StreamData) => void },
+  ): StreamDataSubscription {
+    const onError = options?.onError ?? reportHandlerError;
     const native = this.native.onStreamData(streamId, event => {
-      handler({ peerNodeId: event.peerNodeId, streamId: event.streamId, payload: event.payload });
+      const data: StreamData = {
+        peerNodeId: event.peerNodeId,
+        streamId: event.streamId,
+        payload: event.payload,
+      };
+      try {
+        handler(data);
+      } catch (error) {
+        try {
+          onError(error, data);
+        } catch {
+          // An onError that itself throws must not reach the native callback either.
+        }
+      }
     });
     return {
       get streamId() {

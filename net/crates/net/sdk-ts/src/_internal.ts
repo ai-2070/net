@@ -119,3 +119,46 @@ export function nativeOrgClientOf(org: unknown): unknown {
   }
   return org;
 }
+
+/**
+ * Flatten a daemon instance into the plain object the native bridge
+ * destructures, binding every method to the instance.
+ *
+ * The napi bridges read `process` / `snapshot` / … off the object with
+ * `get_named_property` and later invoke them through a threadsafe
+ * function whose receiver is `undefined`. A class-based daemon whose
+ * methods touch `this` (the shape the groups docs show) therefore threw
+ * `TypeError` on every event on any path that handed native the raw
+ * instance — migration-in, group spawn, MeshOS registration — while the
+ * same class worked under `spawn()`, which already bound (SDK audit
+ * 2026-10-11). Methods live on the prototype, so a spread would drop
+ * them; each named key is read through the instance instead.
+ */
+export function bindDaemonObject(
+  instance: object,
+  keys: readonly string[],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const src = instance as Record<string, unknown>;
+  for (const key of keys) {
+    const value = src[key];
+    if (typeof value === 'function') {
+      out[key] = (value as (...args: unknown[]) => unknown).bind(instance);
+    } else if (value !== undefined) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Default sink for a throwing `MeshNode.onStreamData` handler: a process
+ * warning, never an exception escaping into the native callback (where napi
+ * turns it into a fatal `uncaughtException`). SDK audit 2026-10-11.
+ *
+ * @internal
+ */
+export function reportHandlerError(error: unknown): void {
+  const message = error instanceof Error ? error.stack ?? error.message : String(error);
+  process.emitWarning(`stream handler threw: ${message}`, 'NetStreamHandlerError');
+}
