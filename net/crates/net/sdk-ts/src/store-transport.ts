@@ -37,7 +37,7 @@
 
 import type { MeshNode, MeshStream, StreamDataSubscription } from './mesh';
 import { streamIdFromLabel } from './identity';
-import { reportHandlerError } from './_internal.js';
+import { callIsolated, reportHandlerError } from './_internal.js';
 
 /** The frame shape the store's `onEvent` consumes. */
 export interface StoreTransportFrame {
@@ -127,11 +127,7 @@ export function meshStoreTransport(mesh: MeshNode, options: MeshStoreTransportOp
           // Isolate handlers: one that throws must neither stop delivery
           // to the rest nor escape into the native callback.
           for (const handler of [...handlers]) {
-            try {
-              handler(frame);
-            } catch (error) {
-              reportHandlerError(error);
-            }
+            callIsolated(() => handler(frame), reportHandlerError);
           }
         }),
       );

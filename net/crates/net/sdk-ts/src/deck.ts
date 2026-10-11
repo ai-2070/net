@@ -409,6 +409,12 @@ export class DeckClient {
    * `unknown` because the substrate snapshot's exact shape isn't
    * mirrored in the TS surface — consumers cast or use a runtime
    * validator).
+   *
+   * Integers beyond `Number.MAX_SAFE_INTEGER` (node ids, origin hashes —
+   * nearly always) arrive as `bigint`, smaller ones as `number`, so the
+   * same field's type varies by value: compare ids via `BigInt(x)`, and
+   * pass `JSON.stringify` a bigint-aware replacer. The same holds for
+   * `snapshots()`, `audit()` records and `blastRadius()`.
    */
   status(): unknown {
     try {

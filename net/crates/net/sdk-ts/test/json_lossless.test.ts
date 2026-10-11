@@ -29,4 +29,16 @@ describe('parseJsonLossless', () => {
       expect(() => parseJsonLossless(bad)).toThrow(SyntaxError);
     }
   });
+
+  // Code review 2026-10-11 TS-2: `obj[key] = v` with key "__proto__"
+  // swapped the prototype instead of making an own property.
+  it('keeps a "__proto__" key as an own property, like JSON.parse', () => {
+    const text = '{"__proto__":{"polluted":true},"a":1}';
+    const got = parseJsonLossless(text) as Record<string, unknown>;
+    const want = JSON.parse(text) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(got)).toBe(Object.prototype);
+    expect(Object.keys(got)).toEqual(Object.keys(want));
+    expect((got as { polluted?: unknown }).polluted).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(got, '__proto__')?.value).toEqual({ polluted: true });
+  });
 });

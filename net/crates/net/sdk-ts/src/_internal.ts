@@ -164,9 +164,49 @@ export function reportHandlerError(error: unknown): void {
 }
 
 /**
+ * Run a user handler so that neither a synchronous throw nor a rejected
+ * promise escapes: both go to `onError`, and an `onError` that throws is
+ * swallowed. A plain `try/catch` caught only the throw — an `async`
+ * handler's rejection became an unhandled rejection, which ends the
+ * process under Node's default `--unhandled-rejections=throw` (code
+ * review 2026-10-11, TS-1).
+ */
+export function callIsolated(run: () => unknown, onError: (error: unknown) => void): void {
+  const report = (error: unknown): void => {
+    try {
+      onError(error);
+    } catch {
+      // An onError that itself throws must not escape either.
+    }
+  };
+  let result: unknown;
+  try {
+    result = run();
+  } catch (error) {
+    report(error);
+    return;
+  }
+  if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
+    const then = (result as { then?: unknown }).then;
+    if (typeof then === 'function') {
+      try {
+        then.call(result, undefined, report);
+      } catch (error) {
+        report(error);
+      }
+    }
+  }
+}
+
+/**
  * `JSON.parse` that keeps full-range integers: an integer literal outside
  * `Number.MAX_SAFE_INTEGER` comes back as a `bigint` instead of a silently
  * rounded `number`. Everything else matches `JSON.parse`.
+ *
+ * So one field can be a `number` in one record and a `bigint` in the next,
+ * by magnitude. Compare ids through `BigInt(x)`, and give `JSON.stringify`
+ * a replacer (`(_, v) => typeof v === 'bigint' ? v.toString() : v`) — a
+ * `bigint` anywhere makes the bare call throw.
  *
  * The native layer serializes u64 node ids, daemon origin hashes and epoch
  * ids as JSON numbers, and those are mostly > 2^53: plain `JSON.parse` rounded
@@ -200,7 +240,14 @@ export function parseJsonLossless(text: string): unknown {
         ws();
         if (text[i] !== ':') fail("expected ':'");
         i += 1;
-        obj[key] = value();
+        const v = value();
+        if (key === '__proto__') {
+          // An own property, as `JSON.parse` makes it — plain assignment
+          // would swap the object's prototype (code review 2026-10-11, TS-2).
+          Object.defineProperty(obj, key, { value: v, writable: true, enumerable: true, configurable: true });
+        } else {
+          obj[key] = v;
+        }
         ws();
         if (text[i] === ',') {
           i += 1;
