@@ -434,6 +434,85 @@ async fn cancel_client_stream_mid_finish_surfaces_terminal() {
     }
 }
 
+/// Code review 2026-10-11 GO-2: a `send` parked on request-side
+/// flow-control credit waits on the credit semaphore, which the cancel
+/// watcher never touched — `pending.cancel` only signals the response
+/// side. A cancel (the Go binding's `Close()` / ctx-cancel wake) left the
+/// send parked for good, and with it the borrowed handle. The silent
+/// handler never reads, so it never grants credit back: with a window of
+/// one, the second send parks until the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_wakes_a_client_stream_send_parked_on_credit() {
+    let (a, b, _serving) = build_pair().await;
+    let token = a.reserve_cancel_token();
+    let opts = CallOptions {
+        cancel_token: Some(token),
+        request_window_initial: Some(1),
+        ..CallOptions::default()
+    };
+    let mut call = a
+        .call_client_stream(b.node_id(), "silent.cs", opts)
+        .await
+        .expect("call_client_stream should open against a reachable peer");
+    call.send(Bytes::from_static(b"chunk1"))
+        .await
+        .expect("the first send spends the one credit");
+
+    let send_task = tokio::spawn(async move { call.send(Bytes::from_static(b"chunk2")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !send_task.is_finished(),
+        "the second send should be parked on credit"
+    );
+    a.cancel(token);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), send_task)
+        .await
+        .expect("a send parked on credit must resolve after cancel")
+        .expect("spawn task panicked");
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled after cancel, got {other:?}"),
+    }
+}
+
+/// GO-2, duplex shape: same parked-on-credit send, on the duplex sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_wakes_a_duplex_send_parked_on_credit() {
+    let (a, b, _serving) = build_pair().await;
+    let token = a.reserve_cancel_token();
+    let opts = CallOptions {
+        cancel_token: Some(token),
+        request_window_initial: Some(1),
+        ..CallOptions::default()
+    };
+    let call = a
+        .call_duplex(b.node_id(), "silent.dx", opts)
+        .await
+        .expect("call_duplex should open against a reachable peer");
+    let (mut sink, _stream) = call.into_split();
+    sink.send(Bytes::from_static(b"chunk1"))
+        .await
+        .expect("the first send spends the one credit");
+
+    let send_task = tokio::spawn(async move { sink.send(Bytes::from_static(b"chunk2")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !send_task.is_finished(),
+        "the second send should be parked on credit"
+    );
+    a.cancel(token);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), send_task)
+        .await
+        .expect("a send parked on credit must resolve after cancel")
+        .expect("spawn task panicked");
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled after cancel, got {other:?}"),
+    }
+}
+
 // =====================================================================
 // Duplex (call_duplex) mid-flight cancel.
 // =====================================================================

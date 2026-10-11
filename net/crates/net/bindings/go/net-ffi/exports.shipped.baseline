@@ -4,7 +4,8 @@
 # generated-at: 13fe95dbc9c57b4d4e64209f6a299614ad5dcc7f
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi
-# count: 596
+# count: 597
+# edited: net_rpc_request_stream_retire added by hand (intended C-ABI addition, SDK audit 2026-10-11 #8; mirrors exports.baseline)
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -511,6 +512,7 @@ net_rpc_new
 net_rpc_observer_dropped_total
 net_rpc_observer_install
 net_rpc_request_stream_next
+net_rpc_request_stream_retire
 net_rpc_reserve_cancel_token
 net_rpc_reserve_handler_id
 net_rpc_response_free

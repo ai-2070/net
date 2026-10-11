@@ -1076,6 +1076,11 @@ func newStreamHandleGuard(free func()) *streamHandleGuard {
 	return &streamHandleGuard{free: free}
 }
 
+// closing reports whether teardown has been requested.
+func (g *streamHandleGuard) closing() bool {
+	return g.state.Load()&1 != 0
+}
+
 // enter registers an in-flight op. Returns false if teardown has
 // already been requested (the op must abort without touching the
 // handle). On true the caller MUST pair it with exactly one leave().
@@ -1110,6 +1115,20 @@ func (g *streamHandleGuard) leave() {
 // caller wins). Frees immediately if no op is in flight, otherwise the
 // last op to leave() will. Never blocks.
 func (g *streamHandleGuard) requestFree() {
+	g.requestFreeWaking(true)
+}
+
+// requestFreeQuiet is requestFree without the wake: for a terminal op
+// that hands the call on rather than ending it. DuplexCall.Split is the
+// one caller — its own enter() is still counted in flight, so
+// requestFree would always see an op in flight and fire the substrate
+// cancel, killing the very call the split halves now own (code review
+// 2026-10-11, GO-1).
+func (g *streamHandleGuard) requestFreeQuiet() {
+	g.requestFreeWaking(false)
+}
+
+func (g *streamHandleGuard) requestFreeWaking(wake bool) {
 	for {
 		s := g.state.Load()
 		if s&1 != 0 {
@@ -1118,7 +1137,7 @@ func (g *streamHandleGuard) requestFree() {
 		if g.state.CompareAndSwap(s, s|1) {
 			if s>>1 == 0 { // no ops in flight
 				g.free()
-			} else if g.wake != nil {
+			} else if wake && g.wake != nil {
 				// Wake the parked op; its leave() then runs the free.
 				g.wake()
 			}
@@ -1978,8 +1997,16 @@ func (d *DuplexCall) FinishSending() error {
 func (d *DuplexCall) Recv() ([]byte, error) {
 	d.recvActive.Add(1)
 	defer d.recvActive.Add(-1)
-	if d.splitting.Load() {
-		return nil, ErrStreamDone // the call is being split into halves
+	// A Split under way either backs out (it saw this Recv counted in)
+	// or completes and closes the guard — both promptly, as Split never
+	// waits. Wait for whichever: returning ErrStreamDone on sight told a
+	// reader a live call had ended cleanly when the Split backed out
+	// (code review 2026-10-11, GO-4).
+	for d.splitting.Load() {
+		if d.guard.closing() {
+			return nil, ErrStreamDone // split: the halves own the call now
+		}
+		runtime.Gosched()
 	}
 	if !d.guard.enter() {
 		return nil, ErrStreamDone
@@ -2017,8 +2044,9 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 // Split does not wait for a Recv on the same call: with one in flight it
 // returns ErrSplitWhileReceiving and leaves the call usable (the native
 // side holds the stream across a parked Recv, so waiting could block
-// forever). A Recv that starts while a Split is under way returns
-// ErrStreamDone. Split before handing the call to goroutines.
+// forever). A Recv that starts while a Split is under way waits for its
+// outcome: ErrStreamDone once the split succeeds, a normal Recv if it
+// backs out. Split before handing the call to goroutines.
 func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 	d.splitting.Store(true)
 	if d.recvActive.Load() != 0 {
@@ -2038,7 +2066,8 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 	// Terminal: request teardown and leave so the empty shell is freed
 	// once this op (and any draining Send/Recv) has left. The split
 	// halves below use the new outSink/outStream handles, not d.handle.
-	d.guard.requestFree()
+	// Quiet: the call lives on in the halves, so no substrate cancel.
+	d.guard.requestFreeQuiet()
 	d.guard.leave()
 	if d.cancel != nil {
 		d.cancel()

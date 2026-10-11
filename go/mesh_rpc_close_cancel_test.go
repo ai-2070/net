@@ -330,3 +330,71 @@ func TestDuplexSplitDoesNotParkBehindRecv(t *testing.T) {
 		t.Fatal("Close did not wake the parked Recv")
 	}
 }
+
+// Code review 2026-10-11 GO-1: Split ran requestFree while its own
+// enter() was counted in flight, so the guard always fired the wake —
+// a substrate cancel of the call the split halves had just taken over.
+// Every DuplexStream.Recv then saw a cancellation instead of the reply.
+func TestDuplexSplitHalvesStillCarryTheCall(t *testing.T) {
+	a, b, cleanup := meshHandshakePair(t)
+	defer cleanup()
+	rpcA, err := NewMeshRpc(a)
+	if err != nil {
+		t.Fatalf("NewMeshRpc(a): %v", err)
+	}
+	defer rpcA.Close()
+	rpcB, err := NewMeshRpc(b)
+	if err != nil {
+		t.Fatalf("NewMeshRpc(b): %v", err)
+	}
+	defer rpcB.Close()
+
+	serve, err := rpcB.ServeDuplex("audit.split.echo", func(in *RequestStreamRecv, out *ResponseSinkSend) error {
+		for {
+			msg, err := in.Recv()
+			if err != nil {
+				return nil
+			}
+			if err := out.Send(msg); err != nil {
+				return err
+			}
+		}
+	})
+	if err != nil {
+		t.Fatalf("ServeDuplex: %v", err)
+	}
+	defer serve.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	call, err := rpcA.CallDuplex(ctx, b.NodeID(), "audit.split.echo", DuplexOptions{})
+	if err != nil {
+		t.Fatalf("CallDuplex: %v", err)
+	}
+	sink, stream, err := call.Split()
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	defer sink.Close()
+	defer stream.Close()
+
+	for i := 0; i < 3; i++ {
+		want := []byte{'p', 'i', 'n', 'g', byte('0' + i)}
+		if err := sink.Send(want); err != nil {
+			t.Fatalf("sink.Send #%d: %v", i, err)
+		}
+		got, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("stream.Recv #%d after Split: %v (the split cancelled its own call)", i, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("stream.Recv #%d = %q, want %q", i, got, want)
+		}
+	}
+	if err := sink.Finish(); err != nil {
+		t.Fatalf("sink.Finish: %v", err)
+	}
+	if _, err := stream.Recv(); !errors.Is(err, ErrStreamDone) {
+		t.Fatalf("Recv after Finish = %v, want ErrStreamDone", err)
+	}
+}
