@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newLocalMesh builds a single-node mesh on an OS-assigned
@@ -868,4 +869,73 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// closingDaemon has ANOTHER goroutine close its runtime while Process is
+// running, and waits (bounded) for that Close to return. Calling Close on
+// Process's own goroutine is refused by the compute FFI's re-entry guard;
+// the cross-goroutine shape is the one that deadlocked.
+type closingDaemon struct {
+	rt       *DaemonRuntime
+	closedIn chan bool
+}
+
+func (d closingDaemon) Process(event CausalEvent) ([][]byte, error) {
+	closed := make(chan struct{})
+	go func() {
+		d.rt.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		d.closedIn <- true
+	case <-time.After(3 * time.Second):
+		d.closedIn <- false
+	}
+	return [][]byte{event.Payload}, nil
+}
+
+// cubic review of PR #1228 (follow-up): Deliver held rt.mu's read lock
+// across native code that runs the daemon's Process. A Close from another
+// goroutine then waited for the write lock behind that read lock — and a
+// Process waiting on that goroutine deadlocked. Deliver now pins the
+// handle; Close detaches it at once and the free waits for the unpin.
+func TestDeliver_ACloseDuringProcessDoesNotWaitForDeliver(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	id := newTestIdentity(t)
+	defer id.Close()
+	closedIn := make(chan bool, 1)
+	h, err := rt.Spawn("closer", id, closingDaemon{rt: rt, closedIn: closedIn}, nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer h.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := rt.Deliver(h.OriginHash(), CausalEvent{
+			OriginHash: id.OriginHash(), Sequence: 1, Payload: []byte("x"),
+		})
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Deliver never returned")
+	}
+	if !<-closedIn {
+		t.Fatal("Close blocked behind the in-flight Deliver")
+	}
+	if err := rt.Start(); !errors.Is(err, ErrRuntimeShutDown) {
+		t.Fatalf("after Close: Start = %v, want ErrRuntimeShutDown", err)
+	}
 }

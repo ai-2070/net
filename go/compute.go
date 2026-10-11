@@ -111,9 +111,20 @@ func (rt *DaemonRuntime) pin() (*C.net_compute_runtime_t, func()) {
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
 		if rt.pendingFree != nil && rt.pins.Load() == 0 {
+			shutdownDetached(rt.pendingFree)
 			rt.freeDetached(rt.pendingFree)
 			rt.pendingFree = nil
 		}
+	}
+}
+
+// shutdownDetached best-effort shuts down a handle Close already detached
+// (the error is discarded, as Close always has).
+func shutdownDetached(h *C.net_compute_runtime_t) {
+	var errOut *C.char
+	_ = C.net_compute_runtime_shutdown(h, &errOut)
+	if errOut != nil {
+		C.net_compute_free_cstring(errOut)
 	}
 }
 
@@ -194,13 +205,18 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 // already-ready runtime; returns an error if the runtime has been
 // shut down.
 func (rt *DaemonRuntime) Start() error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return ErrRuntimeShutDown
 	}
+	defer release()
 	var errOut *C.char
-	code := C.net_compute_runtime_start(rt.handle, &errOut)
+	code := C.net_compute_runtime_start(rh, &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -212,13 +228,18 @@ func (rt *DaemonRuntime) Start() error {
 // After Shutdown, the native handle is still allocated — call
 // Close to release it, or let the finalizer do so.
 func (rt *DaemonRuntime) Shutdown() error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return ErrRuntimeShutDown
 	}
+	defer release()
 	var errOut *C.char
-	code := C.net_compute_runtime_shutdown(rt.handle, &errOut)
+	code := C.net_compute_runtime_shutdown(rh, &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -391,17 +412,17 @@ func (rt *DaemonRuntime) Close() {
 	}
 	h := rt.handle
 	rt.handle = nil
-	var errOut *C.char
-	_ = C.net_compute_runtime_shutdown(h, &errOut)
-	if errOut != nil {
-		C.net_compute_free_cstring(errOut)
-	}
 	if rt.pins.Load() > 0 {
-		// A pinned native call (a group spawn — possibly the very one
-		// whose factory is calling Close) still runs on h: the last
-		// unpin frees it. See pin.
+		// A pinned native call (a group spawn, a Deliver — possibly the
+		// very one whose callback is waiting on this Close) still runs on
+		// h: the last unpin shuts it down and frees it. The native
+		// shutdown is deferred too: it drains daemons, so it waits for
+		// that in-flight call, and running it here blocked this Close
+		// behind the call — a deadlock when the call waited on the Close
+		// (cubic review of PR #1228). See pin.
 		rt.pendingFree = h
 	} else {
+		shutdownDetached(h)
 		rt.freeDetached(h)
 	}
 	runtime.SetFinalizer(rt, nil)
@@ -477,11 +498,16 @@ func (rt *DaemonRuntime) Spawn(
 	daemon MeshDaemon,
 	cfg *DaemonHostConfig,
 ) (*DaemonHandle, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 	if daemon == nil {
 		return nil, &DaemonError{Message: "daemon is nil"}
 	}
@@ -518,7 +544,7 @@ func (rt *DaemonRuntime) Spawn(
 	var nativeHandle *C.net_compute_daemon_handle_t
 	var errOut *C.char
 	code := C.net_compute_spawn(
-		rt.handle,
+		rh,
 		kindPtr,
 		C.size_t(len(kindBytes)),
 		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
@@ -554,13 +580,18 @@ func (rt *DaemonRuntime) Spawn(
 // Stop removes the daemon identified by originHash from the
 // runtime's registry. Idempotent during ShuttingDown.
 func (rt *DaemonRuntime) Stop(originHash uint64) error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return ErrRuntimeShutDown
 	}
+	defer release()
 	var errOut *C.char
-	code := C.net_compute_runtime_stop(rt.handle, C.uint64_t(originHash), &errOut)
+	code := C.net_compute_runtime_stop(rh, C.uint64_t(originHash), &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -572,14 +603,19 @@ func (rt *DaemonRuntime) Stop(originHash uint64) error {
 // The returned bytes round-trip through SpawnFromSnapshot; callers
 // treat the slice as opaque.
 func (rt *DaemonRuntime) Snapshot(originHash uint64) ([]byte, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 	var outputs *C.net_compute_outputs_t
 	var errOut *C.char
-	code := C.net_compute_runtime_snapshot(rt.handle, C.uint64_t(originHash), &outputs, &errOut)
+	code := C.net_compute_runtime_snapshot(rh, C.uint64_t(originHash), &outputs, &errOut)
 	if code != C.NET_COMPUTE_OK {
 		return nil, computeErr(code, errOut)
 	}
@@ -617,11 +653,16 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 	daemon MeshDaemon,
 	cfg *DaemonHostConfig,
 ) (*DaemonHandle, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 	if daemon == nil {
 		return nil, &DaemonError{Message: "daemon is nil"}
 	}
@@ -659,7 +700,7 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 	var nativeHandle *C.net_compute_daemon_handle_t
 	var errOut *C.char
 	code := C.net_compute_spawn_from_snapshot(
-		rt.handle,
+		rh,
 		kindPtr,
 		C.size_t(len(kindBytes)),
 		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
@@ -697,11 +738,16 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 // originHash. Returns the daemon's output payloads (each a fresh
 // []byte).
 func (rt *DaemonRuntime) Deliver(originHash uint64, event CausalEvent) ([][]byte, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 
 	var payloadPtr *C.uint8_t
 	if len(event.Payload) > 0 {
@@ -711,7 +757,7 @@ func (rt *DaemonRuntime) Deliver(originHash uint64, event CausalEvent) ([][]byte
 	var outputs *C.net_compute_outputs_t
 	var errOut *C.char
 	code := C.net_compute_runtime_deliver(
-		rt.handle,
+		rh,
 		C.uint64_t(originHash),
 		C.uint64_t(event.OriginHash),
 		C.uint64_t(event.Sequence),
