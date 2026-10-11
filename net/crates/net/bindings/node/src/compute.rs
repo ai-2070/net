@@ -673,10 +673,13 @@ impl DaemonRuntime {
     #[napi]
     pub async fn snapshot(&self, origin_hash: BigInt) -> Result<Option<Buffer>> {
         let origin = daemon_bigint_u64("originHash", origin_hash)?;
-        let snap = self
-            .inner
-            .snapshot(origin)
+        // Off the async workers, as `deliver`: the snapshot waits on the JS
+        // `snapshot` callback.
+        let rt = Arc::clone(&self.inner);
+        let handle = tokio::runtime::Handle::current();
+        let snap = tokio::task::spawn_blocking(move || handle.block_on(rt.snapshot(origin)))
             .await
+            .map_err(|e| daemon_err(format!("snapshot task failed: {e}")))?
             .map_err(|e| daemon_err(e.to_string()))?;
         Ok(snap.map(|s| Buffer::from(s.to_bytes())))
     }
@@ -821,9 +824,14 @@ impl DaemonRuntime {
         // happens. The outputs come back as `Vec<Bytes>` wrapped
         // in causal events; we discard the chain wrapping and
         // return just the payload buffers.
-        let outputs = self
-            .inner
-            .deliver(origin, &core_event)
+        // Off the async workers: `deliver` parks its thread on the JS
+        // `process` callback (up to `callbackTimeoutMs`), and enough
+        // concurrent delivers used to stall every other napi async op
+        // (SDK audit 2026-10-11).
+        let rt = Arc::clone(&self.inner);
+        let outputs = tokio::task::spawn_blocking(move || rt.deliver(origin, &core_event))
+            .await
+            .map_err(|e| daemon_err(format!("deliver task failed: {e}")))?
             .map_err(|e| daemon_err(e.to_string()))?;
 
         Ok(outputs

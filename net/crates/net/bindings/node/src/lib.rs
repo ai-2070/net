@@ -2072,7 +2072,8 @@ mod mesh_bindings {
         #[napi]
         pub fn shard_for_stream(&self, stream_id: BigInt) -> Result<u32> {
             let guard = self.load_node()?;
-            let (_, id, _) = stream_id.get_u64();
+            // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
+            let id = crate::common::bigint_u64(stream_id)?;
             Ok(guard.as_ref().unwrap().shard_for_stream(id) as u32)
         }
 

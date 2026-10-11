@@ -130,16 +130,16 @@ pub(crate) fn capacity_ranking(
     let query: CapacityQuery = serde_json::from_str(&query_json)
         .map_err(|e| Error::from_reason(format!("CapacityQuery JSON: {e}")))?;
 
+    // via bigint_u64: a raw get_u64() reinterpreted a bad node id and
+    // attached its RTT to another node (SDK audit 2026-10-11).
     let rtt_map: HashMap<u64, u32> = rtt_entries
         .map(|entries| {
             entries
                 .into_iter()
-                .map(|e| {
-                    let (_signed, words, _lossless) = e.node_id.get_u64();
-                    (words, e.rtt_ms)
-                })
-                .collect()
+                .map(|e| Ok((crate::common::bigint_u64(e.node_id)?, e.rtt_ms)))
+                .collect::<Result<HashMap<u64, u32>>>()
         })
+        .transpose()?
         .unwrap_or_default();
 
     let rows: Vec<CapacityRow> =

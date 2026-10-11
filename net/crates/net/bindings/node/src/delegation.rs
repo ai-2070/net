@@ -6,11 +6,13 @@
 //! [`RevocationRegistry`], and [`derive_child_identity`] to derive a
 //! stable child `Identity` handle from a parent.
 //!
-//! **H8 (no key material, ever).** Every function here takes and returns
-//! opaque `Identity` handles and *public* entity-ids / chain bytes.
-//! Private ed25519 seeds never cross into JS: `deriveChildIdentity`
-//! derives the child keypair inside Rust and hands back a handle; the
-//! chain is a blob of ed25519-signed public tokens. The one and only
+//! **H8 (no key material from this module).** Every function here takes and
+//! returns opaque `Identity` handles and *public* entity-ids / chain bytes:
+//! `deriveChildIdentity` derives the child keypair inside Rust and hands back
+//! a handle; the chain is a blob of ed25519-signed public tokens. The handle
+//! is an ordinary `Identity`, though — its own `toBytes()` /
+//! `toStateBytes()` DO export the private seed, so treat a derived handle
+//! with the same care as its parent. The one and only
 //! implementation of derivation + verification lives in the Rust SDK
 //! (bridge doctrine H2) — this file just forwards.
 
@@ -72,8 +74,10 @@ pub(crate) fn u64_arg(name: &str, value: BigInt) -> Result<u64> {
 /// Deterministic (blake3 KDF over the parent seed), so a machine / gateway
 /// identity is reproducible across restarts from the root alone — no extra
 /// persistence, and every process that holds the root derives the same
-/// child. The returned handle owns its keypair; the private seed is never
-/// exposed (H8). `label` namespaces siblings, e.g. `"machine:hostA"` vs
+/// child. The returned handle owns its keypair; this function never returns
+/// the seed itself, but the handle's `toBytes()` does (H8 applies to this
+/// module's surface, not to the `Identity` class). `label` namespaces
+/// siblings, e.g. `"machine:hostA"` vs
 /// `"gateway:hostA:hermes"`.
 #[napi]
 pub fn derive_child_identity(parent: &Identity, label: String) -> Identity {

@@ -288,10 +288,9 @@ impl BlobRef {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&hash);
-        let (signed, size_u64, _losses) = size.get_u64();
-        if signed {
-            return Err(blob_err("BlobRef", "size must be non-negative"));
-        }
+        // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
+        let size_u64 = crate::common::bigint_u64(size)
+            .map_err(|e| blob_err("BlobRef", format!("size: {e}")))?;
         Ok(Self {
             inner: InnerBlobRef::small(uri, arr, size_u64),
         })
@@ -808,9 +807,13 @@ pub fn register_blob_adapter(
     let fetch: FetchTsfn = fetch_fn.build_threadsafe_function().build()?;
     let fetch_range: FetchRangeTsfn = fetch_range_fn.build_threadsafe_function().build()?;
     let exists: ExistsTsfn = exists_fn.build_threadsafe_function().build()?;
-    let timeout = timeout_ms
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(DEFAULT_JS_ADAPTER_TIMEOUT);
+    // `0` disables the cap, as on every `serve*` verb; it used to fail
+    // every adapter call at 0 ms (SDK audit 2026-10-11).
+    let timeout = match timeout_ms {
+        Some(0) => Duration::from_secs(u64::MAX / 1000),
+        Some(ms) => Duration::from_millis(ms as u64),
+        None => DEFAULT_JS_ADAPTER_TIMEOUT,
+    };
     let wrapper =
         NodeBlobAdapter::new_with_timeout(id.clone(), store, fetch, fetch_range, exists, timeout);
     let arc: Arc<dyn BlobAdapter> = Arc::new(wrapper);
@@ -1079,9 +1082,13 @@ pub fn register_async_blob_adapter(
     let fetch: FetchAsyncTsfn = fetch_fn.build_threadsafe_function().build()?;
     let fetch_range: FetchRangeAsyncTsfn = fetch_range_fn.build_threadsafe_function().build()?;
     let exists: ExistsAsyncTsfn = exists_fn.build_threadsafe_function().build()?;
-    let timeout = timeout_ms
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(DEFAULT_JS_ADAPTER_TIMEOUT);
+    // `0` disables the cap, as on every `serve*` verb; it used to fail
+    // every adapter call at 0 ms (SDK audit 2026-10-11).
+    let timeout = match timeout_ms {
+        Some(0) => Duration::from_secs(u64::MAX / 1000),
+        Some(ms) => Duration::from_millis(ms as u64),
+        None => DEFAULT_JS_ADAPTER_TIMEOUT,
+    };
     let wrapper = NodeAsyncBlobAdapter::new_with_timeout(
         id.clone(),
         store,
@@ -1346,8 +1353,9 @@ impl MeshBlobAdapter {
     ) -> Result<Buffer> {
         let adapter = self.inner.clone();
         let blob = blob_ref.inner.clone();
-        let (_, start_u, _) = start.get_u64();
-        let (_, end_u, _) = end.get_u64();
+        // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
+        let start_u = crate::common::bigint_u64(start)?;
+        let end_u = crate::common::bigint_u64(end)?;
         let bytes = adapter
             .fetch_range(&blob, start_u..end_u)
             .await
