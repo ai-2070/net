@@ -107,18 +107,31 @@ export interface OpenStreamOptions {
   lossy?: boolean;
 }
 
+/** Most frames a {@link LeafStream} buffers before its first consumer. */
+export const LEAF_STREAM_PENDING_MAX_FRAMES = 1024;
+/** Most bytes a {@link LeafStream} buffers before its first consumer. */
+export const LEAF_STREAM_PENDING_MAX_BYTES = 1 << 20;
+
 /**
  * One open stream.
  *
  * Inbound payloads are delivered to `for await` consumers and to
  * {@link LeafStream.onMessage} listeners. Payloads that arrive before
  * anyone consumes them are buffered in arrival order, so a page that
- * opens a stream and awaits it a tick later loses nothing.
+ * opens a stream and awaits it a tick later loses nothing — up to
+ * {@link LEAF_STREAM_PENDING_MAX_FRAMES} frames and
+ * {@link LEAF_STREAM_PENDING_MAX_BYTES} bytes. Past either bound the
+ * OLDEST buffered frame is dropped and counted in
+ * {@link LeafStream.droppedBeforeConsumer}: a stream used only to send
+ * (the store, netcode and region-link layers read inbound traffic
+ * elsewhere) must not keep every frame the peer sends for its lifetime.
  */
 export class LeafStream implements AsyncIterable<Uint8Array> {
   private readonly queues = new Set<AsyncQueue<Uint8Array>>();
   private readonly listeners = new Set<(payload: Uint8Array) => void>();
   private readonly pending: Uint8Array[] = [];
+  private pendingBytes = 0;
+  private dropped = 0;
   private closed = false;
   /**
    * This stream's wire id as a number, or `null` when the inner
@@ -186,6 +199,14 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
       );
     }
     inner.on_message((event) => this.receive(event));
+  }
+
+  /**
+   * Frames dropped from the pre-consumer buffer because no `for await`
+   * consumer or `onMessage` listener was attached and it was full.
+   */
+  get droppedBeforeConsumer(): number {
+    return this.dropped;
   }
 
   /** The authenticated peer this stream is with, 16 lowercase hex. */
@@ -262,6 +283,17 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     if (payload === null || this.closed) return;
     if (this.queues.size === 0 && this.listeners.size === 0) {
       this.pending.push(payload);
+      this.pendingBytes += payload.byteLength;
+      // Bounded (SDK audit 2026-10-11): unbounded, an unread stream grew
+      // at the peer's send rate until the tab ran out of memory.
+      while (
+        this.pending.length > LEAF_STREAM_PENDING_MAX_FRAMES ||
+        (this.pendingBytes > LEAF_STREAM_PENDING_MAX_BYTES && this.pending.length > 1)
+      ) {
+        const oldest = this.pending.shift()!;
+        this.pendingBytes -= oldest.byteLength;
+        this.dropped += 1;
+      }
       return;
     }
     for (const listener of this.listeners) {
