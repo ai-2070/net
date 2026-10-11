@@ -223,7 +223,10 @@ pub(crate) fn mesh_publish_tools(
     skip_from_py_object
 )]
 pub struct PyLocalPublicationHandle {
-    inner: Option<LocalPublicationHandle>,
+    // A lock, not `&mut self`: `withdraw` released the GIL while holding the
+    // mutable borrow, so any concurrent read raised "Already borrowed" (SDK
+    // audit 2026-10-11).
+    inner: parking_lot::Mutex<Option<LocalPublicationHandle>>,
     runtime: Arc<GuardedRuntime>,
 }
 
@@ -232,7 +235,7 @@ impl PyLocalPublicationHandle {
     /// ([`crate::payment_provider`]), which reuses the same handle type.
     pub(crate) fn wrap(inner: LocalPublicationHandle, runtime: Arc<GuardedRuntime>) -> Self {
         Self {
-            inner: Some(inner),
+            inner: parking_lot::Mutex::new(Some(inner)),
             runtime,
         }
     }
@@ -245,6 +248,7 @@ impl PyLocalPublicationHandle {
     #[getter]
     fn tools(&self) -> Vec<String> {
         self.inner
+            .lock()
             .as_ref()
             .map(|h| h.tools().to_vec())
             .unwrap_or_default()
@@ -254,6 +258,7 @@ impl PyLocalPublicationHandle {
     #[getter]
     fn skipped_tools(&self) -> Vec<String> {
         self.inner
+            .lock()
             .as_ref()
             .map(|h| h.skipped_tools().to_vec())
             .unwrap_or_default()
@@ -262,15 +267,16 @@ impl PyLocalPublicationHandle {
     /// Whether the publication is still live.
     #[getter]
     fn serving(&self) -> bool {
-        self.inner.is_some()
+        self.inner.lock().is_some()
     }
 
     /// Withdraw the publication immediately: re-announce the remaining
     /// publications' set so peers stop advertising these tools, then stop the
     /// services. Idempotent — a second call is a no-op. Releases the GIL for the
     /// re-announce round-trip.
-    fn withdraw(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(handle) = self.inner.take() {
+    fn withdraw(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self.inner.lock().take();
+        if let Some(handle) = taken {
             let rt = Arc::clone(&self.runtime);
             py.detach(move || rt.block_on(handle.withdraw()))
                 .map_err(|e| PyRuntimeError::new_err(format!("withdraw failed: {e}")))?;
@@ -281,15 +287,17 @@ impl PyLocalPublicationHandle {
     /// Stop serving (unregister the services on drop; unlike
     /// [`withdraw`](Self::withdraw) this does not re-announce — the announcement
     /// reconciles at the next registry change). Idempotent.
-    fn stop(&mut self) {
-        self.inner = None;
+    fn stop(&self) {
+        let taken = self.inner.lock().take();
+        drop(taken);
     }
 
     fn __repr__(&self) -> String {
+        let inner = self.inner.lock();
         format!(
             "LocalPublicationHandle(serving={}, tools={})",
-            self.inner.is_some(),
-            self.inner.as_ref().map(|h| h.tools().len()).unwrap_or(0),
+            inner.is_some(),
+            inner.as_ref().map(|h| h.tools().len()).unwrap_or(0),
         )
     }
 }

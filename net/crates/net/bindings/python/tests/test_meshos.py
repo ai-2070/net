@@ -569,3 +569,55 @@ def test_anext_control_returns_none_on_timeout() -> None:
 
     result = asyncio.run(_run())
     assert result is None
+
+
+# SDK audit 2026-10-11: the router kept every daemon's control sender
+# alive, so after `sdk.shutdown()` a daemon looping on control events
+# never learned the runtime was gone — `async for` polled forever and a
+# sync `next_control()` never returned. Shutdown now closes the channels.
+
+
+def test_control_closed_after_sdk_shutdown() -> None:
+    sdk = MeshOsDaemonSdk.start()
+    handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
+    assert handle.control_closed() is False
+    sdk.shutdown()
+    assert handle.control_closed() is True
+    assert handle.next_control() is None  # returns at once, not forever
+
+
+def test_wrapper_loops_end_on_sdk_shutdown() -> None:
+    try:
+        from net_sdk.meshos import MeshOsDaemonSdk as _Sdk
+    except ImportError:
+        pytest.skip("net_sdk wrapper not installed")
+    import threading
+
+    async def _run() -> str:
+        sdk = _Sdk.start()
+        handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
+
+        async def consume() -> str:
+            async for _ev in handle:
+                pass
+            return "ended"
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)
+        await asyncio.get_running_loop().run_in_executor(None, sdk.shutdown)
+        return await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert asyncio.run(_run()) == "ended"
+
+    sdk = _Sdk.start()
+    handle = sdk.register_daemon(_EchoDaemon(), Identity.generate())
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(handle.next_control()), daemon=True)
+    t.start()
+    import time
+
+    time.sleep(0.1)
+    sdk.shutdown()
+    t.join(timeout=2)
+    assert not t.is_alive(), "sync next_control() never returned after sdk.shutdown()"
+    assert out == [None]

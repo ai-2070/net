@@ -378,6 +378,8 @@ class MeshOsDaemonHandleWrapper:
                 raise
             if ev is not None:
                 return ev  # type: ignore[return-value]
+            if self._control_closed():
+                return None  # the runtime shut down: nothing will arrive
 
     def try_next_control(self) -> Optional[DaemonControl]:
         """Non-blocking variant of :meth:`next_control`."""
@@ -425,6 +427,8 @@ class MeshOsDaemonHandleWrapper:
                 raise
             if ev is not None:
                 return ev
+            if self._control_closed():
+                return None  # the runtime shut down: nothing will arrive
             if remaining_ms is not None and remaining_ms <= 0:
                 return None
             step = poll_ms if remaining_ms is None else min(poll_ms, remaining_ms)
@@ -446,11 +450,24 @@ class MeshOsDaemonHandleWrapper:
         finally:
             self._borrow_lock.release()
 
+    def _control_closed(self) -> bool:
+        """Whether the native control channel is closed and drained (the
+        runtime shut down). Never waits for the borrow lock — a busy lock
+        reads as "not closed yet" and the caller polls again. A wheel
+        that predates ``control_closed`` reads as never closed."""
+        probe = getattr(self._raw, "control_closed", None)
+        if probe is None or not self._borrow_lock.acquire(blocking=False):
+            return False
+        try:
+            return bool(probe())
+        finally:
+            self._borrow_lock.release()
+
     def __aiter__(self) -> "MeshOsDaemonHandleWrapper":
         """``async for ev in handle`` — yields each control event
         as it arrives. Stops iterating when the handle is consumed
         by :meth:`graceful_shutdown` or the substrate shuts down
-        (``try_next_control`` raises ``already_shutdown``)."""
+        (the native control channel closes on ``sdk.shutdown()``)."""
         return self
 
     async def __anext__(self) -> DaemonControl:
@@ -467,6 +484,11 @@ class MeshOsDaemonHandleWrapper:
                 ev = self._try_next_nonblocking()
                 if ev is not None:
                     return ev
+                if self._control_closed():
+                    # The runtime shut down (`sdk.shutdown()`): the channel
+                    # is closed and drained, so iteration ends rather than
+                    # polling forever (SDK audit 2026-10-11).
+                    raise StopAsyncIteration
                 await asyncio.sleep(_CONTROL_POLL_INTERVAL_MS / 1000.0)
         except MeshOsSdkError as e:
             if getattr(e, "kind", None) == "already_shutdown":

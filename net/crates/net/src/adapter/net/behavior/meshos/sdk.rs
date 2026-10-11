@@ -225,6 +225,9 @@ pub struct DaemonControlRouter {
     /// dispatcher when an `MeshOsControl::BackpressureOn/Off`
     /// fans out.
     broadcast: Arc<RwLock<Vec<Arc<DaemonControlSlot>>>>,
+    /// Set by [`Self::close`]; a registration after it gets an
+    /// already-closed channel.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DaemonControlRouter {
@@ -237,6 +240,11 @@ impl DaemonControlRouter {
     /// the SDK hands to the daemon handle.
     fn register(&self, daemon_id: u64, capacity: usize) -> mpsc::Receiver<DaemonControl> {
         let (tx, rx) = mpsc::channel(capacity);
+        if self.closed.load(Ordering::Acquire) {
+            // Dropping `tx` closes the channel: the handle observes the
+            // shut-down runtime instead of waiting forever.
+            return rx;
+        }
         let slot = Arc::new(DaemonControlSlot {
             tx,
             dropped: AtomicU64::new(0),
@@ -254,6 +262,19 @@ impl DaemonControlRouter {
         if let Some(removed) = removed {
             self.broadcast.write().retain(|s| !Arc::ptr_eq(s, &removed));
         }
+    }
+
+    /// Close every daemon's control channel: drop the senders, so a
+    /// parked [`MeshOsDaemonHandle::next_control`] returns `None` and
+    /// [`MeshOsDaemonHandle::control_closed`] reports it. Called when
+    /// the SDK shuts its runtime down — before this, handles held router
+    /// clones that kept every sender alive, so a daemon looping on
+    /// control events never learned the runtime was gone (SDK audit
+    /// 2026-10-11).
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.inner.write().clear();
+        self.broadcast.write().clear();
     }
 
     /// Push a control event to a specific daemon. At-most-once:
@@ -393,6 +414,15 @@ impl MeshOsDaemonHandle {
     /// `None` immediately when the channel is empty.
     pub fn try_next_control(&mut self) -> Option<DaemonControl> {
         self.control_rx.try_recv().ok()
+    }
+
+    /// Whether no control event can ever arrive again: the channel is
+    /// closed (the runtime shut down, or the handle was unregistered)
+    /// and drained. Tells a `None` from [`Self::try_next_control`] (or a
+    /// timed-out wait) that means "nothing yet" from one that means
+    /// "never".
+    pub fn control_closed(&self) -> bool {
+        self.control_rx.is_closed() && self.control_rx.is_empty()
     }
 
     /// The daemon's substrate identifier (the keypair's
@@ -746,7 +776,11 @@ impl MeshOsDaemonSdk {
 
     /// Drive a clean shutdown of the wrapped runtime.
     pub async fn shutdown(self) -> Result<RuntimeStats, RuntimeShutdownError> {
-        self.runtime.shutdown().await
+        let result = self.runtime.shutdown().await;
+        // After the runtime's own shutdown, so any final daemon-targeted
+        // control it dispatches is still delivered.
+        self.router.close();
+        result
     }
 
     /// Read `MeshOsConfig::this_node` off the runtime. Sourced
@@ -871,6 +905,42 @@ mod tests {
         assert_eq!(handle.daemon_id(), expected_id);
         assert_eq!(handle.daemon_name(), "telemetry");
         let _ = sdk.shutdown().await;
+    }
+
+    // SDK audit 2026-10-11: handles held router clones that kept every
+    // sender alive, so a daemon parked on `next_control` never learned
+    // the runtime had shut down.
+    #[tokio::test]
+    async fn sdk_shutdown_closes_every_daemon_control_channel() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = MeshOsDaemonSdk::start(fast_config(), dispatcher);
+        let (daemon, _counter) = NoopDaemon::new("parked");
+        let mut handle = sdk
+            .register_daemon(Box::new(daemon), EntityKeypair::generate())
+            .unwrap();
+        assert!(!handle.control_closed());
+        let parked = tokio::spawn(async move {
+            let ev = handle.next_control().await;
+            (ev, handle.control_closed())
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = sdk.shutdown().await;
+        let (ev, closed) = tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .expect("next_control must return once the SDK shuts down")
+            .unwrap();
+        assert!(ev.is_none());
+        assert!(closed);
+    }
+
+    #[tokio::test]
+    async fn control_router_registration_after_close_is_closed() {
+        let router = DaemonControlRouter::new();
+        let mut live = router.register(1, 4);
+        router.close();
+        assert!(live.recv().await.is_none(), "close drops the live sender");
+        let mut late = router.register(2, 4);
+        assert!(late.recv().await.is_none());
     }
 
     #[tokio::test]

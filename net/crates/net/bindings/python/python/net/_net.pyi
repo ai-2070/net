@@ -2189,6 +2189,11 @@ class MeshOsDaemonHandle:
         """Non-blocking control-event receive. Returns ``None``
         if the channel is empty / closed."""
         ...
+    def control_closed(self) -> bool:
+        """Whether no control event can ever arrive again: the runtime
+        shut down (or the handle was consumed) and the channel is
+        drained. Tells a "never" ``None`` from a "not yet" one."""
+        ...
     def publish_log(self, level: str, message: str) -> None:
         """Publish a log line tagged with this daemon's id.
         ``level`` is one of ``trace|debug|info|warn|error``."""
@@ -4301,6 +4306,7 @@ class AsyncMeshOsDaemonHandle:
     @property
     def daemon_name(self) -> str: ...
     def try_next_control(self) -> Optional[Dict[str, Any]]: ...
+    def control_closed(self) -> bool: ...
     async def next_control(
         self, timeout_ms: Optional[int] = None
     ) -> Optional[Dict[str, Any]]: ...

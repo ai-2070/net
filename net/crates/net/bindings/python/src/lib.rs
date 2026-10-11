@@ -1350,7 +1350,12 @@ mod mesh_bindings {
         /// socket or handshake table. Shutdown drops this Arc —
         /// any remaining clones held by a `DaemonRuntime` observe
         /// a shut-down node the next time they call into it.
-        node: Option<Arc<MeshNode>>,
+        ///
+        /// Behind a lock (not `Option` on `&mut self`) so `shutdown()` /
+        /// `__exit__` are `&self`: with `&mut self` they raised "Already
+        /// borrowed" whenever another thread was parked in a blocking
+        /// `&self` call (SDK audit 2026-10-11). Calls clone the `Arc` out.
+        node: parking_lot::RwLock<Option<Arc<MeshNode>>>,
         runtime: Arc<GuardedRuntime>,
         /// The immutable named-export map resolved at construction
         /// (SSDK §3.3) — the checked map this binding retains beside its
@@ -1704,7 +1709,7 @@ mod mesh_bindings {
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {
-                node: Some(Arc::new(node)),
+                node: parking_lot::RwLock::new(Some(Arc::new(node))),
                 runtime,
                 #[cfg(feature = "org")]
                 subnet_exports: subnet_exports_map,
@@ -1821,11 +1826,7 @@ mod mesh_bindings {
             // holding the GIL, and our blocking connect on this
             // thread would otherwise deadlock that thread's GIL
             // acquire at the end of handshake.
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -1841,11 +1842,7 @@ mod mesh_bindings {
             // without this, a caller running `accept` in a thread
             // would pin the GIL and starve a concurrent `connect` on
             // the main thread (same reason as `connect` above).
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let (addr, _) = runtime
@@ -1863,10 +1860,7 @@ mod mesh_bindings {
         /// re-classify trigger) and — when `auto_direct_upgrade`
         /// is set — the background direct-path upgrade.
         fn start(&self) -> PyResult<()> {
-            let node = self
-                .node
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             // `MeshNode::start` uses `tokio::spawn` internally, so
             // it must run inside a tokio runtime context. Enter
             // our owned runtime for the duration of the call.
@@ -2338,11 +2332,7 @@ mod mesh_bindings {
         ///     RuntimeError: the stream already has a receiver.
         #[pyo3(signature = (stream_id, capacity=4096))]
         fn open_stream_inbox(&self, stream_id: u64, capacity: usize) -> PyResult<StreamInbox> {
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let inner = node.open_stream_inbox(stream_id, capacity).ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
                     "open_stream_inbox: stream {stream_id:#x} already has a receiver"
@@ -3235,11 +3225,7 @@ mod mesh_bindings {
         /// Requires the `nat-traversal` build.
         #[cfg(feature = "nat-traversal")]
         fn probe_reflex(&self, py: Python<'_>, peer_node_id: u64) -> PyResult<String> {
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -3257,11 +3243,7 @@ mod mesh_bindings {
         /// Requires the `nat-traversal` build.
         #[cfg(feature = "nat-traversal")]
         fn reclassify_nat(&self, py: Python<'_>) -> PyResult<()> {
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(node.reclassify_nat());
@@ -3352,11 +3334,7 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -3392,11 +3370,7 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -3445,8 +3419,8 @@ mod mesh_bindings {
         }
 
         /// Shutdown the mesh node. Idempotent — a second call is a no-op.
-        fn shutdown(&mut self, py: Python<'_>) -> PyResult<()> {
-            let Some(node) = self.node.take() else {
+        fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+            let Some(node) = self.node.write().take() else {
                 return Ok(());
             };
             // Joins every background task (seconds): GIL released.
@@ -3457,7 +3431,7 @@ mod mesh_bindings {
         }
 
         fn __repr__(&self) -> String {
-            if let Some(node) = &self.node {
+            if let Some(node) = self.node.read().as_ref() {
                 format!(
                     "NetMesh(addr={}, peers={}, nodes={})",
                     node.local_addr(),
@@ -3474,7 +3448,7 @@ mod mesh_bindings {
         }
 
         fn __exit__(
-            &mut self,
+            &self,
             py: Python<'_>,
             _exc_type: Option<&Bound<'_, PyAny>>,
             _exc_val: Option<&Bound<'_, PyAny>>,
@@ -3486,9 +3460,10 @@ mod mesh_bindings {
     }
 
     impl NetMesh {
-        fn get_node(&self) -> PyResult<&MeshNode> {
+        fn get_node(&self) -> PyResult<Arc<MeshNode>> {
             self.node
-                .as_deref()
+                .read()
+                .clone()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
@@ -3531,8 +3506,8 @@ mod mesh_bindings {
         #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
         pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
             self.node
-                .as_ref()
-                .cloned()
+                .read()
+                .clone()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
@@ -3717,8 +3692,8 @@ mod mesh_bindings {
         fn new(mesh: &NetMesh) -> PyResult<Self> {
             let node = mesh
                 .node
-                .as_ref()
-                .cloned()
+                .read()
+                .clone()
                 .ok_or_else(|| PyRuntimeError::new_err("NetMesh has been shut down"))?;
             Ok(Self {
                 node,

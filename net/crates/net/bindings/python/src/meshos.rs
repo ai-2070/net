@@ -798,6 +798,15 @@ impl PyMeshOsDaemonHandle {
         }
     }
 
+    /// Whether no control event can ever arrive again: the runtime shut
+    /// down (or the handle was unregistered) and every queued event was
+    /// read. Tells a `None` from `next_control` / `try_next_control`
+    /// that means "never" from one that means "not yet". `True` once the
+    /// handle was consumed by `graceful_shutdown`.
+    fn control_closed(&self) -> bool {
+        self.inner.as_ref().is_none_or(|h| h.control_closed())
+    }
+
     /// Non-blocking control-event receive. Returns the next event
     /// as a dict, or `None` if the channel is empty / closed.
     fn try_next_control<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -1196,6 +1205,16 @@ impl PyAsyncMeshOsDaemonHandle {
     #[getter]
     fn daemon_name(&self) -> String {
         self.daemon_name.clone()
+    }
+
+    /// Whether no control event can ever arrive again (the runtime shut
+    /// down, or the handle was consumed). `False` while another task
+    /// holds the handle's lock — poll again.
+    fn control_closed(&self) -> bool {
+        match self.inner.try_lock() {
+            Ok(guard) => guard.as_ref().is_none_or(|h| h.control_closed()),
+            Err(_) => false,
+        }
     }
 
     /// Non-blocking control-event receive. Sync — no awaiting.

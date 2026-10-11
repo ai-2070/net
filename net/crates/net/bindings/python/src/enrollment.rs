@@ -656,7 +656,7 @@ pub(crate) fn mesh_serve_enrollment_auto(
         .serve_renewal_auto(operator, grant_ttl, max_depth)
         .map_err(enroll_err)?;
     Ok(PyEnrollmentServeHandle {
-        inner: Some((mesh, vec![enroll, renew])),
+        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll, renew]))),
     })
 }
 
@@ -667,23 +667,25 @@ pub struct PyEnrollmentServeHandle {
     // The `Mesh` holds the channel registry the services registered against and
     // each `ServeHandle` holds one dispatcher registration (enroll + renew) —
     // all must outlive the services.
-    inner: Option<(Mesh, Vec<ServeHandle>)>,
+    // A lock, not `&mut self` (SDK audit 2026-10-11): see `NetMesh.node`.
+    inner: parking_lot::Mutex<Option<(Mesh, Vec<ServeHandle>)>>,
 }
 
 #[pymethods]
 impl PyEnrollmentServeHandle {
     /// Stop serving enrollment (unregister the service).
-    fn stop(&mut self) {
-        self.inner = None;
+    fn stop(&self) {
+        let taken = self.inner.lock().take();
+        drop(taken);
     }
 
     /// Whether the service is still registered.
     #[getter]
     fn serving(&self) -> bool {
-        self.inner.is_some()
+        self.inner.lock().is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("EnrollmentServeHandle(serving={})", self.inner.is_some())
+        format!("EnrollmentServeHandle(serving={})", self.inner.lock().is_some())
     }
 }
