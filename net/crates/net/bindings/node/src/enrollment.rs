@@ -27,9 +27,9 @@
 #![allow(dead_code)]
 
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use parking_lot::Mutex;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

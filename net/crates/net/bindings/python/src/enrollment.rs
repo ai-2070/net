@@ -692,7 +692,8 @@ pub(crate) fn mesh_serve_enrollment(
     })
 }
 
-type PendingAnswer = std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<Py<PyAny>>> + Send>>;
+type PendingAnswer =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<Py<PyAny>>> + Send>>;
 
 enum Answer {
     Now(bool),
@@ -754,6 +755,9 @@ impl PyEnrollmentServeHandle {
     }
 
     fn __repr__(&self) -> String {
-        format!("EnrollmentServeHandle(serving={})", self.inner.lock().is_some())
+        format!(
+            "EnrollmentServeHandle(serving={})",
+            self.inner.lock().is_some()
+        )
     }
 }

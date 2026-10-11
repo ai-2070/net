@@ -312,7 +312,9 @@ impl BlobRef {
     /// onto one cache key; C and Go refuse it (SDK audit 2026-10-11).
     #[napi(getter)]
     pub fn hash(&self) -> Option<Buffer> {
-        self.inner.small_hash().map(|hash| Buffer::from(hash.to_vec()))
+        self.inner
+            .small_hash()
+            .map(|hash| Buffer::from(hash.to_vec()))
     }
 
     #[napi(getter)]

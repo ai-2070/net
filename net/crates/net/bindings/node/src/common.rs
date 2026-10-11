@@ -59,7 +59,9 @@ pub(crate) fn bigint_u64(b: BigInt) -> Result<u64> {
 /// testable without a Node host.
 pub(crate) fn validate_ttl_seconds(name: &str, value: f64) -> std::result::Result<u64, String> {
     if !value.is_finite() || value.fract() != 0.0 {
-        return Err(format!("{name} must be a whole number of seconds, got {value}"));
+        return Err(format!(
+            "{name} must be a whole number of seconds, got {value}"
+        ));
     }
     if value < 1.0 || value > f64::from(u32::MAX) {
         return Err(format!("{name} must be in 1..={}, got {value}", u32::MAX));
