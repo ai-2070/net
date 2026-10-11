@@ -21,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=21 universal=96, total=152
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=21 universal=97, total=153
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -89,6 +89,7 @@ pages:
   releases/RELEASE_v0.41_THUNDERSTRUCK: universal
   releases/RELEASE_v0.41.1_THUNDERSTRUCK: universal
   releases/RELEASE_v0.42_BACK_IN_BLACK: universal
+  releases/RELEASE_v0.43_IRON_MAN: universal
   releases/RELEASE_v0.8_KILLING_MOON: universal
   releases/RELEASE_v0.9_FIRST_BLOOD: universal
   start: universal

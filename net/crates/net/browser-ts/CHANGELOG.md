@@ -14,6 +14,30 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## 0.43.0 — one identity per origin, bounded streams
+
+- **`connect()` locks its identity.** With a custodial identity it takes
+  a per-identity Web Lock, so a second tab running the same identity is
+  refused with `IdentityError` until the first closes. `openSession()`
+  elects under the same lock. A page that runs several nodes with one
+  identity on purpose passes `lockIdentity: false`.
+- **An unread `LeafStream` is bounded.** Before a consumer attaches it
+  holds at most 1,024 frames or 1 MiB, dropping the oldest;
+  `droppedBeforeConsumer` counts them. It used to buffer every frame,
+  and the store, netcode and region links never read theirs.
+- **Store handles are capped at 16 per peer.**
+- **A follower tab's org calls have a deadline,** across the open and
+  every stream leg; a proxied call carries the absolute deadline.
+- **A leader change no longer strands a store:** session streams retire
+  with the reopenable "stale stream handle" error, and
+  `joinStore().reconnect()` closes the stream it replaces.
+- **`lobby.kick` reads node ids in decimal,** and the join key reaches
+  `authorize` on every read decision.
+- **The STUN probe's `notRun`** now also covers gathering that completes
+  beside a public host candidate with nothing reflexive and no "no
+  response" report (an engine may suppress that reflexive candidate).
+  Anywhere else it is silence, and blocked UDP is still `udp-blocked`.
+
 ## 0.41.1 — two pages can connect to each other at once
 
 - **`connectPeer` from both sides no longer cancels both attempts.** When
