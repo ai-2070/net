@@ -356,6 +356,9 @@ typedef void (*NetMeshOsUserCtxDestroyFn)(void* user_ctx);
  * Identical to `net_meshos_register_daemon_with_vtable` except for
  * `destroy`, which may be NULL (making the two identical).
  *
+ * A daemon name containing a NUL byte is refused with
+ * NET_MESHOS_ERR_INVALID_ARG before anything is registered.
+ *
  * Ownership passes ONLY on success. On any non-OK return `destroy` is
  * never called and the caller still owns `user_ctx`, so it must
  * release the context itself.

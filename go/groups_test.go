@@ -15,7 +15,9 @@ package net
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // runtimeWithPeers builds a started DaemonRuntime with a factory
@@ -427,5 +429,126 @@ func TestGroups_ConstructorsOnClosedRuntimeReturnErrRuntimeShutDown(t *testing.T
 		MemberCount: 2, GroupSeed: seed(0x32),
 	}); !errors.Is(err, ErrRuntimeShutDown) {
 		t.Errorf("NewStandbyGroup on closed runtime: got %v, want ErrRuntimeShutDown", err)
+	}
+}
+
+// Code review 2026-10-11: group spawns held rt.mu's read lock across the
+// native call, which invokes the registered factory synchronously — so a
+// factory that called rt.Close() waited for the write lock its own spawn
+// was blocking, forever. The spawn now pins the handle instead of holding
+// the lock (DaemonRuntime.pin).
+func TestGroups_FactoryThatClosesTheRuntimeDoesNotDeadlock(t *testing.T) {
+	rt, mesh := runtimeWithPeers(t, 3)
+	defer mesh.Shutdown()
+	defer rt.Close()
+
+	var once sync.Once
+	if err := rt.RegisterFactoryFunc("closer", func() MeshDaemon {
+		once.Do(rt.Close)
+		return &noopDaemon{}
+	}); err != nil {
+		t.Fatalf("RegisterFactoryFunc: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		g, err := NewReplicaGroup(rt, "closer", ReplicaGroupConfig{
+			ReplicaCount: 2, GroupSeed: seed(0x41),
+		})
+		if g != nil {
+			g.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-done: // success or a shutdown error — either is fine; returning is the assertion
+	case <-time.After(10 * time.Second):
+		t.Fatal("NewReplicaGroup deadlocked behind a factory that closed the runtime")
+	}
+	if err := rt.Start(); !errors.Is(err, ErrRuntimeShutDown) {
+		t.Fatalf("runtime closed from the factory: Start = %v, want ErrRuntimeShutDown", err)
+	}
+}
+
+// Code review 2026-10-11: the closed-runtime test above only covers calls
+// made after Close finished. This one closes the runtime WHILE a spawn is
+// inside native code (parked in the factory) and pins the lifetime rule
+// that replaced the read lock: Close returns at once and detaches the
+// handle, but the free waits for the in-flight spawn — dropping the pin
+// would free the runtime box under the spawn, and this test would see the
+// handle freed (pendingFree == nil) while the spawn is still running.
+func TestGroups_ConcurrentCloseDefersTheFreePastAnInflightSpawn(t *testing.T) {
+	rt, mesh := runtimeWithPeers(t, 3)
+	defer mesh.Shutdown()
+	defer rt.Close()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	if err := rt.RegisterFactoryFunc("parker", func() MeshDaemon {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		return &noopDaemon{}
+	}); err != nil {
+		t.Fatalf("RegisterFactoryFunc: %v", err)
+	}
+
+	spawnDone := make(chan struct{})
+	go func() {
+		defer close(spawnDone)
+		g, _ := NewReplicaGroup(rt, "parker", ReplicaGroupConfig{
+			ReplicaCount: 2, GroupSeed: seed(0x42),
+		})
+		if g != nil {
+			g.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("the spawn never reached the factory")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		rt.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("Close blocked behind an in-flight spawn")
+	}
+
+	rt.mu.RLock()
+	detached, pending, pins := rt.handle == nil, rt.pendingFree != nil, rt.pins.Load()
+	rt.mu.RUnlock()
+	if !detached {
+		t.Error("Close returned but the handle is still published")
+	}
+	if !pending || pins != 1 {
+		t.Errorf("handle freed under an in-flight spawn: pendingFree set=%v pins=%d, want true/1", pending, pins)
+	}
+	if _, err := NewReplicaGroup(rt, "parker", ReplicaGroupConfig{
+		ReplicaCount: 2, GroupSeed: seed(0x43),
+	}); !errors.Is(err, ErrRuntimeShutDown) {
+		t.Errorf("spawn after a concurrent Close: got %v, want ErrRuntimeShutDown", err)
+	}
+
+	close(release)
+	select {
+	case <-spawnDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the in-flight spawn never returned")
+	}
+	rt.mu.RLock()
+	pending, pins = rt.pendingFree != nil, rt.pins.Load()
+	rt.mu.RUnlock()
+	if pending || pins != 0 {
+		t.Errorf("the last unpin did not free the detached handle: pendingFree set=%v pins=%d", pending, pins)
 	}
 }

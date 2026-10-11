@@ -276,17 +276,20 @@ func NewRegistryClient(node *MeshNode) (*RegistryClient, error) {
 			Detail: "mesh node is nil",
 		}
 	}
-	node.mu.RLock()
-	defer node.mu.RUnlock()
-	if node.handle == nil {
+	// The native client clones the node's Arc, so it does not borrow
+	// node.handle past this call. Refused once Shutdown has begun, not
+	// only once it has freed the handle: a client built beside the
+	// in-progress native shutdown was bound to a stopped node (code
+	// review 2026-10-11).
+	var h *C.net_registry_client_handle_t
+	if !node.withHandleForChild(func(nh unsafe.Pointer) {
+		h = C.net_registry_client_new(nh)
+	}) {
 		return nil, &RegistryClientError{
 			Kind:   RegistryErrKindInvalidArgs,
 			Detail: "mesh node is shut down",
 		}
 	}
-	// The native client clones the node's Arc, so it does not borrow
-	// node.handle past this call.
-	h := C.net_registry_client_new(unsafe.Pointer(node.handle))
 	if h == nil {
 		return nil, &RegistryClientError{
 			Kind:   RegistryErrKindInvalidArgs,
@@ -452,17 +455,20 @@ func NewFoldQueryClient(node *MeshNode) (*FoldQueryClient, error) {
 			Detail: "mesh node is nil",
 		}
 	}
-	node.mu.RLock()
-	defer node.mu.RUnlock()
-	if node.handle == nil {
+	// The native client clones the node's Arc, so it does not borrow
+	// node.handle past this call. Refused once Shutdown has begun, not
+	// only once it has freed the handle: a client built beside the
+	// in-progress native shutdown was bound to a stopped node (code
+	// review 2026-10-11).
+	var h *C.net_fold_query_client_handle_t
+	if !node.withHandleForChild(func(nh unsafe.Pointer) {
+		h = C.net_fold_query_client_new(nh)
+	}) {
 		return nil, &FoldQueryClientError{
 			Kind:   FoldQueryErrKindInvalidArgs,
 			Detail: "mesh node is shut down",
 		}
 	}
-	// The native client clones the node's Arc, so it does not borrow
-	// node.handle past this call.
-	h := C.net_fold_query_client_new(unsafe.Pointer(node.handle))
 	if h == nil {
 		return nil, &FoldQueryClientError{
 			Kind:   FoldQueryErrKindInvalidArgs,

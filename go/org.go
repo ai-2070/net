@@ -735,6 +735,19 @@ func CallExported[Req, Resp any](ctx context.Context, c *OrgClient, service stri
 	return jsonDecodeTyped[Resp](respBody)
 }
 
+// orgStreamConstructError maps a streaming construction that failed
+// because the caller's ctx fired to ctx.Err(), as readOrgCallResult does
+// for the unary path.
+func orgStreamConstructError(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		var oe *OrgError
+		if errors.As(err, &oe) && oe.Domain == OrgDomainRPC && oe.Kind == "cancelled" {
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
 func readOrgCallResult(
 	ctx context.Context,
 	code C.int,
@@ -833,19 +846,26 @@ func (c *OrgClient) CallStreaming(ctx context.Context, service string, req []byt
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
+	// The construction blocks (signed opening / initial ACK): arm ctx for
+	// it with a reserved token, stopped on every exit. A token of 0 (no
+	// ctx Done) keeps the uncancellable construction.
+	cancelToken, constructing, stopConstructing := installOrgCancelWatcher(ctx, c)
+	defer stopConstructing()
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_org_call_streaming(
 			h,
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
-			C.uint64_t(deadlineMs), C.uint64_t(0), // 0 = uncancellable construction
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
 			&outStream, &outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
 	if err := orgErrorFromCall(code, outErr); err != nil {
-		return nil, err
+		return nil, orgStreamConstructError(ctx, err)
 	}
 	stream := newRpcStreamFromOrg(unsafe.Pointer(outStream))
 	stream.cancel, stream.watcherDone = spawnCtxCancelWatcher(ctx, stream.guard)
@@ -865,18 +885,25 @@ func (c *OrgClient) CallClientStream(ctx context.Context, service string) (*Clie
 	var outHandle *C.ClientStreamCallHandleC
 	var outErr *C.char
 	var code C.int
+	// The construction blocks (signed opening / initial ACK): arm ctx for
+	// it with a reserved token, stopped on every exit. A token of 0 (no
+	// ctx Done) keeps the uncancellable construction.
+	cancelToken, constructing, stopConstructing := installOrgCancelWatcher(ctx, c)
+	defer stopConstructing()
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_org_call_client_stream(
 			h,
 			(*C.char)(cService.ptr), cService.len,
-			C.uint64_t(deadlineMs), C.uint64_t(0),
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
 			&outHandle, &outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
 	if err := orgErrorFromCall(code, outErr); err != nil {
-		return nil, err
+		return nil, orgStreamConstructError(ctx, err)
 	}
 	call := newClientStreamCallFromOrg(unsafe.Pointer(outHandle))
 	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, call.guard)
@@ -894,18 +921,25 @@ func (c *OrgClient) CallDuplex(ctx context.Context, service string) (*DuplexCall
 	var outHandle *C.DuplexCallHandleC
 	var outErr *C.char
 	var code C.int
+	// The construction blocks (signed opening / initial ACK): arm ctx for
+	// it with a reserved token, stopped on every exit. A token of 0 (no
+	// ctx Done) keeps the uncancellable construction.
+	cancelToken, constructing, stopConstructing := installOrgCancelWatcher(ctx, c)
+	defer stopConstructing()
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_org_call_duplex(
 			h,
 			(*C.char)(cService.ptr), cService.len,
-			C.uint64_t(deadlineMs), C.uint64_t(0),
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
 			&outHandle, &outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
 	if err := orgErrorFromCall(code, outErr); err != nil {
-		return nil, err
+		return nil, orgStreamConstructError(ctx, err)
 	}
 	call := newDuplexCallFromOrg(unsafe.Pointer(outHandle))
 	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, call.guard)

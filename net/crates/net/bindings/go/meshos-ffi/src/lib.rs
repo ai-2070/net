@@ -832,6 +832,15 @@ pub extern "C" fn net_meshos_register_daemon(
                 return NET_MESHOS_ERR_INVALID_ARG;
             }
         };
+        // Refused BEFORE registering: the handle's C name is built after a
+        // successful registration (and, on the destroy path, after
+        // `user_ctx` ownership passed), so an embedded NUL used to panic
+        // there and report failure for a daemon that was registered (cubic
+        // review of PR #1228).
+        if name.contains('\0') {
+            set_last_error("invalid_argument", "daemon name contains a NUL byte");
+            return NET_MESHOS_ERR_INVALID_ARG;
+        }
         let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_ptr, 32) }
             .try_into()
             .expect("slice was constructed with len 32");
@@ -986,6 +995,15 @@ fn register_with_vtable_inner(
                 return NET_MESHOS_ERR_INVALID_ARG;
             }
         };
+        // Refused BEFORE registering: the handle's C name is built after a
+        // successful registration (and, on the destroy path, after
+        // `user_ctx` ownership passed), so an embedded NUL used to panic
+        // there and report failure for a daemon that was registered (cubic
+        // review of PR #1228).
+        if name.contains('\0') {
+            set_last_error("invalid_argument", "daemon name contains a NUL byte");
+            return NET_MESHOS_ERR_INVALID_ARG;
+        }
         let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_ptr, 32) }
             .try_into()
             .expect("slice was constructed with len 32");
@@ -1119,6 +1137,9 @@ pub extern "C" fn net_meshos_try_next_control(
 
 /// Longest single wait `net_meshos_next_control` makes while holding the
 /// handle mutex.
+/// How often `net_meshos_graceful_shutdown` checks whether the daemon left.
+const GRACEFUL_SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
 const NEXT_CONTROL_SLICE: Duration = Duration::from_millis(50);
 
 /// Block until the next control event arrives, the runtime shuts
@@ -1266,26 +1287,46 @@ pub extern "C" fn net_meshos_graceful_shutdown(
             set_last_error("invalid_argument", "handle pointer is NULL");
             return NET_MESHOS_ERR_NULL;
         };
-        let inner = match h_ref.inner.lock().take() {
-            Some(h) => h,
-            None => {
-                set_last_error("already_shutdown", "daemon handle was already consumed");
-                return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
-            }
-        };
-        clear_last_error_inner();
         let grace = if grace_ms == 0 {
             DEFAULT_GRACEFUL_SHUTDOWN
         } else {
             Duration::from_millis(grace_ms)
         };
-        match runtime().block_on(inner.graceful_shutdown(grace)) {
-            Ok(()) => NET_MESHOS_OK,
-            Err(e) => {
-                set_last_error_from_sdk(&e);
-                NET_MESHOS_ERR_CALL_FAILED
+        // Signal, then wait out the grace WITHOUT holding the handle, then
+        // take it. Taking it first (the core one-shot) left the Shutdown
+        // event in a channel no reader could reach: a concurrent
+        // `net_meshos_next_control` found the handle consumed and returned
+        // NONE (cubic review of PR #1228).
+        match h_ref.inner.lock().as_ref() {
+            Some(h) => h.signal_shutdown(grace),
+            None => {
+                set_last_error("already_shutdown", "daemon handle was already consumed");
+                return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
             }
         }
+        clear_last_error_inner();
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            // The daemon left (or another caller consumed the handle): a
+            // clean exit is not a hung daemon.
+            if !h_ref
+                .inner
+                .lock()
+                .as_ref()
+                .is_some_and(|h| h.is_registered())
+            {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(GRACEFUL_SHUTDOWN_POLL));
+        }
+        // Failsafe unregister (the core handle's Drop), outside the lock.
+        let handle = h_ref.inner.lock().take();
+        drop(handle);
+        NET_MESHOS_OK
     })
 }
 

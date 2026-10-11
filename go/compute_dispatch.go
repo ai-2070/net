@@ -183,6 +183,45 @@ func restoreFactoryFunc(runtimeID uint64, kind string, ourEpoch uint64, prev fac
 	}
 }
 
+// factoryRegInflight serializes registrations of ONE (runtime, kind)
+// through their native result. The check-then-swap in RegisterFactoryFunc
+// was two steps, so two concurrent registrations of the same key could both
+// pass the check and both swap: the loser's factory sat in the map — where
+// a migration landing in that window would build with it — until Rust
+// rejected it and the rollback ran (code review 2026-10-11). Holding the
+// key across check, swap and native call closes that window.
+//
+// Deliberately separate from factoryFuncsMu: trampoline lookups
+// (goComputeFactory) never wait on a registration in flight, and different
+// keys never wait on each other.
+var (
+	factoryRegMu       sync.Mutex
+	factoryRegInflight = make(map[factoryKey]chan struct{})
+)
+
+// lockFactoryRegistration blocks until no other registration of
+// (runtimeID, kind) is in flight, claims the key, and returns its release.
+func lockFactoryRegistration(runtimeID uint64, kind string) func() {
+	k := factoryKey{runtimeID: runtimeID, kind: kind}
+	for {
+		factoryRegMu.Lock()
+		busy, inflight := factoryRegInflight[k]
+		if !inflight {
+			mine := make(chan struct{})
+			factoryRegInflight[k] = mine
+			factoryRegMu.Unlock()
+			return func() {
+				factoryRegMu.Lock()
+				delete(factoryRegInflight, k)
+				factoryRegMu.Unlock()
+				close(mine)
+			}
+		}
+		factoryRegMu.Unlock()
+		<-busy
+	}
+}
+
 // lookupFactoryFunc returns the factory for `(runtimeID, kind)` or nil.
 func lookupFactoryFunc(runtimeID uint64, kind string) DaemonFactory {
 	factoryFuncsMu.RLock()

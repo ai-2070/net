@@ -1335,13 +1335,11 @@ func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
 	for {
 		wait := slice
 		if timeoutMs != 0 {
-			left := time.Until(deadline).Milliseconds()
+			left := time.Until(deadline)
 			if left <= 0 {
 				return ErrStreamTimeout
 			}
-			if left < int64(wait) {
-				wait = uint32(left)
-			}
+			wait = waitSliceMs(left, slice)
 		}
 		w.mu.RLock()
 		if w.handle == nil {
@@ -1354,6 +1352,22 @@ func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
 			return err
 		}
 	}
+}
+
+// waitSliceMs is the next bounded native wait for a positive remaining
+// budget `left`: `left` rounded UP to whole milliseconds, capped at
+// `slice`. Truncating sent a positive sub-millisecond remainder to 0 — so
+// WaitForSeq(seq, 1) could time out without ever checking the fold, and a
+// 0 would mean "wait forever" to the native call (code review 2026-10-11).
+func waitSliceMs(left time.Duration, slice uint32) uint32 {
+	ms := (left + time.Millisecond - 1) / time.Millisecond
+	if ms < 1 {
+		ms = 1
+	}
+	if ms > time.Duration(slice) {
+		return slice
+	}
+	return uint32(ms)
 }
 
 // Subtree returns `id` plus all its transitive descendants (the delete

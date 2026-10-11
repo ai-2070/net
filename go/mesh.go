@@ -486,6 +486,37 @@ type RecvdEvent struct {
 type MeshNode struct {
 	mu     sync.RWMutex
 	handle *C.net_meshnode_t
+	// ctorMu + shuttingDown gate the constructors of objects that bind
+	// to this node (withHandleForChild) against Shutdown. Shutdown runs
+	// its native call under the READ lock, so a constructor could slip in
+	// beside it and hand back a client bound to a stopped node; it now
+	// marks the node shutting down — waiting out any constructor already
+	// in progress — before that call (code review 2026-10-11).
+	ctorMu       sync.RWMutex
+	shuttingDown bool
+}
+
+// withHandleForChild runs fn with the live handle for a constructor that
+// binds a long-lived object (an RPC / org / registry / fold-query client,
+// a daemon runtime) to this node. Returns false — fn not run — once
+// Shutdown has begun or the node is freed. fn must not block: Shutdown
+// waits for every constructor in progress before it starts.
+//
+// The handle crosses as unsafe.Pointer because each cgo file declares its
+// own C types (aggregator.go's TU has no net_meshnode_t).
+func (m *MeshNode) withHandleForChild(fn func(h unsafe.Pointer)) bool {
+	m.ctorMu.RLock()
+	defer m.ctorMu.RUnlock()
+	if m.shuttingDown {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return false
+	}
+	fn(unsafe.Pointer(m.handle))
+	return true
 }
 
 // NewMeshNode opens a mesh node. Call Shutdown to cleanly tear down.
@@ -527,6 +558,12 @@ func (m *MeshNode) free() {
 // preference, froze every other method on the node meanwhile (SDK audit
 // 2026-10-11).
 func (m *MeshNode) Shutdown() error {
+	// From here on no constructor binds a new object to this node; one
+	// already in progress finishes first (see withHandleForChild).
+	m.ctorMu.Lock()
+	m.shuttingDown = true
+	m.ctorMu.Unlock()
+
 	m.mu.RLock()
 	if m.handle == nil {
 		m.mu.RUnlock()
@@ -588,12 +625,11 @@ func (m *MeshNode) NodeID() uint64 {
 // `Box<Arc<MeshNode>>`). The consumer takes ownership; callers MUST
 // NOT free it directly.
 func (m *MeshNode) arcClonePtr() unsafe.Pointer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.handle == nil {
-		return nil
-	}
-	return unsafe.Pointer(C.net_mesh_arc_clone(m.handle))
+	var p unsafe.Pointer
+	m.withHandleForChild(func(h unsafe.Pointer) {
+		p = unsafe.Pointer(C.net_mesh_arc_clone((*C.net_meshnode_t)(h)))
+	})
+	return p
 }
 
 // EntityID returns this node's 32-byte ed25519 entity id. Matches

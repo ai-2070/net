@@ -312,8 +312,23 @@ func TestNextControlUnboundedDoesNotBlockGracefulShutdown(t *testing.T) {
 	}
 	defer h.Free()
 
-	go func() { _, _ = h.NextControl(0) }() // parks: no control event yet
-	time.Sleep(200 * time.Millisecond)
+	// Capture the parked call's outcome: if NextControl(0) returned early
+	// (an error, or an event) the rest of this test would pass without the
+	// parked-call regression ever being exercised.
+	type nextResult struct {
+		ctl MeshOsDaemonControl
+		err error
+	}
+	parked := make(chan nextResult, 1)
+	go func() {
+		ctl, err := h.NextControl(0) // parks: no control event yet
+		parked <- nextResult{ctl, err}
+	}()
+	select {
+	case r := <-parked:
+		t.Fatalf("NextControl(0) returned before shutdown (%+v, %v): nothing was parked", r.ctl, r.err)
+	case <-time.After(200 * time.Millisecond):
+	}
 
 	logDone := make(chan error, 1)
 	go func() { logDone <- h.PublishLog(LogInfo, "still reachable") }()
@@ -323,11 +338,29 @@ func TestNextControlUnboundedDoesNotBlockGracefulShutdown(t *testing.T) {
 		t.Fatal("PublishLog blocked behind a parked NextControl(0)")
 	}
 
+	select {
+	case r := <-parked:
+		t.Fatalf("NextControl(0) returned before shutdown (%+v, %v): nothing was parked", r.ctl, r.err)
+	default:
+	}
+
 	done := make(chan error, 1)
 	go func() { done <- h.GracefulShutdown(200) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("GracefulShutdown blocked behind a parked NextControl(0)")
+	}
+	// The parked call must not outlive the shutdown that ends the daemon.
+	select {
+	case r := <-parked:
+		// The shutdown is signalled before the handle is consumed, so the
+		// parked reader receives the event (cubic review of PR #1228: the
+		// FFI used to consume the handle first and the reader got NONE).
+		if r.err != nil || r.ctl.Kind != ControlShutdown {
+			t.Fatalf("parked NextControl(0) = %+v, %v; want the Shutdown event", r.ctl, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("NextControl(0) stayed parked after GracefulShutdown")
 	}
 }

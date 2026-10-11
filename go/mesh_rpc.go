@@ -1200,6 +1200,42 @@ func (r *MeshRpc) reserveStreamCancel() (uint64, func()) {
 	}
 }
 
+// watchStreamConstruction arms ctx cancellation for the span a streaming
+// constructor is inside native code. The constructor's block_on awaits the
+// peer's initial-frame ACK; spawnCtxCancelWatcher only exists once the
+// handle does, so without this a ctx cancelled mid-construction could not
+// abort that wait — the constructor sat out the full call deadline (code
+// review 2026-10-11).
+//
+// The cancel fires the substrate token the constructor was given, against
+// the handle the call publishes via inflightCancel (enter/leave inside
+// withHandle) — never via r.withHandle, which deadlocks against a queued
+// Close. The returned stop MUST run on every exit path (defer it); it joins
+// the watcher. Token 0 or a ctx without Done yields (nil, noop).
+func watchStreamConstruction(ctx context.Context, token uint64) (*inflightCancel, func()) {
+	if token == 0 || ctx == nil || ctx.Done() == nil {
+		return nil, func() {}
+	}
+	ic := newInflightCancel(token, func(h unsafe.Pointer, t uint64) {
+		C.net_rpc_cancel_call((*C.MeshRpcHandle)(h), C.uint64_t(t))
+	})
+	return ic, ic.watchCtx(ctx.Done())
+}
+
+// streamConstructError classifies a failed streaming construction. A
+// cancellation while the caller's ctx is done is that ctx firing: surface
+// ctx.Err() so `errors.Is(err, context.Canceled)` works, as the unary
+// paths do (readCancellableResult).
+func streamConstructError(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		var rpcErr *RpcError
+		if errors.As(err, &rpcErr) && rpcErr.Kind == RpcKindCancelled {
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
 // RpcStream is an open streaming RPC call. Recv blocks until the
 // next chunk arrives, the deadline fires, or the stream
 // terminates. Close MUST be called eventually (defer is fine);
@@ -1254,10 +1290,15 @@ func (r *MeshRpc) CallStreaming(
 	defer freeReq()
 
 	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_rpc_call_streaming_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
@@ -1274,7 +1315,7 @@ func (r *MeshRpc) CallStreaming(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outStream
 	guard := newStreamHandleGuard(func() {
@@ -1317,10 +1358,15 @@ func (r *MeshRpc) CallServiceStreaming(
 	defer freeReq()
 
 	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_rpc_call_service_streaming(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -1336,7 +1382,7 @@ func (r *MeshRpc) CallServiceStreaming(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outStream
 	guard := newStreamHandleGuard(func() {
@@ -1723,10 +1769,15 @@ func (r *MeshRpc) CallClientStream(
 	defer C.free(cService.ptr)
 
 	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outHandle *C.ClientStreamCallHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_rpc_call_client_stream_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
@@ -1742,7 +1793,7 @@ func (r *MeshRpc) CallClientStream(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outHandle
 	guard := newStreamHandleGuard(func() {
@@ -1906,10 +1957,15 @@ func (r *MeshRpc) CallDuplex(
 	defer C.free(cService.ptr)
 
 	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outHandle *C.DuplexCallHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_rpc_call_duplex_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
@@ -1926,7 +1982,7 @@ func (r *MeshRpc) CallDuplex(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outHandle
 	guard := newStreamHandleGuard(func() {

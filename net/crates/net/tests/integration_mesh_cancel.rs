@@ -434,6 +434,53 @@ async fn cancel_client_stream_mid_finish_surfaces_terminal() {
     }
 }
 
+/// cubic review of PR #1228: a streaming constructor's setup (the
+/// reply-channel subscription and the opening publish) ignored the cancel
+/// token — its watcher is armed only once the stream exists — so against a
+/// silent peer a cancel could not end the wait; the constructor blocked for
+/// the whole setup budget (seconds) and returned an already-cancelled
+/// stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_ends_a_streaming_constructor_waiting_on_a_silent_peer() {
+    use net::adapter::Adapter;
+    let (a, b, _serving) = build_pair().await;
+    let target = b.node_id();
+    b.shutdown().await.expect("silence the peer");
+
+    let token = a.reserve_cancel_token();
+    let opts = CallOptions {
+        cancel_token: Some(token),
+        ..CallOptions::default()
+    };
+    let a2 = a.clone();
+    let open = tokio::spawn(async move {
+        a2.call_streaming(
+            target,
+            "never.subscribed.stream",
+            Bytes::from_static(b"x"),
+            opts,
+        )
+        .await
+        .map(|_| ())
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    a.cancel(token);
+    let result = tokio::time::timeout(Duration::from_secs(2), open)
+        .await
+        .expect("the constructor must return promptly after cancel")
+        .expect("spawn task panicked");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        started.elapsed()
+    );
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled, got {other:?}"),
+    }
+}
+
 /// Code review 2026-10-11 GO-2: a `send` parked on request-side
 /// flow-control credit waits on the credit semaphore, which the cancel
 /// watcher never touched — `pending.cancel` only signals the response

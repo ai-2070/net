@@ -4440,6 +4440,36 @@ fn spawn_stream_cancel_watcher(
     done_tx
 }
 
+/// Await one of a streaming constructor's setup steps (the reply-channel
+/// subscription, the opening publish) against the caller's cancel token.
+///
+/// The token's watcher is armed only once the stream exists, so a cancel
+/// landing while the constructor waited on a silent peer was merely
+/// remembered: the constructor still blocked for the full setup budget and
+/// returned an already-cancelled stream (cubic review of PR #1228). A cancel
+/// now ends the wait with [`RpcError::Cancelled`] and releases the token.
+/// When the step completes first, nothing is consumed: a later cancel still
+/// pre-arms the stream's watcher.
+async fn until_cancelled<T>(
+    mesh: &Arc<MeshNode>,
+    opts: &CallOptions,
+    step: impl std::future::Future<Output = Result<T, RpcError>>,
+) -> Result<T, RpcError> {
+    let token = opts.cancel_token.unwrap_or(0);
+    if token == 0 {
+        return step.await;
+    }
+    let notify = mesh.cancel_registry().register_notify(token);
+    tokio::select! {
+        biased;
+        _ = notify.notified() => {
+            mesh.cancel_registry().release(token);
+            Err(RpcError::Cancelled)
+        }
+        r = step => r,
+    }
+}
+
 /// One-call helper that registers a cancel-notify against the
 /// caller's `opts.cancel_token` and spawns the stream cancel
 /// watcher. Used by every streaming call shape (`call_streaming`,
@@ -6417,11 +6447,15 @@ impl MeshNode {
         // 2 format! + 2 ChannelName::new + xxhash per call.
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
-        self.ensure_reply_subscription(
-            target_node_id,
-            service,
-            route.reply_channel.clone(),
-            route.reply_hash,
+        until_cancelled(
+            self,
+            &opts,
+            self.ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            ),
         )
         .await?;
 
@@ -7067,11 +7101,15 @@ impl MeshNode {
         // 2 format! + 2 ChannelName::new + xxhash per call.
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
-        self.ensure_reply_subscription(
-            target_node_id,
-            service,
-            route.reply_channel.clone(),
-            route.reply_hash,
+        until_cancelled(
+            self,
+            &opts,
+            self.ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            ),
         )
         .await?;
 
@@ -7193,11 +7231,15 @@ impl MeshNode {
         // xxhash per call.
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
-        self.ensure_reply_subscription(
-            target_node_id,
-            service,
-            route.reply_channel.clone(),
-            route.reply_hash,
+        until_cancelled(
+            self,
+            &opts,
+            self.ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            ),
         )
         .await?;
 
@@ -7263,8 +7305,8 @@ impl MeshNode {
         req.encode_into(&mut buf);
 
         let payload_bytes = Bytes::from(buf);
-        if let Err(e) = self
-            .publish_to_peer(
+        let published = until_cancelled(self, &opts, async {
+            self.publish_to_peer(
                 target_node_id,
                 route.request_channel_hash,
                 route.request_stream_id,
@@ -7272,9 +7314,12 @@ impl MeshNode {
                 std::slice::from_ref(&payload_bytes),
             )
             .await
-        {
+            .map_err(RpcError::Transport)
+        })
+        .await;
+        if let Err(e) = published {
             pending.cancel(call_id);
-            return Err(RpcError::Transport(e));
+            return Err(e);
         }
 
         let request_bytes_len = payload_bytes.len() as u32;

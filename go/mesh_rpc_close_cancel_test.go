@@ -303,11 +303,29 @@ func TestDuplexSplitDoesNotParkBehindRecv(t *testing.T) {
 	defer call.Close()
 
 	recvDone := make(chan error, 1)
+	readerEntered := make(chan struct{})
 	go func() {
+		close(readerEntered)
 		_, err := call.Recv()
 		recvDone <- err
 	}()
-	time.Sleep(200 * time.Millisecond) // parked in native next
+	// Synchronize on the reader rather than sleeping: a sleep does not
+	// establish the Recv is in flight, and a Split that ran first would
+	// succeed and fail this test for the wrong reason. recvActive is the
+	// exact counter Split consults.
+	<-readerEntered
+	waitUntil := time.Now().Add(5 * time.Second)
+	for call.recvActive.Load() == 0 {
+		if time.Now().After(waitUntil) {
+			t.Fatal("Recv never registered itself as in flight")
+		}
+		select {
+		case err := <-recvDone:
+			t.Fatalf("Recv on a quiet stream returned before Split: %v", err)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	split := make(chan error, 1)
 	go func() {
