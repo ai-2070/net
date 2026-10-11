@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 
-use super::invite::{EnrollmentKey, MembershipInvite, RedemptionIntent};
+use super::invite::{EnrollmentKey, MembershipInvite, RedemptionIntent, Relation};
 use super::policy::PolicyError;
 use super::redeem::{
     decode_request, encode_response, read_frame, send_sealed, session_hash, transcript,
@@ -315,6 +315,13 @@ fn decide(ctx: &Ctx, hh: &[u8; 32], plain: &[u8]) -> Result<RedeemOutcome, Refus
     intent
         .check_against(&invite)
         .map_err(|_| Refusal::Invalid)?;
+    // This endpoint delivers the mesh PSK. A Mesh-less (standalone subnet,
+    // org or channel) link names the same endpoint, but its only redemption
+    // path is `standalone::answer_standalone_redeem` over an existing
+    // session; refuse it here before anything is claimed.
+    if !invite.relations().contains(&Relation::Mesh) {
+        return Err(Refusal::Invalid);
+    }
     let message = transcript(hh, &invite.digest(), intent.subject(), &intent.digest());
     intent
         .subject()

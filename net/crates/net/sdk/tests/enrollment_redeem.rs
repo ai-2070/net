@@ -266,6 +266,60 @@ async fn unrecorded_and_foreign_issuer_invites_are_invalid() {
 }
 
 #[tokio::test]
+async fn a_mesh_less_link_is_refused_at_the_psk_endpoint_without_claiming() {
+    // SDK audit 2026-10-11: a standalone subnet link names this same
+    // endpoint, but must never be redeemed here for a PSK-bearing bundle.
+    use net::adapter::net::subnet::{SubnetRef, SubnetRights, TopologySubnetId};
+    use net_sdk::enrollment::invite::SubnetOffer;
+    let fx = Fixture::start(ServiceConfig::default()).await;
+    let spec = InviteSpec {
+        trust_domain_name: "test".into(),
+        trust_domain: Psk::new([1; 32]).trust_domain(),
+        endpoint: Some(
+            EnrollmentEndpoint::parse(&format!("127.0.0.1:{}", fx.service.local_addr().port()))
+                .unwrap(),
+        ),
+        relay: None,
+        enrollment_key: fx.service.enrollment_key(),
+        subnet: Some(SubnetOffer {
+            scope: SubnetRef {
+                authority: Identity::generate().entity_id().clone(),
+                path: TopologySubnetId::new(&[3]),
+            },
+            topology_epoch: 0,
+            rights: SubnetRights::ATTACH,
+        }),
+        org: None,
+        channel: None,
+        relations: vec![Relation::Subnet],
+        intended_subject: None,
+        policy: InvitationPolicy::with_options(
+            now(),
+            Duration::from_secs(3600),
+            ApprovalMode::Preauthorized,
+        )
+        .unwrap(),
+    };
+    let link = MembershipInvite::sign(&fx.issuer, spec).unwrap();
+    fx.service
+        .ledger()
+        .lock()
+        .offer(link.offer_spec(), now())
+        .unwrap();
+    let err = join(&link, &Identity::generate()).await.unwrap_err();
+    assert!(
+        matches!(err, RedeemError::Refused(Refusal::Invalid)),
+        "{err:?}"
+    );
+    assert_eq!(fx.bundles.issued.load(Ordering::SeqCst), 0);
+    assert!(
+        matches!(fx.state(&link), OfferState::Offered),
+        "nothing claimed: {:?}",
+        fx.state(&link)
+    );
+}
+
+#[tokio::test]
 async fn revocation_blocks_issue_and_current_authority_blocks_recovery() {
     let fx = Fixture::start(ServiceConfig::default()).await;
     let revoked = fx.invite(ApprovalMode::Preauthorized);

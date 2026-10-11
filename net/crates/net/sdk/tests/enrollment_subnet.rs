@@ -190,6 +190,27 @@ fn a_subnet_invite_delivers_a_delegated_credential_for_exactly_this_device() {
 }
 
 #[test]
+fn a_subnet_only_link_never_yields_a_psk_bundle() {
+    // SDK audit 2026-10-11: the bundle always carries the mesh PSK, so a
+    // standalone (Mesh-less) link must be refused by the PSK issuer even
+    // with a leaf issuer configured; its only path is the standalone redeem.
+    let operator = Identity::generate();
+    let invite = MembershipInvite::sign(
+        &operator,
+        spec(
+            vec![Relation::Subnet],
+            Some(offer(&[3, 7], SubnetRights::ATTACH)),
+        ),
+    )
+    .unwrap();
+    let device = Identity::generate();
+    let intent = RedemptionIntent::for_invite(&invite, device.entity_id().clone()).unwrap();
+    let issuer =
+        MembershipIssuer::new(operator, Psk::new(PSK), contact()).with_subnet_issuer(leaf_issuer());
+    assert_eq!(issuer.issue(&invite, &intent), Err(Refusal::Invalid));
+}
+
+#[test]
 fn the_device_refuses_subnet_credentials_it_was_not_offered() {
     let operator = Identity::generate();
     let subnet_invite = MembershipInvite::sign(
