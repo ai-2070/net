@@ -136,7 +136,11 @@ class EventStream:
                 if elapsed >= self._opts.timeout:
                     return
 
-            response = self._poll()
+            # Off the event loop: a poll is a synchronous native call (a
+            # network round trip on Redis / JetStream), and running it on
+            # the loop stalled every other task for its duration (SDK
+            # audit 2026-10-11).
+            response = await asyncio.to_thread(self._poll)
 
             # Adopt the core's cursor on EVERY poll: a filtered poll whose
             # whole window was filtered out still advances ``next_id`` past

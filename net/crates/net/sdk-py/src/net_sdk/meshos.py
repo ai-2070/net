@@ -61,6 +61,10 @@ LogLevel = Literal["trace", "debug", "info", "warn", "error"]
 # (graceful_shutdown, publish_log) can grab the lock between polls.
 _CONTROL_POLL_INTERVAL_MS = 10
 
+# Longest single native wait `next_control` makes while holding the
+# handle's borrow lock.
+_NEXT_CONTROL_SLICE_MS = 50
+
 
 # =========================================================================
 # Typed dict envelopes — match the PyO3 binding's emitted shape.
@@ -346,9 +350,34 @@ class MeshOsDaemonHandleWrapper:
         ``timeout_ms`` elapses, or the runtime shuts down.
 
         Returns the event dict, or ``None`` on timeout / runtime
-        shutdown."""
-        with self._borrow_lock:
-            return self._raw.next_control(timeout_ms=timeout_ms)  # type: ignore[return-value]
+        shutdown.
+
+        Waits in short native slices and releases the borrow lock
+        between them. Holding it across one unbounded native wait
+        blocked every other call on the handle — including
+        :meth:`graceful_shutdown` from another thread, the very call
+        that would deliver the ``Shutdown`` event (SDK audit
+        2026-10-11)."""
+        import time
+
+        deadline = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000.0
+        while True:
+            if deadline is None:
+                slice_ms = _NEXT_CONTROL_SLICE_MS
+            else:
+                left_ms = int((deadline - time.monotonic()) * 1000)
+                if left_ms <= 0:
+                    return None
+                slice_ms = min(_NEXT_CONTROL_SLICE_MS, left_ms)
+            try:
+                with self._borrow_lock:
+                    ev = self._raw.next_control(timeout_ms=slice_ms)
+            except MeshOsSdkError as e:
+                if getattr(e, "kind", None) == "already_shutdown":
+                    return None  # consumed mid-wait: the runtime shut down
+                raise
+            if ev is not None:
+                return ev  # type: ignore[return-value]
 
     def try_next_control(self) -> Optional[DaemonControl]:
         """Non-blocking variant of :meth:`next_control`."""
@@ -366,7 +395,9 @@ class MeshOsDaemonHandleWrapper:
         :meth:`graceful_shutdown`).
 
         Returns the event dict, or ``None`` on timeout / runtime
-        shutdown — same semantics as the sync variant.
+        shutdown — same semantics as the sync variant: with
+        ``timeout_ms=None`` it waits until an event arrives (it used to
+        return ``None`` after 100 ms).
 
         Slice-3 helper that lets daemons hosted inside an asyncio
         application drive ``MeshOsDaemonHandle`` from coroutines
@@ -384,18 +415,36 @@ class MeshOsDaemonHandleWrapper:
 
         # See `_CONTROL_POLL_INTERVAL_MS` for the cadence rationale.
         poll_ms = _CONTROL_POLL_INTERVAL_MS
-        ms = 100 if timeout_ms is None else timeout_ms
-        remaining_ms = ms
+        remaining_ms = timeout_ms
         while True:
-            with self._borrow_lock:
-                ev = self._raw.try_next_control()
+            try:
+                ev = self._try_next_nonblocking()
+            except MeshOsSdkError as e:
+                if getattr(e, "kind", None) == "already_shutdown":
+                    return None
+                raise
             if ev is not None:
                 return ev
-            if remaining_ms <= 0:
+            if remaining_ms is not None and remaining_ms <= 0:
                 return None
-            step = min(poll_ms, remaining_ms)
+            step = poll_ms if remaining_ms is None else min(poll_ms, remaining_ms)
             await asyncio.sleep(step / 1000.0)
-            remaining_ms -= step
+            if remaining_ms is not None:
+                remaining_ms -= step
+
+    def _try_next_nonblocking(self) -> Optional[DaemonControl]:
+        """``try_next_control`` for the event loop: never WAITS for the
+        borrow lock. Another thread can hold it across a blocking native
+        call (``graceful_shutdown`` holds it for the grace period), and a
+        blocking acquire on the loop thread froze the whole event loop for
+        that long (SDK audit 2026-10-11). A busy lock reads as "no event
+        yet"; the caller polls again."""
+        if not self._borrow_lock.acquire(blocking=False):
+            return None
+        try:
+            return self._raw.try_next_control()  # type: ignore[return-value]
+        finally:
+            self._borrow_lock.release()
 
     def __aiter__(self) -> "MeshOsDaemonHandleWrapper":
         """``async for ev in handle`` — yields each control event
@@ -415,8 +464,7 @@ class MeshOsDaemonHandleWrapper:
 
         try:
             while True:
-                with self._borrow_lock:
-                    ev = self._raw.try_next_control()
+                ev = self._try_next_nonblocking()
                 if ev is not None:
                     return ev
                 await asyncio.sleep(_CONTROL_POLL_INTERVAL_MS / 1000.0)
