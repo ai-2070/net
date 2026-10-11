@@ -13873,6 +13873,23 @@ impl MeshNode {
     ) -> Result<Self, AdapterError> {
         let node_id = identity.node_id();
 
+        // A zero heartbeat interval busy-loops the heartbeat task (a
+        // pegged core) and a zero session timeout expires every session
+        // at once. Only the C ABI refused them; Node, Python and the Rust
+        // SDK passed them straight through and Go silently swapped in the
+        // defaults — one config, three behaviours (SDK audit 2026-10-11).
+        // Refusing here gives every surface the C ABI's answer.
+        if config.heartbeat_interval.is_zero() {
+            return Err(AdapterError::Fatal(
+                "heartbeat interval must be greater than zero".into(),
+            ));
+        }
+        if config.session_timeout.is_zero() {
+            return Err(AdapterError::Fatal(
+                "session timeout must be greater than zero".into(),
+            ));
+        }
+
         // Review-10 P1-6: freeze the NAMED EXPORT map before any
         // networking starts. Empty and duplicate labels are
         // configuration mistakes, and a node must never come up holding

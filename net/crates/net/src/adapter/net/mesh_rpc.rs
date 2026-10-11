@@ -2274,7 +2274,49 @@ impl RpcStream {
     /// `window/2` after every `window/2` chunks consumed) when
     /// `auto_grant`-style amortization isn't enough.
     pub fn grant(&self, amount: u32) {
-        if !self.flow_controlled() || amount == 0 {
+        self.grant_handle().grant(amount);
+    }
+
+    /// A cloneable handle that grants credits to this stream's server
+    /// pump without borrowing the stream.
+    ///
+    /// For bindings that park a consumer inside [`Self::next`] while
+    /// another thread grants: with the stream taken out for the await, a
+    /// grant routed through the stream was dropped, and on a
+    /// flow-controlled stream whose window was exhausted that stalled the
+    /// call for good (SDK audit 2026-10-11).
+    pub fn grant_handle(&self) -> RpcStreamGrant {
+        RpcStreamGrant {
+            mesh: Arc::clone(&self.mesh),
+            target_node_id: self.target_node_id,
+            request_channel_hash: self.request_channel_hash,
+            request_stream_id: self.request_stream_id,
+            self_origin: self.self_origin,
+            call_id: self.call_id,
+            flow_controlled: self.flow_controlled(),
+        }
+    }
+}
+
+/// Grants credits to one [`RpcStream`]'s server pump — see
+/// [`RpcStream::grant_handle`]. Must be used inside a tokio runtime context
+/// (the grant is a spawned fire-and-forget publish).
+#[derive(Clone)]
+pub struct RpcStreamGrant {
+    mesh: Arc<MeshNode>,
+    target_node_id: u64,
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
+    self_origin: u64,
+    call_id: u64,
+    flow_controlled: bool,
+}
+
+impl RpcStreamGrant {
+    /// Grant `amount` more credits; a no-op when the stream is not flow
+    /// controlled or `amount == 0` — exactly [`RpcStream::grant`].
+    pub fn grant(&self, amount: u32) {
+        if !self.flow_controlled || amount == 0 {
             return;
         }
         spawn_grant_publish(

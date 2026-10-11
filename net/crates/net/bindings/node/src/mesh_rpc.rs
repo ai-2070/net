@@ -210,6 +210,7 @@ pub struct CallOptions {
     /// races a `tokio::time::sleep`; whichever fires first wins.
     /// On timeout the caller emits CANCEL to the server so the
     /// in-flight handler observes its `ctx.cancellation` token.
+    /// `0` (or omitted) means no deadline, as in the Go / C ABI.
     pub deadline_ms: Option<u32>,
     /// Streaming-only: initial credit window for per-streaming-
     /// response flow control. `Some(n)` means "the server pump
@@ -271,7 +272,10 @@ impl CallOptions {
     /// "no token" sentinel and does no registry work.
     fn into_inner(self) -> InnerCallOptions {
         let mut opts = InnerCallOptions::default();
-        if let Some(ms) = self.deadline_ms {
+        // `0` means "no deadline", as in the Go / C ABI. It used to become
+        // `Instant::now()` — a call that failed instantly, which no caller
+        // means (SDK audit 2026-10-11).
+        if let Some(ms) = self.deadline_ms.filter(|&ms| ms > 0) {
             opts.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
         }
         opts.stream_window_initial = self.stream_window_initial;

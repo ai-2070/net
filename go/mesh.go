@@ -232,7 +232,12 @@ func (e *EventTooLargeError) Unwrap() error { return ErrEventTooLarge }
 type MeshConfig struct {
 	BindAddr string `json:"bind_addr"`
 	// Hex-encoded 32-byte pre-shared key.
-	PskHex           string `json:"psk_hex"`
+	PskHex string `json:"psk_hex"`
+	// HeartbeatMs / SessionTimeoutMs: 0 means "use the default" (5 s /
+	// 30 s) — a Go zero value cannot say "unset", so it is omitted from
+	// the config. There is no way to request a zero interval, which every
+	// other binding now refuses at node construction anyway (a zero
+	// heartbeat busy-loops; a zero session timeout expires every session).
 	HeartbeatMs      uint64 `json:"heartbeat_ms,omitempty"`
 	SessionTimeoutMs uint64 `json:"session_timeout_ms,omitempty"`
 	NumShards        uint16 `json:"num_shards,omitempty"`

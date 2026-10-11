@@ -346,7 +346,12 @@ fn call_options_from_dict(opts: Option<&Bound<'_, PyDict>>) -> PyResult<InnerCal
         let ms: u64 = v.extract().map_err(|e| {
             pyo3::exceptions::PyTypeError::new_err(format!("deadline_ms must be int: {e}"))
         })?;
-        inner.deadline = Some(Instant::now() + Duration::from_millis(ms));
+        // `0` means "no deadline", as in the Go / C ABI. It used to become
+        // `Instant::now()` — a call that failed instantly, which no caller
+        // means (SDK audit 2026-10-11).
+        if ms > 0 {
+            inner.deadline = Some(Instant::now() + Duration::from_millis(ms));
+        }
     }
     // `stream_window_initial` is the canonical key; `stream_window`
     // is an alias accepted for parity with the README example. We
@@ -1019,19 +1024,47 @@ pub struct PyRpcStream {
     /// Error vocabulary for midstream/terminal failures — see
     /// [`handle_error`]. Set only by the org verbs' factories.
     org_errors: bool,
+    /// Set by `close()` — the source of truth for closure. `__next__`
+    /// takes the stream out of `inner` for its await, so `close()` used
+    /// to find `None`, do nothing, and watch the reader put the call
+    /// back (no CANCEL, and iteration resumed). A parked `__next__` is
+    /// woken through `close_wake`, and a closed stream is never put
+    /// back (SDK audit 2026-10-11).
+    closed: Arc<AtomicBool>,
+    close_wake: Arc<tokio::sync::Notify>,
+    /// Grants without borrowing the stream, so a grant from another
+    /// thread reaches a stream parked in `__next__` (it used to be
+    /// dropped — a permanent stall on an exhausted window).
+    grant: ::net::adapter::net::mesh_rpc::RpcStreamGrant,
+    flow_controlled: bool,
 }
 
 impl PyRpcStream {
+    /// Wrap a freshly opened stream.
+    pub(crate) fn wrap(
+        inner: InnerRpcStream,
+        runtime: Arc<GuardedRuntime>,
+        org_errors: bool,
+    ) -> Self {
+        let grant = inner.grant_handle();
+        let flow_controlled = inner.flow_controlled();
+        Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime,
+            org_errors,
+            closed: Arc::new(AtomicBool::new(false)),
+            close_wake: Arc::new(tokio::sync::Notify::new()),
+            grant,
+            flow_controlled,
+        }
+    }
+
     /// Wrap a raw stream an org facade seam returned (`org` feature only):
     /// same class as every nRPC stream, but midstream errors classify
     /// through the `org:` vocabulary (§4.4).
     #[cfg(feature = "org")]
     pub(crate) fn from_org_stream(inner: InnerRpcStream, runtime: Arc<GuardedRuntime>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime,
-            org_errors: true,
-        }
+        Self::wrap(inner, runtime, true)
     }
 }
 
@@ -1048,24 +1081,55 @@ impl PyRpcStream {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
         let org_errors = self.org_errors;
+        let closed = self.closed.clone();
+        let close_wake = self.close_wake.clone();
         let result = py.detach(|| {
             runtime.block_on(async move {
+                if closed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
                 // Take the inner stream out of the mutex while we
                 // await — holding a `std::sync::MutexGuard` across
-                // an `.await` is unsound (and clippy-flagged). A
-                // concurrent `close()` that takes the inner first
-                // races us cleanly: we observe `None` and report
-                // "stream already closed."
+                // an `.await` is unsound (and clippy-flagged).
                 let mut stream = match inner.lock().take() {
                     Some(s) => s,
+                    None if closed.load(Ordering::Acquire) => return Ok(None),
                     None => return Err(RpcError::new_err("stream already closed")),
                 };
-                let next = stream.next().await;
+                // Race the next chunk against `close()`. `enable` before
+                // the flag re-check, so a close landing in between is
+                // never missed.
+                let mut woken = std::pin::pin!(close_wake.notified());
+                woken.as_mut().enable();
+                if closed.load(Ordering::Acquire) {
+                    drop(stream); // CANCEL on drop
+                    return Ok(None);
+                }
+                let next = {
+                    let pull = std::pin::pin!(stream.next());
+                    match futures::future::select(woken, pull).await {
+                        futures::future::Either::Left(_) => None,
+                        futures::future::Either::Right((item, _)) => Some(item),
+                    }
+                };
+                let Some(next) = next else {
+                    // Closed while parked: end iteration; dropping the
+                    // stream fires its CANCEL.
+                    drop(stream);
+                    return Ok(None);
+                };
                 match next {
                     Some(Ok(bytes)) => {
                         // Put the stream back so subsequent __next__
-                        // polls keep going.
-                        *inner.lock() = Some(stream);
+                        // polls keep going — unless a close landed
+                        // meanwhile: a closed call is never revived.
+                        let mut slot = inner.lock();
+                        if closed.load(Ordering::Acquire) {
+                            drop(slot);
+                            drop(stream);
+                        } else {
+                            *slot = Some(stream);
+                        }
                         Ok::<Option<Bytes>, PyErr>(Some(bytes))
                     }
                     Some(Err(e)) => {
@@ -1093,23 +1157,26 @@ impl PyRpcStream {
     /// Grant `n` additional flow-control credits to the server's
     /// pump. No-op if the call didn't set `stream_window_initial`.
     fn grant(&self, n: u32) {
-        let guard = self.inner.lock();
-        if let Some(stream) = guard.as_ref() {
-            stream.grant(n);
+        if self.closed.load(Ordering::Acquire) {
+            return;
         }
+        // The grant spawns its publish, so it needs this mesh's runtime.
+        let _entered = self.runtime.enter();
+        self.grant.grant(n);
     }
 
     /// `True` if the call set `stream_window_initial`.
     fn flow_controlled(&self) -> bool {
-        let guard = self.inner.lock();
-        guard.as_ref().map(|s| s.flow_controlled()).unwrap_or(false)
+        self.flow_controlled
     }
 
     /// Close the stream; emits CANCEL to the server (best-effort).
-    /// Idempotent.
+    /// Idempotent, and effective even while another thread is parked
+    /// in iteration: that `__next__` wakes and ends the iteration.
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.closed.store(true, Ordering::Release);
+        self.close_wake.notify_waiters();
+        let _ = self.inner.lock().take();
     }
 }
 
@@ -1121,6 +1188,50 @@ impl PyRpcStream {
 // can race cleanly. finish() takes the inner permanently
 // (consumes the call); close() releases without REQUEST_END.
 // ============================================================================
+
+/// Close state for the sync streaming classes (`ClientStreamCall`,
+/// `DuplexCall` and its split halves).
+///
+/// Each blocking method takes its call out of the mutex for the await and
+/// puts it back after. `close()` used to `take()` only — finding `None`
+/// while another thread held the call — and the put-back then revived the
+/// call: no CANCEL, and it carried on. `__next__` did not watch the close
+/// at all. Now `close()` latches `closed` and wakes every waiter, a
+/// put-back after a close drops the call instead (its drop fires CANCEL),
+/// and every blocking await races [`Self::closed`] (SDK audit 2026-10-11).
+#[derive(Default)]
+pub struct CloseSignal {
+    closed: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl CloseSignal {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    /// Resolves once closed — immediately if it already is.
+    async fn closed(&self) {
+        let mut woken = std::pin::pin!(self.wake.notified());
+        woken.as_mut().enable();
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        woken.await;
+    }
+
+    /// Return `value` to `slot`, unless closed meanwhile — then drop it.
+    fn put_back<T>(&self, slot: &Mutex<Option<T>>, value: T) {
+        let mut guard = slot.lock();
+        if self.closed.load(Ordering::Acquire) {
+            drop(guard);
+            drop(value);
+        } else {
+            *guard = Some(value);
+        }
+    }
+}
 
 /// Open client-streaming call. Push chunks via ``send(bytes)``,
 /// then ``finish()`` to await the terminal response. ``close()``
@@ -1135,7 +1246,7 @@ pub struct PyClientStreamCall {
     /// flow-control credit. Same role as the Node binding's
     /// ``close_notify`` — a Notify permit fires the select branch
     /// in send and the call is dropped (CANCEL fires from Drop).
-    close_notify: Arc<tokio::sync::Notify>,
+    close_notify: Arc<CloseSignal>,
     /// Error vocabulary — see [`handle_error`].
     org_errors: bool,
 }
@@ -1154,7 +1265,7 @@ impl PyClientStreamCall {
             runtime,
             call_id_cached,
             flow_controlled_cached,
-            close_notify: Arc::new(tokio::sync::Notify::new()),
+            close_notify: Arc::new(CloseSignal::default()),
             org_errors: true,
         }
     }
@@ -1173,9 +1284,9 @@ impl PyClientStreamCall {
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
-        let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 let mut call = match inner.lock().take() {
@@ -1184,7 +1295,7 @@ impl PyClientStreamCall {
                 };
                 let result = tokio::select! {
                     r = call.send(body_bytes) => r,
-                    _ = notify.notified() => {
+                    _ = closer.closed() => {
                         // close() fired. Drop the call (which
                         // fires CANCEL via SDK's Drop).
                         drop(call);
@@ -1193,7 +1304,7 @@ impl PyClientStreamCall {
                 };
                 match result {
                     Ok(()) => {
-                        *inner.lock() = Some(call);
+                        closer.put_back(&inner, call);
                         Ok(())
                     }
                     Err(e) => {
@@ -1210,6 +1321,7 @@ impl PyClientStreamCall {
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
@@ -1217,7 +1329,10 @@ impl PyClientStreamCall {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("client-stream call already closed")),
                 };
-                call.finish().await.map_err(|e| handle_error(org_errors, e))
+                tokio::select! {
+                    r = call.finish() => r.map_err(|e| handle_error(org_errors, e)),
+                    _ = closer.closed() => Err(RpcError::new_err("finish aborted by close()")),
+                }
             })
         })?;
         Ok(PyBytes::new(py, result.body.as_ref()))
@@ -1240,9 +1355,8 @@ impl PyClientStreamCall {
     /// Concurrent in-flight ``send()`` waiting on credit is
     /// interrupted via the close-notify.
     fn close(&self) {
-        self.close_notify.notify_one();
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.close_notify.close();
+        let _ = self.inner.lock().take();
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1275,7 +1389,7 @@ pub struct PyDuplexCall {
     /// Same role as ``PyClientStreamCall::close_notify`` — lets
     /// ``close()`` interrupt a pending ``send()`` blocked on
     /// flow-control credit.
-    close_notify: Arc<tokio::sync::Notify>,
+    close_notify: Arc<CloseSignal>,
     /// Error vocabulary — see [`handle_error`].
     org_errors: bool,
 }
@@ -1291,7 +1405,7 @@ impl PyDuplexCall {
             runtime,
             call_id_cached,
             flow_controlled_cached,
-            close_notify: Arc::new(tokio::sync::Notify::new()),
+            close_notify: Arc::new(CloseSignal::default()),
             org_errors: true,
         }
     }
@@ -1306,9 +1420,9 @@ impl PyDuplexCall {
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
-        let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 let mut call = match inner.lock().take() {
@@ -1317,14 +1431,14 @@ impl PyDuplexCall {
                 };
                 let result = tokio::select! {
                     r = call.send(body_bytes) => r,
-                    _ = notify.notified() => {
+                    _ = closer.closed() => {
                         drop(call);
                         return Err(RpcError::new_err("send aborted by close()"));
                     }
                 };
                 match result {
                     Ok(()) => {
-                        *inner.lock() = Some(call);
+                        closer.put_back(&inner, call);
                         Ok(())
                     }
                     Err(e) => {
@@ -1341,6 +1455,7 @@ impl PyDuplexCall {
     fn finish_sending(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         py.detach(|| {
             runtime.block_on(async move {
@@ -1349,7 +1464,7 @@ impl PyDuplexCall {
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
                 let result = call.finish_sending().await;
-                *inner.lock() = Some(call);
+                closer.put_back(&inner, call);
                 result.map_err(|e| handle_error(org_errors, e))
             })
         })
@@ -1368,6 +1483,7 @@ impl PyDuplexCall {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
@@ -1375,10 +1491,18 @@ impl PyDuplexCall {
                     Some(c) => c,
                     None => return Err(RpcError::new_err("duplex call already closed")),
                 };
-                let next = call.next().await;
+                let next = tokio::select! {
+                    n = call.next() => n,
+                    _ = closer.closed() => {
+                        // close() while parked: end iteration; the drop
+                        // fires CANCEL (SDK audit 2026-10-11).
+                        drop(call);
+                        return Ok(None);
+                    }
+                };
                 match next {
                     Some(Ok(bytes)) => {
-                        *inner.lock() = Some(call);
+                        closer.put_back(&inner, call);
                         Ok::<Option<Bytes>, PyErr>(Some(bytes))
                     }
                     Some(Err(e)) => {
@@ -1418,13 +1542,14 @@ impl PyDuplexCall {
                 runtime: self.runtime.clone(),
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
-                close_notify: Arc::new(tokio::sync::Notify::new()),
+                close_notify: Arc::new(CloseSignal::default()),
                 org_errors: self.org_errors,
             },
             PyDuplexStream {
                 inner: Arc::new(Mutex::new(Some(stream))),
                 runtime: self.runtime.clone(),
                 call_id_cached: call_id,
+                close_notify: Arc::new(CloseSignal::default()),
                 org_errors: self.org_errors,
             },
         ))
@@ -1445,9 +1570,8 @@ impl PyDuplexCall {
     /// Idempotent. Concurrent in-flight ``send()`` waiting on
     /// credit is interrupted via the close-notify.
     fn close(&self) {
-        self.close_notify.notify_one();
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.close_notify.close();
+        let _ = self.inner.lock().take();
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1472,7 +1596,7 @@ pub struct PyDuplexSink {
     call_id_cached: u64,
     flow_controlled_cached: bool,
     /// Same role as ``PyClientStreamCall::close_notify``.
-    close_notify: Arc<tokio::sync::Notify>,
+    close_notify: Arc<CloseSignal>,
     /// Error vocabulary — see [`handle_error`].
     org_errors: bool,
 }
@@ -1485,9 +1609,9 @@ impl PyDuplexSink {
     fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
-        let notify = self.close_notify.clone();
         py.detach(|| {
             runtime.block_on(async move {
                 let mut sink = match inner.lock().take() {
@@ -1496,14 +1620,14 @@ impl PyDuplexSink {
                 };
                 let result = tokio::select! {
                     r = sink.send(body_bytes) => r,
-                    _ = notify.notified() => {
+                    _ = closer.closed() => {
                         drop(sink);
                         return Err(RpcError::new_err("send aborted by close()"));
                     }
                 };
                 match result {
                     Ok(()) => {
-                        *inner.lock() = Some(sink);
+                        closer.put_back(&inner, sink);
                         Ok(())
                     }
                     Err(e) => {
@@ -1520,6 +1644,7 @@ impl PyDuplexSink {
     fn finish(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         py.detach(|| {
             runtime.block_on(async move {
@@ -1527,9 +1652,10 @@ impl PyDuplexSink {
                     Some(s) => s,
                     None => return Err(RpcError::new_err("duplex sink already closed")),
                 };
-                sink.finish_sending()
-                    .await
-                    .map_err(|e| handle_error(org_errors, e))
+                tokio::select! {
+                    r = sink.finish_sending() => r.map_err(|e| handle_error(org_errors, e)),
+                    _ = closer.closed() => Err(RpcError::new_err("finish aborted by close()")),
+                }
             })
         })
     }
@@ -1541,9 +1667,8 @@ impl PyDuplexSink {
         self.flow_controlled_cached
     }
     fn close(&self) {
-        self.close_notify.notify_one();
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.close_notify.close();
+        let _ = self.inner.lock().take();
     }
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
@@ -1566,6 +1691,8 @@ pub struct PyDuplexStream {
     inner: Arc<Mutex<Option<InnerDuplexStream>>>,
     runtime: Arc<GuardedRuntime>,
     call_id_cached: u64,
+    /// See [`CloseSignal`].
+    close_notify: Arc<CloseSignal>,
     /// Error vocabulary — see [`handle_error`].
     org_errors: bool,
 }
@@ -1578,6 +1705,7 @@ impl PyDuplexStream {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let runtime = self.runtime.clone();
         let inner = self.inner.clone();
+        let closer = self.close_notify.clone();
         let org_errors = self.org_errors;
         let result = py.detach(|| {
             runtime.block_on(async move {
@@ -1586,10 +1714,18 @@ impl PyDuplexStream {
                     None => return Err(RpcError::new_err("duplex stream already closed")),
                 };
                 use futures::StreamExt;
-                let next = stream.next().await;
+                let next = tokio::select! {
+                    n = stream.next() => n,
+                    _ = closer.closed() => {
+                        // close() while parked: end iteration; the drop
+                        // fires CANCEL (SDK audit 2026-10-11).
+                        drop(stream);
+                        return Ok(None);
+                    }
+                };
                 match next {
                     Some(Ok(bytes)) => {
-                        *inner.lock() = Some(stream);
+                        closer.put_back(&inner, stream);
                         Ok::<Option<Bytes>, PyErr>(Some(bytes))
                     }
                     Some(Err(e)) => {
@@ -1613,8 +1749,8 @@ impl PyDuplexStream {
         self.call_id_cached
     }
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.close_notify.close();
+        let _ = self.inner.lock().take();
     }
 }
 
@@ -2521,11 +2657,7 @@ impl PyMeshRpc {
                     .map_err(rpc_error_to_pyerr)
             })
         })?;
-        Ok(PyRpcStream {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime: self.runtime.clone(),
-            org_errors: false,
-        })
+        Ok(PyRpcStream::wrap(inner, self.runtime.clone(), false))
     }
 
     /// Capability-routed streaming call. Resolves ``service``
@@ -2563,11 +2695,7 @@ impl PyMeshRpc {
                     .map_err(rpc_error_to_pyerr)
             })
         })?;
-        Ok(PyRpcStream {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime: self.runtime.clone(),
-            org_errors: false,
-        })
+        Ok(PyRpcStream::wrap(inner, self.runtime.clone(), false))
     }
 
     /// Open a client-streaming call. Returns a
@@ -2609,7 +2737,7 @@ impl PyMeshRpc {
             runtime: self.runtime.clone(),
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
-            close_notify: Arc::new(tokio::sync::Notify::new()),
+            close_notify: Arc::new(CloseSignal::default()),
             org_errors: false,
         })
     }
@@ -2652,7 +2780,7 @@ impl PyMeshRpc {
             runtime: self.runtime.clone(),
             call_id_cached: call_id,
             flow_controlled_cached: flow_controlled,
-            close_notify: Arc::new(tokio::sync::Notify::new()),
+            close_notify: Arc::new(CloseSignal::default()),
             org_errors: false,
         })
     }

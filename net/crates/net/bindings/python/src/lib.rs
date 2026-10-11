@@ -764,6 +764,7 @@ impl Net {
     #[pyo3(signature = (limit, cursor=None, filter=None, ordering=None))]
     fn poll(
         &self,
+        py: Python<'_>,
         limit: usize,
         cursor: Option<&str>,
         filter: Option<&str>,
@@ -800,9 +801,9 @@ impl Net {
             request = request.ordering(ordering_mode);
         }
 
-        let response = self
-            .runtime
-            .block_on(bus.poll(request))
+        // GIL released across the bus round trip (SDK audit 2026-10-11).
+        let response = py
+            .detach(|| self.runtime.block_on(bus.poll(request)))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let events: Vec<StoredEvent> = response
@@ -863,7 +864,7 @@ impl Net {
     /// in-flight batches short of `shutdown()`, which is terminal —
     /// so "publish, make sure it landed, keep publishing" was
     /// inexpressible here while Rust, Node, Go and C all had it.
-    fn flush(&self) -> PyResult<()> {
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
         // Holds the read guard across `block_on`, matching `shutdown`
         // below (which holds the write guard). A concurrent shutdown
         // waits for the flush rather than racing it, which is the
@@ -872,17 +873,17 @@ impl Net {
         let bus = bus_guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
-        self.runtime
-            .block_on(bus.flush())
+        py.detach(|| self.runtime.block_on(bus.flush()))
             .map_err(|e| PyRuntimeError::new_err(format!("flush: {}", e)))
     }
 
     /// Gracefully shutdown the event bus.
-    fn shutdown(&self) -> PyResult<()> {
-        let mut bus_guard = self.bus.write();
-        if let Some(bus) = bus_guard.take() {
-            self.runtime
-                .block_on(bus.shutdown())
+    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+        // Take the bus out under the write guard, then drop the guard and
+        // the GIL for the (I/O-bound) shutdown itself.
+        let bus = self.bus.write().take();
+        if let Some(bus) = bus {
+            py.detach(|| self.runtime.block_on(bus.shutdown()))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         Ok(())
@@ -903,11 +904,12 @@ impl Net {
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<&Bound<'_, pyo3::types::PyType>>,
         _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
         _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
-        self.shutdown()?;
+        self.shutdown(py)?;
         Ok(false)
     }
 }
@@ -2138,7 +2140,7 @@ mod mesh_bindings {
         }
 
         /// Send raw JSON to a direct peer.
-        fn push_to(&self, peer_addr: &str, json: &str) -> PyResult<bool> {
+        fn push_to(&self, py: Python<'_>, peer_addr: &str, json: &str) -> PyResult<bool> {
             let node = self.get_node()?;
             let addr: std::net::SocketAddr = peer_addr
                 .parse()
@@ -2155,8 +2157,7 @@ mod mesh_bindings {
                 process_nonce: net::event::batch_process_nonce(),
             };
 
-            self.runtime
-                .block_on(node.send_to_peer(addr, &batch))
+            py.detach(|| self.runtime.block_on(node.send_to_peer(addr, &batch)))
                 .map_err(|e| PyRuntimeError::new_err(format!("send: {}", e)))?;
             Ok(true)
         }
@@ -2178,11 +2179,18 @@ mod mesh_bindings {
         ///
         /// Pair with ``shard_for_stream`` when you want one stream
         /// rather than a merge across all of them.
-        fn poll_shard(&self, shard_id: u16, limit: usize) -> PyResult<Vec<StoredEvent>> {
+        fn poll_shard(
+            &self,
+            py: Python<'_>,
+            shard_id: u16,
+            limit: usize,
+        ) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
-            let result = self
-                .runtime
-                .block_on(node.poll_shard(shard_id, None, limit))
+            let result = py
+                .detach(|| {
+                    self.runtime
+                        .block_on(node.poll_shard(shard_id, None, limit))
+                })
                 .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
             Ok(Self::map_events(result.events))
         }
@@ -2198,7 +2206,7 @@ mod mesh_bindings {
         /// The sweep starts from a rotating shard, so no shard can be
         /// starved by a busier one and events are not returned in
         /// shard order.
-        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+        fn poll(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
             let shards = node.num_shards().max(1);
             // Rotate the starting shard so a saturated shard 0 cannot
@@ -2216,9 +2224,11 @@ mod mesh_bindings {
                 }
                 let shard = net::shard::rotating_shard(start, offset, shards);
                 let remaining = limit - events.len();
-                let result = self
-                    .runtime
-                    .block_on(node.poll_shard(shard, None, remaining))
+                let result = py
+                    .detach(|| {
+                        self.runtime
+                            .block_on(node.poll_shard(shard, None, remaining))
+                    })
                     .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
                 events.extend(result.events);
             }
@@ -2557,6 +2567,7 @@ mod mesh_bindings {
         #[pyo3(signature = (publisher_node_id, channel, token = None))]
         fn subscribe_channel(
             &self,
+            py: Python<'_>,
             publisher_node_id: u64,
             channel: &str,
             token: Option<&[u8]>,
@@ -2569,31 +2580,42 @@ mod mesh_bindings {
                 Some(bytes) => {
                     let parsed = net::adapter::net::identity::PermissionToken::from_bytes(bytes)
                         .map_err(super::identity::token_err)?;
-                    self.runtime
-                        .block_on(node.subscribe_channel_with_token(
+                    // Waits for the membership ack: GIL released.
+                    py.detach(|| {
+                        self.runtime.block_on(node.subscribe_channel_with_token(
                             publisher_node_id,
                             name,
                             parsed,
                         ))
-                        .map_err(adapter_to_channel_pyerr)
+                    })
+                    .map_err(adapter_to_channel_pyerr)
                 }
-                None => self
-                    .runtime
-                    .block_on(node.subscribe_channel(publisher_node_id, name))
+                None => py
+                    .detach(|| {
+                        self.runtime
+                            .block_on(node.subscribe_channel(publisher_node_id, name))
+                    })
                     .map_err(adapter_to_channel_pyerr),
             }
         }
 
         /// Mirror of `subscribe_channel`. Idempotent on the publisher
         /// side — unsubscribing a non-member returns `None`.
-        fn unsubscribe_channel(&self, publisher_node_id: u64, channel: &str) -> PyResult<()> {
+        fn unsubscribe_channel(
+            &self,
+            py: Python<'_>,
+            publisher_node_id: u64,
+            channel: &str,
+        ) -> PyResult<()> {
             let node = self.get_node()?;
             let name = InnerChannelName::new(channel).map_err(|e| {
                 super::ChannelError::new_err(format!("channel: invalid name: {}", e))
             })?;
-            self.runtime
-                .block_on(node.unsubscribe_channel(publisher_node_id, name))
-                .map_err(adapter_to_channel_pyerr)
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.unsubscribe_channel(publisher_node_id, name))
+            })
+            .map_err(adapter_to_channel_pyerr)
         }
 
         /// Publish one payload to every subscriber of `channel`.
@@ -2652,9 +2674,13 @@ mod mesh_bindings {
             }
             let publisher = ChannelPublisher::new(name, pub_cfg);
             let payload_bytes = bytes::Bytes::copy_from_slice(payload);
-            let report: InnerPublishReport = self
-                .runtime
-                .block_on(node.publish(&publisher, payload_bytes))
+            // A reliable publish waits for per-subscriber acks: GIL released
+            // (SDK audit 2026-10-11).
+            let report: InnerPublishReport = py
+                .detach(|| {
+                    self.runtime
+                        .block_on(node.publish(&publisher, payload_bytes))
+                })
                 .map_err(adapter_to_channel_pyerr)?;
             publish_report_to_pydict(py, report)
         }
@@ -3419,12 +3445,13 @@ mod mesh_bindings {
         }
 
         /// Shutdown the mesh node. Idempotent — a second call is a no-op.
-        fn shutdown(&mut self) -> PyResult<()> {
+        fn shutdown(&mut self, py: Python<'_>) -> PyResult<()> {
             let Some(node) = self.node.take() else {
                 return Ok(());
             };
-            self.runtime
-                .block_on(node.shutdown())
+            // Joins every background task (seconds): GIL released.
+            let runtime = Arc::clone(&self.runtime);
+            py.detach(move || runtime.block_on(node.shutdown()))
                 .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))?;
             Ok(())
         }
@@ -3448,11 +3475,12 @@ mod mesh_bindings {
 
         fn __exit__(
             &mut self,
+            py: Python<'_>,
             _exc_type: Option<&Bound<'_, PyAny>>,
             _exc_val: Option<&Bound<'_, PyAny>>,
             _exc_tb: Option<&Bound<'_, PyAny>>,
         ) -> PyResult<bool> {
-            self.shutdown()?;
+            self.shutdown(py)?;
             Ok(false)
         }
     }
@@ -3672,6 +3700,13 @@ mod mesh_bindings {
         /// Shared with the source `NetMesh`, so the sync and async
         /// `poll` rotate through the shards together.
         recv_cursor: Arc<std::sync::atomic::AtomicU16>,
+        /// The source `NetMesh`'s runtime. The node was built inside it,
+        /// so its UDP socket and background tasks live on that runtime's
+        /// driver: holding only the node let a collected `NetMesh` shut
+        /// the runtime down under a live `AsyncNetMesh` (dead reactor,
+        /// dead receive loop). Held, never used directly (SDK audit
+        /// 2026-10-11) — the same keep-alive `AsyncMeshRpc` carries.
+        _runtime: Arc<GuardedRuntime>,
     }
 
     #[pymethods]
@@ -3688,6 +3723,7 @@ mod mesh_bindings {
             Ok(Self {
                 node,
                 recv_cursor: mesh.recv_cursor.clone(),
+                _runtime: mesh.runtime_arc(),
             })
         }
 

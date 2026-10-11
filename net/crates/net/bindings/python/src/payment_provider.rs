@@ -558,7 +558,12 @@ mod provider {
         ///
         /// Reaches the facilitator over the network, so call it when
         /// publishing, not per request.
-        fn pricing_terms(&self, capability: &str, requirements_json: &str) -> PyResult<String> {
+        fn pricing_terms(
+            &self,
+            py: Python<'_>,
+            capability: &str,
+            requirements_json: &str,
+        ) -> PyResult<String> {
             let id: [u8; 32] = self
                 .provider_entity_id
                 .as_slice()
@@ -573,9 +578,12 @@ mod provider {
             .map_err(PyValueError::new_err)?;
             let accepts = crate::payment_provider::parse_requirements(requirements_json)
                 .map_err(PyValueError::new_err)?;
-            self.runtime
-                .block_on(self.engine.check_settlement_routes(&accepts))
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            // Facilitator I/O: GIL released (SDK audit 2026-10-11).
+            py.detach(|| {
+                self.runtime
+                    .block_on(self.engine.check_settlement_routes(&accepts))
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
             Ok(terms)
         }
 
