@@ -148,6 +148,13 @@ impl RevocationStore {
         for (bytes, gen) in &self.floors {
             registry.revoke_below(&EntityId::from_bytes(*bytes), *gen);
         }
+        // Subjects too: a provider that verifies chains itself
+        // (`load(..).apply_to(&registry)` then `DelegationChain::verify`)
+        // got only the floors, so a revoked device's root-issued grant
+        // still verified there (code review 2026-10-11, RUST-2).
+        for bytes in &self.subjects {
+            registry.revoke_subject(&EntityId::from_bytes(*bytes));
+        }
     }
 
     /// Whether `subject` has been revoked as a subject (see the type docs).
@@ -392,6 +399,43 @@ mod tests {
         );
         assert_eq!(store.revoked_subjects().count(), 1);
         assert!(!store.is_empty());
+    }
+
+    /// Code review 2026-10-11 RUST-2: the revoked-subject record reached
+    /// only the MCP wrap gate. The documented provider path —
+    /// `load(..).apply_to(&registry)` then `DelegationChain::verify` — got
+    /// the floors alone, so a revoked device's bare root-issued grant still
+    /// verified until expiry.
+    #[test]
+    fn apply_to_carries_revoked_subjects_into_chain_verification() {
+        use crate::delegation::{DelegationChain, DEFAULT_DELEGATION_DEPTH};
+        use net::adapter::net::identity::TokenError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            std::time::Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+
+        let reg = RevocationRegistry::new();
+        RevocationStore::load(&path).unwrap().apply_to(&reg);
+        assert!(chain
+            .verify(device.entity_id(), root.entity_id(), &reg, 0)
+            .is_ok());
+
+        RevocationStore::revoke_subject(&path, device.entity_id()).unwrap();
+        RevocationStore::load(&path).unwrap().apply_to(&reg);
+        assert!(reg.is_subject_revoked(device.entity_id()));
+        assert!(matches!(
+            chain.verify(device.entity_id(), root.entity_id(), &reg, 0),
+            Err(TokenError::Revoked)
+        ));
     }
 
     #[test]

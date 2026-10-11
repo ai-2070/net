@@ -1562,3 +1562,72 @@ async fn wait_on_a_cancelled_migration_reports_failure_not_success() {
         "a cancelled migration must not report success: {outcome:?}"
     );
 }
+
+/// Code review 2026-10-11 RUST-1: `cancel()` overwrote an already recorded
+/// failure with "cancel requested", and when the abort then failed (no
+/// record left) it `remove`d the slot — erasing the genuine failure, so
+/// `wait()` read "record gone + no failure" and reported success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_never_erases_or_overwrites_a_recorded_failure() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    // The target never answers, so the migration stays in flight.
+    source_rt.mesh().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let handle = source_rt
+        .spawn("counter", identity, DaemonHostConfig::default())
+        .await
+        .expect("spawn on source");
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+
+    // The dispatcher's failure callback has already recorded a reason.
+    source_rt.inject_migration_failure(handle.origin_hash, MigrationFailureReason::FactoryNotFound);
+    mig.cancel()
+        .await
+        .expect("cancel aborts the in-flight record");
+    assert!(
+        matches!(
+            source_rt.peek_migration_failure(handle.origin_hash),
+            Some(MigrationFailureReason::FactoryNotFound)
+        ),
+        "cancel overwrote the recorded failure"
+    );
+    // No record left: this cancel fails, and must leave the reason alone.
+    assert!(mig.cancel().await.is_err(), "nothing left to abort");
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        mig.wait_with_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .expect("wait returns promptly");
+    assert!(
+        matches!(
+            outcome,
+            Err(DaemonError::MigrationFailed(
+                MigrationFailureReason::FactoryNotFound
+            ))
+        ),
+        "a failed migration must not report success after cancel: {outcome:?}"
+    );
+}

@@ -137,11 +137,6 @@ pub struct DelegationGate {
     /// error just keeps the last-known floors (logged, never fail-open into
     /// *granting* — the chain must still root-anchor + verify).
     revocation_store: Option<PathBuf>,
-    /// Revoked SUBJECTS, refreshed from `revocation_store` (monotonic union):
-    /// a chain naming one as any link's subject is refused. Floors cannot
-    /// express this — they apply to a link's issuer, so a revoked device's
-    /// own root-issued grant survived its floor (SDK audit 2026-10-11).
-    revoked_subjects: Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for DelegationGate {
@@ -168,7 +163,6 @@ impl DelegationGate {
             nonces: Mutex::new(HashMap::new()),
             audit: None,
             revocation_store: None,
-            revoked_subjects: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -262,17 +256,6 @@ impl DelegationGate {
         chain
             .verify(&leaf, &self.owner_root, &self.revocation, self.skew_secs)
             .map_err(|e| DelegationReject::Chain(format!("{e:?}")))?;
-        {
-            let revoked = self.revoked_subjects.lock();
-            if !revoked.is_empty()
-                && chain
-                    .subjects()
-                    .iter()
-                    .any(|s| revoked.contains(s.as_bytes()))
-            {
-                return Err(DelegationReject::Chain("RevokedSubject".to_string()));
-            }
-        }
 
         // [4] Replay: only now, after authentication, touch the nonce cache —
         //     so an unauthenticated peer can't grow it. Keyed by the leaf, so
@@ -297,12 +280,9 @@ impl DelegationGate {
     fn refresh_revocations(&self) {
         if let Some(path) = &self.revocation_store {
             match RevocationStore::load(path) {
-                Ok(store) => {
-                    store.apply_to(&self.revocation);
-                    self.revoked_subjects
-                        .lock()
-                        .extend(store.revoked_subjects().map(|e| *e.as_bytes()));
-                }
+                // Floors and revoked subjects both land in the registry,
+                // which `chain.verify` consults for every link.
+                Ok(store) => store.apply_to(&self.revocation),
                 Err(e) => eprintln!(
                     "net wrap: revocation store unreadable ({e}); keeping last-known floors"
                 ),
@@ -714,7 +694,7 @@ mod tests {
         let env = envelope(&device, TOOL, ARGS, now_secs(), 3);
         assert!(matches!(
             g.verify(TOOL, ARGS, &chain, &env),
-            Err(DelegationReject::Chain(ref k)) if k == "RevokedSubject"
+            Err(DelegationReject::Chain(ref k)) if k == "Revoked"
         ));
     }
 

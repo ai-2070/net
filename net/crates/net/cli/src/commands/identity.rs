@@ -111,6 +111,15 @@ pub struct RevokeArgs {
     #[arg(long, default_value_t = 1)]
     pub generation: u32,
 
+    /// Also revoke the entity itself as a SUBJECT: every grant issued TO it
+    /// — including its own root-issued `root → device` grant — is refused.
+    /// The floor alone only kills links the entity signs (a generation
+    /// rotation), so a revoked device kept its own grant until expiry. Use
+    /// this when the device is gone, not merely rotating. There is no
+    /// un-revoke.
+    #[arg(long)]
+    pub subject: bool,
+
     /// Revocation-store path (default: the per-user shared file a
     /// `net-mesh wrap --owner-root` provider honors).
     #[arg(long = "revocation-store", value_name = "PATH")]
@@ -383,10 +392,15 @@ async fn run_revoke(args: RevokeArgs, output: Option<OutputFormat>) -> Result<()
     let path = resolve_revocation_store(args.revocation_store.as_deref())?;
     let floor = net_sdk::revocation::RevocationStore::revoke_below(&path, &issuer, args.generation)
         .map_err(|e| sdk(format!("revoke failed: {e}")))?;
+    if args.subject {
+        net_sdk::revocation::RevocationStore::revoke_subject(&path, &issuer)
+            .map_err(|e| sdk(format!("revoke subject failed: {e}")))?;
+    }
     let info = RevokeOutput {
         issuer_hex: hex::encode(issuer.as_bytes()),
         generation: args.generation,
         floor,
+        subject_revoked: args.subject,
         store: path.display().to_string(),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &info)
@@ -514,6 +528,8 @@ struct RevokeOutput {
     generation: u32,
     /// The floor now in effect for this issuer (≥ `generation`).
     floor: u32,
+    /// Whether the entity was also revoked as a subject (`--subject`).
+    subject_revoked: bool,
     /// The store the revocation was written to.
     store: String,
 }

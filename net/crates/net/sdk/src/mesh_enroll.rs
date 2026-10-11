@@ -261,7 +261,8 @@ impl Mesh {
         let response: Vec<u8> = self
             .call_raw_bytes(rv.node_id, RENEWAL_SERVICE, request.to_bytes())
             .await
-            .map_err(|e| JoinFlowError::Transport(format!("call: {e}")))?;
+            // `SdkError::Rpc` already reads "call: …".
+            .map_err(|e| JoinFlowError::Transport(e.to_string()))?;
         // The renewed grant must anchor at the same root and bind to this
         // device — the same rogue-operator defense as `join`.
         let root = current_chain.root();
@@ -300,7 +301,8 @@ impl Mesh {
         let response: Vec<u8> = self
             .call_raw_bytes(rv.node_id, ENROLLMENT_SERVICE, request.to_bytes())
             .await
-            .map_err(|e| JoinFlowError::Transport(format!("call: {e}")))?;
+            // `SdkError::Rpc` already reads "call: …".
+            .map_err(|e| JoinFlowError::Transport(e.to_string()))?;
 
         JoinOutcome::from_bytes(&response)
             .and_then(|outcome| outcome.into_chain(device.entity_id(), &invite.root))

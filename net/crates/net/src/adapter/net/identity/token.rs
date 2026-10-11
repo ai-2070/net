@@ -1126,9 +1126,19 @@ pub struct TokenCache {
 /// every outstanding token from that issuer — including delegated
 /// children — without needing to enumerate them. Issuers ship the
 /// floor out-of-band alongside their public key when rotation matters.
+///
+/// Also holds revoked SUBJECTS: a token issued *to* a revoked entity is
+/// revoked whatever its issuer's floor. A floor cannot express "this
+/// device is gone" — it applies to the links an entity *signs*, so a
+/// revoked device's own root-issued grant outlived it (code review
+/// 2026-10-11, RUST-2).
 #[derive(Debug, Default)]
 pub struct RevocationRegistry {
     floors: DashMap<[u8; 32], u32>,
+    subjects: DashMap<[u8; 32], ()>,
+    /// Set once the first subject is revoked: keeps [`Self::is_revoked`]
+    /// on the hot path a single atomic load for registries without any.
+    has_subjects: AtomicBool,
 }
 
 impl RevocationRegistry {
@@ -1164,10 +1174,25 @@ impl RevocationRegistry {
             .unwrap_or(0)
     }
 
-    /// Returns true if `token` is below its issuer's floor.
+    /// Revoke `subject` outright: every token issued to it is revoked,
+    /// whatever its issuer's floor. Monotonic; there is no un-revoke.
+    pub fn revoke_subject(&self, subject: &EntityId) {
+        self.subjects.insert(*subject.as_bytes(), ());
+        self.has_subjects.store(true, AtomicOrdering::Release);
+    }
+
+    /// Whether `subject` has been revoked via [`Self::revoke_subject`].
+    pub fn is_subject_revoked(&self, subject: &EntityId) -> bool {
+        self.has_subjects.load(AtomicOrdering::Acquire)
+            && self.subjects.contains_key(subject.as_bytes())
+    }
+
+    /// Returns true if `token` is below its issuer's floor, or was issued
+    /// to a revoked subject.
     #[inline]
     pub fn is_revoked(&self, token: &PermissionToken) -> bool {
         token.issuer_generation < self.floor(&token.issuer)
+            || self.is_subject_revoked(&token.subject)
     }
 }
 
@@ -2477,6 +2502,42 @@ mod tests {
             "legacy delegate must stamp signer generation zero, not \
              inherit the parent's 9"
         );
+    }
+
+    /// Code review 2026-10-11 RUST-2: a revoked subject's tokens are
+    /// revoked whatever their issuer's floor — a floor bump on the device
+    /// only reaches links the device signs, never the grant issued to it.
+    #[test]
+    fn a_revoked_subject_revokes_the_tokens_issued_to_it() {
+        let root = EntityKeypair::generate();
+        let device = EntityKeypair::generate();
+        let other = EntityKeypair::generate();
+        let grant = |subject: &EntityKeypair| {
+            PermissionToken::try_issue_with_generation(
+                &root,
+                0,
+                subject.entity_id().clone(),
+                TokenScope::PUBLISH,
+                0xFEED_FACE,
+                3600,
+                0,
+            )
+            .expect("root -> subject")
+        };
+        let to_device = grant(&device);
+        let to_other = grant(&other);
+
+        let registry = RevocationRegistry::new();
+        registry.revoke_below(device.entity_id(), 1);
+        assert!(
+            !registry.is_revoked(&to_device),
+            "a floor on the device does not reach its own grant"
+        );
+
+        registry.revoke_subject(device.entity_id());
+        assert!(registry.is_subject_revoked(device.entity_id()));
+        assert!(registry.is_revoked(&to_device));
+        assert!(!registry.is_revoked(&to_other), "other subjects untouched");
     }
 
     /// Revocation stays transitive without inheritance.
