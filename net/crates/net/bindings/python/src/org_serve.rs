@@ -403,8 +403,19 @@ where
                 let coro = callable
                     .call1(py, args)
                     .map_err(|pyerr| (true, format!("org {label} handler raised: {pyerr}")))?;
-                crate::async_bridge::dispatch_handler_coro(py, coro.into_bound(py))
-                    .map_err(|pyerr| (true, format!("org {label} handler raised: {pyerr}")))
+                // A dispatcher failure (the bridge loop failed to boot, or
+                // the handler returned a non-coroutine) is a provider-internal
+                // fault, not the handler's own raise — keep it out of the
+                // application band so callers' retry decisions see the right
+                // signal (SDK audit 2026-10-11).
+                crate::async_bridge::dispatch_handler_coro(py, coro.into_bound(py)).map_err(
+                    |pyerr| {
+                        (
+                            false,
+                            format!("org {label} handler could not be dispatched: {pyerr}"),
+                        )
+                    },
+                )
             });
             let fut = match dispatched {
                 Ok(f) => f,

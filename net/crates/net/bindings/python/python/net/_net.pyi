@@ -3991,7 +3991,22 @@ class AsyncMemoriesAdapter:
     def close(self) -> None: ...
     def is_running(self) -> bool: ...
     def count(self) -> int: ...
-    def list_memories(self, **kwargs: Any) -> List[Memory]: ...
+    def list_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Memory]: ...
     async def watch_memories(self, **kwargs: Any) -> AsyncMemoryWatchIter: ...
     async def snapshot_and_watch_memories(
         self, **kwargs: Any
@@ -4023,7 +4038,18 @@ class AsyncTasksAdapter:
     def close(self) -> None: ...
     def is_running(self) -> bool: ...
     def count(self) -> int: ...
-    def list_tasks(self, **kwargs: Any) -> List[Task]: ...
+    def list_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Task]: ...
     async def watch_tasks(self, **kwargs: Any) -> AsyncTaskWatchIter: ...
     async def snapshot_and_watch_tasks(
         self, **kwargs: Any
@@ -4827,7 +4853,11 @@ class CapabilityGateway:
         ...
 
     def a2a_resolve_attempt(
-        self, task_id: str, outcome_json: str, provider_node: int | None = None
+        self,
+        task_id: str,
+        outcome_json: str,
+        provider_node: int | None = None,
+        generation: str | None = None,
     ) -> None:
         """Close an attempt the automatic path cannot: ``unknown``, ``denied``
         with ``funds_ambiguous``, or ``unexecutable``.
@@ -5251,7 +5281,14 @@ class PaymentProvider:
         journal. Requires the ``a2a`` build feature."""
         ...
 
-    def a2a_resolve(self, owner_json: str, task_id: str, state_json: str) -> None:
+    def a2a_resolve(
+        self,
+        owner_json: str,
+        task_id: str,
+        state_json: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
         """Resolve one unresolved-financial admission to a terminal state:
         ``owner_json`` and ``task_id`` exactly as they appear on an
         :meth:`a2a_unresolved` row, ``state_json`` the ``TaskState`` the

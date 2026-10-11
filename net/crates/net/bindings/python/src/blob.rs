@@ -182,8 +182,8 @@ impl PyBlobRef {
     /// bytes do not start with the discriminator (i.e. an inline
     /// payload, not a blob ref).
     #[staticmethod]
-    fn from_encoded(bytes: &[u8]) -> PyResult<Option<Self>> {
-        match InnerBlobRef::decode(bytes).map_err(map_blob_err)? {
+    fn from_encoded(data: &[u8]) -> PyResult<Option<Self>> {
+        match InnerBlobRef::decode(data).map_err(map_blob_err)? {
             Some(inner) => Ok(Some(Self { inner })),
             None => Ok(None),
         }
@@ -909,8 +909,8 @@ impl BlobAdapter for PyBlobAdapter {
 /// from inside the adapter method — the binding does not (and
 /// cannot) know about the application's loop.
 #[pyfunction]
-pub fn register_blob_adapter(adapter_id: String, instance: Py<PyAny>) -> PyResult<()> {
-    let adapter: Arc<dyn BlobAdapter> = Arc::new(PyBlobAdapter::new(adapter_id.clone(), instance));
+pub fn register_blob_adapter(adapter_id: String, adapter: Py<PyAny>) -> PyResult<()> {
+    let adapter: Arc<dyn BlobAdapter> = Arc::new(PyBlobAdapter::new(adapter_id.clone(), adapter));
     global_blob_adapter_registry()
         .register(adapter)
         .map_err(|e| BlobError::new_err(format!("{}", e)))

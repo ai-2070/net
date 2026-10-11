@@ -253,7 +253,7 @@ impl RevocationStore {
                     generation: *gen,
                 })
                 .collect(),
-            revoked_subjects: self.subjects.iter().map(|b| encode_entity_hex(b)).collect(),
+            revoked_subjects: self.subjects.iter().map(encode_entity_hex).collect(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| RevocationStoreError::Io {
             path: path.display().to_string(),
