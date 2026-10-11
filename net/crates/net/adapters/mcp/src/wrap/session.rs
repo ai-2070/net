@@ -420,20 +420,61 @@ pub struct ServerPublisher {
     shared: Arc<PublisherShared>,
 }
 
+/// The live [`PublisherShared`] of each mesh node, so every
+/// [`ServerPublisher`] built over the same node joins ONE merge.
+///
+/// The merge is per node, not per publisher value: announcements replace the
+/// node's whole capability set and the describe service can be served once.
+/// Two independent publishers on one node (the bindings built a fresh one per
+/// `publish_tools` call, so a free plus a paid publication was enough) made
+/// the second announce only its own tools — wiping the first's — and then
+/// fail on `serve_rpc(DESCRIBE_SERVICE)` with `AlreadyServing`, rolling back
+/// to an EMPTY announcement (SDK audit 2026-10-11).
+///
+/// Keyed by the node's `Arc` address; the entry also keeps a `Weak` to the
+/// node so a reused address is never mistaken for the old node. Holds only
+/// weak references: the shared state lives exactly as long as some
+/// publisher or publication holds it.
+type PublisherRegistry = HashMap<
+    usize,
+    (
+        std::sync::Weak<net_sdk::MeshNode>,
+        std::sync::Weak<PublisherShared>,
+    ),
+>;
+
+fn publisher_registry() -> &'static Mutex<PublisherRegistry> {
+    static REGISTRY: std::sync::OnceLock<Mutex<PublisherRegistry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl ServerPublisher {
-    /// A publisher for `mesh`. All publications made through it (and its
-    /// clones) merge into the node's single announcement + describe catalog.
+    /// A publisher for `mesh`. All publications made through it, its clones,
+    /// and any other `ServerPublisher` over the same mesh node merge into
+    /// the node's single announcement + describe catalog.
     pub fn new(mesh: Arc<Mesh>) -> Self {
-        Self {
-            mesh,
-            shared: Arc::new(PublisherShared {
+        let node = mesh.node();
+        let key = Arc::as_ptr(node) as usize;
+        let mut registry = publisher_registry().lock();
+        // Opportunistic GC: drop entries whose node or state is gone.
+        registry.retain(|_, (n, s)| n.strong_count() > 0 && s.strong_count() > 0);
+        let live = registry.get(&key).and_then(|(n, s)| {
+            let same_node = n.upgrade().is_some_and(|n| Arc::ptr_eq(&n, node));
+            same_node.then(|| s.upgrade()).flatten()
+        });
+        let shared = live.unwrap_or_else(|| {
+            let shared = Arc::new(PublisherShared {
                 contributions: Mutex::new(BTreeMap::new()),
                 next_id: AtomicU64::new(0),
                 sync: tokio::sync::Mutex::new(()),
                 catalog: shared_catalog(Vec::new()),
                 describe: Mutex::new(None),
-            }),
-        }
+            });
+            registry.insert(key, (Arc::downgrade(node), Arc::downgrade(&shared)));
+            shared
+        });
+        drop(registry);
+        Self { mesh, shared }
     }
 
     /// Publish a stdio MCP server as mesh capabilities: spawn, discover,
