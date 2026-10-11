@@ -1284,7 +1284,7 @@ func go_net_org_streaming_trampoline(
 	// Invalidate the wrapper BEFORE returning to Rust — anything the
 	// handler captured into a goroutine sees ErrStreamDone on Send, never
 	// the C handle Rust is about to free.
-	sink.invalidated.Store(1)
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -1336,7 +1336,7 @@ func go_net_org_client_streaming_trampoline(
 	}
 	stream := newRequestStreamRecvFromPtr(unsafe.Pointer(requestStream))
 	resp, err := safeCallOrgClientStreamingHandler(handler, orgCallerFromC(caller), stream)
-	stream.invalidated.Store(1)
+	stream.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -1395,8 +1395,8 @@ func go_net_org_duplex_trampoline(
 	err := safeCallOrgDuplexHandler(handler, orgCallerFromC(caller), stream, sink)
 	// Invalidate BOTH wrappers before returning — Rust is about to free
 	// the underlying handles.
-	stream.invalidated.Store(1)
-	sink.invalidated.Store(1)
+	stream.retire()
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1

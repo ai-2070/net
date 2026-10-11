@@ -289,6 +289,7 @@ int go_net_rpc_handler_trampoline(
 );
 
 // ABI 0x0002 — server-side dispatcher hooks.
+extern int net_rpc_request_stream_retire(RpcRequestStreamHandleC* handle);
 extern int net_rpc_request_stream_next(
     RpcRequestStreamHandleC* handle,
     uint8_t** out_chunk_ptr, size_t* out_chunk_len
@@ -2173,22 +2174,26 @@ func (s *DuplexStream) finalize() { s.Close() }
 // be retained past the callback.
 type RequestStreamRecv struct {
 	handle *C.RpcRequestStreamHandleC
-	// invalidated is flipped to 1 by the trampoline after the
-	// handler returns; Recv checks it before any cgo call so a
-	// user goroutine that captures the wrapper past the callback
-	// returns ErrStreamDone instead of dereferencing a freed C
-	// handle. Use atomic.Int32 — the Go runtime guarantees
-	// happens-before between the trampoline's Store and the
-	// reader's Load.
-	invalidated atomic.Int32
+	// gate brackets every Recv's cgo call. The trampoline retires it
+	// before returning to Rust (which then frees the handle): a
+	// goroutine the handler spawned sees ErrStreamDone afterwards, and
+	// one parked in native next is woken and waited for first. See
+	// serverHandleGate.
+	gate serverHandleGate
+}
+
+// retire is called by the trampoline once the handler has returned.
+func (r *RequestStreamRecv) retire() {
+	r.gate.retire(func() { C.net_rpc_request_stream_retire(r.handle) })
 }
 
 // Recv blocks until the next inbound chunk arrives. Returns
 // ErrStreamDone on caller-side REQUEST_END or CANCEL.
 func (r *RequestStreamRecv) Recv() ([]byte, error) {
-	if r == nil || r.handle == nil || r.invalidated.Load() != 0 {
+	if r == nil || r.handle == nil || !r.gate.enter() {
 		return nil, ErrStreamDone
 	}
+	defer r.gate.leave()
 	var outChunk *C.uint8_t
 	var outChunkLen C.size_t
 	code := C.net_rpc_request_stream_next(r.handle, &outChunk, &outChunkLen)
@@ -2217,20 +2222,23 @@ func (r *RequestStreamRecv) Recv() ([]byte, error) {
 // lifetime contract as *RequestStreamRecv.
 type ResponseSinkSend struct {
 	handle *C.RpcResponseSinkHandleC
-	// Same invalidation gate as RequestStreamRecv: flipped after
-	// the handler returns so a goroutine that captures the sink
-	// can't UAF on the freed C handle.
-	invalidated atomic.Int32
+	// Same gate as RequestStreamRecv. Send never parks (try_send), so
+	// retiring only has to wait for an in-flight Send to leave.
+	gate serverHandleGate
 }
+
+// retire is called by the trampoline once the handler has returned.
+func (s *ResponseSinkSend) retire() { s.gate.retire(nil) }
 
 // Send emits one response chunk. Non-blocking — the SDK's
 // underlying try_send drops on overflow. Returns ErrStreamDone
 // only if the sink has already been torn down (caller cancelled
 // mid-stream).
 func (s *ResponseSinkSend) Send(body []byte) error {
-	if s == nil || s.handle == nil || s.invalidated.Load() != 0 {
+	if s == nil || s.handle == nil || !s.gate.enter() {
 		return ErrStreamDone
 	}
+	defer s.gate.leave()
 	cBody, freeBody := bytesToCBytes(body)
 	defer freeBody()
 	code := C.net_rpc_response_sink_send(s.handle, cBody.ptr, cBody.len)
@@ -2326,7 +2334,7 @@ func go_net_rpc_client_streaming_trampoline(
 	// the handler captured into a goroutine will now see
 	// ErrStreamDone on Recv instead of dereferencing the C handle
 	// that Rust is about to free.
-	stream.invalidated.Store(1)
+	stream.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -2380,8 +2388,8 @@ func go_net_rpc_duplex_trampoline(
 	// to free the underlying handles, and any goroutine the
 	// handler spawned that captured them must see ErrStreamDone
 	// on subsequent Recv / Send instead of UAF.
-	stream.invalidated.Store(1)
-	sink.invalidated.Store(1)
+	stream.retire()
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -2444,7 +2452,7 @@ func go_net_rpc_streaming_trampoline(
 	err := safeCallStreamingHandler(handler, req, sink)
 	// Invalidate the sink wrapper before returning — Rust is about
 	// to free the underlying handle.
-	sink.invalidated.Store(1)
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -2697,7 +2705,7 @@ func newDuplexCallFromOrg(p unsafe.Pointer) *DuplexCall {
 // newRequestStreamRecvFromPtr wraps a per-call request-stream handle the
 // org shape dispatchers borrowed across one callback. Same
 // lifetime contract as the nRPC trampolines' wrappers: bounded by the
-// callback; the org trampoline flips `invalidated` before returning.
+// callback; the org trampoline retires the wrapper (serverHandleGate) before returning.
 func newRequestStreamRecvFromPtr(p unsafe.Pointer) *RequestStreamRecv {
 	return &RequestStreamRecv{handle: (*C.RpcRequestStreamHandleC)(p)}
 }

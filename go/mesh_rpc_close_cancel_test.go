@@ -171,3 +171,97 @@ func TestMeshRpc_CtxCancelWakesAParkedStreamRecv(t *testing.T) {
 		})
 	}
 }
+
+// SDK audit 2026-10-11: a goroutine a server handler spawned could still be
+// parked in native `next` (or past the old "invalidated" check) when the
+// handler returned, and Rust frees the handle the moment the trampoline
+// returns — the next chunk, END or CANCEL then wrote through freed memory.
+// The trampoline now retires the wrapper: the parked Recv is woken with
+// ErrStreamDone and waited for before control goes back to Rust.
+func TestServerStream_ParkedRecvIsRetiredBeforeTheHandleIsFreed(t *testing.T) {
+	a, b, cleanup := meshHandshakePair(t)
+	defer cleanup()
+	rpcA, err := NewMeshRpc(a)
+	if err != nil {
+		t.Fatalf("NewMeshRpc(a): %v", err)
+	}
+	defer rpcA.Close()
+	rpcB, err := NewMeshRpc(b)
+	if err != nil {
+		t.Fatalf("NewMeshRpc(b): %v", err)
+	}
+	defer rpcB.Close()
+
+	parked := make(chan struct{})
+	reader := make(chan error, 1)
+	serve, err := rpcB.ServeDuplex("audit.escaping.reader", func(stream *RequestStreamRecv, _ *ResponseSinkSend) error {
+		go func() {
+			close(parked)
+			for { // drain the opening chunk, then park on the next
+				if _, err := stream.Recv(); err != nil {
+					reader <- err
+					return
+				}
+			}
+		}()
+		<-parked
+		time.Sleep(100 * time.Millisecond) // let the goroutine reach native next
+		return nil                         // returns while the reader is parked
+	})
+	if err != nil {
+		t.Fatalf("ServeDuplex: %v", err)
+	}
+	defer serve.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	call, err := rpcA.CallDuplex(ctx, b.NodeID(), "audit.escaping.reader", DuplexOptions{})
+	if err != nil {
+		t.Fatalf("CallDuplex: %v", err)
+	}
+	defer call.Close()
+	if err := call.Send([]byte("open")); err != nil {
+		t.Fatalf("first Send: %v", err)
+	}
+
+	select {
+	case err := <-reader:
+		if !errors.Is(err, ErrStreamDone) {
+			t.Fatalf("escaped Recv returned %v, want ErrStreamDone", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a Recv parked past its handler's return was not retired")
+	}
+	// Traffic after the handler returned must not touch a freed handle.
+	_ = call.Send([]byte("late"))
+	_ = call.FinishSending()
+	time.Sleep(200 * time.Millisecond)
+}
+
+func TestServerHandleGate_RetireWaitsForInflightOps(t *testing.T) {
+	var g serverHandleGate
+	if !g.enter() {
+		t.Fatal("enter on a fresh gate")
+	}
+	woken := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		g.retire(func() { close(woken) })
+		close(done)
+	}()
+	<-woken
+	select {
+	case <-done:
+		t.Fatal("retire returned while an op was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	g.leave()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retire did not return after the op left")
+	}
+	if g.enter() {
+		t.Fatal("enter after retire must refuse")
+	}
+}

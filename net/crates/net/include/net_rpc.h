@@ -1050,6 +1050,18 @@ int net_rpc_request_stream_next(
     uint8_t** out_chunk_ptr,
     size_t* out_chunk_len);
 
+/* Retire a request-stream handle the dispatcher is about to return.
+ * Wakes a net_rpc_request_stream_next parked on it and makes every
+ * later call return NET_RPC_ERR_STREAM_DONE immediately; never frees
+ * (the library still frees the handle after the dispatcher returns).
+ *
+ * A handler that hands the stream to another thread must retire it,
+ * wait for that thread's in-flight next to return, and only then
+ * return from the dispatcher: the handle is freed the moment the
+ * dispatcher returns. Idempotent. Returns NET_RPC_OK, or
+ * NET_RPC_ERR_NULL on a NULL handle. Additive within ABI 0x0004. */
+int net_rpc_request_stream_retire(RpcRequestStreamHandleC* handle);
+
 /* Emit one response chunk via the sink (duplex handlers). Non-
  * blocking; SDK try_send semantics. Returns NET_RPC_OK on success
  * or NET_RPC_ERR_NULL on NULL handle. */
