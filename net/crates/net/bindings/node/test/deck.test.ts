@@ -534,6 +534,10 @@ d('Deck SDK operator-side bindings (Phase 5 slice 1)', () => {
     try {
       const client = await DeckClient.fromMeshos(sdk, OperatorIdentity.generate());
       const proposal = client.ice.freezeCluster(60_000n);
+      // Let the clock move between proposing and simulating: the
+      // commit must still verify against the proposal's own stamp
+      // (it failed `provenance_mismatch` whenever a millisecond passed).
+      await new Promise((resolve) => setTimeout(resolve, 5));
       const simulated = await proposal.simulate();
       try {
         await simulated.commit([]);

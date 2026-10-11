@@ -1509,7 +1509,9 @@ impl PyIceProposal {
         let action_for_build = action.clone();
         let blast = py.detach(move || {
             runtime.block_on(async move {
-                let proposal = build_core_proposal(&client, action_for_build)?;
+                // Simulate at the husk's own stamp, the one commit uses.
+                let proposal =
+                    build_core_proposal(&client, action_for_build)?.with_issued_at_ms(issued_at_ms);
                 proposal
                     .simulate()
                     .await
@@ -2430,8 +2432,10 @@ impl PyAsyncIceProposal {
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
         let action_for_future = action.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Simulate at the husk's own stamp, the one commit uses.
             let proposal = build_core_proposal(&client, action_for_future)
-                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
+                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?
+                .with_issued_at_ms(issued_at_ms);
             let simulated = proposal
                 .simulate()
                 .await

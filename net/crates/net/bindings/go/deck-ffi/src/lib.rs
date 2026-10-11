@@ -2136,8 +2136,9 @@ pub extern "C" fn net_deck_ice_proposal_simulate(
         // Validate the variant before flipping `consumed` so an
         // unknown-variant rejection leaves the husk retry-able
         // instead of stranding it as consumed-but-unused.
+        // Simulate at the husk's pinned stamp, the one commit uses.
         let core_proposal = match build_core_proposal(inner, action.clone()) {
-            Ok(p) => p,
+            Ok(p) => p.with_issued_at_ms(issued_at_ms),
             Err(msg) => {
                 set_last_error("unknown_action", &msg);
                 return NET_DECK_ERR_CALL_FAILED;
