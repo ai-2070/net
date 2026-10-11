@@ -1,0 +1,37 @@
+net/crates/net/bindings/python/tests/test_enrollment.py
+  s_ae82cd919caae2::t_9d65d2d6e2cd8b 282-315,317-323,330-334,336-339
+  s_ae82cd919caae2::t_00b14a0da0f95e 316,324-329,335
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_ae82cd919caae2::t_09c695b5212ffc 984-997
+  s_ae82cd919caae2::t_68815d3d5546ad 258
+net/crates/net/bindings/node/src/enrollment.rs
+  s_ae82cd919caae2::t_702186f39d5e1e 739-788,805-832
+  s_ae82cd919caae2::t_5046f04dac2ea2 32
+  s_ae82cd919caae2::t_798451d084279e 833
+net/crates/net/bindings/python/src/lib.rs
+  s_ae82cd919caae2::t_1f2b6797d810f1 1930-1960
+net/crates/net/bindings/python/src/enrollment.rs
+  s_ae82cd919caae2::t_1f2b6797d810f1 663-730
+net/crates/net/bindings/node/test/enrollment.test.ts
+  s_ae82cd919caae2::t_36f8be69e579b1 280-324
+net/crates/net/sdk-ts/src/mesh.ts
+  s_ae82cd919caae2::t_09c695b5212ffc 1153-1162
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_ae82cd919caae2::t_09c695b5212ffc 672-686
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "831c2ea5da26fbc0d250675182eff50cd4c4ac47",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
