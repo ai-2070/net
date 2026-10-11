@@ -309,3 +309,20 @@ describe('regression: number values reject negatives', () => {
     expect(report.errors).toEqual([]);
   });
 });
+
+// SDK audit 2026-10-11: two drifts from the substrate.
+describe('regression: validator mirrors the substrate byte/index rules', () => {
+  it('accepts a `+N` index, as u32::from_str does', () => {
+    const report = validateCapabilities({ tags: ['software.model.+0.id=x'], metadata: {} });
+    expect(report.errors.find((e) => e.kind === 'index_malformed')).toBeUndefined();
+  });
+
+  it('measures metadata in UTF-8 bytes, not UTF-16 units', () => {
+    // 2000 CJK chars: 2000 UTF-16 units (under 4 KiB) but 6000 UTF-8 bytes.
+    const report = validateCapabilities({ tags: [], metadata: { k: '中'.repeat(2000) } });
+    const w = report.warnings.find((x) => x.kind === 'metadata_oversize') as
+      | { actual_bytes: number }
+      | undefined;
+    expect(w?.actual_bytes).toBe(1 + 6000);
+  });
+});

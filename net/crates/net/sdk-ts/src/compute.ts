@@ -567,13 +567,19 @@ export class MigrationHandle {
    * **Usage pattern:**
    * ```ts
    * const mig = await rt.startMigration(origin, a, b);
-   * const phases: MigrationPhase[] = [];
-   * for await (const phase of mig.phases()) {
-   *   phases.push(phase);
-   * }
-   * // Inspect `phases.at(-1)` — `'complete'` vs anything else
-   * // distinguishes success from abort / failure.
+   * const progress = (async () => {
+   *   for await (const phase of mig.phases()) render(phase);
+   * })();
+   * await mig.wait(); // THE success signal: resolves on complete, rejects otherwise
+   * await progress;
    * ```
+   *
+   * **For progress display only — never as the success signal.** The
+   * last observed phase is not reliable: a record that goes `cutover` →
+   * `complete` → removed within one 50 ms tick ends the iterator on
+   * `cutover`, so a successful migration would read as a failure. Use
+   * {@link MigrationHandle.wait} to tell success from abort (SDK audit
+   * 2026-10-11).
    *
    * **Call site ordering:** iterate as soon as the handle is
    * returned. If you await `wait()` first and then call

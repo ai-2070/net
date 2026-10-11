@@ -343,7 +343,10 @@ function validateAxisKey(
       // would later reject.
       const idxNum = Number(idx);
       if (
-        !/^\d+$/.test(idx) ||
+        // `u32::from_str` (the substrate's parser) also accepts a leading
+        // `+`; rejecting it here flagged tags Rust accepts (SDK audit
+        // 2026-10-11).
+        !/^\+?\d+$/.test(idx) ||
         !Number.isInteger(idxNum) ||
         idxNum > 0xffff_ffff
       ) {
@@ -448,9 +451,13 @@ export function validateCapabilities(
   }
 
   // Metadata soft-cap check.
+  // UTF-8 BYTES, as the substrate counts — `String.length` counts UTF-16
+  // units, so non-ASCII metadata (CJK is 3 bytes per char) passed here
+  // while Rust and Python warned (SDK audit 2026-10-11).
+  const utf8 = new TextEncoder();
   let metadataBytes = 0;
   for (const [k, v] of Object.entries(caps.metadata)) {
-    metadataBytes += k.length + v.length;
+    metadataBytes += utf8.encode(k).length + utf8.encode(v).length;
   }
   if (metadataBytes > METADATA_SOFT_CAP_BYTES) {
     warnings.push({

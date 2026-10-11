@@ -157,4 +157,12 @@ export interface SubscribeOpts {
   pollIntervalMs?: number;
   /** Maximum backoff interval in ms. */
   maxBackoffMs?: number;
+  /**
+   * Resume after this cursor — an `EventStream.cursor` /
+   * `TypedEventStream.cursor` value from an earlier stream. Without it a
+   * consumer whose typed stream ended on one bad event could only start
+   * over from the beginning, re-processing everything it had already
+   * consumed.
+   */
+  cursor?: string;
 }

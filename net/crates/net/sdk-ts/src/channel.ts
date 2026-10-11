@@ -203,7 +203,7 @@ export class TypedChannel<T> {
   subscribe(opts: SubscribeOpts = {}): TypedEventStream<T> {
     const mergedOpts: SubscribeOpts = {
       ...opts,
-      filter: opts.filter ?? this.filter,
+      filter: this.scoped(opts.filter),
     };
 
     const parse = this.validator
@@ -222,8 +222,19 @@ export class TypedChannel<T> {
   subscribeRaw(opts: SubscribeOpts = {}): EventStream {
     const mergedOpts: SubscribeOpts = {
       ...opts,
-      filter: opts.filter ?? this.filter,
+      filter: this.scoped(opts.filter),
     };
     return new EventStream(this.bus, mergedOpts);
+  }
+
+  /**
+   * The channel's own filter AND-ed with a caller's. A caller filter used
+   * to REPLACE the channel scoping: events from every channel matching it
+   * came back typed as `T`, with the `_channel` tag that would have
+   * revealed it stripped (SDK audit 2026-10-11).
+   */
+  private scoped(filter: string | undefined): string {
+    if (filter === undefined || filter === '') return this.filter;
+    return JSON.stringify({ $and: [JSON.parse(this.filter), JSON.parse(filter)] });
   }
 }

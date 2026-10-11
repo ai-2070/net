@@ -60,3 +60,24 @@ describe('EventStream cursor', () => {
     expect(b.calls).toEqual([undefined, 'k1', 'k1']);
   });
 });
+
+describe('EventStream resume', () => {
+  it('exposes its cursor and resumes from SubscribeOpts.cursor', async () => {
+    const b = bus((cursor) =>
+      cursor === 'k1'
+        ? { events: [ev('b')], nextId: 'k2', hasMore: false }
+        : { events: [ev('a')], nextId: 'k1', hasMore: false },
+    );
+    const first = new EventStream(b as never, opts);
+    for await (const e of first) {
+      expect(e.raw).toBe('a');
+      break;
+    }
+    expect(first.cursor).toBe('k1');
+    const resumed = new EventStream(b as never, { ...opts, cursor: first.cursor });
+    for await (const e of resumed) {
+      expect(e.raw).toBe('b');
+      break;
+    }
+  });
+});
