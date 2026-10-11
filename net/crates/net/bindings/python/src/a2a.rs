@@ -433,10 +433,16 @@ impl PyA2aServeHandle {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "A2aServeHandle(serving={}, services={})",
-            self.inner.lock().is_some(),
-            self.services()
-        )
+        // One lock, read once: `services()` locks `inner` itself, and a
+        // guard temporary inside `format!` lives to the end of the
+        // statement, so calling both here re-locked a held mutex.
+        let (serving, services) = {
+            let inner = self.inner.lock();
+            (
+                inner.is_some(),
+                inner.as_ref().map_or(0, |(_, r)| r.services()),
+            )
+        };
+        format!("A2aServeHandle(serving={serving}, services={services})")
     }
 }

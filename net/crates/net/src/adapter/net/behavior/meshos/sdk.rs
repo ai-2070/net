@@ -539,13 +539,7 @@ impl MeshOsDaemonHandle {
     pub async fn graceful_shutdown(mut self, grace: Duration) -> Result<(), SdkError> {
         // Inject a shutdown event so the daemon's `next_control`
         // loop wakes up.
-        let grace_ms = grace.as_millis() as u64;
-        self.router.route(
-            self.daemon_id,
-            DaemonControl::Shutdown {
-                grace_period_ms: grace_ms,
-            },
-        );
+        self.signal_shutdown(grace);
         // Park for the grace window, but short-circuit as soon as
         // the daemon clears itself from the registry — a clean
         // exit shouldn't be indistinguishable from a hung daemon.
@@ -572,6 +566,30 @@ impl MeshOsDaemonHandle {
         }
         self.unregister_inner();
         Ok(())
+    }
+
+    /// The first step of [`graceful_shutdown`](Self::graceful_shutdown)
+    /// on its own: route `DaemonControl::Shutdown { grace_period_ms }`
+    /// to this daemon's control channel and return. The handle stays
+    /// usable, so the consumer that reads it via
+    /// [`next_control`](Self::next_control) sees the event during the
+    /// grace window. For a host (a binding) that cannot lend the
+    /// handle to `graceful_shutdown` and to its reader at once: signal,
+    /// wait on [`is_registered`](Self::is_registered) up to the grace,
+    /// then drop the handle.
+    pub fn signal_shutdown(&self, grace: Duration) {
+        let grace_ms = grace.as_millis() as u64;
+        self.router.route(
+            self.daemon_id,
+            DaemonControl::Shutdown {
+                grace_period_ms: grace_ms,
+            },
+        );
+    }
+
+    /// Whether the daemon is still in the registry.
+    pub fn is_registered(&self) -> bool {
+        !self.unregistered && self.registry.contains(self.daemon_id)
     }
 
     fn unregister_inner(&mut self) {

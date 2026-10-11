@@ -2221,6 +2221,18 @@ class MeshOsDaemonHandle:
         parks for ``grace_ms``, then unregisters. Consumes the
         handle."""
         ...
+    def signal_shutdown(self, grace_ms: Optional[int] = None) -> None:
+        """Send ``Shutdown { grace_period_ms }`` and return at once,
+        WITHOUT consuming the handle, so a parked ``next_control``
+        receives it. Wait on ``registered``, then ``close()``."""
+        ...
+    @property
+    def registered(self) -> bool:
+        """Whether the daemon is still registered."""
+        ...
+    def close(self) -> None:
+        """Unregister and consume the handle now. Idempotent."""
+        ...
     def __enter__(self) -> "MeshOsDaemonHandle": ...
     def __exit__(
         self,

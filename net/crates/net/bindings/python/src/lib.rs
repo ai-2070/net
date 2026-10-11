@@ -343,8 +343,24 @@ fn generate_net_keypair() -> NetKeypair {
 /// ```
 #[pyclass]
 pub struct Net {
-    bus: Arc<RwLock<Option<EventBus>>>,
+    // The bus sits behind its own `Arc` so the I/O-bound calls (`poll`,
+    // `flush`, `shutdown`) clone it out and drop the lock guard BEFORE
+    // releasing the GIL. Holding a guard across `py.detach` deadlocks:
+    // the detached thread reacquires the GIL with the read guard held
+    // while `shutdown` waits for the write guard with the GIL held.
+    bus: RwLock<Option<Arc<EventBus>>>,
     runtime: Arc<GuardedRuntime>,
+}
+
+impl Net {
+    /// The live bus, or the shut-down error. Clones the `Arc` so the
+    /// caller holds no lock guard while it waits.
+    fn live_bus(&self) -> PyResult<Arc<EventBus>> {
+        self.bus
+            .read()
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))
+    }
 }
 
 #[pymethods]
@@ -684,7 +700,7 @@ impl Net {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         Ok(Net {
-            bus: Arc::new(RwLock::new(Some(bus))),
+            bus: RwLock::new(Some(Arc::new(bus))),
             runtime,
         })
     }
@@ -770,10 +786,7 @@ impl Net {
         filter: Option<&str>,
         ordering: Option<&str>,
     ) -> PyResult<PollResponse> {
-        let bus_guard = self.bus.read();
-        let bus = bus_guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
+        let bus = self.live_bus()?;
 
         let mut request = ConsumeRequest::new(limit);
 
@@ -865,14 +878,10 @@ impl Net {
     /// so "publish, make sure it landed, keep publishing" was
     /// inexpressible here while Rust, Node, Go and C all had it.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        // Holds the read guard across `block_on`, matching `shutdown`
-        // below (which holds the write guard). A concurrent shutdown
-        // waits for the flush rather than racing it, which is the
-        // ordering a caller flushing before teardown wants anyway.
-        let bus_guard = self.bus.read();
-        let bus = bus_guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
+        // No lock guard is held across the wait (see `Net::bus`). A
+        // concurrent shutdown drains the same batches this flush waits
+        // on, so the flush still returns once they have landed.
+        let bus = self.live_bus()?;
         py.detach(|| self.runtime.block_on(bus.flush()))
             .map_err(|e| PyRuntimeError::new_err(format!("flush: {}", e)))
     }
@@ -880,10 +889,12 @@ impl Net {
     /// Gracefully shutdown the event bus.
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
         // Take the bus out under the write guard, then drop the guard and
-        // the GIL for the (I/O-bound) shutdown itself.
+        // the GIL for the (I/O-bound) shutdown itself. An in-flight
+        // `poll` / `flush` may still hold an `Arc` clone, hence the
+        // by-reference shutdown.
         let bus = self.bus.write().take();
         if let Some(bus) = bus {
-            py.detach(|| self.runtime.block_on(bus.shutdown()))
+            py.detach(|| self.runtime.block_on(bus.shutdown_via_ref()))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         Ok(())

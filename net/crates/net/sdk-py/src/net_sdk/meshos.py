@@ -65,6 +65,11 @@ _CONTROL_POLL_INTERVAL_MS = 10
 # handle's borrow lock.
 _NEXT_CONTROL_SLICE_MS = 50
 
+# The native default grace period (`DEFAULT_GRACEFUL_SHUTDOWN`), and the
+# cadence at which `graceful_shutdown` checks whether the daemon left.
+_DEFAULT_GRACE_MS = 5000
+_SHUTDOWN_POLL_S = 0.05
+
 
 # =========================================================================
 # Typed dict envelopes — match the PyO3 binding's emitted shape.
@@ -323,13 +328,14 @@ class MeshOsDaemonHandleWrapper:
     ``await loop.run_in_executor(None, handle.graceful_shutdown)``.
     """
 
-    __slots__ = ("_raw", "_borrow_lock")
+    __slots__ = ("_raw", "_borrow_lock", "_shutting_down")
 
     def __init__(self, raw: _RawHandle) -> None:
         import threading
 
         self._raw = raw
         self._borrow_lock = threading.Lock()
+        self._shutting_down = False
 
     @property
     def daemon_id(self) -> int:
@@ -358,17 +364,22 @@ class MeshOsDaemonHandleWrapper:
         :meth:`graceful_shutdown` from another thread, the very call
         that would deliver the ``Shutdown`` event (SDK audit
         2026-10-11)."""
+        import math
         import time
 
         deadline = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000.0
+        first = True
         while True:
             if deadline is None:
                 slice_ms = _NEXT_CONTROL_SLICE_MS
             else:
-                left_ms = int((deadline - time.monotonic()) * 1000)
-                if left_ms <= 0:
+                left_ms = max(0, math.ceil((deadline - time.monotonic()) * 1000))
+                # Always make one native call: `timeout_ms=0` is a
+                # non-blocking receive that still returns a queued event.
+                if left_ms <= 0 and not first:
                     return None
                 slice_ms = min(_NEXT_CONTROL_SLICE_MS, left_ms)
+            first = False
             try:
                 with self._borrow_lock:
                     ev = self._raw.next_control(timeout_ms=slice_ms)
@@ -516,18 +527,50 @@ class MeshOsDaemonHandleWrapper:
         ``Shutdown { grace_period_ms }`` on the daemon's control
         channel, parks for ``grace_ms``, then unregisters. Consumes
         the handle — subsequent method calls raise
-        ``MeshOsSdkError(kind="already_shutdown")``."""
+        ``MeshOsSdkError(kind="already_shutdown")``.
+
+        The grace period is waited out WITHOUT the borrow lock, so a
+        thread parked in :meth:`next_control` (or an ``async for``)
+        receives the ``Shutdown`` event and can drain. The native
+        one-shot ``graceful_shutdown`` consumed the handle before the
+        grace period, so the event sat in a channel no reader could
+        reach (code review 2026-10-11, PY-4)."""
+        import time
+
+        signal = getattr(self._raw, "signal_shutdown", None)
+        if signal is None:  # a wheel that predates the split shutdown
+            with self._borrow_lock:
+                self._raw.graceful_shutdown(grace_ms=grace_ms)
+            return
         with self._borrow_lock:
-            self._raw.graceful_shutdown(grace_ms=grace_ms)
+            if self._shutting_down:
+                # A shutdown is already waiting out its grace period: this
+                # call is the daemon finishing its drain (typically its own
+                # ``with`` exit). Unregister now so that wait ends early.
+                self._raw.close()
+                return
+            self._shutting_down = True
+            signal(grace_ms=grace_ms)
+        grace_s = (_DEFAULT_GRACE_MS if grace_ms is None else grace_ms) / 1000.0
+        deadline = time.monotonic() + grace_s
+        try:
+            # End early once the daemon leaves the registry (a clean exit
+            # is not a hung daemon), as the native one-shot does.
+            while time.monotonic() < deadline:
+                with self._borrow_lock:
+                    if not self._raw.registered:
+                        break
+                time.sleep(min(_SHUTDOWN_POLL_S, max(0.0, deadline - time.monotonic())))
+        finally:
+            with self._borrow_lock:
+                self._raw.close()
 
     def __enter__(self) -> "MeshOsDaemonHandleWrapper":
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
         try:
-            # Under the borrow lock like every other mutating call.
-            with self._borrow_lock:
-                self._raw.graceful_shutdown(grace_ms=None)
+            self.graceful_shutdown(grace_ms=None)
         except MeshOsSdkError as e:
             if getattr(e, "kind", None) != "already_shutdown":
                 raise

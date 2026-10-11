@@ -888,6 +888,33 @@ impl PyMeshOsDaemonHandle {
         })
     }
 
+    /// Step one of a graceful shutdown the caller drives itself: send
+    /// `Shutdown { grace_period_ms }` on the control channel and return
+    /// at once. Unlike `graceful_shutdown`, the handle is NOT consumed,
+    /// so a thread parked in `next_control` receives the event. Wait on
+    /// `registered` (up to the grace), then call `close()`.
+    #[pyo3(signature = (grace_ms=None))]
+    fn signal_shutdown(&self, grace_ms: Option<u64>) -> PyResult<()> {
+        let grace = grace_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN);
+        self.require_inner()?.signal_shutdown(grace);
+        Ok(())
+    }
+
+    /// Whether the daemon is still registered. `False` once the handle
+    /// was consumed or closed.
+    #[getter]
+    fn registered(&self) -> bool {
+        self.inner.as_ref().is_some_and(|h| h.is_registered())
+    }
+
+    /// Unregister and consume the handle now (the failsafe step of a
+    /// graceful shutdown). Idempotent.
+    fn close(&mut self) {
+        self.inner.take();
+    }
+
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
