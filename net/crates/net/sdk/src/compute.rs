@@ -612,7 +612,7 @@ impl DaemonRuntime {
             }
             let inner = inner_for_teardown.clone();
             rt_for_teardown.spawn(async move {
-                teardown_subscriptions(inner, bindings).await;
+                teardown_subscriptions(inner, origin_hash, bindings).await;
             });
         });
         let inner_for_readiness = self.inner.clone();
@@ -1060,11 +1060,22 @@ impl DaemonRuntime {
         if self.state() == State::Registering {
             return Err(DaemonError::NotReady);
         }
+        // Snapshot the ledger before the host goes: a stopped daemon's
+        // subscriptions used to stay on publisher rosters until the session
+        // timed out.
+        let bindings = self
+            .inner
+            .registry
+            .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
+            .unwrap_or_default();
         // Treat a missing daemon as success during ShuttingDown —
         // the shutdown sweep drained it.
         match self.inner.registry.unregister(origin_hash) {
             Ok(_) => {
                 self.inner.factory_registry.remove(origin_hash);
+                if !bindings.is_empty() {
+                    teardown_subscriptions(self.inner.clone(), origin_hash, bindings).await;
+                }
                 Ok(())
             }
             Err(CoreDaemonError::NotFound(_)) if self.state() == State::ShuttingDown => Ok(()),
@@ -1261,16 +1272,22 @@ impl DaemonRuntime {
         if !self.inner.registry.contains(origin_hash) {
             return Err(DaemonError::Core(CoreDaemonError::NotFound(origin_hash)));
         }
-        self.inner
-            .mesh
-            .inner()
-            .unsubscribe_channel(publisher, channel.clone())
-            .await
-            .map_err(|e| {
-                DaemonError::Core(CoreDaemonError::ProcessFailed(format!(
-                    "unsubscribe_channel failed: {e}"
-                )))
-            })?;
+        // Membership is per NODE on the wire. Only leave the publisher's
+        // roster when no other daemon on this runtime still holds the
+        // same (publisher, channel) — otherwise one daemon's unsubscribe
+        // silently cut off its co-located siblings (SDK audit 2026-10-11).
+        if !subscription_held_elsewhere(&self.inner, origin_hash, publisher, &channel) {
+            self.inner
+                .mesh
+                .inner()
+                .unsubscribe_channel(publisher, channel.clone())
+                .await
+                .map_err(|e| {
+                    DaemonError::Core(CoreDaemonError::ProcessFailed(format!(
+                        "unsubscribe_channel failed: {e}"
+                    )))
+                })?;
+        }
         let _ = self.inner.registry.with_host(origin_hash, |host| {
             host.forget_subscription(publisher, &channel);
         });
@@ -1848,8 +1865,17 @@ async fn replay_subscriptions(inner: Arc<Inner>, origin_hash: u64) {
 /// publisher so rosters drop the source without waiting for
 /// session-timeout (~30 s). Fire-and-forget: we don't block the
 /// cutover dispatch on acks.
-async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBinding>) {
+async fn teardown_subscriptions(
+    inner: Arc<Inner>,
+    leaving: u64,
+    bindings: Vec<SubscriptionBinding>,
+) {
     for sub in bindings {
+        // Node-level membership: keep it while a co-located daemon still
+        // holds the same subscription.
+        if subscription_held_elsewhere(&inner, leaving, sub.publisher, &sub.channel) {
+            continue;
+        }
         if let Err(e) = inner
             .mesh
             .inner()
@@ -1865,6 +1891,34 @@ async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBin
             );
         }
     }
+}
+
+/// Whether a daemon OTHER than `except` on this runtime still has
+/// `(publisher, channel)` in its subscription ledger. Channel membership is
+/// per node on the wire, so the node must stay on the publisher's roster
+/// while any local daemon still wants it.
+fn subscription_held_elsewhere(
+    inner: &Inner,
+    except: u64,
+    publisher: u64,
+    channel: &ChannelName,
+) -> bool {
+    inner
+        .registry
+        .list()
+        .into_iter()
+        .filter(|(origin, _)| *origin != except)
+        .any(|(origin, _)| {
+            inner
+                .registry
+                .with_host(origin, |host| {
+                    host.bindings_snapshot()
+                        .subscriptions
+                        .iter()
+                        .any(|b| b.publisher == publisher && b.channel == *channel)
+                })
+                .unwrap_or(false)
+        })
 }
 
 /// Options for [`DaemonRuntime::start_migration_with`].

@@ -11,9 +11,8 @@
 //! ```ignore
 //! let group = StandbyGroup::spawn(&rt, "counter", cfg)?;
 //!
-//! // Every event deliver:
+//! // Every event deliver — this ALSO buffers it for replay:
 //! rt.deliver(group.active_origin(), &event)?;
-//! group.on_event_delivered(event);    // buffer for replay
 //!
 //! // Periodic catchup:
 //! group.sync_standbys()?;
@@ -22,9 +21,15 @@
 //! group.on_node_failure(failed_node)?;  // may auto-promote
 //! ```
 //!
-//! The `on_event_delivered` call is manual — SDK doesn't
-//! auto-hook into `DaemonRuntime::deliver`. See the plan doc's
-//! "Open questions" section for the rationale.
+//! **Replay buffering is automatic.** The group installs a
+//! post-delivery observer on its active member's origin at spawn and
+//! re-points it on promote / failover, so every
+//! `DaemonRuntime::deliver` to the active feeds the replay buffer.
+//! Do NOT also call `on_event_delivered`: the buffer does not dedup,
+//! so a paired manual call buffers each event twice and promotion
+//! replays it twice — silently diverging stateful daemons. That
+//! method exists for tests that simulate a gap without a live
+//! runtime. (Same contract as the Node and TS SDKs.)
 
 use parking_lot::Mutex;
 use std::sync::Arc;
