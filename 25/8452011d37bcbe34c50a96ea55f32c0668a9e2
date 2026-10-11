@@ -1,0 +1,26 @@
+net/crates/net/sdk-ts/src/mesh.ts
+  s_ae82cd919caae2::t_6470120465a1f8 437-442,746-747
+  s_ae82cd919caae2::t_8ef69099e7fe31 748
+net/crates/net/bindings/node/src/lib.rs
+  s_ae82cd919caae2::t_31c727399cc3ae 1151-1160,1171-1177,1192-1199,1206-1207,2267-2272,2274,2282-2284,2298
+net/crates/net/bindings/node/test/mesh_rpc_live.test.ts
+  s_ae82cd919caae2::t_2e964462346779 425-444
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_ae82cd919caae2::t_84d1657cc0d564 412-419,452-465
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "258452011d37bcbe34c50a96ea55f32c0668a9e2",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
