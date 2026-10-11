@@ -1,0 +1,33 @@
+net/crates/net/tests/c_abi/SURFACE.md
+  s_16bd53708deb14::t_78cf5a00cf1483 21,653
+net/crates/net/tests/integration_mesh_cancel.rs
+  s_16bd53708deb14::t_813f68e299cce4 463-466,500-503
+  s_16bd53708deb14::t_147ae7dc77d2b7 434-435,437-462,467-499,504-512
+  s_16bd53708deb14::t_f1c33afac974e1 436
+net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
+  s_16bd53708deb14::t_f87187889f4a6e 7-8,515
+go/mesh_rpc_close_cancel_test.go
+  s_16bd53708deb14::t_fcbd6b765d3f14 333-400
+go/mesh_rpc.go
+  s_16bd53708deb14::t_d4d2ef14ac8a05 2047-2049
+  s_16bd53708deb14::t_a56c31c61318db 1118-1131,1140,2069-2070
+  s_16bd53708deb14::t_987766e8a695a8 1079-1083,2000-2009
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_16bd53708deb14::t_25571168d54dd0 2695-2700,3060-3065,4397,4418-4427,4456,4466,6467-6468,7120-7121,7283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e38414477a235e93bc85839387debf4aea4951ef",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
