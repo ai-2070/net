@@ -1,0 +1,29 @@
+net/crates/net/browser-ts/tests/abi_real_package.mjs
+  s_16bd53708deb14::t_510aa26d145a92 1152-1153,1354
+.claude/skills/net-event-bus/examples/objectstore.ts
+  s_16bd53708deb14::t_42096bdb6f5957 75-78,80,101-102
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_16bd53708deb14::t_c17bcef5650197 2283
+net/crates/net/src/adapter/net/mesh.rs
+  s_16bd53708deb14::t_286034837eee90 27721-27723
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_16bd53708deb14::t_286034837eee90 2734-2744
+.claude/skills/net-event-bus/examples/objectstore.py
+  s_16bd53708deb14::t_42096bdb6f5957 89-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e88aec27eaf734b90c2905b769aea088b1a72b68",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
