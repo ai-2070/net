@@ -288,3 +288,43 @@ async fn publish_needs_the_managed_chain_and_exact_removal_spares_a_successor() 
     assert_eq!(local.publish_chain_fingerprint(&channel()), Some(fp2));
     publish().await.expect("the successor still publishes");
 }
+
+/// SDK audit 2026-10-11: a mesh built WITHOUT an identity installed no
+/// token cache, so a `require_token` channel refused every subscriber —
+/// valid ones included — while the Node, Python and C bindings (which
+/// always install one) admitted them. The cache only supplies revocation
+/// and clock-skew policy; subscriber chains verify inline either way.
+#[tokio::test]
+async fn an_identity_less_publisher_admits_a_valid_subscriber() {
+    let root = EntityKeypair::generate();
+    let publisher = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    publisher.register_channel(gated(&root));
+    let device = Identity::generate();
+    let subscriber = mesh(&device).await;
+    link(&subscriber, &publisher).await;
+
+    let token = PermissionToken::try_issue(
+        &root,
+        device.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel().hash(),
+        DAY,
+        0,
+    )
+    .unwrap();
+    subscriber
+        .subscribe_channel_with(
+            publisher.node_id(),
+            &channel(),
+            SubscribeOptions {
+                chain: Some(TokenChain::single(token)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a root-signed SUBSCRIBE token admits on an identity-less publisher");
+}

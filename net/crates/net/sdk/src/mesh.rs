@@ -611,11 +611,15 @@ impl MeshBuilder {
         // installed into it — they are verified inline against the
         // channel's `token_roots` and retained as chains.
         //
-        // Without an identity no cache is installed, and
-        // `require_token` channels reject — at subscribe, not silently
-        // at first publish (M4).
-        if let Some(id) = sdk_identity.as_ref() {
-            node.set_token_cache(id.token_cache().clone());
+        // Without an identity a fresh cache is installed, as the Node,
+        // Python and C bindings always do: it carries no credentials of
+        // its own, but it supplies the revocation and clock-skew policy
+        // subscriber chains are verified against. With none, `require_token`
+        // channels refused every subscriber at subscribe (the core's M4
+        // rule), valid ones included (SDK audit 2026-10-11).
+        match sdk_identity.as_ref() {
+            Some(id) => node.set_token_cache(id.token_cache().clone()),
+            None => node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new())),
         }
         Ok(Mesh {
             node: Arc::new(node),
