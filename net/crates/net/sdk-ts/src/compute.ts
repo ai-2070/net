@@ -774,6 +774,14 @@ export class DaemonRuntime {
           typeof instance === 'object' &&
           typeof (instance as { then?: unknown }).then === 'function'
         ) {
+          // The abandoned Promise may still reject later; consume that so
+          // it is not an unhandled rejection on top of this error (cubic
+          // review of PR #1228).
+          try {
+            (instance as unknown as PromiseLike<unknown>).then(undefined, () => {});
+          } catch {
+            // A hostile thenable: the DaemonError below still names the cause.
+          }
           throw new DaemonError(
             `factory for kind '${kind}' returned a Promise: migration-in and ` +
               'group spawn need a synchronous factory (async factories are ' +

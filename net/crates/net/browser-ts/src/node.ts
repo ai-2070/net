@@ -1259,6 +1259,28 @@ export async function connect(options: ConnectOptions): Promise<BrowserNode> {
 }
 
 /**
+ * The Web Lock name for one custodial identity, or `null` where
+ * `crypto.subtle` is unavailable. A hash of the secret, never the secret.
+ *
+ * Shared by `connect()` and `openSession()`: a session with a custodial
+ * secret names its election lock with this too, so a `connect()` tab and
+ * an `openSession()` tab given one secret contend for ONE lock instead of
+ * each running a node with that identity (cubic review of PR #1228).
+ *
+ * @internal
+ */
+export async function identityLockName(entitySecretHex: string): Promise<string | null> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) return null;
+  // Lowercased: the secret parses case-insensitively, so "AB…" and "ab…" are
+  // one identity and must contend for one lock (code review 2026-10-11,
+  // BROWSER-3).
+  const canonical = entitySecretHex.toLowerCase();
+  const digest = new Uint8Array(await subtle.digest('SHA-256', new TextEncoder().encode(`net-mesh:identity:${canonical}`)));
+  return `net-mesh:identity:${Array.from(digest.subarray(0, 16), b => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
  * Take the exclusive Web Lock for one custodial identity, or throw an
  * {@link IdentityError} when another tab or window holds it. Returns the
  * release, or `null` where Web Locks (or `crypto.subtle`, for the hashed
@@ -1266,14 +1288,9 @@ export async function connect(options: ConnectOptions): Promise<BrowserNode> {
  */
 async function lockIdentity(entitySecretHex: string): Promise<(() => void) | null> {
   const locks = (globalThis.navigator as { locks?: LockManager } | undefined)?.locks;
-  const subtle = globalThis.crypto?.subtle;
-  if (locks === undefined || subtle === undefined) return null;
-  // Lowercased: the secret parses case-insensitively, so "AB…" and "ab…" are
-  // one identity and must contend for one lock (code review 2026-10-11,
-  // BROWSER-3).
-  const canonical = entitySecretHex.toLowerCase();
-  const digest = new Uint8Array(await subtle.digest('SHA-256', new TextEncoder().encode(`net-mesh:identity:${canonical}`)));
-  const name = `net-mesh:identity:${Array.from(digest.subarray(0, 16), b => b.toString(16).padStart(2, '0')).join('')}`;
+  if (locks === undefined) return null;
+  const name = await identityLockName(entitySecretHex);
+  if (name === null) return null;
   const acquired = await new Promise<(() => void) | 'busy'>((resolve, reject) => {
     let release!: () => void;
     const held = new Promise<void>(done => {

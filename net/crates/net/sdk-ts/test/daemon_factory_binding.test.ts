@@ -67,6 +67,24 @@ describe('registerFactory native adapter', () => {
     expect(() => registered.get('slow')!()).toThrow(DaemonError);
     expect(() => registered.get('slow')!()).toThrow(/synchronous factory/);
   });
+
+  // cubic review of PR #1228: the abandoned Promise of an async factory that
+  // later rejects must not surface as an unhandled rejection.
+  it('consumes a later rejection of the abandoned async factory result', async () => {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const rt = runtime();
+      rt.registerFactory('failing', async () => {
+        throw new Error('factory failed');
+      });
+      expect(() => registered.get('failing')!()).toThrow(DaemonError);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
 });
 
 describe('bindDaemonObject', () => {

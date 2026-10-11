@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 
 import { openSession, type MeshSession } from '../src/leader/session.js';
 import { asSessionModule } from '../src/leader/wasm.js';
+import { identityLockName } from '../src/node.js';
 import { isLifecycleEvent, parseSessionEvent } from '../src/leader/events.js';
 import { NotLeaderError, RpcError, type LeafError } from '../src/errors.js';
 import { isStaleStream } from '../src/store/errors.js';
@@ -75,6 +76,28 @@ describe('openSession', () => {
       'credentialB64',
       'origin',
     ]);
+  });
+
+  // cubic review of PR #1228: openSession() used to elect under
+  // `net-mesh/<origin>/<fingerprint>` while connect() locked the hashed
+  // `net-mesh:identity:…` name, so a connect() tab and an openSession() tab
+  // with one secret both ran the identity. A custodial session now elects
+  // under connect()'s lock name.
+  it('elects a custodial identity under the same lock name connect() takes', async () => {
+    const secret = { entitySecretHex: '41'.repeat(32), noiseSecretHex: '42'.repeat(32) };
+    const observed: { options?: LeafWasmSessionOptions } = {};
+    await openSession({ ...BASE, ...secret, wasm: fakeSessionModule(new FakeSession(), observed) });
+    const shared = await identityLockName(secret.entitySecretHex);
+    expect(shared).toMatch(/^net-mesh:identity:[0-9a-f]{32}$/);
+    expect(observed.options?.lockScope).toBe(shared);
+
+    // An explicit lockScope, or lockIdentity: false, keeps the caller's choice.
+    const explicit: { options?: LeafWasmSessionOptions } = {};
+    await openSession({ ...BASE, ...secret, lockScope: 'mine', wasm: fakeSessionModule(new FakeSession(), explicit) });
+    expect(explicit.options?.lockScope).toBe('mine');
+    const optedOut: { options?: LeafWasmSessionOptions } = {};
+    await openSession({ ...BASE, ...secret, lockIdentity: false, wasm: fakeSessionModule(new FakeSession(), optedOut) });
+    expect(optedOut.options?.lockScope).toBeUndefined();
   });
 
   it('re-types whatever the boundary rejected with', async () => {
@@ -298,6 +321,10 @@ describe('MeshSession', () => {
     const other = await session.openStream({ reliability: 'reliable', label: 'app2' });
     session.close();
     const closed = await other.send(new Uint8Array([1])).catch((error: unknown) => error);
+    // The send must actually fail: `isStaleStream(undefined)` is false too,
+    // so without this a send that succeeded would pass (cubic review of
+    // PR #1228).
+    expect(closed).toBeInstanceOf(Error);
     expect(isStaleStream(closed)).toBe(false);
   });
 

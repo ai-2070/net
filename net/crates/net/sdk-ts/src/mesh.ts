@@ -732,6 +732,15 @@ export class MeshNode {
    * could trigger. The error goes to `options.onError` if given, else to a
    * process warning, and delivery continues.
    *
+   * Handlers are NOT serialized: each event invokes `handler` as it
+   * arrives, without awaiting the previous call's promise, so a slow
+   * `async` handler can have many invocations in flight at once and its
+   * pending work is unbounded. The native queue's bound (and
+   * `droppedEvents`) applies only to events not yet handed to `handler`.
+   * A handler doing slow async work should apply its own backpressure —
+   * a bounded queue it drains serially, dropping or coalescing when full
+   * (cubic review of PR #1228).
+   *
    * The subscription lasts until `close()` or until this node is gone —
    * discarding the returned handle does not end it.
    */

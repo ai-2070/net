@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { BrowserNode, connect, parseAttemptStatus, parseCounters, peerIdHex } from '../src/node.js';
+import { BrowserNode, connect, identityLockName, parseAttemptStatus, parseCounters, peerIdHex } from '../src/node.js';
 import {
   fromWasmError,
   IceServerConflictError,
@@ -123,6 +123,32 @@ describe('connect', () => {
       });
       first.close();
       await settle();
+    });
+
+    // cubic review of PR #1228: a session leader for this secret elects
+    // under the same name (see leader.test.ts), so connect() is refused
+    // while one holds it.
+    it('is refused while an openSession() leader holds the identity', async () => {
+      const name = await identityLockName(identity.entitySecretHex.toUpperCase());
+      expect(name).not.toBeNull();
+      let release!: () => void;
+      const held = new Promise<void>(done => {
+        release = done;
+      });
+      let acquired!: () => void;
+      const ready = new Promise<void>(done => {
+        acquired = done;
+      });
+      const lock = navigator.locks.request(name!, async () => {
+        acquired();
+        await held;
+      });
+      await ready;
+      await expect(connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) })).rejects.toMatchObject({
+        kind: 'identity',
+      });
+      release();
+      await lock;
     });
 
     it('is skipped with lockIdentity: false, and never applies without a custodial identity', async () => {

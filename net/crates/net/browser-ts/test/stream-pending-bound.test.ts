@@ -68,6 +68,18 @@ describe('LeafStream pre-consumer buffer', () => {
     expect(seen[seen.length - 1]).toBe(count - 1);
   });
 
+  // cubic review of PR #1228: the eviction loop stopped at one frame, so a
+  // single frame over the byte cap stayed buffered past it.
+  it('drops and counts a single frame larger than the byte cap', () => {
+    const { stream, deliver } = fake();
+    deliver(frame(1, LEAF_STREAM_PENDING_MAX_BYTES + 1));
+    expect(stream.droppedBeforeConsumer).toBe(1);
+    deliver(frame(2));
+    const seen: number[] = [];
+    stream.onMessage((p) => seen.push(idOf(p)));
+    expect(seen).toEqual([2]);
+  });
+
   it('a consumer attaching within the bound loses nothing', () => {
     const { stream, deliver } = fake();
     for (let i = 0; i < 10; i += 1) deliver(frame(i));

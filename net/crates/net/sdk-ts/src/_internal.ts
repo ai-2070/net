@@ -173,11 +173,16 @@ export function reportHandlerError(error: unknown): void {
  */
 export function callIsolated(run: () => unknown, onError: (error: unknown) => void): void {
   const report = (error: unknown): void => {
+    let sunk: unknown;
     try {
-      onError(error);
+      sunk = onError(error);
     } catch {
       // An onError that itself throws must not escape either.
+      return;
     }
+    // An `async` onError that rejects must not escape as an unhandled
+    // rejection either (cubic review of PR #1228).
+    consumeRejection(sunk);
   };
   let result: unknown;
   try {
@@ -187,14 +192,31 @@ export function callIsolated(run: () => unknown, onError: (error: unknown) => vo
     return;
   }
   if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
-    const then = (result as { then?: unknown }).then;
-    if (typeof then === 'function') {
-      try {
+    try {
+      // The `then` read is inside the try: a thenable whose `then` getter
+      // throws must be reported, not escape (cubic review of PR #1228).
+      const then = (result as { then?: unknown }).then;
+      if (typeof then === 'function') {
         then.call(result, undefined, report);
-      } catch (error) {
-        report(error);
       }
+    } catch (error) {
+      report(error);
     }
+  }
+}
+
+/** Swallow a rejection of `value` if it is a thenable; never throws. */
+function consumeRejection(value: unknown): void {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return;
+  try {
+    const then = (value as { then?: unknown }).then;
+    if (typeof then === 'function') {
+      then.call(value, undefined, () => {
+        // Deliberately ignored: the error sink itself failed.
+      });
+    }
+  } catch {
+    // A throwing `then` getter on the sink's result is ignored too.
   }
 }
 

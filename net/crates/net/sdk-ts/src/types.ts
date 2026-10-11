@@ -159,10 +159,17 @@ export interface SubscribeOpts {
   maxBackoffMs?: number;
   /**
    * Resume after this cursor — an `EventStream.cursor` /
-   * `TypedEventStream.cursor` value from an earlier stream. Without it a
-   * consumer whose typed stream ended on one bad event could only start
-   * over from the beginning, re-processing everything it had already
-   * consumed.
+   * `TypedEventStream.cursor` value from an earlier stream — instead of
+   * starting over from the beginning.
+   *
+   * The cursor is batch-granular: it points past the whole batch the stream
+   * last FETCHED, not past the last event it yielded. Resuming a typed
+   * stream that stopped on a parse error therefore skips the rest of that
+   * batch (the bad event and any after it in the same batch), so it is not
+   * lossless recovery. The cursor is the core's composite multi-shard
+   * position, so there is no per-event value to resume from (cubic review
+   * of PR #1228). To survive bad payloads without losing events, consume an
+   * `EventStream` and parse each `event.raw` yourself.
    */
   cursor?: string;
 }

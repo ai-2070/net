@@ -68,6 +68,11 @@ export interface TagKey {
  * there; we surface as a thrown error here).
  */
 export function tagKey(axis: TaxonomyAxis, key: string): TagKey {
+  // A plain-JS caller can pass any string; reject axes outside the closed
+  // taxonomy (cubic review of PR #1228).
+  if (!(TAXONOMY_AXES as readonly string[]).includes(axis)) {
+    throw new Error(`tagKey: unknown axis '${String(axis)}'`);
+  }
   if (!key) {
     throw new Error(`tagKey: key must be non-empty (axis=${axis})`);
   }
@@ -582,6 +587,12 @@ function validateWireNode(n: PredicateNode, idx: number): void {
     const k = node.key as Record<string, unknown> | null;
     if (k === null || typeof k !== 'object' || typeof k.axis !== 'string' || typeof k.key !== 'string') {
       bad("field 'key' must be a tag key { axis, key }");
+    }
+    // The axis is a closed enum on the substrate side; an unknown axis
+    // string would build a predicate that can never match a typed tag
+    // (cubic review of PR #1228).
+    if (axisFromPrefix((k as Record<string, unknown>).axis as string) === undefined) {
+      bad(`field 'key.axis' must be one of ${TAXONOMY_AXES.join(', ')}`);
     }
   };
   switch (node.kind) {

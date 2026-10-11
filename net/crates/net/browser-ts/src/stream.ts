@@ -122,7 +122,8 @@ export const LEAF_STREAM_PENDING_MAX_BYTES = 1 << 20;
  * {@link LEAF_STREAM_PENDING_MAX_FRAMES} frames and
  * {@link LEAF_STREAM_PENDING_MAX_BYTES} bytes. Past either bound the
  * OLDEST buffered frame is dropped and counted in
- * {@link LeafStream.droppedBeforeConsumer}: a stream used only to send
+ * {@link LeafStream.droppedBeforeConsumer} (a single frame larger than the
+ * byte bound is never buffered, and is counted there too): a stream used only to send
  * (the store, netcode and region-link layers read inbound traffic
  * elsewhere) must not keep every frame the peer sends for its lifetime.
  */
@@ -309,13 +310,20 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     const payload = this.decode(event);
     if (payload === null || this.closed) return;
     if (this.queues.size === 0 && this.listeners.size === 0) {
+      // A single frame over the byte cap is dropped and counted rather
+      // than buffered: the eviction loop below stops at one frame, so it
+      // would otherwise sit there past the cap (cubic review of PR #1228).
+      if (payload.byteLength > LEAF_STREAM_PENDING_MAX_BYTES) {
+        this.dropped += 1;
+        return;
+      }
       this.pending.push(payload);
       this.pendingBytes += payload.byteLength;
       // Bounded (SDK audit 2026-10-11): unbounded, an unread stream grew
       // at the peer's send rate until the tab ran out of memory.
       while (
         this.pending.length > LEAF_STREAM_PENDING_MAX_FRAMES ||
-        (this.pendingBytes > LEAF_STREAM_PENDING_MAX_BYTES && this.pending.length > 1)
+        this.pendingBytes > LEAF_STREAM_PENDING_MAX_BYTES
       ) {
         const oldest = this.pending.shift()!;
         this.pendingBytes -= oldest.byteLength;

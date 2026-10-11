@@ -98,4 +98,36 @@ describe('callIsolated', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(errors).toEqual(['sync', 'async']);
   });
+
+  // cubic review of PR #1228: an async onError that rejects, and a thenable
+  // whose `then` getter throws, must not escape either.
+  it('consumes an async onError rejection', async () => {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      callIsolated(
+        () => {
+          throw new Error('x');
+        },
+        async () => {
+          throw new Error('async onError threw');
+        },
+      );
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
+  it('reports a returned object whose then getter throws', () => {
+    const errors: unknown[] = [];
+    const hostile = {
+      get then(): never {
+        throw new Error('then getter');
+      },
+    };
+    expect(() => callIsolated(() => hostile, e => errors.push((e as Error).message))).not.toThrow();
+    expect(errors).toEqual(['then getter']);
+  });
 });

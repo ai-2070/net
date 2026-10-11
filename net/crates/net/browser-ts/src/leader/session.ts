@@ -59,6 +59,7 @@ import {
 } from '../org.js';
 import {
   buildConnectRequest,
+  identityLockName,
   parseAttemptStatus,
   parseCounters,
   parseDescriptors,
@@ -113,7 +114,10 @@ export interface SessionOptions extends ConnectOptions {
   dbName?: string;
   /**
    * Override the Web Lock and `BroadcastChannel` name. Defaults to
-   * `net-mesh/<origin>/<identity-fingerprint>`.
+   * `net-mesh/<origin>/<identity-fingerprint>`, or — with a custodial
+   * `entitySecretHex` — to the identity lock `connect()` takes for that
+   * secret, so a `connect()` tab and an `openSession()` tab cannot both run
+   * the identity. Setting it opts out of that contention.
    *
    * For tests that need two independent elections inside one origin.
    * A page should not set it: two scopes on one identity is two nodes
@@ -975,6 +979,16 @@ export async function openSession(options: SessionOptions): Promise<MeshSession>
     ...(options.dbName === undefined ? {} : { dbName: options.dbName }),
     ...(options.lockScope === undefined ? {} : { lockScope: options.lockScope }),
   };
+  // A custodial identity elects under the same lock name `connect()` takes
+  // for it, so mixed connect()/openSession() tabs with one secret cannot
+  // both run a node (cubic review of PR #1228). The scope also names the
+  // `BroadcastChannel`, and every session tab with that secret derives the
+  // same name, so the leader and its followers still meet.
+  // `lockIdentity: false` keeps the leaf's own default scope.
+  if (request.lockScope === undefined && request.entitySecretHex !== undefined && options.lockIdentity !== false) {
+    const shared = await identityLockName(request.entitySecretHex);
+    if (shared !== null) request.lockScope = shared;
+  }
 
   try {
     return new MeshSession(await module.MeshSession.open(request));

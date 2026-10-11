@@ -2,7 +2,7 @@
 // `undefined` and accepted mistyped fields (threshold: null evaluated as
 // `n >= null`). Malformed nodes are now rejected at decode time.
 import { describe, expect, it } from 'vitest';
-import { predicateFromWire } from '../src/capability-enhancements';
+import { predicateFromWire, tagKey } from '../src/capability-enhancements';
 
 const key = { axis: 'hardware', key: 'gpu.vram_gb' };
 
@@ -23,6 +23,14 @@ describe('predicateFromWire validation', () => {
     expect(() => predicateFromWire({ nodes: [{ kind: 'exists', key: 'gpu' } as never], root_idx: 0 })).toThrow(
       /tag key/,
     );
+  });
+
+  // cubic review of PR #1228: the axis is a closed enum.
+  it('rejects a tag key with an unknown axis', () => {
+    expect(() =>
+      predicateFromWire({ nodes: [{ kind: 'exists', key: { axis: 'firmware', key: 'gpu' } } as never], root_idx: 0 }),
+    ).toThrow(/key\.axis/);
+    expect(() => tagKey('firmware' as never, 'gpu')).toThrow(/unknown axis/);
   });
 
   it('still decodes well-formed trees', () => {
