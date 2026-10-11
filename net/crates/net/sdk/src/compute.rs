@@ -2183,9 +2183,17 @@ impl MigrationHandle {
             .map_err(DaemonError::Migration)?;
 
         let msgs = if self.opts.transport_identity {
-            self.runtime
+            match self
+                .runtime
                 .maybe_seal_chunked_snapshot(self.origin_hash, self.target_node, msgs)
-                .await?
+                .await
+            {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    self.abort_retry("retry seal failed");
+                    return Err(e);
+                }
+            }
         } else {
             msgs
         };
@@ -2215,9 +2223,25 @@ impl MigrationHandle {
         };
 
         for msg in &msgs {
-            self.runtime.send_migration_message(dest_node, msg).await?;
+            if let Err(e) = self.runtime.send_migration_message(dest_node, msg).await {
+                // Mirror `start_migration_with`: a record the retry created
+                // but never got onto the wire is aborted, or every later
+                // `start_migration` answered `AlreadyMigrating` until restart
+                // (SDK audit 2026-10-11).
+                self.abort_retry("retry send failed");
+                return Err(e);
+            }
         }
         Ok(())
+    }
+
+    /// Abort the orchestrator record a failed retry created.
+    fn abort_retry(&self, reason: &str) {
+        let _ = self
+            .runtime
+            .inner
+            .orchestrator
+            .abort_migration(self.origin_hash, reason.into());
     }
 
     /// Pop the most recent `MigrationFailureReason` the dispatcher

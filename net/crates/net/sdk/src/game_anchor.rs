@@ -362,6 +362,11 @@ struct Open {
     /// Writes to the state file that failed (the game still works until
     /// the next restart).
     state_write_errors: AtomicU64,
+    /// Serializes every write of the state file. Appends and rewrites
+    /// used to race: a line appended between a rewrite's snapshot and its
+    /// rename was lost, and two rewrites shared one `.tmp` (SDK audit
+    /// 2026-10-11).
+    state_lock: Mutex<()>,
 }
 
 /// The games an anchor admits browsers for.
@@ -473,6 +478,7 @@ impl GameRegistry {
             config: open,
             window: Mutex::new((0, 0)),
             state_write_errors: AtomicU64::new(0),
+            state_lock: Mutex::new(()),
         });
         if self.open_count() > 0 {
             // Rewrite, so a file with junk or duplicates comes back clean.
@@ -579,7 +585,10 @@ impl GameRegistry {
             }
         }
         let created = self.create_open(origin, game, open.config.issue_per_minute, now);
-        self.append_state(origin, game);
+        // A full rewrite under the state lock, never an append: the
+        // snapshot taken inside the lock includes this game and any
+        // concurrent one.
+        self.write_state();
         Ok(created)
     }
 
@@ -615,24 +624,6 @@ impl GameRegistry {
         self.write_state();
     }
 
-    fn append_state(&self, origin: &str, game: &str) {
-        let Some(open) = self.open.as_ref() else {
-            return;
-        };
-        let Some(path) = &open.config.state_file else {
-            return;
-        };
-        use std::io::Write as _;
-        let written = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut file| writeln!(file, "{origin} {game}"));
-        if written.is_err() {
-            open.state_write_errors.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Rewrite the state file with exactly the open games held now.
     fn write_state(&self) {
         let Some(open) = self.open.as_ref() else {
@@ -641,6 +632,7 @@ impl GameRegistry {
         let Some(path) = &open.config.state_file else {
             return;
         };
+        let _serialized = open.state_lock.lock();
         let mut lines: Vec<String> = self
             .games
             .read()
