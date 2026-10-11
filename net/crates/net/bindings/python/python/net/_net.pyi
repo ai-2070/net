@@ -255,7 +255,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -980,6 +980,20 @@ class NetMesh:
         the invite is the authorization): enroll (join) + renew. Hold the
         returned handle to keep the services open. This node must be
         ``start()``ed. (Requires ``delegation``.)"""
+        ...
+    def serve_enrollment(
+        self,
+        operator: "OperatorEnrollment",
+        approver: Callable[["JoinRequest"], Union[bool, Awaitable[bool]]],
+        grant_ttl_seconds: int,
+        max_depth: Optional[int] = ...,
+        approve_timeout_ms: Optional[int] = ...,
+    ) -> "EnrollmentServeHandle":
+        """Operator-side, approver-gated enrollment: each valid join request
+        is passed to ``approver`` (sync or async) and admitted only on an
+        explicit ``True``. A denial, raise or timeout (default 300 s) answers
+        a coded rejection and does not burn the invite. Serves enrollment
+        only (no renewal). (Requires ``delegation``.)"""
         ...
     def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
         """Device-side renewal: refresh the grant carried by ``enrollment`` over

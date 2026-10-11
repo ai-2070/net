@@ -1927,6 +1927,37 @@ mod mesh_bindings {
             )
         }
 
+        /// Operator-side, **approver-gated** enrollment: every valid join
+        /// request is passed to `approver(request: JoinRequest)` — a callable
+        /// or coroutine function — before it is admitted; return `True` to
+        /// admit. A denial (anything but `True`, a raise, or no answer within
+        /// `approve_timeout_ms`, default 300 000) answers the device a coded
+        /// rejection and does not burn the single-use invite. Safer than
+        /// `serve_enrollment_auto`: a leaked invite lets its holder ask, never
+        /// admits them. Serves enrollment only (no renewal). Same node
+        /// requirements as `serve_enrollment_auto`.
+        #[cfg(feature = "delegation")]
+        #[pyo3(signature = (operator, approver, grant_ttl_seconds, max_depth=None, approve_timeout_ms=None))]
+        fn serve_enrollment(
+            &self,
+            operator: &crate::enrollment::PyOperatorEnrollment,
+            approver: Py<PyAny>,
+            grant_ttl_seconds: u64,
+            max_depth: Option<u8>,
+            approve_timeout_ms: Option<u64>,
+        ) -> PyResult<crate::enrollment::PyEnrollmentServeHandle> {
+            let depth = max_depth.unwrap_or(net_sdk::delegation::DEFAULT_DELEGATION_DEPTH);
+            crate::enrollment::mesh_serve_enrollment(
+                self.node_arc_clone()?,
+                &self.runtime,
+                operator.arc(),
+                std::time::Duration::from_secs(grant_ttl_seconds),
+                depth,
+                approver,
+                std::time::Duration::from_millis(approve_timeout_ms.unwrap_or(300_000)),
+            )
+        }
+
         /// Device-side renewal: refresh the grant carried by `enrollment` over
         /// the mesh, returning the verified fresh `root -> device`
         /// `DelegationChain`. This node must be `start()`ed and built with

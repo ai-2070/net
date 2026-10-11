@@ -29,6 +29,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use parking_lot::Mutex;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -735,6 +736,56 @@ impl NetMesh {
         })
     }
 
+    /// Operator-side, **approver-gated** enrollment: every valid join
+    /// request is handed to `approver` (a `JoinRequest` — device id, name,
+    /// tags) before it is admitted; return `true` (or a Promise of it) to
+    /// admit. A denial — `false`, a throw, a rejection, or no answer within
+    /// `approveTimeoutMs` (default 300 000) — answers the device a coded
+    /// rejection and does **not** burn the single-use invite. The mode
+    /// Rust's `serve_enrollment` provides and the safer default: a leaked
+    /// invite lets its holder *ask*, never admits them. Serves enrollment
+    /// only (no renewal; serve that with `serveEnrollmentAuto` if wanted).
+    /// Same node requirements as `serveEnrollmentAuto`.
+    ///
+    /// Added by the SDK audit (2026-10-11): the approver-gated mode existed
+    /// only in Rust, so every TS/Node operator ran the weaker auto mode.
+    #[napi(
+        ts_args_type = "operator: OperatorEnrollment, approver: (request: JoinRequest) => boolean | Promise<boolean>, grantTtlSeconds: number, maxDepth?: number | undefined | null, approveTimeoutMs?: number | undefined | null",
+        ts_return_type = "Promise<EnrollmentServeHandle>"
+    )]
+    pub fn serve_enrollment<'env>(
+        &self,
+        env: &'env Env,
+        operator: &OperatorEnrollment,
+        approver: Function<'_, JoinRequest, Either<Promise<bool>, bool>>,
+        grant_ttl_seconds: f64,
+        max_depth: Option<u8>,
+        approve_timeout_ms: Option<u32>,
+    ) -> Result<PromiseRaw<'env, EnrollmentServeHandle>> {
+        let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
+        let budget = Duration::from_millis(u64::from(approve_timeout_ms.unwrap_or(300_000)));
+        let tsfn: ApproverTsfn = approver.build_threadsafe_function().build()?;
+        let tsfn = Arc::new(tsfn);
+        let node = self.node_arc_clone()?;
+        let op = operator.arc();
+        env.spawn_future(async move {
+            let mesh = mesh_over(node, None);
+            let approve = move |request: SdkJoinRequest| {
+                let tsfn = Arc::clone(&tsfn);
+                async move { ask_approver(&tsfn, request, budget).await }
+            };
+            let enroll = mesh
+                .serve_enrollment(op, ttl, depth, approve)
+                .map_err(enroll_err)?;
+            Ok(EnrollmentServeHandle {
+                inner: Mutex::new(Some((mesh, vec![enroll]))),
+            })
+        })
+    }
+
     /// Device-side renewal: refresh the grant carried by `enrollment` over
     /// the mesh, returning the verified **fresh** `root → device`
     /// `DelegationChain`. This node must be `start()`ed and built with
@@ -750,4 +801,33 @@ impl NetMesh {
             .map_err(enroll_err)?;
         Ok(DelegationChain::from_inner(renewed))
     }
+}
+
+type ApproverTsfn =
+    ThreadsafeFunction<JoinRequest, Either<Promise<bool>, bool>, JoinRequest, Status, false>;
+
+/// Ask the JS approver about one request. Fails closed: anything but an
+/// explicit `true` inside `budget` is a denial (which leaves the invite
+/// unburned, so the real device can still use it).
+async fn ask_approver(tsfn: &ApproverTsfn, request: SdkJoinRequest, budget: Duration) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Either<Promise<bool>, bool>>>();
+    let status = tsfn.call_with_return_value(
+        JoinRequest { inner: request },
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret, _env| {
+            let _ = tx.send(ret);
+            Ok(())
+        },
+    );
+    if status != Status::Ok {
+        return false;
+    }
+    let answer = async move {
+        match rx.await {
+            Ok(Ok(Either::B(admit))) => admit,
+            Ok(Ok(Either::A(promise))) => promise.await.unwrap_or(false),
+            _ => false,
+        }
+    };
+    tokio::time::timeout(budget, answer).await.unwrap_or(false)
 }

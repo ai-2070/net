@@ -669,6 +669,21 @@ class MeshNode:
         kwargs = _set_only(max_depth=max_depth)
         return self._native.serve_enrollment_auto(operator, grant_ttl_seconds, **kwargs)
 
+    def serve_enrollment(
+        self,
+        operator: Any,
+        approver: Any,
+        grant_ttl_seconds: int,
+        max_depth: Optional[int] = None,
+        approve_timeout_ms: Optional[int] = None,
+    ) -> Any:
+        """Operator side, approver-gated: each valid join request is passed
+        to ``approver(request)`` (sync or async) and admitted only on an
+        explicit ``True``; a denial does not burn the invite. Safer than
+        :meth:`serve_enrollment_auto`. Hold the returned handle."""
+        kwargs = _set_only(max_depth=max_depth, approve_timeout_ms=approve_timeout_ms)
+        return self._native.serve_enrollment(operator, approver, grant_ttl_seconds, **kwargs)
+
     def join(self, device: Any, invite: str, name: str, tags: List[str]) -> Any:
         """Device side: enroll ``device``'s key into the mesh the ``invite``
         names; returns the verified ``root -> device`` ``DelegationChain``."""

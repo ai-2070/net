@@ -1150,6 +1150,16 @@ export class MeshNode {
     return this.native.rendezvousString(...args);
   }
 
+  /**
+   * Operator side, approver-gated: each valid join request is passed to
+   * `approver` and admitted only on an explicit `true`; a denial, throw or
+   * timeout does not burn the invite. Safer than `serveEnrollmentAuto`.
+   * Serves enrollment only (no renewal). Hold the returned handle.
+   */
+  serveEnrollment(...args: Parameters<NapiNetMesh['serveEnrollment']>): ReturnType<NapiNetMesh['serveEnrollment']> {
+    return this.native.serveEnrollment(...args);
+  }
+
   /** Operator side: serve device enrollment (join + renew) on this node; the invite is the authorization. Hold the returned handle. */
   serveEnrollmentAuto(...args: Parameters<NapiNetMesh['serveEnrollmentAuto']>): ReturnType<NapiNetMesh['serveEnrollmentAuto']> {
     return this.native.serveEnrollmentAuto(...args);

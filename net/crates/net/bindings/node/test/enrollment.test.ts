@@ -277,6 +277,51 @@ describe.skipIf(!HAS_ENROLLMENT)('enrollment', () => {
     }
   })
 
+  // SDK audit 2026-10-11: the approver-gated mode existed only in Rust. A
+  // denial refuses WITHOUT burning the invite; the same invite then admits.
+  it.each([
+    ['sync', (admit: () => boolean) => () => admit()],
+    ['async', (admit: () => boolean) => async () => admit()],
+  ])('gates enrollment on a %s approver', async (_kind, make) => {
+    const root = Identity.generate()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const meshes: any[] = []
+    const mesh = async () => {
+      const m = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
+      meshes.push(m)
+      await m.start()
+      return m
+    }
+    try {
+      const opMesh = await mesh()
+      const { op } = operator(root)
+      let yes = false
+      let asked = 0
+      const handle = await opMesh.serveEnrollment(
+        op,
+        make(() => {
+          asked += 1
+          return yes
+        }),
+        3600,
+      )
+      const invite = op.invite(opMesh.rendezvousString(), 300).encode()
+      const device = Identity.generate()
+
+      await expect((await mesh()).join(device, invite, 'pc')).rejects.toThrow()
+      expect(asked).toBe(1)
+      expect((await op.devices()).length).toBe(0)
+
+      yes = true // a fresh node: the first holds a session with the operator
+      const chain = await (await mesh()).join(device, invite, 'pc')
+      expect(chain.leaf.equals(device.entityId)).toBe(true)
+      expect(asked).toBe(2)
+      handle.stop()
+    } finally {
+      for (const m of meshes.reverse()) await m.shutdown().catch(() => {})
+    }
+  })
+
   it('renews a grant over the mesh into a fresh chain', async () => {
     // A device joins, then renews its grant over the wire into a fresh one —
     // silent auto-renewal, no re-pairing.
