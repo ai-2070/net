@@ -27678,6 +27678,17 @@ impl MeshNode {
                 sdp: sdp.clone(),
             },
         )?;
+        // Releases THIS call's take if the future is dropped before a
+        // terminal outcome names an owner for it (an HTTP request deadline
+        // drops the handler mid-ICE). Disarmed on every outcome below, each
+        // of which hands the reservation to its owner or releases it itself
+        // (cubic review of PR #1228).
+        let mut take_guard = BootstrapOfferTakeGuard {
+            node: self,
+            admitted: Some(admitted),
+            budget_key,
+            dialog,
+        };
         let outcome = {
             let mut table = self.rtc_dialogs.lock().await;
             super::rtc::handle_signal(
@@ -27689,6 +27700,10 @@ impl MeshNode {
             )
             .await
         };
+        let admitted = take_guard
+            .admitted
+            .take()
+            .expect("the take guard is disarmed only here");
         match outcome {
             super::rtc::SignalOutcome::Answer {
                 dialog, sdp, peer, ..
@@ -66314,5 +66329,26 @@ mod component_reclaim_tests {
             alive(&wa),
             alive(&wb)
         );
+    }
+}
+
+/// Releases a bootstrap offer's signal-budget take if
+/// [`MeshNode::accept_bootstrap_offer_keyed`] is dropped before an outcome
+/// names an owner for it. Disarmed by taking `admitted`.
+#[cfg(feature = "webrtc")]
+struct BootstrapOfferTakeGuard<'a> {
+    node: &'a MeshNode,
+    admitted: Option<super::rtc::SignalAdmit>,
+    budget_key: u64,
+    dialog: u64,
+}
+
+#[cfg(feature = "webrtc")]
+impl Drop for BootstrapOfferTakeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(admitted) = self.admitted.take() {
+            self.node
+                .release_bootstrap_offer_take(admitted, self.budget_key, self.dialog);
+        }
     }
 }

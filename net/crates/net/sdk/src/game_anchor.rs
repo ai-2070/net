@@ -585,10 +585,14 @@ impl GameRegistry {
             }
         }
         let created = self.create_open(origin, game, open.config.issue_per_minute, now);
-        // A full rewrite under the state lock, never an append: the
-        // snapshot taken inside the lock includes this game and any
-        // concurrent one.
-        self.write_state();
+        // One appended line, not a full rewrite: rewriting the whole
+        // registry on every admission wrote quadratic data while filling
+        // the capacity (cubic review of PR #1228). Reclamation still
+        // rewrites (compacts) the file. Both run under the state lock, and
+        // a rewrite snapshots the games inside it, so a game is never lost
+        // between the two; a duplicate line (two racing admissions of one
+        // game) is skipped on load.
+        self.append_state(origin, game);
         Ok(created)
     }
 
@@ -622,6 +626,28 @@ impl GameRegistry {
             }
         }
         self.write_state();
+    }
+
+    /// Append one open game to the state file.
+    fn append_state(&self, origin: &str, game: &str) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let Some(path) = &open.config.state_file else {
+            return;
+        };
+        let _serialized = open.state_lock.lock();
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(format!("{origin} {game}\n").as_bytes())
+            });
+        if written.is_err() {
+            open.state_write_errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Rewrite the state file with exactly the open games held now.
@@ -1665,6 +1691,42 @@ mod tests {
             DEFAULT_GRANT_TTL,
             NOW + 60
         )));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// cubic review of PR #1228: every admission rewrote the whole
+    /// registry, so filling the capacity wrote quadratic data. An admission
+    /// now appends its one line; a re-issue for a held game writes nothing.
+    #[test]
+    fn an_admission_appends_one_line() {
+        let path = scratch_file("append");
+        let issuer = Identity::generate();
+        let games = open_registry(OpenGames::new(Some(path.clone())));
+        let lines = || {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let base = lines().len();
+        for game in ["chess", "go", "shogi"] {
+            games
+                .issue_open_credential_at(SITE_A, game, &issuer, &params(), NOW)
+                .unwrap();
+        }
+        let after = lines();
+        assert_eq!(after.len(), base + 3, "{after:?}");
+        assert!(after.ends_with(&[
+            format!("{SITE_A} chess"),
+            format!("{SITE_A} go"),
+            format!("{SITE_A} shogi"),
+        ]));
+        // A held game is not appended again.
+        games
+            .issue_open_credential_at(SITE_A, "chess", &issuer, &params(), NOW)
+            .unwrap();
+        assert_eq!(lines().len(), base + 3);
         let _ = std::fs::remove_file(&path);
     }
 

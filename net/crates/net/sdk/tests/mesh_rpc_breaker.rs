@@ -471,3 +471,53 @@ async fn a_stray_closed_call_does_not_disturb_half_open() {
     probe.await.unwrap().expect("probe succeeds");
     assert_eq!(breaker.state(), BreakerState::Closed);
 }
+
+/// cubic review of PR #1228: the state check alone missed a full
+/// Open -> HalfOpen -> Closed cycle. A slow failure admitted in the FIRST
+/// Closed period, finishing after the breaker closed again, counted in the
+/// new period and (threshold 1) re-tripped the breaker it had just closed.
+#[tokio::test]
+async fn a_stray_from_an_earlier_closed_period_does_not_retrip() {
+    let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        reset_after: Duration::from_millis(50),
+        ..CircuitBreakerConfig::default()
+    }));
+
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let stray = {
+        let breaker = Arc::clone(&breaker);
+        tokio::spawn(async move {
+            breaker
+                .call(|| async move {
+                    let _ = release_rx.await;
+                    Err::<(), _>(RpcError::Timeout { elapsed_ms: 1 })
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Trip, cool down, probe successfully: Closed again.
+    let _ = breaker
+        .call(|| async { Err::<(), _>(RpcError::Timeout { elapsed_ms: 1 }) })
+        .await;
+    assert_eq!(breaker.state(), BreakerState::Open);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    breaker
+        .call(|| async { Ok::<(), RpcError>(()) })
+        .await
+        .expect("probe succeeds");
+    assert_eq!(breaker.state(), BreakerState::Closed);
+
+    // The stray from the first Closed period finishes now.
+    let _ = release_tx.send(());
+    let _ = stray.await.unwrap();
+    assert_eq!(
+        breaker.state(),
+        BreakerState::Closed,
+        "a failure admitted before the cycle must not count in the new Closed period"
+    );
+    assert_eq!(breaker.consecutive_failures(), 0);
+}

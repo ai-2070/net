@@ -687,6 +687,12 @@ struct Attempt {
     socket: u64,
     /// When the token was minted — for [`Attempts::prune`].
     minted: std::time::Instant,
+    /// True from mint until the core has finished accepting the offer.
+    /// [`Attempts::prune`] never drops an accepting token: an acceptance
+    /// that ran past [`ATTEMPT_PRUNE_GRACE`] (a long ICE deadline) had its
+    /// token pruned by a concurrent offer before the core registered the
+    /// attempt (cubic review of PR #1228).
+    accepting: bool,
 }
 
 /// How long a minted attempt token survives without a live core attempt
@@ -754,9 +760,18 @@ impl Attempts {
                 budget_id,
                 socket: 0,
                 minted: std::time::Instant::now(),
+                accepting: true,
             },
         );
         Some((token, budget_id))
+    }
+
+    /// The core accepted the offer: the token is now prunable once its
+    /// attempt is no longer live.
+    fn accepted(&self, token: &str) {
+        if let Some(a) = self.by_token.lock().get_mut(token) {
+            a.accepting = false;
+        }
     }
 
     /// Drop tokens whose core attempt is gone (expired, rejected or
@@ -766,9 +781,9 @@ impl Attempts {
     /// life of the process (SDK audit 2026-10-11).
     fn prune(&self, is_live: impl Fn(&Attempt) -> bool) {
         let now = std::time::Instant::now();
-        self.by_token
-            .lock()
-            .retain(|_, a| now.duration_since(a.minted) < ATTEMPT_PRUNE_GRACE || is_live(a));
+        self.by_token.lock().retain(|_, a| {
+            a.accepting || now.duration_since(a.minted) < ATTEMPT_PRUNE_GRACE || is_live(a)
+        });
     }
 
     /// Whether socket generation `socket` still owns `token`'s attempt.
@@ -1949,12 +1964,22 @@ async fn post_offer(
             "the anchor could not mint an attempt token",
         );
     };
-    match state
+    // Retires the token if this handler is dropped mid-acceptance (the
+    // request deadline in `bounded_request` drops it): an accepting token
+    // is exempt from pruning, so without this it would never go (cubic
+    // review of PR #1228).
+    let mut minted = RetireTokenOnDrop {
+        attempts: Arc::clone(&state.attempts),
+        token: Some(attempt_token.clone()),
+    };
+    let accepted = state
         .node
         .accept_bootstrap_offer_keyed(budget_id, node_id, dialog, request.sdp)
-        .await
-    {
+        .await;
+    minted.token = None;
+    match accepted {
         Ok(sdp) => {
+            state.attempts.accepted(&attempt_token);
             let candidate = state.node.bootstrap_host_candidate().unwrap_or_default();
             tracing::debug!(
                 dialog,
@@ -1987,6 +2012,20 @@ async fn post_offer(
             } else {
                 refuse(BootstrapRefusal::OfferRefused, message)
             }
+        }
+    }
+}
+
+/// Retires a minted attempt token when dropped while still armed.
+struct RetireTokenOnDrop {
+    attempts: Arc<Attempts>,
+    token: Option<String>,
+}
+
+impl Drop for RetireTokenOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.attempts.retire(&token);
         }
     }
 }
@@ -2254,6 +2293,7 @@ mod attempt_prune_tests {
             budget_id: dialog,
             socket: 0,
             minted: Instant::now() - age,
+            accepting: false,
         }
     }
 
@@ -2276,6 +2316,41 @@ mod attempt_prune_tests {
         assert!(!map.contains_key("dead-old"));
         assert!(map.contains_key("live-old"));
         assert!(map.contains_key("dead-fresh"));
+    }
+
+    /// cubic review of PR #1228: an offer still being accepted is not live
+    /// in the core yet; past the grace window a concurrent offer's prune
+    /// dropped its token before the acceptance finished.
+    #[test]
+    fn an_accepting_token_is_never_pruned() {
+        let attempts = Attempts::default();
+        let old = ATTEMPT_PRUNE_GRACE + Duration::from_secs(1);
+        {
+            let mut map = attempts.by_token.lock();
+            let mut accepting = attempt(4, old);
+            accepting.accepting = true;
+            map.insert("accepting-old".into(), accepting);
+        }
+        attempts.prune(|_| false);
+        assert!(attempts.by_token.lock().contains_key("accepting-old"));
+        attempts.accepted("accepting-old");
+        attempts.prune(|_| false);
+        assert!(!attempts.by_token.lock().contains_key("accepting-old"));
+    }
+
+    /// The drop guard retires the token of an acceptance that never
+    /// finished (the request deadline dropped the handler).
+    #[test]
+    fn a_dropped_acceptance_retires_its_token() {
+        let attempts = std::sync::Arc::new(Attempts::default());
+        let (token, _) = attempts.mint(1, 7, 7).expect("mint");
+        {
+            let _guard = super::RetireTokenOnDrop {
+                attempts: std::sync::Arc::clone(&attempts),
+                token: Some(token.clone()),
+            };
+        }
+        assert!(!attempts.by_token.lock().contains_key(&token));
     }
 }
 

@@ -301,7 +301,10 @@ ForkGroup (parent: 0xAAAA, fork_seq: 100)
 
 For stateful daemons that need fault tolerance without duplicate compute, `StandbyGroup` implements active-passive replication. One member processes events. The others hold readiness to promote. No duplicate event processing — standbys consume memory but zero compute.
 
-**The active processes, standbys wait.** Events route exclusively to the active via `active_origin()`. Each delivery to the active is buffered for replay on promotion automatically (the group installs a post-delivery observer on the active origin and re-points it on promote); do not also call `on_event_delivered()`, which is a test hook — the buffer does not dedup, so a manual call replays each event twice. Standbys are registered in the `DaemonRegistry` with their own identity but receive no events.
+**The active processes, standbys wait.** Events route exclusively to the active via `active_origin()`. Standbys are registered in the `DaemonRegistry` with their own identity but receive no events. Who feeds the replay buffer depends on the layer:
+
+- **SDK `StandbyGroup` (`net_sdk::groups`).** Each successful `DaemonRuntime::deliver()` to the active is buffered automatically: the group installs a post-delivery observer on the active origin and re-points it on promote. Do not also call `on_event_delivered()` — the buffer does not dedup, so a manual call replays each event twice.
+- **Core `StandbyGroup`.** `DaemonRegistry::deliver()` installs no delivery observer, so a caller using the core group directly must call `on_event_delivered()` after each successful delivery to the active. Omitting it leaves the buffer empty and loses the gap on promotion.
 
 **Sync is snapshot-based.** `sync_standbys()` snapshots the active daemon, records `synced_through` for each standby, and clears the event buffer. The protocol tracks the sequence each standby is synced to. Persistence of snapshot bytes to disk is an application concern — the protocol provides the bytes and the bookkeeping.
 

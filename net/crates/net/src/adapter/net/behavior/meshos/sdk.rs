@@ -794,11 +794,20 @@ impl MeshOsDaemonSdk {
 
     /// Drive a clean shutdown of the wrapped runtime.
     pub async fn shutdown(self) -> Result<RuntimeStats, RuntimeShutdownError> {
-        let result = self.runtime.shutdown().await;
-        // After the runtime's own shutdown, so any final daemon-targeted
-        // control it dispatches is still delivered.
-        self.router.close();
-        result
+        /// Closes the router when dropped — after the runtime's own
+        /// shutdown on the normal path (so any final daemon-targeted
+        /// control it dispatches is still delivered), and also when this
+        /// future is dropped mid-await: a cancelled shutdown used to skip
+        /// the close, leaving parked `next_control` calls blocked on a
+        /// sender map nothing would ever clear (cubic review of PR #1228).
+        struct CloseRouterOnDrop(DaemonControlRouter);
+        impl Drop for CloseRouterOnDrop {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close = CloseRouterOnDrop(self.router.clone());
+        self.runtime.shutdown().await
     }
 
     /// Read `MeshOsConfig::this_node` off the runtime. Sourced
@@ -928,6 +937,32 @@ mod tests {
     // SDK audit 2026-10-11: handles held router clones that kept every
     // sender alive, so a daemon parked on `next_control` never learned
     // the runtime had shut down.
+    // cubic review of PR #1228: dropping the shutdown future before it
+    // completed skipped `router.close()`, so a daemon parked on
+    // `next_control` stayed blocked.
+    #[tokio::test]
+    async fn a_cancelled_sdk_shutdown_still_closes_the_control_channels() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = MeshOsDaemonSdk::start(fast_config(), dispatcher);
+        let (daemon, _counter) = NoopDaemon::new("parked");
+        let mut handle = sdk
+            .register_daemon(Box::new(daemon), EntityKeypair::generate())
+            .unwrap();
+        let parked = tokio::spawn(async move { handle.next_control().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Poll the shutdown once, then drop it mid-await.
+        {
+            let shutdown = sdk.shutdown();
+            tokio::pin!(shutdown);
+            let _ = futures::poll!(shutdown.as_mut());
+        }
+        let ev = tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .expect("next_control must return once the shutdown future is dropped")
+            .unwrap();
+        assert!(ev.is_none());
+    }
+
     #[tokio::test]
     async fn sdk_shutdown_closes_every_daemon_control_channel() {
         let dispatcher = Arc::new(LoggingDispatcher::new());
