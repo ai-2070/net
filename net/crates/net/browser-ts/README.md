@@ -583,6 +583,15 @@ are the *same* player — and a player can't join itself. (Without it, every tab
 player.) To test with two players on one machine, use two browser profiles, or
 two different browsers.
 
+**Two tabs with one remembered identity run two nodes as the same node id at
+the same time.** `connect()` takes no cross-tab lock (unlike `openSession()`,
+which elects one node per origin), and two live sessions under one identity
+evict each other at the anchor, so stores and lobbies in both tabs flap. If
+players may open a second tab, detect it yourself — e.g. hold
+`navigator.locks.request('my-game-player', { ifAvailable: true }, …)` for the
+page's lifetime and tell the second tab to close — or run the page through
+`openSession()`.
+
 **Announcements expire.** A host that announces once disappears from searches
 a few seconds later. Keep re-announcing on a timer, as in step 3a.
 

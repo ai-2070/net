@@ -781,9 +781,22 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     },
     reconnect: async () => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
-      // The old stream belongs to the lost session.
+      // The old stream belongs to the lost session: CLOSE it, never just
+      // drop it — a dropped LeafStream stays registered with the node and
+      // its wasm listener, so every reconnect leaked one (SDK audit
+      // 2026-10-11). An open still in flight is left alone: nulling it
+      // let it resolve later and overwrite the new stream (orphaning one
+      // of the two), and if it belongs to the lost session `send`
+      // already reopens on its stale-stream refusal.
+      const old = upstream;
       upstream = null;
-      opening = null;
+      if (old !== null) {
+        try {
+          old.close();
+        } catch {
+          // Already gone with its session.
+        }
+      }
       let requests: readonly Request[];
       try {
         requests = replica.reconnect();

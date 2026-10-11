@@ -17,7 +17,13 @@
 import { describe, expect, it } from 'vitest';
 
 import { Assembly, AssemblyTable, type AssemblyManifest } from '../../src/store/assembly.js';
-import { StoreOwner, MAX_HANDLES, HANDLE_LEASE_MS, type Outbound } from '../../src/store/owner.js';
+import {
+  StoreOwner,
+  MAX_HANDLES,
+  MAX_HANDLES_PER_PEER,
+  HANDLE_LEASE_MS,
+  type Outbound,
+} from '../../src/store/owner.js';
 import type { AccessRequest } from '../../src/store/types.js';
 import { decimalValue, decodeMessage, encodeMessage, type Hex } from '../../src/store/wire.js';
 
@@ -321,14 +327,29 @@ describe('a handle stays bound to its authenticated peer', () => {
 describe('bounds and the lease', () => {
   it('refuses a join past the handle bound', () => {
     const r = rig();
+    // Distinct peers: one peer alone is capped well below the table size.
+    const peer = (i: number) => (i + 0x1000).toString(16).padStart(16, '0');
     for (let i = 0; i < MAX_HANDLES; i += 1) {
-      expect(r.owner.receive(joinFrame(['crew']), PEER_A).refused).toBeNull();
+      expect(r.owner.receive(joinFrame(['crew']), peer(i % 64)).refused).toBeNull();
     }
     expect(r.owner.handleCount).toBe(MAX_HANDLES);
 
+    const outcome = r.owner.receive(joinFrame(['crew']), peer(200));
+    expect(outcome.refused).toBe('join-capacity');
+    expect(refusalCode(outcome.out)).toBe('capacity');
+  });
+
+  // SDK audit 2026-10-11: one authenticated peer could take all
+  // MAX_HANDLES and lock every other player out.
+  it('caps the handles one peer may hold, leaving room for everyone else', () => {
+    const r = rig();
+    for (let i = 0; i < MAX_HANDLES_PER_PEER; i += 1) {
+      expect(r.owner.receive(joinFrame(['crew']), PEER_A).refused).toBeNull();
+    }
     const outcome = r.owner.receive(joinFrame(['crew']), PEER_A);
     expect(outcome.refused).toBe('join-capacity');
     expect(refusalCode(outcome.out)).toBe('capacity');
+    expect(r.owner.receive(joinFrame(['crew']), PEER_B).refused).toBeNull();
   });
 
   it('expires a handle on its lease, and a later message is closed', () => {

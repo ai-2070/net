@@ -74,6 +74,16 @@ export const MAX_PENDING_ACTIONS = 32;
 /** Handles one owner will hold (brief §2). */
 export const MAX_HANDLES = 256;
 
+/**
+ * Handles one authenticated peer may hold at once. Room for siblings and
+ * for a reconnect that overlaps its predecessor's lease, but never the
+ * whole table: one peer could otherwise take all {@link MAX_HANDLES} and
+ * lock every other player out — the lobby's capacity rule counts distinct
+ * peers, so a seated player's repeat joins bypassed it (SDK audit
+ * 2026-10-11).
+ */
+export const MAX_HANDLES_PER_PEER = 16;
+
 /** How long a handle lives without an accepted authenticated message. */
 export const HANDLE_LEASE_MS = 60_000;
 
@@ -1482,6 +1492,11 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       return this.refuse('join-wrong-version', [this.no(peer, null, 'version-mismatch', message.q)]);
     }
     if (this.handles.size >= MAX_HANDLES) {
+      return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);
+    }
+    let held = 0;
+    for (const existing of this.handles.values()) if (existing.peer === peer) held += 1;
+    if (held >= MAX_HANDLES_PER_PEER) {
       return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
 

@@ -591,6 +591,43 @@ impl Lifecycle {
     /// that behaves differently depending on which tab you opened
     /// first.
     pub async fn request(&self, request: LeaderRequest) -> ProxyOutcome {
+        // Read before the request is moved: a follower arms its own
+        // clock over the caller's deadline.
+        //
+        // Over the **default** as well as an explicit one, which is
+        // L4: `session.call(service, bytes)` passes `None`, the node
+        // reads that as [`DEFAULT_CALL_TIMEOUT_MS`] — and applies it
+        // only once the leader gets round to executing the request.
+        // A leader frozen while holding its lock executes nothing, so
+        // an ordinary call with no timeout had no deadline anywhere:
+        // the caller's promise waited out the whole suspension. The
+        // default is therefore armed here too, with the same
+        // disposition an explicit one gets — `Indeterminate`, never a
+        // retry, because a deadline on this tab cannot cancel work
+        // that may already have been admitted on another.
+        //
+        // An org call opens the same way (SDK audit 2026-10-11: only
+        // `Call` was armed, so a frozen leader hung `callOrg` forever
+        // and the documented `OrgIndeterminateError` never fired). Its
+        // stream legs are bounded by [`ProxyOrgCall`], which carries
+        // the call's absolute deadline.
+        let deadline = match &request {
+            LeaderRequest::Call { timeout_ms, .. } => Some(
+                timeout_ms.unwrap_or(u32::try_from(DEFAULT_CALL_TIMEOUT_MS).unwrap_or(u32::MAX)),
+            ),
+            LeaderRequest::OrgCall { timeout_ms, .. } => Some(timeout_ms.unwrap_or(u32::MAX)),
+            _ => None,
+        };
+        self.request_with_deadline(request, deadline).await
+    }
+
+    /// [`Self::request`] with an explicit follower-side deadline (ms);
+    /// `None` arms none.
+    pub(crate) async fn request_with_deadline(
+        &self,
+        request: LeaderRequest,
+        deadline: Option<u32>,
+    ) -> ProxyOutcome {
         if self.shared.state.borrow().closed {
             return Err(ProxyFailure::Typed(LeafError::Session(
                 "the session is closed".into(),
@@ -610,27 +647,6 @@ impl Lifecycle {
                 current: Some(supersession.current),
             }));
         }
-        // Read before the request is moved: a follower arms its own
-        // clock over the caller's deadline.
-        //
-        // Over the **default** as well as an explicit one, which is
-        // L4: `session.call(service, bytes)` passes `None`, the node
-        // reads that as [`DEFAULT_CALL_TIMEOUT_MS`] — and applies it
-        // only once the leader gets round to executing the request.
-        // A leader frozen while holding its lock executes nothing, so
-        // an ordinary call with no timeout had no deadline anywhere:
-        // the caller's promise waited out the whole suspension. The
-        // default is therefore armed here too, with the same
-        // disposition an explicit one gets — `Indeterminate`, never a
-        // retry, because a deadline on this tab cannot cancel work
-        // that may already have been admitted on another.
-        let deadline = match &request {
-            LeaderRequest::Call { timeout_ms, .. } => Some(
-                timeout_ms.unwrap_or(u32::try_from(DEFAULT_CALL_TIMEOUT_MS).unwrap_or(u32::MAX)),
-            ),
-            _ => None,
-        };
-
         let receiver = {
             let mut server = self.shared.server.borrow_mut();
             if let Some(server) = server.as_mut() {
@@ -3617,16 +3633,22 @@ pub(crate) struct ProxyOrgCall {
     call: u64,
     /// The generation this call opened under.
     generation: u64,
+    /// The call's absolute deadline on this tab's clock (`now_ms()`
+    /// scale), when it has one. Every leg — pull, send, finish — is
+    /// armed with the time left, so a leader frozen mid-call yields
+    /// `Indeterminate` instead of parking the stream forever.
+    deadline_at_ms: Option<f64>,
 }
 
 impl ProxyOrgCall {
     /// The retained handle for one proxied org call.
-    pub(crate) fn new(lifecycle: Lifecycle, call: u64) -> Self {
+    pub(crate) fn new(lifecycle: Lifecycle, call: u64, timeout_ms: Option<u32>) -> Self {
         let generation = lifecycle.generation();
         Self {
             lifecycle,
             call,
             generation,
+            deadline_at_ms: timeout_ms.map(|ms| now_ms() + f64::from(ms)),
         }
     }
 
@@ -3647,7 +3669,17 @@ impl ProxyOrgCall {
     /// One proxied operation for this call.
     async fn pull(&self, request: LeaderRequest) -> core::result::Result<ProxyOutcome, JsError> {
         self.still_ours().map_err(js)?;
-        Ok(self.lifecycle.request(request).await)
+        // At least 1 ms: an already-elapsed deadline still expires
+        // through the timer, typed, rather than being skipped.
+        let left = self.deadline_at_ms.map(|at| {
+            let ms = (at - now_ms()).max(1.0);
+            if ms >= f64::from(u32::MAX) {
+                u32::MAX
+            } else {
+                ms as u32
+            }
+        });
+        Ok(self.lifecycle.request_with_deadline(request, left).await)
     }
 
     /// The next response item (long-pull: the leader holds the pull
@@ -4278,9 +4310,13 @@ impl MeshSession {
         request: LeaderRequest,
         call: u64,
     ) -> Result<T, JsError> {
+        let timeout_ms = match &request {
+            LeaderRequest::OrgCall { timeout_ms, .. } => *timeout_ms,
+            _ => None,
+        };
         match self.lifecycle.request(request).await {
             Ok(ProxyValue::Bytes(_)) => {
-                let proxy = ProxyOrgCall::new(self.lifecycle.clone(), call);
+                let proxy = ProxyOrgCall::new(self.lifecycle.clone(), call, timeout_ms);
                 Ok(T::wrap(Rc::new(crate::wasm::OrgCall::proxied(proxy))))
             }
             Ok(_) => Err(JsError::new("org_call answered an unexpected value")),
