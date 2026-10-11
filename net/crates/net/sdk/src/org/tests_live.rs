@@ -62,11 +62,10 @@ async fn bring_up_all(callers: &[&Mesh], provider: &Mesh) {
         let p_clone = provider.node().clone();
         let caller_id = caller.node_id();
         let accept = tokio::spawn(async move { p_clone.accept(caller_id).await });
-        caller
+        let connected = caller
             .connect(&provider_addr, &provider_pub, provider.node_id())
-            .await
-            .expect("connect");
-        accept.await.expect("accept task").expect("accept");
+            .await;
+        settle_handshake(connected, accept).await;
     }
     provider.start();
     for caller in callers {
@@ -93,6 +92,29 @@ async fn bring_up_all(callers: &[&Mesh], provider: &Mesh) {
     panic!("entity pins were not established in both directions for every caller");
 }
 
+/// Resolve one connect/accept pair, failing with BOTH sides' errors.
+///
+/// A rare CI flake had `connect` time out (the whole ~15 s budget) on
+/// loopback; panicking on the connect error alone threw away the responder's
+/// own diagnosis — its error names a paced source or the last rejected
+/// datagram — so the flake could not be told apart from a lost packet.
+async fn settle_handshake<T: std::fmt::Debug>(
+    connected: Result<T, crate::error::SdkError>,
+    accept: tokio::task::JoinHandle<Result<(std::net::SocketAddr, u64), net::error::AdapterError>>,
+) {
+    match connected {
+        Ok(_) => {
+            accept.await.expect("accept task").expect("accept");
+        }
+        Err(connect_err) => {
+            // The responder gives up within its own budget; wait a little
+            // past it for its diagnosis rather than aborting it.
+            let accepted = tokio::time::timeout(Duration::from_secs(20), accept).await;
+            panic!("connect: {connect_err:?}; accept side: {accepted:?}");
+        }
+    }
+}
+
 /// Handshake two meshes and wait for both entity pins — protected RPC is
 /// direct-session-only, so the pins ARE the precondition.
 async fn bring_up(caller: &Mesh, provider: &Mesh) {
@@ -102,15 +124,14 @@ async fn bring_up(caller: &Mesh, provider: &Mesh) {
     let p = provider.node();
     let p_clone = p.clone();
     let accept = tokio::spawn(async move { p_clone.accept(caller_id).await });
-    caller
+    let connected = caller
         .connect(
             &provider_addr.to_string(),
             &provider_pub,
             provider.node_id(),
         )
-        .await
-        .expect("connect");
-    accept.await.expect("accept task").expect("accept");
+        .await;
+    settle_handshake(connected, accept).await;
     caller.start();
     provider.start();
 
