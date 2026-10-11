@@ -55,5 +55,9 @@ Repository = "https://github.com/ai-2070/net"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Ship the PEP 561 marker so type checkers read the SDK's annotations.
+[tool.setuptools.package-data]
+net_sdk = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

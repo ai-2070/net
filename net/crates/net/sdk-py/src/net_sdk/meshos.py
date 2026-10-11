@@ -503,7 +503,9 @@ class MeshOsDaemonHandleWrapper:
 
     def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
         try:
-            self._raw.graceful_shutdown(grace_ms=None)
+            # Under the borrow lock like every other mutating call.
+            with self._borrow_lock:
+                self._raw.graceful_shutdown(grace_ms=None)
         except MeshOsSdkError as e:
             if getattr(e, "kind", None) != "already_shutdown":
                 raise

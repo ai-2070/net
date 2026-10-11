@@ -7,8 +7,25 @@ from typing import Any, Callable, Generic, Iterator, Optional, TypeVar, overload
 
 from net import Net, IngestResult, StoredEvent, PollResponse, Stats
 
-from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
-from net_sdk.channel import TypedChannel
+from net_sdk.stream import (
+    DEFAULT_MAX_BACKOFF,
+    DEFAULT_POLL_INTERVAL,
+    EventStream,
+    SubscribeOpts,
+    TypedEventStream,
+)
+from net_sdk.channel import _JSON_SCALARS, TypedChannel, _to_dict
+
+
+def _emit_payload(event: Any) -> Any:
+    """The JSON value ``emit`` sends for ``event``. Scalars and lists go as
+    themselves; everything else through the channel serializer, so a
+    slotted or nested dataclass works here as it does on
+    ``TypedChannel.publish`` (the old duck-typed ``__dict__`` chain failed on
+    both — SDK audit 2026-10-11)."""
+    if isinstance(event, _JSON_SCALARS) or isinstance(event, (list, tuple)):
+        return list(event) if isinstance(event, tuple) else event
+    return _to_dict(event)
 from net_sdk.types import Receipt
 
 __all__ = ["NetNode", "Receipt"]
@@ -124,12 +141,7 @@ class NetNode:
         Returns:
             Receipt with shard_id and timestamp.
         """
-        if hasattr(event, "model_dump"):
-            data = event.model_dump()
-        elif hasattr(event, "__dict__") and not isinstance(event, dict):
-            data = event.__dict__
-        else:
-            data = event
+        data = _emit_payload(event)
         result = self._bus.ingest(data) if isinstance(data, dict) else self._bus.ingest_raw(json.dumps(data))
         return Receipt(shard_id=result.shard_id, timestamp=result.timestamp)
 
@@ -158,14 +170,7 @@ class NetNode:
         """
         payloads: list[str] = []
         for event in events:
-            if hasattr(event, "model_dump"):
-                payloads.append(json.dumps(event.model_dump()))
-            elif isinstance(event, dict):
-                payloads.append(json.dumps(event))
-            elif hasattr(event, "__dict__"):
-                payloads.append(json.dumps(event.__dict__))
-            else:
-                payloads.append(json.dumps(event))
+            payloads.append(json.dumps(_emit_payload(event)))
         return self._bus.ingest_raw_batch(payloads)
 
     def emit_raw_batch(self, json_strs: list[str]) -> int:
@@ -203,8 +208,8 @@ class NetNode:
         filter: Optional[str] = None,
         ordering: Optional[str] = None,
         timeout: Optional[float] = None,
-        poll_interval: float = 0.001,
-        max_backoff: float = 0.1,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+        max_backoff: float = DEFAULT_MAX_BACKOFF,
     ) -> EventStream:
         """
         Subscribe to a stream of events (generator).

@@ -91,8 +91,19 @@ def _native_mesh(mesh: Any) -> Any:
     A :class:`net_sdk.mesh.MeshNode` is unwrapped to its private native
     handle HERE — this facade exists so application code never names
     ``_native`` — and anything else (the raw wheel mesh) passes through.
+
+    An :class:`net_sdk.mesh.AsyncMeshNode` unwraps to its sync node's native
+    handle, as payments and compute already do; it used to pass through as
+    the ``AsyncNetMesh`` the native verbs cannot extract (SDK audit
+    2026-10-11).
     """
-    return getattr(mesh, "_native", mesh)
+    from net_sdk.mesh import AsyncMeshNode, MeshNode
+
+    if isinstance(mesh, MeshNode):
+        return mesh._native
+    if isinstance(mesh, AsyncMeshNode):
+        return mesh.sync._native
+    return mesh
 
 
 class OrgClient:

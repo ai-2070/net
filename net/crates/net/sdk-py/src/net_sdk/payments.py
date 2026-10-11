@@ -128,6 +128,9 @@ def _native_org_client(org: Any) -> Optional[Any]:
         )
     if isinstance(org, _org.OrgClient):
         return org.raw
+    if isinstance(org, _org.TypedOrgClient):
+        # facade -> wheel typed wrapper -> native client (SDK audit 2026-10-11)
+        return org.raw.raw
     return org
 
 
