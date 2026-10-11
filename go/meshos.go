@@ -425,6 +425,10 @@ func (s *MeshOsDaemonSdk) acquire() (*C.NetMeshOsSdk, func()) {
 // LoggingDispatcher. Returns a handle the caller must Shutdown (or
 // rely on the finalizer to free).
 func StartMeshOsDaemonSdk(cfg MeshOsConfig) (*MeshOsDaemonSdk, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var raw *C.NetMeshOsSdk
 	status := C.net_meshos_sdk_start(
 		C.uint64_t(cfg.ThisNode),
@@ -458,6 +462,10 @@ func (s *MeshOsDaemonSdk) DroppedControlEvents() uint64 {
 // seed. The substrate uses an internal no-op daemon — user-supplied
 // dispatch lands via RegisterDaemonWithCallbacks.
 func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemonHandle, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	if s == nil {
 		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
 	}
@@ -492,6 +500,10 @@ func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemo
 // Shutdown drives a clean shutdown. Consumes the SDK — subsequent ops
 // return ErrMeshOsAlreadyShutdown.
 func (s *MeshOsDaemonSdk) Shutdown() error {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	ptr, release := s.acquire()
 	defer release()
 	if ptr == nil {
@@ -612,6 +624,10 @@ func (h *MeshOsDaemonHandle) DaemonName() string {
 // TryNextControl returns the next control event without blocking, or
 // ControlNone if empty.
 func (h *MeshOsDaemonHandle) TryNextControl() (MeshOsDaemonControl, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var out C.NetMeshOsDaemonControl
 	var status C.int
 	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
@@ -628,6 +644,10 @@ func (h *MeshOsDaemonHandle) TryNextControl() (MeshOsDaemonControl, error) {
 // NextControl blocks until the next control event, the runtime shuts
 // down, or timeoutMs elapses. Pass 0 for unbounded wait.
 func (h *MeshOsDaemonHandle) NextControl(timeoutMs uint64) (MeshOsDaemonControl, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var out C.NetMeshOsDaemonControl
 	var status C.int
 	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
@@ -645,6 +665,10 @@ func (h *MeshOsDaemonHandle) NextControl(timeoutMs uint64) (MeshOsDaemonControl,
 // Non-blocking — surfaces MeshOsSdkError(kind: "queue_full" |
 // "loop_closed") when the substrate's log ring is saturated.
 func (h *MeshOsDaemonHandle) PublishLog(level MeshOsLogLevel, message string) error {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var msgPtr *C.char
 	var msgLen C.size_t
 	// Hoist msgBytes to function scope: msgPtr aliases its backing array
@@ -671,6 +695,10 @@ func (h *MeshOsDaemonHandle) PublishLog(level MeshOsLogLevel, message string) er
 // then unregisters. Pass 0 for the substrate default (5 seconds).
 // Consumes the inner handle.
 func (h *MeshOsDaemonHandle) GracefulShutdown(graceMs uint64) error {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var status C.int
 	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
 		status = C.net_meshos_graceful_shutdown(ptr, C.uint64_t(graceMs))
@@ -755,6 +783,10 @@ func (MeshOsDefaultDaemon) Saturation() float32             { return 0 }
 // //export'd trampolines, and hands ownership of the cgo.Handle to
 // the returned MeshOsDaemonHandle.
 func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed []byte) (*MeshOsDaemonHandle, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	if s == nil {
 		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
 	}
@@ -1086,6 +1118,10 @@ type MeshOsMetadataView struct {
 
 // Metadata returns a fresh snapshot of the daemon's MetadataView.
 func (h *MeshOsDaemonHandle) Metadata() (*MeshOsMetadataView, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var raw *C.char
 	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
 		raw = C.net_meshos_metadata(ptr)
@@ -1106,6 +1142,10 @@ func (h *MeshOsDaemonHandle) Metadata() (*MeshOsMetadataView, error) {
 
 // RefreshMetadata re-pulls from the runtime's latest snapshot.
 func (h *MeshOsDaemonHandle) RefreshMetadata() (*MeshOsMetadataView, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var raw *C.char
 	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
 		raw = C.net_meshos_refresh_metadata(ptr)
@@ -1130,6 +1170,10 @@ func (h *MeshOsDaemonHandle) RefreshMetadata() (*MeshOsMetadataView, error) {
 // binding ships the same stub semantics until the chain-commit path
 // lands.
 func (h *MeshOsDaemonHandle) PublishCapabilities(tags []string) error {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	var payloadPtr *C.char
 	var payloadLen C.size_t
 	var payload []byte

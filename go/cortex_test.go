@@ -392,3 +392,17 @@ func TestRegressionMemoriesSnapshotAndWatchForwardsDivergentInitial(t *testing.T
 		r.Free()
 	}
 }
+
+// SDK audit 2026-10-11: a positive sub-millisecond timeout truncated to 0,
+// which the native wait reads as "forever".
+func TestDurationToMillisRoundsSubMillisecondUp(t *testing.T) {
+	if got := durationToMillisU32(500 * time.Microsecond); got != 1 {
+		t.Fatalf("500µs -> %d ms, want 1", got)
+	}
+	if got := durationToMillisU32(0); got != 0 {
+		t.Fatalf("0 -> %d, want 0 (forever stays explicit)", got)
+	}
+	if got := durationToMillisU32(1500 * time.Microsecond); got != 1 {
+		t.Fatalf("1.5ms -> %d, want 1", got)
+	}
+}

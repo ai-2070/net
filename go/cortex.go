@@ -64,6 +64,11 @@ func durationToMillisU32(d time.Duration) C.uint32_t {
 		return 0
 	}
 	ms := d.Milliseconds()
+	if ms == 0 {
+		// A positive sub-millisecond timeout truncated to 0 — which the
+		// native wait reads as "wait forever" (SDK audit 2026-10-11).
+		return 1
+	}
 	if ms > int64(^uint32(0)) {
 		return C.uint32_t(^uint32(0))
 	}
@@ -1317,13 +1322,38 @@ func (w *WorkflowAdapter) StatusCounts() (WorkflowStatusCounts, error) {
 // WaitForSeq blocks until every event up through seq has folded.
 // `timeoutMs` of 0 waits indefinitely.
 func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	if w.handle == nil {
-		return ErrShuttingDown
+	// Wait in bounded slices, releasing the read lock between them. One
+	// native wait held the lock for its whole duration, so with
+	// timeoutMs == 0 (forever) on a seq that never folded, Free() — and the
+	// finalizer — blocked forever (SDK audit 2026-10-11). Between slices a
+	// queued Free gets the lock; the next slice then sees ErrShuttingDown.
+	const slice = uint32(200)
+	var deadline time.Time
+	if timeoutMs != 0 {
+		deadline = time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	}
-	code := C.net_workflow_wait_for_seq(w.handle, C.uint64_t(seq), C.uint32_t(timeoutMs))
-	return cortexErrorFromCode(code)
+	for {
+		wait := slice
+		if timeoutMs != 0 {
+			left := time.Until(deadline).Milliseconds()
+			if left <= 0 {
+				return ErrStreamTimeout
+			}
+			if left < int64(wait) {
+				wait = uint32(left)
+			}
+		}
+		w.mu.RLock()
+		if w.handle == nil {
+			w.mu.RUnlock()
+			return ErrShuttingDown
+		}
+		code := C.net_workflow_wait_for_seq(w.handle, C.uint64_t(seq), C.uint32_t(wait))
+		w.mu.RUnlock()
+		if err := cortexErrorFromCode(code); !errors.Is(err, ErrStreamTimeout) {
+			return err
+		}
+	}
 }
 
 // Subtree returns `id` plus all its transitive descendants (the delete

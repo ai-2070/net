@@ -797,3 +797,16 @@ func TestLiveSameOrgDuplexFromAGeneratedScenario(t *testing.T) {
 	skipIfNotEnabled(t)
 	runDuplexLive(t, setupSameOrgLive(t))
 }
+
+// SDK audit 2026-10-11: C.CString truncates at a NUL, so an audience-secret
+// path containing one silently named another file.
+func TestNewOrgCredentialsRejectsNulInAudienceSecretPath(t *testing.T) {
+	_, err := NewOrgCredentials(OrgCredentialsConfig{
+		Membership:          []byte{1},
+		Dispatcher:          []byte{1},
+		AudienceSecretPaths: []string{"secret\x00.evil"},
+	})
+	if !errors.Is(err, ErrOrgCredentials) {
+		t.Fatalf("want ErrOrgCredentials for a NUL path, got %v", err)
+	}
+}

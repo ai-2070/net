@@ -162,7 +162,9 @@ var ErrDeckEndOfStream = fmt.Errorf("%w: stream ended", ErrDeck)
 // human-readable message. The `.Kind` field matches the
 // `<<deck-sdk-kind:KIND>>MSG` envelope ("register_failed", "queue_full",
 // "already_shutdown", "snapshot_serialize_failed", "invalid_argument",
-// "runtime_panic").
+// "runtime_panic"). "runtime_panic" only occurs in debug / unwind builds:
+// a released libnet is built with panic = "abort", so a Rust panic
+// terminates the process instead (see the README).
 type DeckError struct {
 	Kind string
 	Msg  string
@@ -321,6 +323,10 @@ type DeckClient struct {
 // (`for i := range operatorSeed { operatorSeed[i] = 0 }`) after
 // constructing the client.
 func NewDeckClient(operatorSeed []byte, cfg DeckClientConfig) (*DeckClient, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	if len(operatorSeed) != 32 {
 		return nil, fmt.Errorf("%w: operatorSeed must be 32 bytes (got %d)",
 			ErrDeck, len(operatorSeed))
@@ -375,6 +381,10 @@ func (c *DeckClient) OperatorID() uint64 {
 // Status returns the latest `MeshOsSnapshot` parsed from its JSON
 // representation.
 func (c *DeckClient) Status() (map[string]any, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -395,6 +405,10 @@ func (c *DeckClient) Status() (map[string]any, error) {
 
 // StatusSummary reads the rolled-up cluster summary.
 func (c *DeckClient) StatusSummary() (StatusSummary, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -418,6 +432,10 @@ func (c *DeckClient) adminCall(
 	verb string,
 	call func(*C.NetDeckClient, *C.NetDeckChainCommit) C.int,
 ) (ChainCommit, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -476,6 +494,10 @@ func (c *DeckClient) Uncordon(node uint64) (ChainCommit, error) {
 // DropReplicas drops the `node`'s replica roles for the listed chains.
 // Pass `nil` or an empty slice to drop all replicas on the node.
 func (c *DeckClient) DropReplicas(node uint64, chains []uint64) (ChainCommit, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -534,6 +556,10 @@ type DeckSnapshotStream struct {
 
 // SubscribeSnapshots opens a live snapshot stream.
 func (c *DeckClient) SubscribeSnapshots() (*DeckSnapshotStream, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -553,6 +579,10 @@ func (c *DeckClient) SubscribeSnapshots() (*DeckSnapshotStream, error) {
 // `(nil, nil)` on timeout. Returns `ErrDeckEndOfStream` when the
 // stream has been drained. Pass 0 for an unbounded wait.
 func (s *DeckSnapshotStream) Next(timeoutMs uint64) (map[string]any, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	s.nextMu.Lock()
 	defer s.nextMu.Unlock()
 	s.mu.RLock()
@@ -608,6 +638,10 @@ type DeckStatusSummaryStream struct {
 
 // SubscribeStatusSummaries opens a live status-summary stream.
 func (c *DeckClient) SubscribeStatusSummaries() (*DeckStatusSummaryStream, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.handle == nil {
@@ -626,6 +660,10 @@ func (c *DeckClient) SubscribeStatusSummaries() (*DeckStatusSummaryStream, error
 // Next blocks up to `timeoutMs` for the next status summary. Returns
 // `(nil, nil)` on timeout. Returns `ErrDeckEndOfStream` when drained.
 func (s *DeckStatusSummaryStream) Next(timeoutMs uint64) (*StatusSummary, error) {
+	// Pin the OS thread across the call and the thread-local error drain
+	// (see pinThread): a migrated goroutine read another thread's slot
+	// (SDK audit 2026-10-11).
+	defer pinThread()()
 	s.nextMu.Lock()
 	defer s.nextMu.Unlock()
 	s.mu.RLock()

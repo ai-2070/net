@@ -230,6 +230,13 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 	// discriminator; per-runtime duplicate-kind rejection is the
 	// Rust layer's job (it returns `DUPLICATE_KIND` from the FFI
 	// when a given DaemonRuntime already has `kind` registered).
+	// A kind this runtime already holds is refused HERE, before the swap:
+	// swapping first briefly installed the factory Rust was about to reject,
+	// and a migration landing in that window was built with it (SDK audit
+	// 2026-10-11). Rust's DUPLICATE_KIND below still covers the race.
+	if lookupFactoryFunc(rt.runtimeID, kind) != nil {
+		return &DuplicateKindError{Kind: kind}
+	}
 	prev, existed, ourEpoch := swapFactoryFunc(rt.runtimeID, kind, factory)
 
 	kindBytes := []byte(kind)

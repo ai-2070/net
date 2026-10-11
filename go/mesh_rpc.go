@@ -1962,6 +1962,11 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 // "done" — Send / FinishSending / Recv / Close on it become
 // no-ops. CANCEL fires only when BOTH split halves drop without
 // a clean close.
+//
+// Split must not race a Recv on the same call: the native side holds
+// the stream lock across a parked Recv, so a concurrent Split blocks
+// until that Recv returns (Close / ctx cancel wake it). Split before
+// handing the call to goroutines.
 func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 	// Split is the terminal op. enter() fails (ErrStreamDone) if
 	// Close/the watcher already requested teardown.

@@ -461,6 +461,13 @@ func NewOrgCredentials(cfg OrgCredentialsConfig) (*OrgCredentials, error) {
 	if len(cfg.Membership) == 0 || len(cfg.Dispatcher) == 0 {
 		return nil, errors.New("net.NewOrgCredentials: membership and dispatcher are required")
 	}
+	// C.CString truncates at a NUL, so such a path silently named another
+	// file (SDK audit 2026-10-11).
+	for _, p := range cfg.AudienceSecretPaths {
+		if strings.IndexByte(p, 0) >= 0 {
+			return nil, fmt.Errorf("%w: audience-secret path contains a NUL byte", ErrOrgCredentials)
+		}
+	}
 
 	memC := C.CBytes(cfg.Membership)
 	defer C.free(memC)
