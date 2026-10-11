@@ -2731,7 +2731,17 @@ mod tests {
         assert_eq!(captured.len(), 1, "appender should see one record");
         assert_eq!(captured[0].event, AdminEvent::Cordon { node: 42 });
 
-        let snap = reader.read();
+        // The snapshot carrying the ring is published on a later tick than
+        // the appender fires; a fixed 60 ms sleep flaked on a loaded CI
+        // runner (ring read empty). Poll, bounded.
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
+        let snap = loop {
+            let snap = reader.read();
+            if !snap.admin_audit.is_empty() || std::time::Instant::now() >= deadline {
+                break snap;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        };
         assert_eq!(snap.admin_audit.len(), 1, "ring should hold one record");
         // The appender + ring see the SAME record (seq + content match).
         assert_eq!(snap.admin_audit[0].seq, captured[0].seq);

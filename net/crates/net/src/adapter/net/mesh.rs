@@ -27718,10 +27718,9 @@ impl MeshNode {
             )
             .await
         };
-        let admitted = take_guard
-            .admitted
-            .take()
-            .expect("the take guard is disarmed only here");
+        // Disarm: every outcome below hands the take to its owner or
+        // releases it itself. (`SignalAdmit` is `Copy`; the guard held a copy.)
+        take_guard.admitted = None;
         match outcome {
             super::rtc::SignalOutcome::Answer {
                 dialog, sdp, peer, ..

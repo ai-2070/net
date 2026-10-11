@@ -86,6 +86,10 @@ def main() -> None:
         ref = BlobRef.from_encoded(encoded)
         if ref is None:
             raise RuntimeError("minted address did not decode")
+        # `hash` is None only for a chunked (tree) ref; this payload is one
+        # blob, so it carries its content hash.
+        if ref.hash is None:
+            raise RuntimeError("a single-blob ref always carries its content hash")
         print(f"stored {len(PAYLOAD)} bytes")
         print(f"minted address: {ref.hash.hex()}")
 

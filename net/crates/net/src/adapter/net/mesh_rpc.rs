@@ -2280,7 +2280,7 @@ impl RpcStream {
     /// A cloneable handle that grants credits to this stream's server
     /// pump without borrowing the stream.
     ///
-    /// For bindings that park a consumer inside [`Self::next`] while
+    /// For bindings that park a consumer inside the stream's `next()` while
     /// another thread grants: with the stream taken out for the await, a
     /// grant routed through the stream was dropped, and on a
     /// flow-controlled stream whose window was exhausted that stalled the

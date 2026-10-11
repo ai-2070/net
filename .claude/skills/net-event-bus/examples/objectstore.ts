@@ -72,8 +72,12 @@ async function main(): Promise<void> {
   registerFilesystemBlobAdapter('local', dir);
   const encoded = await blobPublish('local', 'file:orders/2026-09/payload', PAYLOAD);
   const ref = BlobRef.fromEncoded(encoded);
+  // `hash` is null only for a chunked (tree) ref; this payload is one blob,
+  // so it carries its content hash.
+  const hash = ref.hash;
+  if (hash === null) throw new Error('a single-blob ref always carries its content hash');
   console.log(`stored ${PAYLOAD.length} bytes`);
-  console.log(`minted address: ${ref.hash.toString('hex')}`);
+  console.log(`minted address: ${hash.toString('hex')}`);
 
   // Host the same bytes on the mesh so a peer can pull them. Installing the
   // transfer engine is required before serving or fetching.
@@ -94,7 +98,8 @@ async function main(): Promise<void> {
   const again = await blobPublish('local', 'file:another/name/entirely', PAYLOAD);
   // Compare the content hash, not the encoded ref: the URI is part of the ref,
   // so two names for identical bytes encode differently while hashing the same.
-  const dedup = Buffer.compare(ref.hash, BlobRef.fromEncoded(again).hash) === 0 ? 1 : 0;
+  const againHash = BlobRef.fromEncoded(again).hash;
+  const dedup = againHash !== null && Buffer.compare(hash, againHash) === 0 ? 1 : 0;
 
   // The encoded address round-trips through bytes, which is how one rides
   // inside an ordinary event payload without the substrate inspecting it.
