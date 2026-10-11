@@ -62,9 +62,18 @@ export class EventStream implements AsyncIterable<StoredEvent> {
         ordering: this.opts.ordering,
       });
 
+      // Adopt the core's cursor on EVERY poll, not only when events came
+      // back: a filtered poll whose whole window was filtered out still
+      // advances `nextId` past it (and sets `hasMore`). Dropping it re-read
+      // the same window forever, so a filtered subscription behind a run of
+      // non-matching events never delivered (SDK audit 2026-10-11). A null
+      // `nextId` keeps the current cursor rather than restarting.
+      if (response.nextId != null) {
+        this.cursor = response.nextId;
+      }
+
       if (response.events.length > 0) {
         backoff = this.opts.pollIntervalMs;
-        this.cursor = response.nextId ?? undefined;
 
         for (const event of response.events) {
           yield {
@@ -84,6 +93,10 @@ export class EventStream implements AsyncIterable<StoredEvent> {
         if (response.events.length < this.opts.limit) {
           await sleep(this.opts.pollIntervalMs);
         }
+      } else if (response.hasMore) {
+        // Everything fetched was filtered out but the core advanced past
+        // it: keep paging forward without idling.
+        backoff = this.opts.pollIntervalMs;
       } else {
         // Exponential backoff when idle.
         await sleep(backoff);
