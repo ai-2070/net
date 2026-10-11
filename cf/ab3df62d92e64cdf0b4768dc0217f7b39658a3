@@ -1,0 +1,30 @@
+net/crates/net/browser-ts/test/fixtures/stun-probe-verdicts.json
+  s_16bd53708deb14::t_425958aa13de77 2,166,175-198,201-227
+net/crates/net/leaf/src/bootstrap.rs
+  s_16bd53708deb14::t_196bb46515cf5f 590-592,667-674,681-684,691-720
+  s_16bd53708deb14::t_2e9a26a56d8c34 721-722
+net/crates/net/tests/rtc_browser/page/leaf5.js
+  s_16bd53708deb14::t_c449866f29a3c6 673-676
+net/crates/net/tests/rtc_browser/page/org.js
+  s_16bd53708deb14::t_c449866f29a3c6 250-253
+net/crates/net/tests/rtc_browser/page/peer6.js
+  s_16bd53708deb14::t_c449866f29a3c6 156-159
+net/crates/net/browser-ts/src/udp-probe.ts
+  s_16bd53708deb14::t_196bb46515cf5f 112-117,120-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cfab3df62d92e64cdf0b4768dc0217f7b39658a3",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
