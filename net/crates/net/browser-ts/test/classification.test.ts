@@ -291,15 +291,33 @@ describe('probeStunBinding', () => {
 
   // SDK audit 2026-10-11: libwebrtc suppresses a reflexive candidate equal
   // to a public host address, so completion with nothing reflexive and no
-  // "no response" report is inconclusive, never `unanswered`.
-  it('reports notRun when gathering completes with no reflexive candidate and no error', async () => {
+  // "no response" report beside a public host is inconclusive.
+  it('reports notRun when gathering completes beside a public host with nothing reflexive and no error', async () => {
     const outcome = await probeStunBinding(PROBED, {
       peerConnectionFactory: fakePeerConnection((pc) => {
-        pc.emitCandidate(candidate({ type: 'host', address: '198.51.100.7', line: hostLine() }));
+        pc.emitCandidate(candidate({ type: 'host', address: '198.51.100.7', line: hostLine('198.51.100.7') }));
         pc.completeGathering();
       }),
     });
     expect(outcome.type).toBe('notRun');
+  });
+
+  // Firefox against blocked UDP: only `.local` host candidates, no "no
+  // response" report, then gathering completes. Nothing could have been
+  // suppressed, so this is silence (the browser matrix's
+  // stage5_udp_blocked_surfaces_a_typed_failure, red on master after
+  // #1228 when the probe read it as inconclusive).
+  it.each([
+    ['an mDNS .local host', 'candidate:1 1 udp 2122260223 4b921fac-e317-4d23-baa1-ca4e127924a7.local 36194 typ host'],
+    ['a private host', hostLine()],
+  ])('reports unanswered when gathering completes beside %s with nothing reflexive and no error', async (_, line) => {
+    const outcome = await probeStunBinding(PROBED, {
+      peerConnectionFactory: fakePeerConnection((pc) => {
+        pc.emitCandidate(candidate({ type: 'host', address: null, line }));
+        pc.completeGathering();
+      }),
+    });
+    expect(outcome).toEqual({ type: 'unanswered', detail: 'gathering completed with no reflexive candidate' });
   });
 
   it('reports unanswered when nothing at all happens before the deadline', async () => {
@@ -501,8 +519,8 @@ function srflxLine(): string {
   return 'candidate:2 1 udp 1694498815 198.51.100.7 54321 typ srflx raddr 0.0.0.0 rport 0';
 }
 
-function hostLine(): string {
-  return 'candidate:1 1 udp 2130706431 192.168.1.5 50001 typ host';
+function hostLine(address = '192.168.1.5'): string {
+  return `candidate:1 1 udp 2130706431 ${address} 50001 typ host`;
 }
 
 function candidate(spec: { type: string | null; address: string | null; line: string }): RTCIceCandidate {
