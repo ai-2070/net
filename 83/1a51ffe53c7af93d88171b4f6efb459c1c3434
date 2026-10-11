@@ -1,0 +1,21 @@
+net/crates/net/docs/releases/RELEASE_v0.43_IRON_MAN.md
+  s_d8b00bedd146e9::t_e184247b778506 103
+web/src/content/docs/releases/RELEASE_v0.43_IRON_MAN.md
+  s_d8b00bedd146e9::t_8ef50e413da466 107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "831a51ffe53c7af93d88171b4f6efb459c1c3434",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
