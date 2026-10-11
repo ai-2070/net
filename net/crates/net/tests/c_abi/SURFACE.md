@@ -18,7 +18,7 @@ both.
 | `net_meshdb.h` | 28 | 25 | 25 |
 | `net_meshos.h` | 23 | 22 | 22 |
 | `net_org.h` | 30 | 18 | 22 |
-| `net_rpc.h` | 70 | 10 | 17 |
+| `net_rpc.h` | 71 | 10 | 17 |
 | `net_subnet.h` | 4 | 3 | 3 |
 | `net_transport.h` | 7 | 7 | 7 |
 
@@ -650,6 +650,7 @@ both.
 | `net_rpc_observer_dropped_total` | – | – | – |
 | `net_rpc_observer_install` | – | – | – |
 | `net_rpc_request_stream_next` | – | – | – |
+| `net_rpc_request_stream_retire` | – | – | – |
 | `net_rpc_reserve_cancel_token` | – | – | – |
 | `net_rpc_reserve_handler_id` | rpc_callbacks | – | failover, jobqueue |
 | `net_rpc_response_free` | rpc_callbacks | – | failover, jobqueue, net_org_streaming |

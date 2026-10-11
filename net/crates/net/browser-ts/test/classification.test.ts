@@ -289,6 +289,19 @@ describe('probeStunBinding', () => {
     });
   });
 
+  // SDK audit 2026-10-11: libwebrtc suppresses a reflexive candidate equal
+  // to a public host address, so completion with nothing reflexive and no
+  // "no response" report is inconclusive, never `unanswered`.
+  it('reports notRun when gathering completes with no reflexive candidate and no error', async () => {
+    const outcome = await probeStunBinding(PROBED, {
+      peerConnectionFactory: fakePeerConnection((pc) => {
+        pc.emitCandidate(candidate({ type: 'host', address: '198.51.100.7', line: hostLine() }));
+        pc.completeGathering();
+      }),
+    });
+    expect(outcome.type).toBe('notRun');
+  });
+
   it('reports unanswered when nothing at all happens before the deadline', async () => {
     // Chromium against a black-holed address emits no error event and
     // never completes gathering, so this is the path that decides — and

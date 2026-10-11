@@ -37,14 +37,14 @@ import (
 type GroupErrorKind string
 
 const (
-	GroupErrNotReady         GroupErrorKind = "not-ready"
-	GroupErrFactoryNotFound  GroupErrorKind = "factory-not-found"
-	GroupErrNoHealthyMember  GroupErrorKind = "no-healthy-member"
-	GroupErrPlacementFailed  GroupErrorKind = "placement-failed"
-	GroupErrRegistryFailed   GroupErrorKind = "registry-failed"
-	GroupErrInvalidConfig    GroupErrorKind = "invalid-config"
-	GroupErrDaemon           GroupErrorKind = "daemon"
-	GroupErrUnknown          GroupErrorKind = "unknown"
+	GroupErrNotReady        GroupErrorKind = "not-ready"
+	GroupErrFactoryNotFound GroupErrorKind = "factory-not-found"
+	GroupErrNoHealthyMember GroupErrorKind = "no-healthy-member"
+	GroupErrPlacementFailed GroupErrorKind = "placement-failed"
+	GroupErrRegistryFailed  GroupErrorKind = "registry-failed"
+	GroupErrInvalidConfig   GroupErrorKind = "invalid-config"
+	GroupErrDaemon          GroupErrorKind = "daemon"
+	GroupErrUnknown         GroupErrorKind = "unknown"
 )
 
 // GroupError is the typed failure returned by group methods.
@@ -320,10 +320,23 @@ func NewReplicaGroup(rt *DaemonRuntime, kind string, cfg ReplicaGroupConfig) (*R
 	lbBytes, lbPtr, lbLen := cKindBytes(string(strategyOrDefault(cfg.LBStrategy)))
 	autoSnap, maxLog := hostConfigFields(cfg.HostConfig)
 
+	// Pin the runtime handle across the native spawn: a concurrent Close
+	// (or the finalizer, when rt is otherwise unreachable) must not free
+	// the runtime box mid-spawn (SDK audit 2026-10-11). Pinned rather than
+	// read-locked because the spawn calls the user's factory synchronously,
+	// and a factory that calls rt.Close() deadlocked against a held rt.mu
+	// (code review 2026-10-11). See DaemonRuntime.pin.
+	rtHandle, unpin := rt.pin()
+	if rtHandle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	defer unpin()
+	defer runtime.KeepAlive(rt)
+
 	var nativeHandle *C.net_compute_replica_group_t
 	var errOut *C.char
 	code := C.net_compute_replica_group_spawn(
-		rt.handle,
+		rtHandle,
 		kindPtr, kindLen,
 		C.uint32_t(cfg.ReplicaCount),
 		(*C.uint8_t)(unsafe.Pointer(&cfg.GroupSeed[0])),
@@ -487,10 +500,23 @@ func NewForkGroup(
 	lbBytes, lbPtr, lbLen := cKindBytes(string(strategyOrDefault(cfg.LBStrategy)))
 	autoSnap, maxLog := hostConfigFields(cfg.HostConfig)
 
+	// Pin the runtime handle across the native spawn: a concurrent Close
+	// (or the finalizer, when rt is otherwise unreachable) must not free
+	// the runtime box mid-spawn (SDK audit 2026-10-11). Pinned rather than
+	// read-locked because the spawn calls the user's factory synchronously,
+	// and a factory that calls rt.Close() deadlocked against a held rt.mu
+	// (code review 2026-10-11). See DaemonRuntime.pin.
+	rtHandle, unpin := rt.pin()
+	if rtHandle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	defer unpin()
+	defer runtime.KeepAlive(rt)
+
 	var nativeHandle *C.net_compute_fork_group_t
 	var errOut *C.char
 	code := C.net_compute_fork_group_spawn(
-		rt.handle,
+		rtHandle,
 		kindPtr, kindLen,
 		C.uint64_t(parentOrigin),
 		C.uint64_t(forkSeq),
@@ -643,10 +669,23 @@ func NewStandbyGroup(rt *DaemonRuntime, kind string, cfg StandbyGroupConfig) (*S
 	kindBytes, kindPtr, kindLen := cKindBytes(kind)
 	autoSnap, maxLog := hostConfigFields(cfg.HostConfig)
 
+	// Pin the runtime handle across the native spawn: a concurrent Close
+	// (or the finalizer, when rt is otherwise unreachable) must not free
+	// the runtime box mid-spawn (SDK audit 2026-10-11). Pinned rather than
+	// read-locked because the spawn calls the user's factory synchronously,
+	// and a factory that calls rt.Close() deadlocked against a held rt.mu
+	// (code review 2026-10-11). See DaemonRuntime.pin.
+	rtHandle, unpin := rt.pin()
+	if rtHandle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	defer unpin()
+	defer runtime.KeepAlive(rt)
+
 	var nativeHandle *C.net_compute_standby_group_t
 	var errOut *C.char
 	code := C.net_compute_standby_group_spawn(
-		rt.handle,
+		rtHandle,
 		kindPtr, kindLen,
 		C.uint32_t(cfg.MemberCount),
 		(*C.uint8_t)(unsafe.Pointer(&cfg.GroupSeed[0])),

@@ -311,6 +311,19 @@ export interface ConnectOptions extends WasmSource {
    */
   noiseSecretHex?: string;
   /**
+   * Hold this identity exclusively while the node is open (default
+   * `true`; only read with {@link ConnectOptions.entitySecretHex}).
+   *
+   * Two tabs connected as the same node evict each other at the anchor,
+   * so stores and lobbies in both flap — the hazard `openSession()`
+   * avoids by electing one leader. `connect()` takes a Web Lock named
+   * after a hash of the identity (never the secret) and refuses a second
+   * holder with an {@link IdentityError} instead; `close()` releases it.
+   * Where Web Locks are unavailable the lock is skipped. Pass `false` to
+   * run without it (SDK audit 2026-10-11).
+   */
+  lockIdentity?: boolean;
+  /**
    * The `rtc_addr` the anchor publishes, supplied out of band.
    *
    * The STUN probe needs a subject, and before a `connected` event
@@ -363,6 +376,13 @@ export class BrowserNode {
   private anchorRtcAddrs: readonly string[] = [];
   /** Set once the leaf reports a session — a bootstrap that demonstrably worked. */
   private bootstrapObserved = false;
+  /** Releases the identity's Web Lock (`connect({ lockIdentity })`). */
+  private releaseIdentity: (() => void) | null = null;
+
+  /** @internal — `connect()` hands over the identity lock it took. */
+  releaseIdentityOnClose(release: (() => void) | null): void {
+    this.releaseIdentity = release;
+  }
 
   /** @internal — use {@link connect}. */
   constructor(
@@ -1150,6 +1170,10 @@ export class BrowserNode {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Whatever else fails below, the identity is free for another tab.
+    const releaseIdentity = this.releaseIdentity;
+    this.releaseIdentity = null;
+    queueMicrotask(() => releaseIdentity?.());
     const failures: LeafError[] = [];
     // Ownership retirement first, while the node can still put a
     // CANCEL on the wire (plan §4.5): one per dropped caller handle,
@@ -1213,11 +1237,18 @@ export async function connect(options: ConnectOptions): Promise<BrowserNode> {
   const request = buildConnectRequest(options);
   const failureTyping = options.failureTyping ?? {};
   const wasm = await loadLeafWasm(options);
+  const release =
+    request.entitySecretHex !== undefined && options.lockIdentity !== false
+      ? await lockIdentity(request.entitySecretHex)
+      : null;
 
   try {
     const inner = await wasm.LeafNode.connect(request);
-    return new BrowserNode(inner, options.bootstrapUrl ?? null, failureTyping, options.anchorRtcAddr ?? null);
+    const node = new BrowserNode(inner, options.bootstrapUrl ?? null, failureTyping, options.anchorRtcAddr ?? null);
+    node.releaseIdentityOnClose(release);
+    return node;
   } catch (error) {
+    release?.();
     throw await refineIceFailure(fromWasmError(error), {
       bootstrapUrl: options.bootstrapUrl ?? null,
       bootstrapObserved: false,
@@ -1225,6 +1256,65 @@ export async function connect(options: ConnectOptions): Promise<BrowserNode> {
       failureTyping,
     });
   }
+}
+
+/**
+ * The Web Lock name for one custodial identity, or `null` where
+ * `crypto.subtle` is unavailable. A hash of the secret, never the secret.
+ *
+ * Shared by `connect()` and `openSession()`: a session with a custodial
+ * secret names its election lock with this too, so a `connect()` tab and
+ * an `openSession()` tab given one secret contend for ONE lock instead of
+ * each running a node with that identity (cubic review of PR #1228).
+ *
+ * @internal
+ */
+export async function identityLockName(entitySecretHex: string): Promise<string | null> {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) return null;
+  // Lowercased: the secret parses case-insensitively, so "AB…" and "ab…" are
+  // one identity and must contend for one lock (code review 2026-10-11,
+  // BROWSER-3).
+  const canonical = entitySecretHex.toLowerCase();
+  const digest = new Uint8Array(await subtle.digest('SHA-256', new TextEncoder().encode(`net-mesh:identity:${canonical}`)));
+  return `net-mesh:identity:${Array.from(digest.subarray(0, 16), b => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
+ * Take the exclusive Web Lock for one custodial identity, or throw an
+ * {@link IdentityError} when another tab or window holds it. Returns the
+ * release, or `null` where Web Locks (or `crypto.subtle`, for the hashed
+ * name) are unavailable.
+ */
+async function lockIdentity(entitySecretHex: string): Promise<(() => void) | null> {
+  const locks = (globalThis.navigator as { locks?: LockManager } | undefined)?.locks;
+  if (locks === undefined) return null;
+  const name = await identityLockName(entitySecretHex);
+  if (name === null) return null;
+  const acquired = await new Promise<(() => void) | 'busy'>((resolve, reject) => {
+    let release!: () => void;
+    const held = new Promise<void>(done => {
+      release = done;
+    });
+    locks
+      .request(name, { ifAvailable: true }, async lock => {
+        if (lock === null) {
+          resolve('busy');
+          return;
+        }
+        resolve(release);
+        await held;
+      })
+      .catch(reject);
+  });
+  if (acquired === 'busy') {
+    throw new IdentityError(
+      'this identity is already connected in another tab or window of this browser; ' +
+        'two nodes with one identity evict each other at the anchor (use openSession() to share one ' +
+        'node across tabs, or pass lockIdentity: false)',
+    );
+  }
+  return acquired;
 }
 
 /**

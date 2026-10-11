@@ -434,6 +434,132 @@ async fn cancel_client_stream_mid_finish_surfaces_terminal() {
     }
 }
 
+/// cubic review of PR #1228: a streaming constructor's setup (the
+/// reply-channel subscription and the opening publish) ignored the cancel
+/// token — its watcher is armed only once the stream exists — so against a
+/// silent peer a cancel could not end the wait; the constructor blocked for
+/// the whole setup budget (seconds) and returned an already-cancelled
+/// stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_ends_a_streaming_constructor_waiting_on_a_silent_peer() {
+    use net::adapter::Adapter;
+    let (a, b, _serving) = build_pair().await;
+    let target = b.node_id();
+    b.shutdown().await.expect("silence the peer");
+
+    let token = a.reserve_cancel_token();
+    let opts = CallOptions {
+        cancel_token: Some(token),
+        ..CallOptions::default()
+    };
+    let a2 = a.clone();
+    let open = tokio::spawn(async move {
+        a2.call_streaming(
+            target,
+            "never.subscribed.stream",
+            Bytes::from_static(b"x"),
+            opts,
+        )
+        .await
+        .map(|_| ())
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    a.cancel(token);
+    let result = tokio::time::timeout(Duration::from_secs(2), open)
+        .await
+        .expect("the constructor must return promptly after cancel")
+        .expect("spawn task panicked");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        started.elapsed()
+    );
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled, got {other:?}"),
+    }
+}
+
+/// Code review 2026-10-11 GO-2: a `send` parked on request-side
+/// flow-control credit waits on the credit semaphore, which the cancel
+/// watcher never touched — `pending.cancel` only signals the response
+/// side. A cancel (the Go binding's `Close()` / ctx-cancel wake) left the
+/// send parked for good, and with it the borrowed handle. The silent
+/// handler never reads, so it never grants credit back: with a window of
+/// one, the second send parks until the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_wakes_a_client_stream_send_parked_on_credit() {
+    let (a, b, _serving) = build_pair().await;
+    let token = a.reserve_cancel_token();
+    let opts = CallOptions {
+        cancel_token: Some(token),
+        request_window_initial: Some(1),
+        ..CallOptions::default()
+    };
+    let mut call = a
+        .call_client_stream(b.node_id(), "silent.cs", opts)
+        .await
+        .expect("call_client_stream should open against a reachable peer");
+    call.send(Bytes::from_static(b"chunk1"))
+        .await
+        .expect("the first send spends the one credit");
+
+    let send_task = tokio::spawn(async move { call.send(Bytes::from_static(b"chunk2")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !send_task.is_finished(),
+        "the second send should be parked on credit"
+    );
+    a.cancel(token);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), send_task)
+        .await
+        .expect("a send parked on credit must resolve after cancel")
+        .expect("spawn task panicked");
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled after cancel, got {other:?}"),
+    }
+}
+
+/// GO-2, duplex shape: same parked-on-credit send, on the duplex sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_wakes_a_duplex_send_parked_on_credit() {
+    let (a, b, _serving) = build_pair().await;
+    let token = a.reserve_cancel_token();
+    let opts = CallOptions {
+        cancel_token: Some(token),
+        request_window_initial: Some(1),
+        ..CallOptions::default()
+    };
+    let call = a
+        .call_duplex(b.node_id(), "silent.dx", opts)
+        .await
+        .expect("call_duplex should open against a reachable peer");
+    let (mut sink, _stream) = call.into_split();
+    sink.send(Bytes::from_static(b"chunk1"))
+        .await
+        .expect("the first send spends the one credit");
+
+    let send_task = tokio::spawn(async move { sink.send(Bytes::from_static(b"chunk2")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !send_task.is_finished(),
+        "the second send should be parked on credit"
+    );
+    a.cancel(token);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), send_task)
+        .await
+        .expect("a send parked on credit must resolve after cancel")
+        .expect("spawn task panicked");
+    match result {
+        Err(RpcError::Cancelled) => {}
+        other => panic!("expected RpcError::Cancelled after cancel, got {other:?}"),
+    }
+}
+
 // =====================================================================
 // Duplex (call_duplex) mid-flight cancel.
 // =====================================================================
@@ -707,4 +833,36 @@ async fn cancel_client_stream_consume_terminal_still_fires_the_wire_cancel() {
              local-cancellation terminal suppressed the Drop's wire CANCEL",
         )
         .expect("the provider handler task dropped without signalling");
+}
+
+/// cubic review of PR #1228: `accept` sat out its whole handshake budget
+/// (~15 s by default) after the node shut down, so a binding thread parked
+/// in it outlived the node. It now races the handshake against shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_wakes_a_parked_accept() {
+    use net::adapter::Adapter;
+    let node = build_node().await;
+    let accepting = {
+        let node = node.clone();
+        tokio::spawn(async move { node.accept(0xDEAD_BEEF).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !accepting.is_finished(),
+        "nobody handshakes: accept must be parked"
+    );
+    let started = std::time::Instant::now();
+    node.shutdown().await.expect("shutdown");
+    let result = tokio::time::timeout(Duration::from_secs(3), accepting)
+        .await
+        .expect("accept must return promptly once the node shuts down")
+        .expect("spawn task panicked");
+    assert!(result.is_err(), "a shut-down accept cannot succeed");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // An accept started after shutdown fails at once.
+    let late = tokio::time::timeout(Duration::from_secs(1), node.accept(0xDEAD_BEEF))
+        .await
+        .expect("an accept on a shut-down node returns at once");
+    assert!(late.is_err());
 }

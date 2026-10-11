@@ -280,6 +280,8 @@ impl DelegationGate {
     fn refresh_revocations(&self) {
         if let Some(path) = &self.revocation_store {
             match RevocationStore::load(path) {
+                // Floors and revoked subjects both land in the registry,
+                // which `chain.verify` consults for every link.
                 Ok(store) => store.apply_to(&self.revocation),
                 Err(e) => eprintln!(
                     "net wrap: revocation store unreadable ({e}); keeping last-known floors"
@@ -649,6 +651,83 @@ mod tests {
             g.verify(TOOL, ARGS, &chain, b"short"),
             Err(DelegationReject::MalformedEnvelope)
         ));
+    }
+
+    /// SDK audit 2026-10-11: revoking a DEVICE must refuse its own bare
+    /// `root → device` grant. The floor `revoke` raises is keyed on the device
+    /// and only checked against each link's ISSUER (the root, here), so on its
+    /// own it left the grant valid until expiry. The revoked-subject record
+    /// `OperatorEnrollment::revoke` now also writes closes that.
+    #[test]
+    fn a_revoked_device_cannot_present_its_bare_root_grant() {
+        use net_sdk::revocation::RevocationStore;
+
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap()
+        .to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let g = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path);
+
+        let env = envelope(&device, TOOL, ARGS, now_secs(), 1);
+        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok(), "admits first");
+
+        // A floor alone is a generation rotation, not a revocation: the
+        // root-issued grant still verifies (rotation must keep working).
+        RevocationStore::revoke_below(&path, device.entity_id(), 1).unwrap();
+        let env = envelope(&device, TOOL, ARGS, now_secs(), 2);
+        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok(), "floor ≠ revoke");
+
+        // The subject record refuses it.
+        RevocationStore::revoke_subject(&path, device.entity_id()).unwrap();
+        let env = envelope(&device, TOOL, ARGS, now_secs(), 3);
+        assert!(matches!(
+            g.verify(TOOL, ARGS, &chain, &env),
+            Err(DelegationReject::Chain(ref k)) if k == "Revoked"
+        ));
+    }
+
+    /// A revoked device also cannot launder access through a link it signs
+    /// itself (it chooses that link's `issuer_generation`, so its floor alone
+    /// never bound it).
+    #[test]
+    fn a_revoked_device_cannot_delegate_onward() {
+        use net_sdk::revocation::RevocationStore;
+
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let helper = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap()
+        .extend_to_subagent(&device, helper.entity_id())
+        .unwrap()
+        .to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        RevocationStore::revoke_subject(&path, device.entity_id()).unwrap();
+        let g = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path);
+        let env = envelope(&helper, TOOL, ARGS, now_secs(), 1);
+        assert!(g.verify(TOOL, ARGS, &chain, &env).is_err());
     }
 
     #[test]

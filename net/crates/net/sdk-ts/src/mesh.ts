@@ -84,7 +84,13 @@ export type ClaimOutcome = 'won' | 'lost';
 /** Selection policy for {@link MeshNode.matchIslands}. */
 export type SelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
-import { getNapiMesh, nativeOrgClientOf, setNapiMesh } from './_internal.js';
+import {
+  callIsolated,
+  getNapiMesh,
+  nativeOrgClientOf,
+  reportHandlerError,
+  setNapiMesh,
+} from './_internal.js';
 import type { OrgClient as SdkOrgClient } from './org/index.js';
 import type { OrgClient as NapiOrgClient } from '@net-mesh/core';
 import type { TypedOrgClient } from '@net-mesh/core/org';
@@ -434,6 +440,12 @@ export interface StreamData {
 /** Returned by {@link MeshNode.onStreamData}. */
 export interface StreamDataSubscription {
   readonly streamId: bigint;
+  /**
+   * Events dropped because the handler fell more than 1024 events behind
+   * the peers feeding the stream (the queue is bounded so a flooding peer
+   * cannot grow the process without limit).
+   */
+  readonly droppedEvents: bigint;
   /** Stop delivering; the stream's events go back to `recv`. Idempotent. */
   close(): boolean;
 }
@@ -444,6 +456,14 @@ export interface StreamDataSubscription {
  */
 export class MeshNode {
   private native: NapiNetMesh;
+  /**
+   * Every live `onStreamData` subscription, held until `close()`. The
+   * native subscription unregisters when garbage-collected, so a caller
+   * that discarded the returned handle had delivery stop at an arbitrary
+   * GC (code review 2026-10-11, NODE-1). Held here, a subscription lives
+   * as long as this node — as it did before the native collector existed.
+   */
+  private readonly streamSubscriptions = new Set<unknown>();
 
   private constructor(native: NapiNetMesh) {
     this.native = native;
@@ -704,16 +724,55 @@ export class MeshNode {
    * subscription per stream id; a second throws until the first is
    * closed. Pair with {@link streamIdFromLabel} to agree on an id with a
    * browser page.
+   *
+   * A `handler` that throws — or an `async` handler whose promise rejects
+   * — does NOT take the process down: the native callback would turn an
+   * escaping exception into a fatal `uncaughtException`, and an unhandled
+   * rejection is fatal by default, either of which a remote peer's payload
+   * could trigger. The error goes to `options.onError` if given, else to a
+   * process warning, and delivery continues.
+   *
+   * Handlers are NOT serialized: each event invokes `handler` as it
+   * arrives, without awaiting the previous call's promise, so a slow
+   * `async` handler can have many invocations in flight at once and its
+   * pending work is unbounded. The native queue's bound (and
+   * `droppedEvents`) applies only to events not yet handed to `handler`.
+   * A handler doing slow async work should apply its own backpressure —
+   * a bounded queue it drains serially, dropping or coalescing when full
+   * (cubic review of PR #1228).
+   *
+   * The subscription lasts until `close()` or until this node is gone —
+   * discarding the returned handle does not end it.
    */
-  onStreamData(streamId: bigint, handler: (data: StreamData) => void): StreamDataSubscription {
+  onStreamData(
+    streamId: bigint,
+    handler: (data: StreamData) => void | Promise<void>,
+    options?: { onError?: (error: unknown, data: StreamData) => void },
+  ): StreamDataSubscription {
+    const onError = options?.onError ?? reportHandlerError;
     const native = this.native.onStreamData(streamId, event => {
-      handler({ peerNodeId: event.peerNodeId, streamId: event.streamId, payload: event.payload });
+      const data: StreamData = {
+        peerNodeId: event.peerNodeId,
+        streamId: event.streamId,
+        payload: event.payload,
+      };
+      callIsolated(
+        () => handler(data),
+        error => onError(error, data),
+      );
     });
+    this.streamSubscriptions.add(native);
     return {
       get streamId() {
         return native.streamId;
       },
-      close: () => native.close(),
+      get droppedEvents() {
+        return native.droppedEvents;
+      },
+      close: () => {
+        this.streamSubscriptions.delete(native);
+        return native.close();
+      },
     };
   }
 
@@ -1117,6 +1176,16 @@ export class MeshNode {
     return this.native.rendezvousString(...args);
   }
 
+  /**
+   * Operator side, approver-gated: each valid join request is passed to
+   * `approver` and admitted only on an explicit `true`; a denial, throw or
+   * timeout does not burn the invite. Safer than `serveEnrollmentAuto`.
+   * Serves enrollment only (no renewal). Hold the returned handle.
+   */
+  serveEnrollment(...args: Parameters<NapiNetMesh['serveEnrollment']>): ReturnType<NapiNetMesh['serveEnrollment']> {
+    return this.native.serveEnrollment(...args);
+  }
+
   /** Operator side: serve device enrollment (join + renew) on this node; the invite is the authorization. Hold the returned handle. */
   serveEnrollmentAuto(...args: Parameters<NapiNetMesh['serveEnrollmentAuto']>): ReturnType<NapiNetMesh['serveEnrollmentAuto']> {
     return this.native.serveEnrollmentAuto(...args);
@@ -1427,6 +1496,8 @@ export class MeshNode {
   /** Shutdown the mesh node. */
   async shutdown(): Promise<void> {
     await this.native.shutdown();
+    // Nothing is delivered past shutdown; let the subscriptions go.
+    this.streamSubscriptions.clear();
   }
 }
 

@@ -7929,6 +7929,14 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         continue-on-error: true
+        # Playwright's WebKit on Linux trusts only the system store
+        # (GnuTLS), never Chromium's NSS database, so every WebKit page
+        # failed with "Unacceptable TLS certificate". This opt-in lets
+        # the runner add THIS run's CA to the system store of this
+        # ephemeral runner (removed on exit); the harness never does so
+        # without it. Verification stays on.
+        env:
+          RTCB_WEBKIT_SYSTEM_TRUST: "1"
         run: |
           set -uo pipefail
           net/crates/net/tests/rtc_browser/run.sh --engine webkit 2>&1 \

@@ -200,3 +200,29 @@ func TestClosedClientReturnsHandleClosedError(t *testing.T) {
 // flag this import as unused under refactors that move
 // `WithDeadline` somewhere else.
 var _ = time.Second
+
+// SDK audit 2026-10-11: the constructors took an unsafe.Pointer, and the
+// only one a caller outside this package could supply was
+// unsafe.Pointer(node) — a Go struct Rust then read as the native mesh
+// handle. They now take the *MeshNode and pass its native handle.
+func TestAggregatorClientsAreBuiltFromAMeshNode(t *testing.T) {
+	node := newMeshForCaps(t)
+	reg, err := NewRegistryClient(node)
+	if err != nil {
+		t.Fatalf("NewRegistryClient(live node): %v", err)
+	}
+	_ = reg.Close()
+	fq, err := NewFoldQueryClient(node)
+	if err != nil {
+		t.Fatalf("NewFoldQueryClient(live node): %v", err)
+	}
+	_ = fq.Close()
+
+	node.Shutdown()
+	if _, err := NewRegistryClient(node); err == nil {
+		t.Fatal("a shut-down node must be refused")
+	}
+	if _, err := NewFoldQueryClient(node); err == nil {
+		t.Fatal("a shut-down node must be refused")
+	}
+}

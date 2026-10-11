@@ -52,6 +52,50 @@ pub(crate) fn bigint_u64(b: BigInt) -> Result<u64> {
         .map_err(|msg| Error::from_reason(msg.to_string()))
 }
 
+/// A JS-number TTL in seconds, checked: a finite integer in
+/// `1..=u32::MAX`. Taking it as `u32` let napi's `ToUint32` wrap it —
+/// `-1` became a 136-year enrollment invite, `2 ** 32` one born
+/// expired, `1.5` silently `1` (SDK audit 2026-10-11). Pure, so it is
+/// testable without a Node host.
+/// The "no cap" stand-in for a `*TimeoutMs: 0` handler wait: about 30
+/// years, tokio's own far-future horizon. The previous sentinel,
+/// `u64::MAX / 1000` seconds (~584 million years), overflowed `Instant`
+/// arithmetic — `Instant::now() + timeout` panicked on the first
+/// invocation, Windows' `Instant` range being the tightest (cubic review of
+/// PR #1228).
+pub(crate) const UNCAPPED_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60 * 24 * 365 * 30);
+
+/// `now + timeout`, saturating at [`UNCAPPED_WAIT`] instead of panicking
+/// on overflow.
+pub(crate) fn deadline_after(timeout: std::time::Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + UNCAPPED_WAIT)
+}
+
+pub(crate) fn validate_ttl_seconds(name: &str, value: f64) -> std::result::Result<u64, String> {
+    validate_whole_in_u32(name, value, "seconds")
+}
+
+/// The same check for any whole-number JS duration in `1..=u32::MAX`
+/// `unit`s (e.g. a millisecond timeout).
+pub(crate) fn validate_whole_in_u32(
+    name: &str,
+    value: f64,
+    unit: &str,
+) -> std::result::Result<u64, String> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(format!(
+            "{name} must be a whole number of {unit}, got {value}"
+        ));
+    }
+    if value < 1.0 || value > f64::from(u32::MAX) {
+        return Err(format!("{name} must be in 1..={}, got {value}", u32::MAX));
+    }
+    Ok(value as u64)
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression tests for [`validate_bigint_u64_parts`] — the
@@ -68,7 +112,24 @@ mod tests {
     //! through `bigint_u64` → this validator; these tests pin
     //! the validator so the NAT surface can't silently accept
     //! out-of-range ids again.
-    use super::validate_bigint_u64_parts;
+    use super::{validate_bigint_u64_parts, validate_whole_in_u32};
+
+    #[test]
+    fn whole_u32_durations_refuse_zero_negatives_fractions_and_overflow() {
+        // Code review 2026-10-11 NODE-2: approveTimeoutMs.
+        for bad in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY, 4_294_967_296.0] {
+            let err = validate_whole_in_u32("approveTimeoutMs", bad, "milliseconds").unwrap_err();
+            assert!(err.contains("approveTimeoutMs"), "{err}");
+        }
+        assert_eq!(validate_whole_in_u32("t", 1.0, "milliseconds"), Ok(1));
+        assert_eq!(
+            validate_whole_in_u32("t", f64::from(u32::MAX), "milliseconds"),
+            Ok(u64::from(u32::MAX))
+        );
+        assert!(validate_whole_in_u32("t", 1.5, "milliseconds")
+            .unwrap_err()
+            .contains("whole number of milliseconds"));
+    }
 
     #[test]
     fn accepts_positive_single_word() {
@@ -159,5 +220,16 @@ mod tests {
         // Empty-slice (zero) and single-word paths are handled
         // separately above.
         assert!(validate_bigint_u64_parts(false, &[42, 0, 0]).is_err());
+    }
+
+    // SDK audit 2026-10-11: enrollment TTLs were napi-coerced u32s.
+    #[test]
+    fn ttl_seconds_rejects_what_tou_int32_would_wrap() {
+        use super::validate_ttl_seconds as v;
+        assert_eq!(v("ttl", 60.0), Ok(60));
+        assert_eq!(v("ttl", f64::from(u32::MAX)), Ok(u64::from(u32::MAX)));
+        for bad in [-1.0, 0.0, 1.5, 4_294_967_296.0, f64::NAN, f64::INFINITY] {
+            assert!(v("ttl", bad).is_err(), "{bad} must be refused");
+        }
     }
 }

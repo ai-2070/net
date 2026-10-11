@@ -461,6 +461,13 @@ func NewOrgCredentials(cfg OrgCredentialsConfig) (*OrgCredentials, error) {
 	if len(cfg.Membership) == 0 || len(cfg.Dispatcher) == 0 {
 		return nil, errors.New("net.NewOrgCredentials: membership and dispatcher are required")
 	}
+	// C.CString truncates at a NUL, so such a path silently named another
+	// file (SDK audit 2026-10-11).
+	for _, p := range cfg.AudienceSecretPaths {
+		if strings.IndexByte(p, 0) >= 0 {
+			return nil, fmt.Errorf("%w: audience-secret path contains a NUL byte", ErrOrgCredentials)
+		}
+	}
 
 	memC := C.CBytes(cfg.Membership)
 	defer C.free(memC)
@@ -650,7 +657,7 @@ func (c *OrgClient) CallBytes(ctx context.Context, service string, req []byte) (
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installOrgCancelWatcher(ctx, c)
+	cancelToken, inflight, stopWatcher := installOrgCancelWatcher(ctx, c)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -658,6 +665,8 @@ func (c *OrgClient) CallBytes(ctx context.Context, service string, req []byte) (
 	var outErr *C.char
 	var code C.int
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_org_call(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -688,7 +697,7 @@ func (c *OrgClient) CallExportedBytes(ctx context.Context, service string, req [
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installOrgCancelWatcher(ctx, c)
+	cancelToken, inflight, stopWatcher := installOrgCancelWatcher(ctx, c)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -696,6 +705,8 @@ func (c *OrgClient) CallExportedBytes(ctx context.Context, service string, req [
 	var outErr *C.char
 	var code C.int
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_org_call_exported(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -722,6 +733,19 @@ func CallExported[Req, Resp any](ctx context.Context, c *OrgClient, service stri
 		return zero, err
 	}
 	return jsonDecodeTyped[Resp](respBody)
+}
+
+// orgStreamConstructError maps a streaming construction that failed
+// because the caller's ctx fired to ctx.Err(), as readOrgCallResult does
+// for the unary path.
+func orgStreamConstructError(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		var oe *OrgError
+		if errors.As(err, &oe) && oe.Domain == OrgDomainRPC && oe.Kind == "cancelled" {
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func readOrgCallResult(
@@ -755,41 +779,25 @@ func readOrgCallResult(
 // installOrgCancelWatcher reserves a cancel token and spawns a goroutine that
 // fires net_org_cancel_call on ctx.Done(). Returns the token and an idempotent
 // stop. Mirrors mesh_rpc.go's installCancelWatcher.
-func installOrgCancelWatcher(ctx context.Context, c *OrgClient) (uint64, func()) {
+func installOrgCancelWatcher(ctx context.Context, c *OrgClient) (uint64, *inflightCancel, func()) {
 	if ctx == nil || ctx.Done() == nil || c == nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	var token uint64
 	if err := c.withHandle(func(h *C.NetOrgClient) {
 		token = uint64(C.net_org_reserve_cancel_token(h))
 	}); err != nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	if token == 0 {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		select {
-		case <-ctx.Done():
-			// Re-acquire the read lock so a concurrent Close can't free the
-			// handle out from under us. A closed handle is a quiet drop.
-			_ = c.withHandle(func(h *C.NetOrgClient) {
-				C.net_org_cancel_call(h, C.uint64_t(token))
-			})
-		case <-stop:
-		}
-	}()
-	return token, func() {
-		select {
-		case <-stop:
-		default:
-			close(stop)
-		}
-		<-done
-	}
+	// Fired against the handle the call publishes while inside native
+	// code, never via c.withHandle (which deadlocks against a queued Close).
+	ic := newInflightCancel(token, func(h unsafe.Pointer, t uint64) {
+		C.net_org_cancel_call((*C.NetOrgClient)(h), C.uint64_t(t))
+	})
+	return token, ic, ic.watchCtx(ctx.Done())
 }
 
 // OrgCall calls a protected service with JSON marshaling. Free function because
@@ -838,19 +846,26 @@ func (c *OrgClient) CallStreaming(ctx context.Context, service string, req []byt
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
+	// The construction blocks (signed opening / initial ACK): arm ctx for
+	// it with a reserved token, stopped on every exit. A token of 0 (no
+	// ctx Done) keeps the uncancellable construction.
+	cancelToken, constructing, stopConstructing := installOrgCancelWatcher(ctx, c)
+	defer stopConstructing()
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_org_call_streaming(
 			h,
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
-			C.uint64_t(deadlineMs), C.uint64_t(0), // 0 = uncancellable construction
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
 			&outStream, &outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
 	if err := orgErrorFromCall(code, outErr); err != nil {
-		return nil, err
+		return nil, orgStreamConstructError(ctx, err)
 	}
 	stream := newRpcStreamFromOrg(unsafe.Pointer(outStream))
 	stream.cancel, stream.watcherDone = spawnCtxCancelWatcher(ctx, stream.guard)
@@ -870,18 +885,25 @@ func (c *OrgClient) CallClientStream(ctx context.Context, service string) (*Clie
 	var outHandle *C.ClientStreamCallHandleC
 	var outErr *C.char
 	var code C.int
+	// The construction blocks (signed opening / initial ACK): arm ctx for
+	// it with a reserved token, stopped on every exit. A token of 0 (no
+	// ctx Done) keeps the uncancellable construction.
+	cancelToken, constructing, stopConstructing := installOrgCancelWatcher(ctx, c)
+	defer stopConstructing()
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_org_call_client_stream(
 			h,
 			(*C.char)(cService.ptr), cService.len,
-			C.uint64_t(deadlineMs), C.uint64_t(0),
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
 			&outHandle, &outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
 	if err := orgErrorFromCall(code, outErr); err != nil {
-		return nil, err
+		return nil, orgStreamConstructError(ctx, err)
 	}
 	call := newClientStreamCallFromOrg(unsafe.Pointer(outHandle))
 	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, call.guard)
@@ -899,18 +921,25 @@ func (c *OrgClient) CallDuplex(ctx context.Context, service string) (*DuplexCall
 	var outHandle *C.DuplexCallHandleC
 	var outErr *C.char
 	var code C.int
+	// The construction blocks (signed opening / initial ACK): arm ctx for
+	// it with a reserved token, stopped on every exit. A token of 0 (no
+	// ctx Done) keeps the uncancellable construction.
+	cancelToken, constructing, stopConstructing := installOrgCancelWatcher(ctx, c)
+	defer stopConstructing()
 	if err := c.withHandle(func(h *C.NetOrgClient) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_org_call_duplex(
 			h,
 			(*C.char)(cService.ptr), cService.len,
-			C.uint64_t(deadlineMs), C.uint64_t(0),
+			C.uint64_t(deadlineMs), C.uint64_t(cancelToken),
 			&outHandle, &outErr,
 		)
 	}); err != nil {
 		return nil, err
 	}
 	if err := orgErrorFromCall(code, outErr); err != nil {
-		return nil, err
+		return nil, orgStreamConstructError(ctx, err)
 	}
 	call := newDuplexCallFromOrg(unsafe.Pointer(outHandle))
 	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, call.guard)
@@ -1296,7 +1325,7 @@ func go_net_org_streaming_trampoline(
 	// Invalidate the wrapper BEFORE returning to Rust — anything the
 	// handler captured into a goroutine sees ErrStreamDone on Send, never
 	// the C handle Rust is about to free.
-	sink.invalidated.Store(1)
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -1348,7 +1377,7 @@ func go_net_org_client_streaming_trampoline(
 	}
 	stream := newRequestStreamRecvFromPtr(unsafe.Pointer(requestStream))
 	resp, err := safeCallOrgClientStreamingHandler(handler, orgCallerFromC(caller), stream)
-	stream.invalidated.Store(1)
+	stream.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -1407,8 +1436,8 @@ func go_net_org_duplex_trampoline(
 	err := safeCallOrgDuplexHandler(handler, orgCallerFromC(caller), stream, sink)
 	// Invalidate BOTH wrappers before returning — Rust is about to free
 	// the underlying handles.
-	stream.invalidated.Store(1)
-	sink.invalidated.Store(1)
+	stream.retire()
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1

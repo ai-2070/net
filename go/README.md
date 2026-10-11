@@ -257,6 +257,12 @@ Errors are 49 sentinels you compare with `errors.Is`, plus typed structs
 carrying a `Kind` for `errors.As`:
 [Errors](https://ai2070.net/docs/sdk/go/errors).
 
+**A Rust panic aborts the process.** `libnet` is built with
+`panic = "abort"` (the release profile), so a panic inside the library is
+not turned into a Go error — it terminates the whole Go program. The
+`runtime_panic` error kind some types document only occurs in debug /
+unwind builds.
+
 ## What's in the box
 
 | Surface | Guide |

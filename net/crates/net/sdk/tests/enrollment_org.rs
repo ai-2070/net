@@ -783,6 +783,30 @@ mod live {
         let other = OrgFloorRequest::new(&bundle, p_id.entity_id().clone()).unwrap();
         assert!(attestation.verify_for(&other).is_err());
 
+        // SDK audit 2026-10-11: a self-signed bundle of a throwaway org is
+        // not applied — the provider attests NotMember and stores nothing.
+        let stranger = OrgKeypair::generate();
+        let mut junk = std::collections::BTreeMap::new();
+        junk.insert(c_id.entity_id().clone(), 9u32);
+        let foreign = OrgRevocationBundle::try_issue(&stranger, &junk).unwrap();
+        let foreign_req = OrgFloorRequest::new(&foreign, p_id.entity_id().clone()).unwrap();
+        let foreign_att = request_org_floor(
+            b.node(),
+            provider.node_id(),
+            &foreign_req,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        foreign_att.verify_for(&foreign_req).unwrap();
+        assert_eq!(foreign_att.outcome, OrgFloorOutcome::NotMember);
+        let revocation = &provider.node().node_authority().unwrap().revocation;
+        assert_eq!(
+            revocation.floor_for(&stranger.org_id(), c_id.entity_id()),
+            0,
+            "a foreign org's floor is never persisted"
+        );
+
         assert!(
             ping(&b, &provider, &org, &b_id).await.is_err(),
             "B's old membership is refused"

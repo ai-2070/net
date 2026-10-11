@@ -326,6 +326,9 @@ def test_find_nodes_scoped_empty_tenant_and_unknown_kind_raise() -> None:
             {"kind": "tenant"},
             {"kind": "region", "region": ""},
             {"kind": "tenat", "tenant": "oem-123"},
+            # SDK audit 2026-10-11: a missing kind widened to `any`.
+            {"tenant": "oem-123"},
+            {},
         ):
             with pytest.raises(ValueError):
                 m.find_nodes_scoped({"require_tags": ["gpu"]}, scope)

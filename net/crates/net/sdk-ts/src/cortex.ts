@@ -123,6 +123,7 @@ import { classifyError } from '@net-mesh/core/errors';
 
 import { napiMeshOf } from './_internal.js';
 import type { MeshNode } from './mesh.js';
+import { wrapWatchIter, type RawWatchIter, type WatchIterable } from './watch-iter.js';
 
 /**
  * Raised on `redex:` prefixed failures: append / tail / read / sync /
@@ -419,7 +420,7 @@ export class RedexFile {
    *  (default `0n`) — atomically backfills the retained range and
    *  then streams appends. Breaking out of `for await` releases the
    *  native iterator via `return()`. */
-  async tail(fromSeq?: bigint): Promise<AsyncIterable<RedexEvent>> {
+  async tail(fromSeq?: bigint): Promise<WatchIterable<RedexEvent>> {
     try {
       const iter: NapiRedexTailIter = await this.napi.tail(fromSeq ?? null);
       const raw: RawWatchIter<RedexEvent> = {
@@ -468,50 +469,6 @@ export class RedexFile {
 // AsyncIterable wrapper for pull-based NAPI watch iterators
 // ---------------------------------------------------------------------------
 
-/**
- * Minimal shape the NAPI watch iterators expose (`TaskWatchIter`,
- * `MemoryWatchIter`, and the `SnapshotAndWatch` variants). Pull a
- * batch via `next()`; `null` means the iterator has ended or been
- * closed. `close()` terminates early — idempotent.
- */
-interface RawWatchIter<T> {
-  next(): Promise<T | null>;
-  close(): void;
-}
-
-/**
- * Turn a pull-based NAPI iterator into an `AsyncIterable` that plays
- * nicely with `for await (...)`. The `return()` hook (fired by `break`
- * / `throw` inside the loop) calls `close()` so native resources are
- * released deterministically — dropping the loop is enough, no manual
- * cleanup needed.
- */
-function wrapWatchIter<T>(raw: RawWatchIter<T>): AsyncIterable<T> {
-  return {
-    [Symbol.asyncIterator](): AsyncIterator<T> {
-      let done = false;
-      const finish = (): IteratorResult<T> => ({ value: undefined as unknown as T, done: true });
-      return {
-        async next(): Promise<IteratorResult<T>> {
-          if (done) return finish();
-          const v = await raw.next();
-          if (v === null) {
-            done = true;
-            return finish();
-          }
-          return { value: v, done: false };
-        },
-        async return(): Promise<IteratorResult<T>> {
-          if (!done) {
-            done = true;
-            raw.close();
-          }
-          return finish();
-        },
-      };
-    },
-  };
-}
 
 /** Return shape of `snapshotAndWatch` on every adapter. */
 export interface SnapshotAndWatch<T> {
@@ -522,7 +479,7 @@ export interface SnapshotAndWatch<T> {
    * equal `snapshot`; any divergent initial emission (caused by a
    * mutation racing construction) is forwarded through.
    */
-  readonly updates: AsyncIterable<T[]>;
+  readonly updates: WatchIterable<T[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -695,7 +652,7 @@ export class TasksAdapter {
    * per fold tick where the result differs from the previous emission.
    * Breaking out of `for await` calls `close()` automatically.
    */
-  async watch(filter?: TaskFilter | null): Promise<AsyncIterable<Task[]>> {
+  async watch(filter?: TaskFilter | null): Promise<WatchIterable<Task[]>> {
     try {
       const iter: RawWatchIter<Task[]> = await this.napi.watchTasks(filter ?? null);
       return wrapWatchIter(iter);
@@ -902,7 +859,7 @@ export class MemoriesAdapter {
     }
   }
 
-  async watch(filter?: MemoryFilter | null): Promise<AsyncIterable<Memory[]>> {
+  async watch(filter?: MemoryFilter | null): Promise<WatchIterable<Memory[]>> {
     try {
       const iter: RawWatchIter<Memory[]> = await this.napi.watchMemories(filter ?? null);
       return wrapWatchIter(iter);

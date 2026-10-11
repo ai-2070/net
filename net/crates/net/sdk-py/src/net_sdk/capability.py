@@ -968,7 +968,29 @@ def placement_filter_from_fn(
         id_ = f"pf-{_placement_filter_counter}"
     else:
         id_ = explicit_id
-    return RegisteredPlacementFilter(id=id_, fn=fn)
+    return RegisteredPlacementFilter(id=id_, fn=_adapt_placement_filter(fn))
+
+
+def _adapt_placement_filter(fn: PlacementFilterFn) -> PlacementFilterFn:
+    """Hand ``fn`` the :class:`PlacementCandidate` its type promises.
+
+    The native layer calls the registered filter with a plain ``dict``
+    (``node_id`` / ``tags`` / ``metadata``), so a filter written to this
+    module's type (``lambda c: "gpu" in c.tags``) raised on every candidate
+    — and the native layer vetoes on any exception, so placement silently
+    found nothing (SDK audit 2026-10-11). A candidate already of the right
+    type passes through."""
+
+    def adapted(candidate: Any) -> bool:
+        if isinstance(candidate, dict):
+            candidate = PlacementCandidate(
+                node_id=candidate["node_id"],
+                tags=tuple(candidate.get("tags", ())),
+                metadata=dict(candidate.get("metadata", {})),
+            )
+        return fn(candidate)
+
+    return adapted
 
 
 # ============================================================================

@@ -60,6 +60,7 @@
  *   transport        — wire-level failure (peer dropped, disconnect)
  *   codec_encode     — request body failed to encode
  *   codec_decode     — response body failed to decode
+ *   capability_denied — the target's capability gate refused the call
  *   cancelled        — call cancelled via net_rpc_cancel_call
  *
  * The Go binding's `parseRpcError` re-prefixes these with `nrpc:`
@@ -1049,6 +1050,20 @@ int net_rpc_request_stream_next(
     RpcRequestStreamHandleC* handle,
     uint8_t** out_chunk_ptr,
     size_t* out_chunk_len);
+
+/* Retire a request-stream handle the dispatcher is about to return.
+ * Wakes a net_rpc_request_stream_next parked on it and makes every
+ * later call return NET_RPC_ERR_STREAM_DONE immediately; never frees
+ * (the library still frees the handle after the dispatcher returns).
+ *
+ * A handler that hands the stream to another thread must retire it,
+ * wait until that thread can no longer access the handle (join it,
+ * or otherwise ensure it will make no further call on it - an
+ * in-flight next returning is not enough if the thread may call
+ * again), and only then return from the dispatcher: the handle is
+ * freed the moment the dispatcher returns. Idempotent. Returns NET_RPC_OK, or
+ * NET_RPC_ERR_NULL on a NULL handle. Additive within ABI 0x0004. */
+int net_rpc_request_stream_retire(RpcRequestStreamHandleC* handle);
 
 /* Emit one response chunk via the sink (duplex handlers). Non-
  * blocking; SDK try_send semantics. Returns NET_RPC_OK on success

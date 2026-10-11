@@ -264,16 +264,32 @@ type RegistryClient struct {
 	handle *C.net_registry_client_handle_t
 }
 
-// NewRegistryClient builds a RegistryClient bound to `meshHandle`
-// (the opaque pointer produced by the main libnet's net_mesh_new).
-func NewRegistryClient(meshHandle unsafe.Pointer) (*RegistryClient, error) {
-	if meshHandle == nil {
+// NewRegistryClient builds a RegistryClient bound to `node`.
+func NewRegistryClient(node *MeshNode) (*RegistryClient, error) {
+	// Takes the *MeshNode, not a raw pointer: the only pointer a caller
+	// outside this package could supply was unsafe.Pointer(node) — a Go
+	// struct, not the native mesh handle — which Rust then dereferenced
+	// as one (SDK audit 2026-10-11).
+	if node == nil {
 		return nil, &RegistryClientError{
 			Kind:   RegistryErrKindInvalidArgs,
-			Detail: "mesh handle is nil",
+			Detail: "mesh node is nil",
 		}
 	}
-	h := C.net_registry_client_new(meshHandle)
+	// The native client clones the node's Arc, so it does not borrow
+	// node.handle past this call. Refused once Shutdown has begun, not
+	// only once it has freed the handle: a client built beside the
+	// in-progress native shutdown was bound to a stopped node (code
+	// review 2026-10-11).
+	var h *C.net_registry_client_handle_t
+	if !node.withHandleForChild(func(nh unsafe.Pointer) {
+		h = C.net_registry_client_new(nh)
+	}) {
+		return nil, &RegistryClientError{
+			Kind:   RegistryErrKindInvalidArgs,
+			Detail: "mesh node is shut down",
+		}
+	}
 	if h == nil {
 		return nil, &RegistryClientError{
 			Kind:   RegistryErrKindInvalidArgs,
@@ -427,15 +443,32 @@ type FoldQueryClient struct {
 	handle *C.net_fold_query_client_handle_t
 }
 
-// NewFoldQueryClient builds a FoldQueryClient bound to `meshHandle`.
-func NewFoldQueryClient(meshHandle unsafe.Pointer) (*FoldQueryClient, error) {
-	if meshHandle == nil {
+// NewFoldQueryClient builds a FoldQueryClient bound to `node`.
+func NewFoldQueryClient(node *MeshNode) (*FoldQueryClient, error) {
+	// Takes the *MeshNode, not a raw pointer: the only pointer a caller
+	// outside this package could supply was unsafe.Pointer(node) — a Go
+	// struct, not the native mesh handle — which Rust then dereferenced
+	// as one (SDK audit 2026-10-11).
+	if node == nil {
 		return nil, &FoldQueryClientError{
 			Kind:   FoldQueryErrKindInvalidArgs,
-			Detail: "mesh handle is nil",
+			Detail: "mesh node is nil",
 		}
 	}
-	h := C.net_fold_query_client_new(meshHandle)
+	// The native client clones the node's Arc, so it does not borrow
+	// node.handle past this call. Refused once Shutdown has begun, not
+	// only once it has freed the handle: a client built beside the
+	// in-progress native shutdown was bound to a stopped node (code
+	// review 2026-10-11).
+	var h *C.net_fold_query_client_handle_t
+	if !node.withHandleForChild(func(nh unsafe.Pointer) {
+		h = C.net_fold_query_client_new(nh)
+	}) {
+		return nil, &FoldQueryClientError{
+			Kind:   FoldQueryErrKindInvalidArgs,
+			Detail: "mesh node is shut down",
+		}
+	}
 	if h == nil {
 		return nil, &FoldQueryClientError{
 			Kind:   FoldQueryErrKindInvalidArgs,

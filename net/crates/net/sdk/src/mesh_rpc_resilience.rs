@@ -368,12 +368,13 @@ impl Mesh {
     /// Hedge across an explicit set of target node ids. The first
     /// element of `targets` is the primary (fired immediately);
     /// subsequent elements are hedges fired at `policy.delay * idx`.
-    /// Whichever call resolves first wins (Ok or Err). Losing
-    /// in-flight calls are dropped on the caller side.
+    /// The first call to SUCCEED wins; errors are collected while
+    /// any call is still in flight. Losing in-flight calls are
+    /// dropped on the caller side.
     ///
     /// Returns `RpcError::NoRoute` if `targets` is empty. If every
-    /// candidate fails, returns the LAST observed error (after
-    /// all hedges have been awaited).
+    /// candidate fails, returns the PRIMARY's error (the
+    /// lowest-indexed target), once all hedges have been awaited.
     pub async fn call_with_hedge_to(
         &self,
         targets: &[u64],
@@ -805,6 +806,13 @@ struct BreakerInner {
     /// True while a `HalfOpen` probe is in flight. Other calls
     /// arriving during HalfOpen short-circuit on this flag.
     probe_in_flight: bool,
+    /// Bumped on every entry into `Closed`. A call admitted while Closed
+    /// carries the generation it was admitted under, and its outcome
+    /// counts only in that same Closed period: a slow failure admitted
+    /// before an Open -> HalfOpen -> Closed cycle used to land in the NEW
+    /// period's counter and could re-trip a breaker that had just closed
+    /// (cubic review of PR #1228).
+    closed_generation: u64,
 }
 
 impl CircuitBreaker {
@@ -818,6 +826,7 @@ impl CircuitBreaker {
                 consecutive_successes: 0,
                 opened_at: None,
                 probe_in_flight: false,
+                closed_generation: 0,
             }),
         }
     }
@@ -854,6 +863,7 @@ impl CircuitBreaker {
         g.consecutive_successes = 0;
         g.opened_at = None;
         g.probe_in_flight = false;
+        g.closed_generation = g.closed_generation.wrapping_add(1);
     }
 
     /// Wrap an async call. Returns:
@@ -879,7 +889,7 @@ impl CircuitBreaker {
         // Admission decision — short, no awaits.
         let admitted_as = self.try_admit();
         let admitted_as = match admitted_as {
-            AdmissionOutcome::Closed => Admission::Closed,
+            AdmissionOutcome::Closed(generation) => Admission::Closed(generation),
             AdmissionOutcome::HalfOpenProbe => Admission::HalfOpenProbe,
             AdmissionOutcome::Reject => return Err(BreakerError::Open),
         };
@@ -905,8 +915,15 @@ impl CircuitBreaker {
         _probe_guard.disarmed.set(true);
         let mut g = self.lock_inner();
         match (&outcome, admitted_as) {
-            (Ok(_), Admission::Closed) => {
-                g.consecutive_failures = 0;
+            // A call admitted while Closed counts only if the breaker is
+            // STILL Closed. A slow stray finishing during Open / HalfOpen
+            // used to push the cooldown back, or re-trip the breaker while a
+            // probe was in flight — whose success then closed it right
+            // after the fresh failure (SDK audit 2026-10-11).
+            (Ok(_), Admission::Closed(generation)) => {
+                if g.state == BreakerState::Closed && g.closed_generation == generation {
+                    g.consecutive_failures = 0;
+                }
             }
             (Ok(_), Admission::HalfOpenProbe) => {
                 g.probe_in_flight = false;
@@ -916,6 +933,7 @@ impl CircuitBreaker {
                     g.consecutive_failures = 0;
                     g.consecutive_successes = 0;
                     g.opened_at = None;
+                    g.closed_generation = g.closed_generation.wrapping_add(1);
                 }
             }
             (Err(e), admission) => {
@@ -925,7 +943,10 @@ impl CircuitBreaker {
                 }
                 if counts {
                     match admission {
-                        Admission::Closed => {
+                        Admission::Closed(generation)
+                            if g.state != BreakerState::Closed
+                                || g.closed_generation != generation => {}
+                        Admission::Closed(_) => {
                             g.consecutive_failures = g.consecutive_failures.saturating_add(1);
                             if g.consecutive_failures >= self.config.failure_threshold.max(1) {
                                 g.state = BreakerState::Open;
@@ -961,7 +982,7 @@ impl CircuitBreaker {
     fn try_admit(&self) -> AdmissionOutcome {
         let mut g = self.lock_inner();
         match g.state {
-            BreakerState::Closed => AdmissionOutcome::Closed,
+            BreakerState::Closed => AdmissionOutcome::Closed(g.closed_generation),
             BreakerState::Open => {
                 let elapsed = g.opened_at.map(|i| i.elapsed()).unwrap_or(Duration::ZERO);
                 if elapsed >= self.config.reset_after {
@@ -1022,13 +1043,15 @@ impl Drop for ProbeGuard<'_> {
 
 #[derive(Clone, Copy)]
 enum AdmissionOutcome {
-    Closed,
+    /// Admitted while Closed, in this Closed generation.
+    Closed(u64),
     HalfOpenProbe,
     Reject,
 }
 
 #[derive(Clone, Copy)]
 enum Admission {
-    Closed,
+    /// Admitted while Closed, in this Closed generation.
+    Closed(u64),
     HalfOpenProbe,
 }

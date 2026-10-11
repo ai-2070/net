@@ -31,8 +31,8 @@ const DEFAULT_LIMIT = 100;
  */
 export class EventStream implements AsyncIterable<StoredEvent> {
   private bus: NapiNet;
-  private opts: Required<SubscribeOpts>;
-  private cursor?: string;
+  private opts: Required<Omit<SubscribeOpts, 'cursor'>>;
+  private position?: string;
   private aborted = false;
 
   constructor(bus: NapiNet, opts: SubscribeOpts = {}) {
@@ -44,6 +44,17 @@ export class EventStream implements AsyncIterable<StoredEvent> {
       pollIntervalMs: opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL,
       maxBackoffMs: opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF,
     };
+    this.position = opts.cursor;
+  }
+
+  /**
+   * The resume point after the batch this stream most recently FETCHED —
+   * pass it as `SubscribeOpts.cursor` to start a new stream there instead
+   * of from the beginning. Batch-granular: events of that batch not yet
+   * yielded when the stream stopped are not re-delivered.
+   */
+  get cursor(): string | undefined {
+    return this.position;
   }
 
   /** Stop the stream. */
@@ -57,14 +68,23 @@ export class EventStream implements AsyncIterable<StoredEvent> {
     while (!this.aborted) {
       const response = await this.bus.poll({
         limit: this.opts.limit,
-        cursor: this.cursor,
+        cursor: this.position,
         filter: this.opts.filter || undefined,
         ordering: this.opts.ordering,
       });
 
+      // Adopt the core's cursor on EVERY poll, not only when events came
+      // back: a filtered poll whose whole window was filtered out still
+      // advances `nextId` past it (and sets `hasMore`). Dropping it re-read
+      // the same window forever, so a filtered subscription behind a run of
+      // non-matching events never delivered (SDK audit 2026-10-11). A null
+      // `nextId` keeps the current cursor rather than restarting.
+      if (response.nextId != null) {
+        this.position = response.nextId;
+      }
+
       if (response.events.length > 0) {
         backoff = this.opts.pollIntervalMs;
-        this.cursor = response.nextId ?? undefined;
 
         for (const event of response.events) {
           yield {
@@ -84,6 +104,10 @@ export class EventStream implements AsyncIterable<StoredEvent> {
         if (response.events.length < this.opts.limit) {
           await sleep(this.opts.pollIntervalMs);
         }
+      } else if (response.hasMore) {
+        // Everything fetched was filtered out but the core advanced past
+        // it: keep paging forward without idling.
+        backoff = this.opts.pollIntervalMs;
       } else {
         // Exponential backoff when idle.
         await sleep(backoff);
@@ -116,6 +140,11 @@ export class TypedEventStream<T> implements AsyncIterable<T> {
   /** Stop the stream. */
   stop(): void {
     this.inner.stop();
+  }
+
+  /** See {@link EventStream.cursor}. */
+  get cursor(): string | undefined {
+    return this.inner.cursor;
   }
 
   async *[Symbol.asyncIterator](): AsyncIterableIterator<T> {

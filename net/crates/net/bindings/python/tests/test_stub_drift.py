@@ -193,7 +193,7 @@ def test_sampled_class_runtime_methods_are_stubbed(class_name: str) -> None:
     )
 
 
-@pytest.mark.parametrize("class_name", SAMPLED_CLASSES)
+@pytest.mark.parametrize("class_name", _collect_stub_class_names())
 def test_sampled_class_method_parameters_match(class_name: str) -> None:
     """Names are not enough: a stubbed method whose parameters differ
     from the runtime's type-checks wrong calls and rejects right ones.
@@ -203,8 +203,11 @@ def test_sampled_class_method_parameters_match(class_name: str) -> None:
     ``inspect.signature`` of the runtime (PyO3 publishes
     ``__text_signature__``). Properties are skipped; a method whose
     runtime signature is unreadable fails rather than skips."""
+    # Every stubbed class, not only the sampled ones: the SDK audit
+    # (2026-10-11) found `Identity.from_bytes`, `BlobRef.from_encoded`
+    # and two missing `generation` parameters outside the sample.
     runtime_cls = getattr(_net, class_name, None)
-    if runtime_cls is None:
+    if runtime_cls is None or not isinstance(runtime_cls, type):
         pytest.skip(f"{class_name} not present at runtime")
     tree = ast.parse(PYI_PATH.read_text())
     cls_node = next(
@@ -214,12 +217,14 @@ def test_sampled_class_method_parameters_match(class_name: str) -> None:
     )
     mismatched: list[str] = []
     for fn in cls_node.body:
-        if not isinstance(fn, ast.FunctionDef):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if fn.name.startswith("__") and fn.name != "__init__":
             continue
         decorators = {d.id for d in fn.decorator_list if isinstance(d, ast.Name)}
-        if "property" in decorators:
+        if "property" in decorators or "overload" in decorators:
+            # `@overload`s deliberately narrow the runtime's call shape
+            # (e.g. CapabilityGateway's both-or-neither delegation pair).
             continue
         runtime_attr = (
             runtime_cls if fn.name == "__init__" else getattr(runtime_cls, fn.name, None)
@@ -251,6 +256,45 @@ def test_sampled_class_method_parameters_match(class_name: str) -> None:
         if stub_params != runtime_params:
             mismatched.append(f"{fn.name}: runtime={runtime_params} stub={stub_params}")
     assert not mismatched, f"{class_name} stub parameters drift: {mismatched}"
+
+
+def _stub_params(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, str]]:
+    args = fn.args
+    P = inspect.Parameter
+    return (
+        [(a.arg, P.POSITIONAL_ONLY.name) for a in args.posonlyargs]
+        + [(a.arg, P.POSITIONAL_OR_KEYWORD.name) for a in args.args]
+        + ([(args.vararg.arg, P.VAR_POSITIONAL.name)] if args.vararg else [])
+        + [(a.arg, P.KEYWORD_ONLY.name) for a in args.kwonlyargs]
+        + ([(args.kwarg.arg, P.VAR_KEYWORD.name)] if args.kwarg else [])
+    )
+
+
+def test_module_function_parameters_match() -> None:
+    """Module-level ``def``s in the stub against the runtime functions'
+    signatures (the SDK audit found ``register_blob_adapter`` stubbed
+    with ``adapter`` while the runtime took ``instance``)."""
+    tree = ast.parse(PYI_PATH.read_text())
+    mismatched: list[str] = []
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        runtime_fn = getattr(_net, fn.name, None)
+        if runtime_fn is None:
+            continue  # feature-gated out of this wheel
+        try:
+            runtime_params = [
+                (p.name, p.kind.name)
+                for p in inspect.signature(runtime_fn).parameters.values()
+            ]
+        except (TypeError, ValueError):
+            mismatched.append(f"{fn.name}: runtime signature unreadable")
+            continue
+        if _stub_params(fn) != runtime_params:
+            mismatched.append(
+                f"{fn.name}: runtime={runtime_params} stub={_stub_params(fn)}"
+            )
+    assert not mismatched, f"module function stubs drift: {mismatched}"
 
 
 def _collect_stub_attributes(class_name: str) -> list[str]:

@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -46,6 +47,7 @@ use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::operator::OperatorEnrollment as SdkOperatorEnrollment;
 use net_sdk::Identity as SdkIdentity;
 
+use crate::common::{validate_ttl_seconds, validate_whole_in_u32};
 use crate::delegation::{entity_id_from_buffer, u64_arg, DelegationChain, RevocationRegistry};
 use crate::identity::Identity;
 use crate::NetMesh;
@@ -402,12 +404,11 @@ impl OperatorEnrollment {
     /// a later `approve` can match a request to it. `rendezvous` is the
     /// transport locator devices dial (e.g. `NetMesh.rendezvousString()`).
     #[napi]
-    pub fn invite(&self, rendezvous: String, ttl_seconds: u32) -> InviteToken {
-        InviteToken {
-            inner: self
-                .inner
-                .invite(rendezvous, Duration::from_secs(u64::from(ttl_seconds))),
-        }
+    pub fn invite(&self, rendezvous: String, ttl_seconds: f64) -> Result<InviteToken> {
+        let ttl = validate_ttl_seconds("ttlSeconds", ttl_seconds).map_err(enroll_err)?;
+        Ok(InviteToken {
+            inner: self.inner.invite(rendezvous, Duration::from_secs(ttl)),
+        })
     }
 
     /// Approve an arriving request (auto — invite-as-authorization),
@@ -420,11 +421,13 @@ impl OperatorEnrollment {
     pub async fn approve(
         &self,
         request: &JoinRequest,
-        grant_ttl_seconds: u32,
+        grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<DelegationChain> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
-        let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
         let inner = self.inner.clone();
         let request = request.inner.clone();
         let enrollment = off_thread(move || inner.approve(&request, ttl, depth))
@@ -443,11 +446,13 @@ impl OperatorEnrollment {
     pub async fn handle_join_request(
         &self,
         request_bytes: Buffer,
-        grant_ttl_seconds: u32,
+        grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<Buffer> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
-        let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
         let inner = self.inner.clone();
         let bytes = request_bytes.as_ref().to_vec();
         let out = off_thread(move || inner.handle_join_request(&bytes, ttl, depth)).await?;
@@ -711,11 +716,13 @@ impl NetMesh {
     pub async fn serve_enrollment_auto(
         &self,
         operator: &OperatorEnrollment,
-        grant_ttl_seconds: u32,
+        grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<EnrollmentServeHandle> {
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
-        let ttl = Duration::from_secs(u64::from(grant_ttl_seconds));
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
         let mesh = mesh_over(self.node_arc_clone()?, None);
         let op = operator.arc();
         let enroll = mesh
@@ -726,6 +733,65 @@ impl NetMesh {
             .map_err(enroll_err)?;
         Ok(EnrollmentServeHandle {
             inner: Mutex::new(Some((mesh, vec![enroll, renew]))),
+        })
+    }
+
+    /// Operator-side, **approver-gated** enrollment: every valid join
+    /// request is handed to `approver` (a `JoinRequest` — device id, name,
+    /// tags) before it is admitted; return `true` (or a Promise of it) to
+    /// admit. A denial — `false`, a throw, a rejection, or no answer within
+    /// `approveTimeoutMs` (default 300 000) — answers the device a coded
+    /// rejection and does **not** burn the single-use invite. The mode
+    /// Rust's `serve_enrollment` provides and the safer default: a leaked
+    /// invite lets its holder *ask*, never admits them. Serves enrollment
+    /// only (no renewal; serve that with `serveEnrollmentAuto` if wanted).
+    /// Same node requirements as `serveEnrollmentAuto`.
+    ///
+    /// Added by the SDK audit (2026-10-11): the approver-gated mode existed
+    /// only in Rust, so every TS/Node operator ran the weaker auto mode.
+    #[napi(
+        ts_args_type = "operator: OperatorEnrollment, approver: (request: JoinRequest) => boolean | Promise<boolean>, grantTtlSeconds: number, maxDepth?: number | undefined | null, approveTimeoutMs?: number | undefined | null",
+        ts_return_type = "Promise<EnrollmentServeHandle>"
+    )]
+    pub fn serve_enrollment<'env>(
+        &self,
+        env: &'env Env,
+        operator: &OperatorEnrollment,
+        approver: Function<'_, JoinRequest, Either<Promise<bool>, bool>>,
+        grant_ttl_seconds: f64,
+        max_depth: Option<u8>,
+        approve_timeout_ms: Option<f64>,
+    ) -> Result<PromiseRaw<'env, EnrollmentServeHandle>> {
+        let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
+        let ttl = Duration::from_secs(
+            validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
+        );
+        // Validated as an f64: a `u32` parameter took `-1` as 4 294 967 295
+        // ms (~49.7 days of a stalled approver holding each join), and `0`
+        // timed out every approval — every device refused (code review
+        // 2026-10-11, NODE-2).
+        let budget = Duration::from_millis(match approve_timeout_ms {
+            None => 300_000,
+            Some(ms) => {
+                validate_whole_in_u32("approveTimeoutMs", ms, "milliseconds").map_err(enroll_err)?
+            }
+        });
+        let tsfn: ApproverTsfn = approver.build_threadsafe_function().build()?;
+        let tsfn = Arc::new(tsfn);
+        let node = self.node_arc_clone()?;
+        let op = operator.arc();
+        env.spawn_future(async move {
+            let mesh = mesh_over(node, None);
+            let approve = move |request: SdkJoinRequest| {
+                let tsfn = Arc::clone(&tsfn);
+                async move { ask_approver(&tsfn, request, budget).await }
+            };
+            let enroll = mesh
+                .serve_enrollment(op, ttl, depth, approve)
+                .map_err(enroll_err)?;
+            Ok(EnrollmentServeHandle {
+                inner: Mutex::new(Some((mesh, vec![enroll]))),
+            })
         })
     }
 
@@ -744,4 +810,33 @@ impl NetMesh {
             .map_err(enroll_err)?;
         Ok(DelegationChain::from_inner(renewed))
     }
+}
+
+type ApproverTsfn =
+    ThreadsafeFunction<JoinRequest, Either<Promise<bool>, bool>, JoinRequest, Status, false>;
+
+/// Ask the JS approver about one request. Fails closed: anything but an
+/// explicit `true` inside `budget` is a denial (which leaves the invite
+/// unburned, so the real device can still use it).
+async fn ask_approver(tsfn: &ApproverTsfn, request: SdkJoinRequest, budget: Duration) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Either<Promise<bool>, bool>>>();
+    let status = tsfn.call_with_return_value(
+        JoinRequest { inner: request },
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret, _env| {
+            let _ = tx.send(ret);
+            Ok(())
+        },
+    );
+    if status != Status::Ok {
+        return false;
+    }
+    let answer = async move {
+        match rx.await {
+            Ok(Ok(Either::B(admit))) => admit,
+            Ok(Ok(Either::A(promise))) => promise.await.unwrap_or(false),
+            _ => false,
+        }
+    };
+    tokio::time::timeout(budget, answer).await.unwrap_or(false)
 }

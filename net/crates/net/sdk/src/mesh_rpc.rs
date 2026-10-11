@@ -379,8 +379,8 @@ impl Mesh {
     /// Register a typed RPC handler on `service`. The handler
     /// receives a deserialized `Req` and returns either an `Ok(Resp)`
     /// (encoded as the response body) or an `Err(message)`
-    /// (surfaced as `RpcStatus::Internal` with the message as the
-    /// body).
+    /// (surfaced as `RpcStatus::Application(NRPC_TYPED_HANDLER_ERROR)`
+    /// — `0x8001` — with the message as the body).
     ///
     /// Codec is the [`Codec`] passed to the handler factory; the
     /// same codec must be used by the caller.
@@ -452,7 +452,7 @@ impl Mesh {
                 Default::default(),
             )
             .await
-            .map_err(|e| SdkError::Config(format!("call: {e}")))?;
+            .map_err(SdkError::Rpc)?;
         Ok(reply.body.to_vec())
     }
 
@@ -591,8 +591,7 @@ impl Mesh {
     /// `opts.codec`, opens the streaming call, returns an
     /// [`RpcStreamTyped<Resp>`] that decodes each chunk on the fly.
     /// Decode failures terminate the stream with a single
-    /// `RpcError::ServerError(Internal)` carrying the decode
-    /// diagnostic.
+    /// `RpcError::Codec` (decode direction) carrying the diagnostic.
     pub async fn call_streaming_typed<Req, Resp>(
         &self,
         target_node_id: u64,
@@ -848,6 +847,25 @@ impl<Resp: Serialize> ResponseSinkTyped<Resp> {
             .map_err(|e| format!("typed streaming sink encode: {e}"))?;
         self.inner.send(bytes);
         Ok(())
+    }
+
+    /// Backpressured [`Self::send`]: encode `value` and park until the
+    /// stream's pump has room, instead of dropping the chunk when the
+    /// queue is full (the caller withholds credit, or the handler outruns
+    /// the pump). Returns `Err` if encoding fails or the call has been torn
+    /// down (the chunk was not sent; stop producing).
+    ///
+    /// Use it for chunks that must not be lost silently — e.g. a stream's
+    /// terminal envelope.
+    pub async fn send_wait(&self, value: &Resp) -> std::result::Result<(), String> {
+        let bytes = self
+            .codec
+            .encode(value)
+            .map_err(|e| format!("typed streaming sink encode: {e}"))?;
+        self.inner
+            .send_wait(bytes)
+            .await
+            .map_err(|_| "typed streaming sink closed".to_string())
     }
 }
 

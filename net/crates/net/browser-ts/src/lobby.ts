@@ -51,6 +51,7 @@ import { StoreError } from './store/errors.js';
 import {
   hostInternals,
   hostStore,
+  nodeHexOf,
   type HostedStoreHandle,
   type HostProjection,
   type HostStoreBaseOptions,
@@ -327,9 +328,13 @@ export interface Lobby<S extends object, A extends ActionSpec, I extends InputSp
   close(): Promise<void>;
 }
 
+// Read the id the way every other caller-held id is read (`nodeHexOf`):
+// sixteen hex digits are hex, and anything shorter may be the exact-decimal
+// `peerNode` an event handed the page. Reading every digit run as hex kicked
+// a DIFFERENT id and removed nobody (SDK audit 2026-10-11).
 function hexPeer(peer: string): string {
-  const raw = peer.startsWith('0x') ? peer.slice(2) : peer;
-  if (/^[0-9a-fA-F]{1,16}$/.test(raw)) return raw.toLowerCase().padStart(16, '0');
+  const hex = nodeHexOf(peer);
+  if (hex !== null) return hex;
   throw new LobbyError('invalid', `not a peer id: ${JSON.stringify(peer)}`);
 }
 

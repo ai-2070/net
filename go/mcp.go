@@ -79,7 +79,8 @@ var ErrMcp = errors.New("mcp")
 // C ABI recorded for the most recent failure.
 type McpError struct {
 	// Kind is a stable tag: "invalid_arg", "classify_error", "pins_error",
-	// "encode_error", "runtime_panic", etc.
+	// "encode_error", "runtime_panic" (debug / unwind builds only — a
+	// released libnet aborts on a Rust panic), etc.
 	Kind    string
 	Message string
 }

@@ -1510,16 +1510,20 @@ impl PyIceProposal {
         let blast = py.detach(move || {
             runtime.block_on(async move {
                 let proposal = build_core_proposal(&client, action_for_build)?;
-                proposal.simulate().await.map(|s| s.blast_radius().clone())
+                proposal
+                    .simulate()
+                    .await
+                    .map(|s| (s.blast_radius().clone(), s.provenance()))
             })
         });
         match blast {
-            Ok(b) => Ok(PySimulatedIceProposal {
+            Ok((b, provenance)) => Ok(PySimulatedIceProposal {
                 client: self.client.clone(),
                 runtime: self.runtime.clone(),
                 action: Some(action),
                 issued_at_ms,
                 blast: b,
+                provenance,
                 committed: false,
             }),
             Err(e) => Err(deck_err_from(py, e)),
@@ -1546,6 +1550,8 @@ pub struct PySimulatedIceProposal {
     action: Option<net::adapter::net::behavior::meshos::IceActionProposal>,
     issued_at_ms: u64,
     blast: net::adapter::net::behavior::meshos::BlastRadius,
+    /// The simulator's provenance stamp, required at commit.
+    provenance: [u8; 32],
     committed: bool,
 }
 
@@ -1630,11 +1636,22 @@ impl PySimulatedIceProposal {
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
         self.action = None;
         self.committed = true;
+        let issued_at_ms = self.issued_at_ms;
+        let blast = self.blast.clone();
+        let provenance = self.provenance;
         let commit_result = py.detach(move || {
             runtime.block_on(async move {
-                let proposal = build_core_proposal(&client, action)?;
-                let simulated = proposal.simulate().await?;
-                simulated.commit(&sigs).await
+                // Commit exactly what was simulated and signed, never a
+                // re-simulation (SDK audit 2026-10-11).
+                net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+                    &client,
+                    action,
+                    issued_at_ms,
+                    blast,
+                    &provenance,
+                )?
+                .commit(&sigs)
+                .await
             })
         });
         match commit_result {
@@ -2415,18 +2432,19 @@ impl PyAsyncIceProposal {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let proposal = build_core_proposal(&client, action_for_future)
                 .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
-            let blast = proposal
+            let simulated = proposal
                 .simulate()
                 .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?
-                .blast_radius()
-                .clone();
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            let blast = simulated.blast_radius().clone();
+            let provenance = simulated.provenance();
             Ok::<PyAsyncSimulatedIceProposal, PyErr>(PyAsyncSimulatedIceProposal {
                 client: client.clone(),
                 runtime,
                 action: parking_lot::Mutex::new(Some(action)),
                 issued_at_ms,
                 blast,
+                provenance,
                 committed: parking_lot::Mutex::new(false),
             })
         })
@@ -2453,6 +2471,8 @@ pub struct PyAsyncSimulatedIceProposal {
     action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
     issued_at_ms: u64,
     blast: net::adapter::net::behavior::meshos::BlastRadius,
+    /// The simulator's provenance stamp, required at commit.
+    provenance: [u8; 32],
     committed: parking_lot::Mutex<bool>,
 }
 
@@ -2523,12 +2543,20 @@ impl PyAsyncSimulatedIceProposal {
         // synchronously.
         build_core_proposal(&client, action.clone())
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
+        let issued_at_ms = self.issued_at_ms;
+        let blast = self.blast.clone();
+        let provenance = self.provenance;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let proposal = build_core_proposal(&client, action)
-                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
-            let simulated = proposal
-                .simulate()
-                .await
+            // Commit exactly what was simulated and signed, never a
+            // re-simulation (SDK audit 2026-10-11).
+            let simulated =
+                net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+                    &client,
+                    action,
+                    issued_at_ms,
+                    blast,
+                    &provenance,
+                )
                 .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
             let commit = simulated
                 .commit(&sigs)

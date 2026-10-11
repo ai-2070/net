@@ -279,3 +279,82 @@ def test_live_renewal_over_the_mesh(tmp_path):
                 m.shutdown()
             except Exception:  # noqa: BLE001 - best-effort teardown
                 pass
+
+
+class _Answer:
+    """An awaitable that is not a coroutine object (cubic review of PR
+    #1228: `asyncio.run_coroutine_threadsafe` rejected it, so a valid
+    `Awaitable[bool]` approver failed closed)."""
+
+    def __init__(self, value: bool) -> None:
+        self.value = value
+
+    def __await__(self):
+        if False:  # pragma: no cover - makes this a generator
+            yield
+        return self.value
+
+
+@pytest.mark.parametrize("asynchronous", [False, True, "awaitable"])
+def test_live_approver_gated_enrollment(tmp_path, asynchronous):
+    # SDK audit 2026-10-11: the approver-gated mode existed only in Rust, so
+    # every Python operator ran auto-admit. A denial must refuse the device
+    # WITHOUT burning the invite; the same invite then admits on approval.
+    pytest.importorskip("net._net")
+
+    psk = "61" * 32
+    root = net.Identity.generate()
+    op_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    op_mesh.start()
+    op = net.OperatorEnrollment(
+        root, str(tmp_path / "devices.json"), str(tmp_path / "revocations.json")
+    )
+    seen: list = []
+    admit = {"yes": False}
+
+    def sync_approver(request):
+        seen.append(request.name)
+        return admit["yes"]
+
+    async def async_approver(request):
+        seen.append(request.name)
+        return admit["yes"]
+
+    def awaitable_approver(request):
+        seen.append(request.name)
+        return _Answer(admit["yes"])
+
+    approver = {
+        False: sync_approver,
+        True: async_approver,
+        "awaitable": awaitable_approver,
+    }[asynchronous]
+    handle = op_mesh.serve_enrollment(op, approver, 3600)
+    invite = op.invite(op_mesh.rendezvous_string(), 300).encode()
+    device = net.Identity.generate()
+    dev_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+    dev_mesh.start()
+    meshes = [dev_mesh, op_mesh]
+    try:
+        with pytest.raises(Exception):
+            dev_mesh.join(device, invite, "pc", [])
+        assert seen == ["pc"]
+        assert op.devices() == []
+
+        admit["yes"] = True
+        # A fresh node (the first already holds a session with the operator);
+        # same device identity, same invite — the invite survived the denial.
+        retry_mesh = net.NetMesh("127.0.0.1:0", psk, permissive_channels=True)
+        retry_mesh.start()
+        meshes.append(retry_mesh)
+        chain = retry_mesh.join(device, invite, "pc", [])
+        assert chain.leaf == device.entity_id
+        assert seen == ["pc", "pc"]
+        assert len(op.devices()) == 1
+        handle.stop()
+    finally:
+        for m in meshes:
+            try:
+                m.shutdown()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass

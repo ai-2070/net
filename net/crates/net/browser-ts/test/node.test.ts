@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { BrowserNode, connect, parseAttemptStatus, parseCounters, peerIdHex } from '../src/node.js';
+import { BrowserNode, connect, identityLockName, parseAttemptStatus, parseCounters, peerIdHex } from '../src/node.js';
 import {
   fromWasmError,
   IceServerConflictError,
@@ -77,12 +77,88 @@ describe('connect', () => {
       entitySecretHex: '21'.repeat(32),
       noiseSecretHex: '22'.repeat(32),
     };
-    await connect({ ...BASE, ...identity, wasm: module });
-    await connect({ ...BASE, ...identity, wasm: module });
+    (await connect({ ...BASE, ...identity, wasm: module })).close();
+    await new Promise(resolve => setTimeout(resolve, 0)); // the lock is released after close
+    (await connect({ ...BASE, ...identity, wasm: module })).close();
     expect(seen).toEqual([
       { ...BASE, ...identity },
       { ...BASE, ...identity },
     ]);
+  });
+
+  // SDK audit 2026-10-11: two tabs connected with one remembered identity
+  // ran two nodes as one id, evicting each other at the anchor. The second
+  // holder is now refused (Node 24 has a real `navigator.locks`).
+  describe('identity lock', () => {
+    const identity = { entitySecretHex: '31'.repeat(32), noiseSecretHex: '32'.repeat(32) };
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+    it('refuses a second live node with the same identity, until the first closes', async () => {
+      const first = await connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) });
+      await expect(connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) })).rejects.toMatchObject({
+        kind: 'identity',
+      });
+      first.close();
+      await settle();
+      const again = await connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) });
+      again.close();
+      await settle();
+    });
+
+    it('frees the identity when the connect itself fails', async () => {
+      await expect(connect({ ...BASE, ...identity, wasm: failingModule('boom') })).rejects.toBeDefined();
+      const node = await connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) });
+      node.close();
+      await settle();
+    });
+
+    // Code review 2026-10-11 BROWSER-3: the secret parses case-insensitively,
+    // so the lock name must not depend on its case.
+    it('treats an upper-case spelling of the secret as the same identity', async () => {
+      const lower = { entitySecretHex: 'ab'.repeat(32), noiseSecretHex: '32'.repeat(32) };
+      const upper = { ...lower, entitySecretHex: 'AB'.repeat(32) };
+      const first = await connect({ ...BASE, ...lower, wasm: fakeModule(new FakeNode()) });
+      await expect(connect({ ...BASE, ...upper, wasm: fakeModule(new FakeNode()) })).rejects.toMatchObject({
+        kind: 'identity',
+      });
+      first.close();
+      await settle();
+    });
+
+    // cubic review of PR #1228: a session leader for this secret elects
+    // under the same name (see leader.test.ts), so connect() is refused
+    // while one holds it.
+    it('is refused while an openSession() leader holds the identity', async () => {
+      const name = await identityLockName(identity.entitySecretHex.toUpperCase());
+      expect(name).not.toBeNull();
+      let release!: () => void;
+      const held = new Promise<void>(done => {
+        release = done;
+      });
+      let acquired!: () => void;
+      const ready = new Promise<void>(done => {
+        acquired = done;
+      });
+      const lock = navigator.locks.request(name!, async () => {
+        acquired();
+        await held;
+      });
+      await ready;
+      await expect(connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) })).rejects.toMatchObject({
+        kind: 'identity',
+      });
+      release();
+      await lock;
+    });
+
+    it('is skipped with lockIdentity: false, and never applies without a custodial identity', async () => {
+      const a = await connect({ ...BASE, ...identity, wasm: fakeModule(new FakeNode()) });
+      const b = await connect({ ...BASE, ...identity, lockIdentity: false, wasm: fakeModule(new FakeNode()) });
+      const c = await connect({ ...BASE, wasm: fakeModule(new FakeNode()) });
+      const d = await connect({ ...BASE, wasm: fakeModule(new FakeNode()) });
+      for (const n of [a, b, c, d]) n.close();
+      await settle();
+    });
   });
 
   it('omits the custodial keys entirely when the page did not supply them', async () => {

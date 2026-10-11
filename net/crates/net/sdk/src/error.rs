@@ -57,6 +57,17 @@ pub enum SdkError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    /// An nRPC call failed — the structured [`RpcError`], so callers can
+    /// tell a retryable `Timeout` / `Transport` from a terminal
+    /// `CapabilityDenied` or a remote `ServerError` by variant.
+    /// (`Mesh::call_raw_bytes` used to flatten all of them into
+    /// [`Self::Config`] — SDK audit 2026-10-11.)
+    ///
+    /// [`RpcError`]: net::adapter::net::mesh_rpc::RpcError
+    #[cfg(all(feature = "net", feature = "cortex"))]
+    #[error("call: {0}")]
+    Rpc(net::adapter::net::mesh_rpc::RpcError),
+
     #[error("mesh transport not available")]
     NoMesh,
 

@@ -62,6 +62,7 @@ use std::ffi::{c_char, c_int, CString};
 use std::os::raw::c_float;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -506,6 +507,13 @@ struct CDaemonBridge {
     /// `None` for the v1 registration path, where the consumer owns
     /// the context's lifetime and this library never touches it.
     destroy: Option<MeshOsUserCtxDestroyFn>,
+    /// Set only once registration has SUCCEEDED. Until then the caller
+    /// still owns `user_ctx`: a bridge dropped on a failed registration
+    /// (SDK already shut down, registry refusal) must not run `destroy`,
+    /// or the caller's own failure-path release frees it a second time
+    /// (Go: a double `cgo.Handle.Delete`, which panics). SDK audit
+    /// 2026-10-11.
+    armed: Arc<AtomicBool>,
 }
 
 impl Drop for CDaemonBridge {
@@ -514,6 +522,9 @@ impl Drop for CDaemonBridge {
         // away — which is after the registry slot is gone AND after
         // every admitted callback has returned, because a callback
         // holds the bridge for its duration.
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(destroy) = self.destroy {
             // SAFETY: `destroy` is a C function pointer the consumer
             // supplied at registration and promised to keep valid for
@@ -821,6 +832,15 @@ pub extern "C" fn net_meshos_register_daemon(
                 return NET_MESHOS_ERR_INVALID_ARG;
             }
         };
+        // Refused BEFORE registering: the handle's C name is built after a
+        // successful registration (and, on the destroy path, after
+        // `user_ctx` ownership passed), so an embedded NUL used to panic
+        // there and report failure for a daemon that was registered (cubic
+        // review of PR #1228).
+        if name.contains('\0') {
+            set_last_error("invalid_argument", "daemon name contains a NUL byte");
+            return NET_MESHOS_ERR_INVALID_ARG;
+        }
         let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_ptr, 32) }
             .try_into()
             .expect("slice was constructed with len 32");
@@ -975,6 +995,15 @@ fn register_with_vtable_inner(
                 return NET_MESHOS_ERR_INVALID_ARG;
             }
         };
+        // Refused BEFORE registering: the handle's C name is built after a
+        // successful registration (and, on the destroy path, after
+        // `user_ctx` ownership passed), so an embedded NUL used to panic
+        // there and report failure for a daemon that was registered (cubic
+        // review of PR #1228).
+        if name.contains('\0') {
+            set_last_error("invalid_argument", "daemon name contains a NUL byte");
+            return NET_MESHOS_ERR_INVALID_ARG;
+        }
         let seed: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_ptr, 32) }
             .try_into()
             .expect("slice was constructed with len 32");
@@ -988,11 +1017,13 @@ fn register_with_vtable_inner(
         }
         clear_last_error_inner();
         let keypair = EntityKeypair::from_bytes(seed);
+        let armed = Arc::new(AtomicBool::new(false));
         let daemon = Box::new(CDaemonBridge {
             name: name.clone(),
             vtable,
             user_ctx: UserCtx(user_ctx),
             destroy,
+            armed: armed.clone(),
         });
         let guard = sdk_ref.inner.lock();
         let sdk_inner = match guard.as_ref() {
@@ -1004,6 +1035,10 @@ fn register_with_vtable_inner(
         };
         match sdk_inner.register_daemon(daemon, keypair) {
             Ok(handle) => {
+                // Ownership of `user_ctx` passes to the bridge only now.
+                // The SDK lock (`guard`) is still held, so no shutdown can
+                // drop the registered bridge before it is armed.
+                armed.store(true, Ordering::Release);
                 let daemon_id = handle.daemon_id();
                 let daemon_name = match CString::new(handle.daemon_name()) {
                     Ok(s) => s,
@@ -1100,6 +1135,13 @@ pub extern "C" fn net_meshos_try_next_control(
     })
 }
 
+/// Longest single wait `net_meshos_next_control` makes while holding the
+/// handle mutex.
+/// How often `net_meshos_graceful_shutdown` checks whether the daemon left.
+const GRACEFUL_SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+const NEXT_CONTROL_SLICE: Duration = Duration::from_millis(50);
+
 /// Block until the next control event arrives, the runtime shuts
 /// down, or `timeout_ms` elapses. On timeout or shutdown writes
 /// `kind = NET_MESHOS_CONTROL_NONE`. Pass `0` for an unbounded
@@ -1120,24 +1162,41 @@ pub extern "C" fn net_meshos_next_control(
             return NET_MESHOS_ERR_INVALID_ARG;
         }
         clear_last_error_inner();
-        let ev = {
+        // Wait in short slices, dropping the handle mutex between them.
+        // Holding it across one unbounded `block_on(next_control())` —
+        // which only returns on a control event — deadlocked every other
+        // op on the handle, including `graceful_shutdown`, the very call
+        // that would deliver the Shutdown event (SDK audit 2026-10-11).
+        let deadline = (timeout_ms != 0)
+            .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms));
+        let mut first = true;
+        let ev = loop {
+            let slice = match deadline {
+                None => NEXT_CONTROL_SLICE,
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break None;
+                    }
+                    left.min(NEXT_CONTROL_SLICE)
+                }
+            };
             let mut guard = h_ref.inner.lock();
-            let h = match guard.as_mut() {
-                Some(h) => h,
-                None => {
+            let Some(h) = guard.as_mut() else {
+                if first {
                     set_last_error("already_shutdown", "daemon handle was already consumed");
                     return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
                 }
+                // Consumed mid-wait (graceful shutdown): report it as the
+                // documented shutdown outcome, kind = NONE.
+                break None;
             };
-            runtime().block_on(async {
-                if timeout_ms == 0 {
-                    h.next_control().await
-                } else {
-                    tokio::time::timeout(Duration::from_millis(timeout_ms), h.next_control())
-                        .await
-                        .unwrap_or_default()
-                }
-            })
+            first = false;
+            match runtime().block_on(async { tokio::time::timeout(slice, h.next_control()).await })
+            {
+                Ok(ev) => break ev,
+                Err(_) => continue, // slice elapsed: release the lock, go again
+            }
         };
         unsafe {
             *out = match ev {
@@ -1228,26 +1287,46 @@ pub extern "C" fn net_meshos_graceful_shutdown(
             set_last_error("invalid_argument", "handle pointer is NULL");
             return NET_MESHOS_ERR_NULL;
         };
-        let inner = match h_ref.inner.lock().take() {
-            Some(h) => h,
-            None => {
-                set_last_error("already_shutdown", "daemon handle was already consumed");
-                return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
-            }
-        };
-        clear_last_error_inner();
         let grace = if grace_ms == 0 {
             DEFAULT_GRACEFUL_SHUTDOWN
         } else {
             Duration::from_millis(grace_ms)
         };
-        match runtime().block_on(inner.graceful_shutdown(grace)) {
-            Ok(()) => NET_MESHOS_OK,
-            Err(e) => {
-                set_last_error_from_sdk(&e);
-                NET_MESHOS_ERR_CALL_FAILED
+        // Signal, then wait out the grace WITHOUT holding the handle, then
+        // take it. Taking it first (the core one-shot) left the Shutdown
+        // event in a channel no reader could reach: a concurrent
+        // `net_meshos_next_control` found the handle consumed and returned
+        // NONE (cubic review of PR #1228).
+        match h_ref.inner.lock().as_ref() {
+            Some(h) => h.signal_shutdown(grace),
+            None => {
+                set_last_error("already_shutdown", "daemon handle was already consumed");
+                return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
             }
         }
+        clear_last_error_inner();
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            // The daemon left (or another caller consumed the handle): a
+            // clean exit is not a hung daemon.
+            if !h_ref
+                .inner
+                .lock()
+                .as_ref()
+                .is_some_and(|h| h.is_registered())
+            {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(GRACEFUL_SHUTDOWN_POLL));
+        }
+        // Failsafe unregister (the core handle's Drop), outside the lock.
+        let handle = h_ref.inner.lock().take();
+        drop(handle);
+        NET_MESHOS_OK
     })
 }
 
@@ -1769,6 +1848,7 @@ mod tests {
             vtable,
             user_ctx: UserCtx(user_ctx),
             destroy: None,
+            armed: Arc::new(AtomicBool::new(true)),
         };
         let event = CausalEvent {
             link: net::adapter::net::state::causal::CausalLink {
@@ -2028,6 +2108,8 @@ mod user_ctx_destructor_tests {
             vtable: vtable(),
             user_ctx: UserCtx(counter as *const AtomicUsize as *mut std::ffi::c_void),
             destroy,
+            // A registered bridge: registration armed it.
+            armed: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -2146,5 +2228,60 @@ mod user_ctx_destructor_tests {
             "NetMeshOsDaemonVtable must stay six function pointers wide; \
              growing it is an out-of-bounds read against older consumers"
         );
+    }
+
+    /// SDK audit 2026-10-11. A FAILED v2 registration leaves `user_ctx`
+    /// with the caller: the bridge built for it is dropped without
+    /// running `destroy`. Pre-fix the drop fired it, and the Go wrapper's
+    /// own failure-path `cgo.Handle.Delete()` then deleted the handle a
+    /// second time — a panic in the caller's goroutine.
+    #[test]
+    fn a_failed_registration_never_runs_the_destructor() {
+        let calls = AtomicUsize::new(0);
+        let ctx = &calls as *const AtomicUsize as *mut std::ffi::c_void;
+        let vt = vtable();
+        let register = |sdk: *mut NetMeshOsSdk, seed: [u8; 32]| {
+            let name = "fail-path";
+            let mut h: *mut NetMeshOsHandle = ptr::null_mut();
+            let status = net_meshos_register_daemon_with_vtable_v2(
+                sdk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                seed.as_ptr(),
+                &vt,
+                ctx,
+                Some(counting_destroy),
+                &mut h,
+            );
+            (status, h)
+        };
+
+        let mut sdk: *mut NetMeshOsSdk = ptr::null_mut();
+        assert_eq!(net_meshos_sdk_start(0, 0, 0, 0, 0, &mut sdk), NET_MESHOS_OK);
+        // Same seed twice: the registry refuses the second.
+        let (ok, first) = register(sdk, [0x5A; 32]);
+        assert_eq!(ok, NET_MESHOS_OK);
+        let (dup, none) = register(sdk, [0x5A; 32]);
+        assert_ne!(dup, NET_MESHOS_OK);
+        assert!(none.is_null());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "refused: caller still owns ctx"
+        );
+
+        // After shutdown: refused before the registry is reached.
+        assert_eq!(net_meshos_sdk_shutdown(sdk), NET_MESHOS_OK);
+        let after = calls.load(Ordering::SeqCst);
+        let (gone, none) = register(sdk, [0x5B; 32]);
+        assert_eq!(gone, NET_MESHOS_ERR_ALREADY_SHUTDOWN);
+        assert!(none.is_null());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after,
+            "a registration refused at shutdown must not release the caller's ctx"
+        );
+        net_meshos_handle_free(first);
+        net_meshos_sdk_free(sdk);
     }
 }

@@ -53,10 +53,24 @@ pub enum RevocationStoreError {
     Corrupt { path: String, reason: String },
 }
 
+/// The floor that marks an entity revoked as a SUBJECT (see
+/// [`RevocationStore`]). Stored as an ordinary floor so the record lives in
+/// the one field every SDK version reads AND rewrites: a separate list was
+/// silently dropped when an older SDK's `revoke_below` rewrote the shared
+/// file, re-validating the revoked device's grant after a provider restart
+/// (cubic review of PR #1228). It also makes "revoke this device" one
+/// atomic floor write rather than two.
+pub const REVOKED_SUBJECT_FLOOR: u32 = u32::MAX;
+
 #[derive(Serialize, Deserialize, Default)]
 struct RevocationFile {
     #[serde(default)]
     floors: Vec<StoredFloor>,
+    /// Read-only legacy field: revoked subjects as their own list (lowercase
+    /// hex), from a pre-release build of this change. Loaded as
+    /// [`REVOKED_SUBJECT_FLOOR`] floors; never written.
+    #[serde(default, skip_serializing)]
+    revoked_subjects: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,7 +80,19 @@ struct StoredFloor {
     generation: u32,
 }
 
-/// A snapshot of the machine-shared revocation floors (`issuer → generation`).
+/// A snapshot of the machine-shared revocation floors (`issuer → generation`)
+/// and revoked subjects.
+///
+/// The two answer different questions. A **floor** is per *issuer* and
+/// generation-scoped: it kills links that issuer signed below a generation,
+/// which is also how an entity rotates past its own outstanding grants and
+/// keeps working at the new generation. It never touches a link issued *to*
+/// that entity — so raising a device's floor left its own root-issued
+/// `root → device` grant valid. A **revoked subject** is the "this device is
+/// gone" record: any chain that names it as a link subject is refused,
+/// whatever generation signed the link (SDK audit 2026-10-11). It is stored
+/// as the floor [`REVOKED_SUBJECT_FLOOR`], which also kills every link the
+/// entity signs.
 #[derive(Debug, Clone, Default)]
 pub struct RevocationStore {
     floors: BTreeMap<[u8; 32], u32>,
@@ -101,6 +127,14 @@ impl RevocationStore {
                         *e = f.generation;
                     }
                 }
+                for hex in &file.revoked_subjects {
+                    let key =
+                        decode_entity_hex(hex).map_err(|reason| RevocationStoreError::Corrupt {
+                            path: path.display().to_string(),
+                            reason,
+                        })?;
+                    floors.insert(key, REVOKED_SUBJECT_FLOOR);
+                }
                 Ok(Self { floors })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -121,8 +155,29 @@ impl RevocationStore {
     /// against reflects the persisted revocations.
     pub fn apply_to(&self, registry: &RevocationRegistry) {
         for (bytes, gen) in &self.floors {
-            registry.revoke_below(&EntityId::from_bytes(*bytes), *gen);
+            let entity = EntityId::from_bytes(*bytes);
+            registry.revoke_below(&entity, *gen);
+            // Subjects too: a provider that verifies chains itself
+            // (`load(..).apply_to(&registry)` then `DelegationChain::verify`)
+            // got only the floors, so a revoked device's root-issued grant
+            // still verified there (code review 2026-10-11, RUST-2).
+            if *gen == REVOKED_SUBJECT_FLOOR {
+                registry.revoke_subject(&entity);
+            }
         }
+    }
+
+    /// Whether `subject` has been revoked as a subject (see the type docs).
+    pub fn is_subject_revoked(&self, subject: &EntityId) -> bool {
+        self.floor(subject) == REVOKED_SUBJECT_FLOOR
+    }
+
+    /// The revoked subjects.
+    pub fn revoked_subjects(&self) -> impl Iterator<Item = EntityId> + '_ {
+        self.floors
+            .iter()
+            .filter(|(_, gen)| **gen == REVOKED_SUBJECT_FLOOR)
+            .map(|(b, _)| EntityId::from_bytes(*b))
     }
 
     /// Number of revoked issuers (testing/diagnostics).
@@ -135,6 +190,18 @@ impl RevocationStore {
         self.floors.is_empty()
     }
 
+    /// Revoke `subject` outright: persist it to `path` (cross-process lock,
+    /// atomic rename) so every chain naming it as a link subject is refused.
+    /// Monotonic and idempotent; there is no un-revoke.
+    pub fn revoke_subject(
+        path: impl AsRef<Path>,
+        subject: &EntityId,
+    ) -> Result<(), RevocationStoreError> {
+        // One floor write: the subject record and the floor on everything the
+        // entity signs land together or not at all.
+        Self::revoke_below(path, subject, REVOKED_SUBJECT_FLOOR).map(|_| ())
+    }
+
     /// Revoke: raise `issuer`'s floor to at least `generation`, persisting to
     /// `path` under a cross-process lock. Returns the new floor. Blocking — a
     /// revocation is a rare operator action, not a hot path, so a plain blocking
@@ -144,7 +211,19 @@ impl RevocationStore {
         issuer: &EntityId,
         generation: u32,
     ) -> Result<u32, RevocationStoreError> {
-        let path = path.as_ref();
+        let mut new_floor = 0;
+        Self::mutate(path.as_ref(), |store| {
+            let entry = store.floors.entry(*issuer.as_bytes()).or_insert(0);
+            if generation > *entry {
+                *entry = generation;
+            }
+            new_floor = *entry;
+        })?;
+        Ok(new_floor)
+    }
+
+    /// Load → `change` → save atomically, all under the cross-process lock.
+    fn mutate(path: &Path, change: impl FnOnce(&mut Self)) -> Result<(), RevocationStoreError> {
         let io = |e: std::io::Error| RevocationStoreError::Io {
             path: path.display().to_string(),
             reason: e.to_string(),
@@ -171,16 +250,9 @@ impl RevocationStore {
             f
         };
 
-        // Load → raise the floor → save atomically, all under the lock.
         let mut store = Self::load(path)?;
-        let key = *issuer.as_bytes();
-        let entry = store.floors.entry(key).or_insert(0);
-        if generation > *entry {
-            *entry = generation;
-        }
-        let new_floor = *entry;
-        store.save_atomic(path)?;
-        Ok(new_floor)
+        change(&mut store);
+        store.save_atomic(path)
     }
 
     /// Persist atomically: write a sibling temp file (owner-only on Unix), fsync,
@@ -200,6 +272,7 @@ impl RevocationStore {
                     generation: *gen,
                 })
                 .collect(),
+            revoked_subjects: Vec::new(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| RevocationStoreError::Io {
             path: path.display().to_string(),
@@ -313,6 +386,116 @@ mod tests {
         let reloaded = RevocationStore::load(&path).unwrap();
         assert_eq!(reloaded.floor(issuer.entity_id()), 1);
         assert_eq!(reloaded.len(), 1);
+    }
+
+    /// cubic review of PR #1228: an older SDK reads and rewrites only
+    /// `floors`. A subject revocation kept in its own list was dropped by that
+    /// rewrite; as a sentinel floor it survives.
+    #[test]
+    fn a_subject_revocation_survives_an_older_sdk_rewrite() {
+        #[derive(Serialize, Deserialize)]
+        struct OldFile {
+            #[serde(default)]
+            floors: Vec<StoredFloor>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let device = Identity::generate();
+        let other = Identity::generate();
+        RevocationStore::revoke_subject(&path, device.entity_id()).unwrap();
+
+        // An old `revoke_below` on another issuer: load the old shape, add a
+        // floor, write the old shape back.
+        let mut old: OldFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.floors.push(StoredFloor {
+            issuer: encode_entity_hex(other.entity_id().as_bytes()),
+            generation: 2,
+        });
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let store = RevocationStore::load(&path).unwrap();
+        assert!(store.is_subject_revoked(device.entity_id()));
+        assert_eq!(store.floor(other.entity_id()), 2);
+        let reg = RevocationRegistry::new();
+        store.apply_to(&reg);
+        assert!(reg.is_subject_revoked(device.entity_id()));
+    }
+
+    #[test]
+    fn a_legacy_revoked_subjects_list_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let device = Identity::generate();
+        let json = format!(
+            r#"{{"floors":[],"revoked_subjects":["{}"]}}"#,
+            encode_entity_hex(device.entity_id().as_bytes())
+        );
+        std::fs::write(&path, json).unwrap();
+        assert!(RevocationStore::load(&path)
+            .unwrap()
+            .is_subject_revoked(device.entity_id()));
+    }
+
+    #[test]
+    fn revoked_subjects_round_trip_and_keep_floors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let a = Identity::generate();
+        let b = Identity::generate();
+        RevocationStore::revoke_below(&path, a.entity_id(), 3).unwrap();
+        // A store with no revoked subjects keeps the original file shape.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("revoked_subjects"), "{raw}");
+
+        RevocationStore::revoke_subject(&path, b.entity_id()).unwrap();
+        RevocationStore::revoke_subject(&path, b.entity_id()).unwrap(); // idempotent
+        let store = RevocationStore::load(&path).unwrap();
+        assert!(store.is_subject_revoked(b.entity_id()));
+        assert!(!store.is_subject_revoked(a.entity_id()));
+        assert_eq!(
+            store.floor(a.entity_id()),
+            3,
+            "floors survive the subject write"
+        );
+        assert_eq!(store.revoked_subjects().count(), 1);
+        assert!(!store.is_empty());
+    }
+
+    /// Code review 2026-10-11 RUST-2: the revoked-subject record reached
+    /// only the MCP wrap gate. The documented provider path —
+    /// `load(..).apply_to(&registry)` then `DelegationChain::verify` — got
+    /// the floors alone, so a revoked device's bare root-issued grant still
+    /// verified until expiry.
+    #[test]
+    fn apply_to_carries_revoked_subjects_into_chain_verification() {
+        use crate::delegation::{DelegationChain, DEFAULT_DELEGATION_DEPTH};
+        use net::adapter::net::identity::TokenError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let root = Identity::generate();
+        let device = Identity::generate();
+        let chain = DelegationChain::derive_device(
+            &root,
+            device.entity_id(),
+            std::time::Duration::from_secs(3600),
+            DEFAULT_DELEGATION_DEPTH,
+        )
+        .unwrap();
+
+        let reg = RevocationRegistry::new();
+        RevocationStore::load(&path).unwrap().apply_to(&reg);
+        assert!(chain
+            .verify(device.entity_id(), root.entity_id(), &reg, 0)
+            .is_ok());
+
+        RevocationStore::revoke_subject(&path, device.entity_id()).unwrap();
+        RevocationStore::load(&path).unwrap().apply_to(&reg);
+        assert!(reg.is_subject_revoked(device.entity_id()));
+        assert!(matches!(
+            chain.verify(device.entity_id(), root.entity_id(), &reg, 0),
+            Err(TokenError::Revoked)
+        ));
     }
 
     #[test]

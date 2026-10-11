@@ -285,6 +285,11 @@ pub fn spawn_handler_thread<T: Send + 'static>(
 pub struct RpcRequestStreamHandleC {
     pub inner: Mutex<Option<RequestStream>>,
     pub done: AtomicBool,
+    /// Set by `net_rpc_request_stream_retire`: the dispatcher is about to
+    /// return, so every `next` — parked or future — must end now.
+    pub retired: AtomicBool,
+    /// Wakes a `next` parked on the stream when the handle is retired.
+    pub retire_wake: tokio::sync::Notify,
 }
 
 impl RpcRequestStreamHandleC {
@@ -293,6 +298,8 @@ impl RpcRequestStreamHandleC {
         Self {
             inner: Mutex::new(Some(requests)),
             done: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            retire_wake: tokio::sync::Notify::new(),
         }
     }
 }

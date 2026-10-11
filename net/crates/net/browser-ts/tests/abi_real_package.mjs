@@ -1149,7 +1149,8 @@ await probe('real_package_resync_is_authorized_and_recovery_is_not_ready', async
   permit = false;
   const revoked = owner.receive(gap.out[0].frame, '00000000000000aa');
   eq(reads.length, 2, 'authorize was consulted for the resync');
-  eq(reads[1], { type: 'read', peer: '00000000000000aa', audience: ['crew'] }, 'the second read request');
+  // The join's key rides into `authorize` too (SDK audit 2026-10-11).
+  eq(reads[1], { type: 'read', peer: '00000000000000aa', audience: ['crew'], key: 'probe' }, 'the second read request');
   if (revoked.refused === null) throw new Error('a revoked resync was served');
   for (const frame of revoked.out) {
     const decoded = codec.decodeMessage(frame.frame, { maxBytes: 8104, as: 'replica' });
@@ -1350,7 +1351,7 @@ await probe('real_package_owner_serves_a_join_and_binds_the_caller', async () =>
 
   // `authorize` was handed the AUTHENTICATED peer, not anything from
   // the frame.
-  eq(seen, [{ type: 'read', peer: '00000000000000aa', audience: ['crew'] }], 'the access request');
+  eq(seen, [{ type: 'read', peer: '00000000000000aa', audience: ['crew'], key: 'k' }], 'the access request');
 
   // And the frames assemble into the projection.
   const table = new assembly2.AssemblyTable();

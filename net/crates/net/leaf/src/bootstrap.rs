@@ -586,6 +586,11 @@ pub enum ProbeEvent {
     /// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4). Such a probe sent
     /// nothing, so it did not run.
     ConnectionFailed,
+    /// Gathering completed (the end-of-candidates signal). With no
+    /// answer and no "no response" error it is inconclusive only when a
+    /// host candidate carried a public address (an engine may suppress a
+    /// reflexive candidate equal to it); otherwise it is silence.
+    GatheringComplete,
 }
 
 /// What probing one endpoint established.
@@ -596,9 +601,14 @@ pub enum ProbeOutcome {
     Answered,
     /// The probe ran and nothing came back inside its deadline.
     Unanswered,
-    /// The probe could not run: an empty or malformed address, or an
-    /// engine that would not build the probe. It observed nothing, so
-    /// it is never evidence either way.
+    /// The probe produced no evidence either way: it could not run (an
+    /// empty or malformed address, an engine that would not build the
+    /// probe, a connection failed before any candidate was gathered), OR
+    /// it ran and ended inconclusive — gathering completed with neither a
+    /// STUN answer nor a "no response" report (a host with no NAT, or an
+    /// engine that never fires `icecandidateerror`). Callers must not read
+    /// it as "did not run"; read it as "established nothing" (cubic review
+    /// of PR #1228).
     NotRun,
 }
 
@@ -626,7 +636,7 @@ pub fn probe_event_answers(event: &ProbeEvent) -> bool {
             tokens.windows(2).any(|pair| pair == ["typ", "srflx"])
         }
         ProbeEvent::CandidateError(code) => *code < STUN_NO_RESPONSE_CODE,
-        ProbeEvent::ConnectionFailed => false,
+        ProbeEvent::ConnectionFailed | ProbeEvent::GatheringComplete => false,
     }
 }
 
@@ -637,7 +647,9 @@ pub fn probe_event_answers(event: &ProbeEvent) -> bool {
 /// connection the engine failed before gathering a single candidate is
 /// `NotRun`: nothing was sent, so silence is not evidence, and
 /// counting it `Unanswered` is how a browser that could not gather at
-/// all was told UDP is blocked. Everything else is `Unanswered`.
+/// all was told UDP is blocked. Gathering that completed with no answer
+/// and no "no response" report is `NotRun` too (inconclusive — see
+/// [`ProbeOutcome::NotRun`]). Everything else is `Unanswered`.
 pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
     if events.iter().any(probe_event_answers) {
         return ProbeOutcome::Answered;
@@ -649,9 +661,62 @@ pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
         .iter()
         .any(|event| matches!(event, ProbeEvent::ConnectionFailed));
     if failed && !gathered {
+        return ProbeOutcome::NotRun;
+    }
+    // Completed with no answer and no "no response" report is
+    // inconclusive ONLY when a host candidate carried a literal public
+    // address: an engine may suppress a reflexive candidate equal to it,
+    // so a host with no NAT could have been answered invisibly (SDK audit
+    // 2026-10-11). Behind NAT — a private, link-local or mDNS-obfuscated
+    // host — the srflx differs from every host address and is never
+    // suppressed, so its absence IS silence: that is exactly what blocked
+    // UDP looks like in Chromium, and reading it as inconclusive left a
+    // real UDP block untyped (browser matrix, PR #1228).
+    let completed = events
+        .iter()
+        .any(|event| matches!(event, ProbeEvent::GatheringComplete));
+    let reported_no_response = events.iter().any(
+        |event| matches!(event, ProbeEvent::CandidateError(code) if *code >= STUN_NO_RESPONSE_CODE),
+    );
+    let public_host = events.iter().any(
+        |event| matches!(event, ProbeEvent::Candidate(line) if host_candidate_is_public(line)),
+    );
+    if completed && !reported_no_response && public_host {
         ProbeOutcome::NotRun
     } else {
         ProbeOutcome::Unanswered
+    }
+}
+
+/// Whether `line` is a `typ host` candidate whose address is a literal
+/// publicly routable IP: not private, loopback, link-local, CGNAT,
+/// unique-local or unspecified. An obfuscated (`.local`) address is not
+/// known public, so it is not.
+pub fn host_candidate_is_public(line: &str) -> bool {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if !tokens.windows(2).any(|pair| pair == ["typ", "host"]) {
+        return false;
+    }
+    let Some(Ok(addr)) = tokens.get(4).map(|t| t.parse::<std::net::IpAddr>()) else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || cgnat)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            let unique_local = (first & 0xfe00) == 0xfc00;
+            let link_local = (first & 0xffc0) == 0xfe80;
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
     }
 }
 
@@ -939,10 +1004,12 @@ fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
     let events = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
     let candidates = std::rc::Rc::clone(&events);
     let closure = Closure::wrap(Box::new(move |event: RtcPeerConnectionIceEvent| {
-        if let Some(candidate) = event.candidate() {
-            candidates
+        match event.candidate() {
+            Some(candidate) => candidates
                 .borrow_mut()
-                .push(ProbeEvent::Candidate(candidate.candidate()));
+                .push(ProbeEvent::Candidate(candidate.candidate())),
+            // The end-of-candidates signal: gathering completed.
+            None => candidates.borrow_mut().push(ProbeEvent::GatheringComplete),
         }
     }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
     connection.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));

@@ -255,7 +255,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -980,6 +980,26 @@ class NetMesh:
         the invite is the authorization): enroll (join) + renew. Hold the
         returned handle to keep the services open. This node must be
         ``start()``ed. (Requires ``delegation``.)"""
+        ...
+    def serve_enrollment(
+        self,
+        operator: "OperatorEnrollment",
+        approver: Callable[["JoinRequest"], Union[bool, Awaitable[bool]]],
+        grant_ttl_seconds: int,
+        max_depth: Optional[int] = ...,
+        approve_timeout_ms: Optional[int] = ...,
+    ) -> "EnrollmentServeHandle":
+        """Operator-side, approver-gated enrollment: each valid join request
+        is passed to ``approver`` (sync or async) and admitted only on an
+        explicit ``True``. A denial, raise or timeout (default 300 s) answers
+        a coded rejection and does not burn the invite. Serves enrollment
+        only (no renewal). (Requires ``delegation``.)
+
+        ``approver`` may return a ``bool`` or any ``Awaitable[bool]``. The
+        timeout cannot stop a synchronous approver already running: it keeps
+        its worker thread until it returns, and its late answer is ignored.
+        Use a coroutine function for an approver that prompts a human — it
+        is cancelled at the timeout. ``approve_timeout_ms`` must be >= 1."""
         ...
     def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
         """Device-side renewal: refresh the grant carried by ``enrollment`` over
@@ -2189,6 +2209,11 @@ class MeshOsDaemonHandle:
         """Non-blocking control-event receive. Returns ``None``
         if the channel is empty / closed."""
         ...
+    def control_closed(self) -> bool:
+        """Whether no control event can ever arrive again: the runtime
+        shut down (or the handle was consumed) and the channel is
+        drained. Tells a "never" ``None`` from a "not yet" one."""
+        ...
     def publish_log(self, level: str, message: str) -> None:
         """Publish a log line tagged with this daemon's id.
         ``level`` is one of ``trace|debug|info|warn|error``."""
@@ -2201,6 +2226,18 @@ class MeshOsDaemonHandle:
         { grace_period_ms }`` on the daemon's control channel,
         parks for ``grace_ms``, then unregisters. Consumes the
         handle."""
+        ...
+    def signal_shutdown(self, grace_ms: Optional[int] = None) -> None:
+        """Send ``Shutdown { grace_period_ms }`` and return at once,
+        WITHOUT consuming the handle, so a parked ``next_control``
+        receives it. Wait on ``registered``, then ``close()``."""
+        ...
+    @property
+    def registered(self) -> bool:
+        """Whether the daemon is still registered."""
+        ...
+    def close(self) -> None:
+        """Unregister and consume the handle now. Idempotent."""
         ...
     def __enter__(self) -> "MeshOsDaemonHandle": ...
     def __exit__(
@@ -2604,8 +2641,9 @@ class BlobRef:
     @property
     def uri(self) -> str: ...
     @property
-    def hash(self) -> bytes:
-        """32-byte BLAKE3 content hash."""
+    def hash(self) -> Optional[bytes]:
+        """32-byte BLAKE3 content hash of a ``Small`` ref; ``None`` for a
+        chunked (manifest / tree) ref."""
         ...
     @property
     def size(self) -> int: ...
@@ -3991,10 +4029,53 @@ class AsyncMemoriesAdapter:
     def close(self) -> None: ...
     def is_running(self) -> bool: ...
     def count(self) -> int: ...
-    def list_memories(self, **kwargs: Any) -> List[Memory]: ...
-    async def watch_memories(self, **kwargs: Any) -> AsyncMemoryWatchIter: ...
+    def list_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Memory]: ...
+    async def watch_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> AsyncMemoryWatchIter: ...
     async def snapshot_and_watch_memories(
-        self, **kwargs: Any
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> Tuple[List[Memory], AsyncMemoryWatchIter]: ...
 
 class AsyncTaskWatchIter:
@@ -4023,10 +4104,41 @@ class AsyncTasksAdapter:
     def close(self) -> None: ...
     def is_running(self) -> bool: ...
     def count(self) -> int: ...
-    def list_tasks(self, **kwargs: Any) -> List[Task]: ...
-    async def watch_tasks(self, **kwargs: Any) -> AsyncTaskWatchIter: ...
+    def list_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Task]: ...
+    async def watch_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> AsyncTaskWatchIter: ...
     async def snapshot_and_watch_tasks(
-        self, **kwargs: Any
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> Tuple[List[Task], AsyncTaskWatchIter]: ...
 
 class AsyncRedexTailIter:
@@ -4274,6 +4386,7 @@ class AsyncMeshOsDaemonHandle:
     @property
     def daemon_name(self) -> str: ...
     def try_next_control(self) -> Optional[Dict[str, Any]]: ...
+    def control_closed(self) -> bool: ...
     async def next_control(
         self, timeout_ms: Optional[int] = None
     ) -> Optional[Dict[str, Any]]: ...
@@ -4807,7 +4920,11 @@ class CapabilityGateway:
         operator must not be invited to resolve an attempt it could not have
         paid for. Each row is ``{key: {caller_hex, provider_node, task_id},
         commitment, prepared?, quote_id?, quote_expires_at_ns?, state: {...},
-        updated_at_ns}``. The financially unresolved states (``unknown``,
+        updated_at_ns, generation: {seq, incarnation}, retained}``.
+        ``retained`` marks a superseded incarnation kept beside the live
+        attempt that replaced it; its ``generation`` object is what
+        :meth:`a2a_resolve_attempt` takes to close exactly that one. The
+        financially unresolved states (``unknown``,
         ``refused_exposed``, ``paid_unexecutable``, and a ``paid`` attempt
         never submitted) are exempt from retention and stay until
         :meth:`a2a_resolve_attempt` closes them."""
@@ -4827,7 +4944,11 @@ class CapabilityGateway:
         ...
 
     def a2a_resolve_attempt(
-        self, task_id: str, outcome_json: str, provider_node: int | None = None
+        self,
+        task_id: str,
+        outcome_json: str,
+        provider_node: int | None = None,
+        generation: str | None = None,
     ) -> None:
         """Close an attempt the automatic path cannot: ``unknown``, ``denied``
         with ``funds_ambiguous``, or ``unexecutable``.
@@ -4850,7 +4971,14 @@ class CapabilityGateway:
         resolved against this caller's own rows — unambiguous until the same
         id names attempts on two providers, in which case the ``ValueError``
         lists the provider node ids to pass here. Raises ``ValueError`` if no
-        attempt carries ``task_id``."""
+        attempt carries ``task_id``.
+
+        ``generation`` names one incarnation *within* a complete key: the
+        row's own ``generation`` object from :meth:`a2a_attempts`, passed as
+        its JSON text (``'{"seq": ..., "incarnation": ...}'``). Omit it to
+        close the live attempt; pass it to close exactly that retained
+        incarnation (written to the archive only, never touching the live
+        one)."""
         ...
 
     def __repr__(self) -> str: ...
@@ -5251,7 +5379,14 @@ class PaymentProvider:
         journal. Requires the ``a2a`` build feature."""
         ...
 
-    def a2a_resolve(self, owner_json: str, task_id: str, state_json: str) -> None:
+    def a2a_resolve(
+        self,
+        owner_json: str,
+        task_id: str,
+        state_json: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
         """Resolve one unresolved-financial admission to a terminal state:
         ``owner_json`` and ``task_id`` exactly as they appear on an
         :meth:`a2a_unresolved` row, ``state_json`` the ``TaskState`` the

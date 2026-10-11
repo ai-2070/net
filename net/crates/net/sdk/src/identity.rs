@@ -277,14 +277,12 @@ impl Identity {
             "Identity::issue_token called with ttl > MAX_TOKEN_TTL_SECS ({MAX_TOKEN_TTL_SECS}s); \
              release builds soft-clamp to the ceiling, but the call site is likely a bug"
         );
-        let effective_ttl = if ttl.is_zero() {
-            Duration::from_secs(1)
-        } else {
-            // Clamp to the issuance ceiling so the infallible wrapper
-            // can't panic on the `TtlTooLong` that `try_issue` returns
-            // past `MAX_TOKEN_TTL_SECS`.
-            Duration::from_secs(ttl.as_secs().min(MAX_TOKEN_TTL_SECS))
-        };
+        // Clamp in WHOLE SECONDS to [1, MAX_TOKEN_TTL_SECS]. Tokens carry
+        // second granularity, so a sub-second TTL (500 ms) used to pass the
+        // `is_zero` check, truncate to 0 s, and hit the `ZeroTtl` the
+        // `.expect` below turned into a release-build panic (SDK audit
+        // 2026-10-11).
+        let effective_ttl = Duration::from_secs(ttl.as_secs().clamp(1, MAX_TOKEN_TTL_SECS));
         self.try_issue_token(subject, scope, channel, effective_ttl, delegation_depth)
             .expect("Identity::issue_token: invalid input (use try_issue_token for fallible)")
     }

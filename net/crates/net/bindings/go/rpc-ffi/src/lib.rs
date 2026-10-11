@@ -2905,7 +2905,7 @@ pub extern "C" fn net_rpc_request_stream_next(
         let Some(h) = (unsafe { handle.as_ref() }) else {
             return NET_RPC_ERR_NULL;
         };
-        if h.done.load(Ordering::Relaxed) {
+        if h.done.load(Ordering::Relaxed) || h.retired.load(Ordering::Acquire) {
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
                 *out_chunk_len = 0;
@@ -2925,7 +2925,36 @@ pub extern "C" fn net_rpc_request_stream_next(
             }
         };
         use futures::StreamExt;
-        let result = block_on(async { stream.next().await });
+        // Race the next chunk against retirement, so a `next` parked when
+        // the dispatcher returns is woken instead of outliving the handle
+        // Rust is about to free. `enable` before the flag re-check: a
+        // retire landing between the two is then never missed.
+        let result = block_on(async {
+            let mut retired = std::pin::pin!(h.retire_wake.notified());
+            retired.as_mut().enable();
+            if h.retired.load(Ordering::Acquire) {
+                return None;
+            }
+            let next = std::pin::pin!(stream.next());
+            // `select` polls the retirement side first.
+            match futures::future::select(retired, next).await {
+                futures::future::Either::Left(_) => None,
+                futures::future::Either::Right((item, _)) => Some(item),
+            }
+        });
+        let result = match result {
+            Some(item) => item,
+            None => {
+                // Retired: keep the stream for the owner's drop, report done.
+                *h.inner.lock() = Some(stream);
+                h.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                return NET_RPC_ERR_STREAM_DONE;
+            }
+        };
         match result {
             Some(bytes) => {
                 *h.inner.lock() = Some(stream);
@@ -2942,6 +2971,30 @@ pub extern "C" fn net_rpc_request_stream_next(
                 NET_RPC_ERR_STREAM_DONE
             }
         }
+    })
+}
+
+/// Retire a request-stream handle the dispatcher is about to return.
+///
+/// Wakes any `net_rpc_request_stream_next` parked on it and makes every
+/// later call return `NET_RPC_ERR_STREAM_DONE` immediately. It never
+/// frees: Rust still frees the handle once the dispatcher returns.
+///
+/// Why it exists: a handler may hand the stream to a thread that is still
+/// parked in `next` when the handler returns. Rust frees the handle as
+/// soon as the dispatcher returns, so that parked call then wrote through
+/// freed memory. A binding retires the handle, waits for its own in-flight
+/// calls to leave, and only then returns from the dispatcher (the Go
+/// binding does exactly this). Idempotent; NULL is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_request_stream_retire(handle: *mut RpcRequestStreamHandleC) -> c_int {
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        h.retired.store(true, Ordering::Release);
+        h.retire_wake.notify_waiters();
+        NET_RPC_OK
     })
 }
 
@@ -4398,6 +4451,8 @@ mod tests {
         let handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
             inner: Mutex::new(None),
             done: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            retire_wake: tokio::sync::Notify::new(),
         }));
         let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
         let mut chunk_len: usize = 0;
@@ -4405,6 +4460,31 @@ mod tests {
         assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
         assert!(chunk_ptr.is_null());
         assert_eq!(chunk_len, 0);
+        unsafe { drop(Box::from_raw(handle)) };
+    }
+
+    /// SDK audit 2026-10-11: `net_rpc_request_stream_retire` is NULL-safe
+    /// and idempotent, and a retired handle answers `next` with
+    /// `STREAM_DONE` without touching its stream.
+    #[test]
+    fn a_retired_request_stream_reports_done() {
+        assert_eq!(
+            net_rpc_request_stream_retire(std::ptr::null_mut()),
+            NET_RPC_ERR_NULL
+        );
+        let handle = Box::into_raw(Box::new(RpcRequestStreamHandleC {
+            inner: Mutex::new(None),
+            done: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            retire_wake: tokio::sync::Notify::new(),
+        }));
+        assert_eq!(net_rpc_request_stream_retire(handle), NET_RPC_OK);
+        assert_eq!(net_rpc_request_stream_retire(handle), NET_RPC_OK);
+        let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
+        let mut chunk_len: usize = 0;
+        let code = net_rpc_request_stream_next(handle, &mut chunk_ptr, &mut chunk_len);
+        assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
+        assert!(chunk_ptr.is_null());
         unsafe { drop(Box::from_raw(handle)) };
     }
 

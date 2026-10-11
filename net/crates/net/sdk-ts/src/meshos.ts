@@ -56,6 +56,7 @@ import {
   type Identity,
   type CapabilitySetJs,
 } from '@net-mesh/core';
+import { bindDaemonObject } from './_internal.js';
 
 // ----------------------------------------------------------------------------
 // Typed error envelope
@@ -255,6 +256,19 @@ export type CapabilityAdvert = string[] | (() => string[]);
  *    list or callable returning one. Resolved once at registration
  *    time and cached on the substrate side.
  */
+/** The {@link MeshOsDaemon} members the native bridge reads. */
+const MESH_OS_DAEMON_KEYS = [
+  'name',
+  'process',
+  'snapshot',
+  'restore',
+  'onControl',
+  'health',
+  'saturation',
+  'requiredCapabilities',
+  'optionalCapabilities',
+] as const;
+
 export interface MeshOsDaemon {
   name: string;
   process(event: CausalEvent): Buffer[];
@@ -349,8 +363,12 @@ export class MeshOsDaemonSdk {
       // and richer domain types (`DaemonHealth`, `CapabilityAdvert`) that
       // the generated declaration spells structurally. `compute.ts` does
       // the same thing for the same reason.
+      // Bind every method to the daemon: the bridge invokes them through
+      // threadsafe functions with an `undefined` receiver, so a class-based
+      // daemon using `this` would otherwise throw (SDK audit 2026-10-11).
+      const flat = bindDaemonObject(daemon, MESH_OS_DAEMON_KEYS);
       const handle = await this.raw.registerDaemon(
-        daemon as unknown as Parameters<NapiSdk['registerDaemon']>[0],
+        flat as unknown as Parameters<NapiSdk['registerDaemon']>[0],
         identity,
       );
       return new MeshOsDaemonHandle(handle);

@@ -18,7 +18,11 @@
 //! whose attestation does not verify, is pending, never applied.
 //!
 //! A floor bundle authenticates itself (root-signed, and it can only raise),
-//! so any node may be asked to apply one by any peer.
+//! so any peer may carry one — but a node applies only bundles of its OWN
+//! org. An org id is just a public key: honouring any self-signed bundle let
+//! any peer grow a node's permanent floor state without bound under
+//! throwaway orgs. Floors of a foreign (cross-org) issuer stay an operator
+//! import, matching the adopt ceremony's `ForeignFloorBundle` rule.
 
 use net::adapter::net::behavior::org::{OrgId, OrgRevocationBundle};
 use net::adapter::net::behavior::org_authority::NodeAuthority;
@@ -159,7 +163,8 @@ impl OrgFloorRequest {
 pub enum OrgFloorOutcome {
     /// Applied and persisted: the node's floors are at least the bundle's.
     Applied,
-    /// This node holds no org authority, so it enforces no org membership.
+    /// This node holds no org authority for the bundle's org (none at all,
+    /// or another org's), so it enforces no membership of it.
     NotMember,
     /// Merged and published, but the durable write is uncertain (it may not
     /// survive a restart); not a success.
@@ -327,6 +332,10 @@ pub fn answer_org_floor(
     let members: Vec<EntityId> = bundle.floors().iter().map(|f| f.0.clone()).collect();
     let (outcome, floors) = match authority {
         None => (OrgFloorOutcome::NotMember, Vec::new()),
+        // Only the owner org's floors are applied from the network.
+        Some(authority) if bundle.org_id != authority.config.owner_org => {
+            (OrgFloorOutcome::NotMember, Vec::new())
+        }
         Some(authority) => {
             let outcome = match authority.revocation.apply_bundle(&bundle) {
                 Ok(_) => OrgFloorOutcome::Applied,

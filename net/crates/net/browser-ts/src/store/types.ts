@@ -185,7 +185,17 @@ export interface ActionContext<S extends object> {
 
 /** What the owner's `authorize` is asked to rule on. */
 export type AccessRequest<A extends ActionSpec, I extends InputSpec> =
-  | { readonly type: 'read'; readonly peer: string; readonly audience: readonly string[] }
+  | {
+      readonly type: 'read';
+      readonly peer: string;
+      readonly audience: readonly string[];
+      /**
+       * The opaque key the replica joined with (`joinStore({ key })`),
+       * carried on every later read decision for that subscription.
+       * Absent for the host's own player, which joins no wire.
+       */
+      readonly key?: string;
+    }
   | {
       [K in keyof A]: {
         readonly type: 'action';

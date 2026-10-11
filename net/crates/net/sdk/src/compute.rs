@@ -206,6 +206,13 @@ struct Inner {
     /// `dashmap` directly, and this map sees low write frequency
     /// (one entry per failed migration).
     recent_failures: Mutex<HashMap<u64, MigrationFailureReason>>,
+    /// Serializes node-level channel membership changes against the
+    /// daemon ledgers. A subscribe records its ledger entry only after the
+    /// wire join, so without this an unsubscribe / stop / migration
+    /// teardown running in that window saw no other holder and left the
+    /// node — cutting off the daemon whose join had just been acked (code
+    /// review 2026-10-11, RUST-3). Held across the wire call; async.
+    membership: tokio::sync::Mutex<()>,
     /// Test-only knob: when set to `true`, the readiness callback
     /// reports "not ready" even when the runtime is in `Ready`.
     /// Lets integration tests drive the `NotReady` retry path
@@ -338,6 +345,7 @@ impl DaemonRuntime {
                 source_handler,
                 target_handler,
                 recent_failures: Mutex::new(HashMap::new()),
+                membership: tokio::sync::Mutex::new(()),
                 simulate_not_ready: AtomicBool::new(false),
                 spawn_stall_ms: std::sync::atomic::AtomicU32::new(0),
                 start_stall_ms: std::sync::atomic::AtomicU32::new(0),
@@ -612,7 +620,7 @@ impl DaemonRuntime {
             }
             let inner = inner_for_teardown.clone();
             rt_for_teardown.spawn(async move {
-                teardown_subscriptions(inner, bindings).await;
+                teardown_subscriptions(inner, origin_hash, bindings).await;
             });
         });
         let inner_for_readiness = self.inner.clone();
@@ -1056,15 +1064,37 @@ impl DaemonRuntime {
     /// while `Ready` and (idempotently) during `ShuttingDown` —
     /// `ShuttingDown` paths through here are a no-op because the
     /// shutdown sweep has already drained the registry.
+    ///
+    /// Stopping leaves every channel in the daemon's subscription ledger
+    /// that no other daemon on this runtime still holds. Channel membership
+    /// is per NODE on the wire, and the runtime only sees subscriptions made
+    /// through [`Self::subscribe_channel`]: a channel the host application
+    /// joined directly on the same node (`mesh.inner().subscribe_channel`)
+    /// is left too when its last daemon holder stops. Subscribe such
+    /// channels through a daemon, or re-subscribe after the stop.
     pub async fn stop(&self, origin_hash: u64) -> Result<(), DaemonError> {
         if self.state() == State::Registering {
             return Err(DaemonError::NotReady);
         }
+        // Snapshot the ledger before the host goes: a stopped daemon's
+        // subscriptions used to stay on publisher rosters until the session
+        // timed out. Under the membership lock, taken BEFORE the snapshot and
+        // the unregister: otherwise a subscribe for this daemon could join
+        // in between, fail to record (host gone) and leave the node on the
+        // roster (cubic review of PR #1228).
+        let membership = self.inner.membership.lock().await;
+        let bindings = self
+            .inner
+            .registry
+            .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
+            .unwrap_or_default();
         // Treat a missing daemon as success during ShuttingDown —
         // the shutdown sweep drained it.
         match self.inner.registry.unregister(origin_hash) {
             Ok(_) => {
                 self.inner.factory_registry.remove(origin_hash);
+                leave_unheld_channels(&self.inner, origin_hash, bindings).await;
+                drop(membership);
                 Ok(())
             }
             Err(CoreDaemonError::NotFound(_)) if self.state() == State::ShuttingDown => Ok(()),
@@ -1207,6 +1237,10 @@ impl DaemonRuntime {
         token: Option<PermissionToken>,
     ) -> Result<(), DaemonError> {
         self.require_ready()?;
+        // Join + ledger record as one step against concurrent leaves — and
+        // the registration check inside it, so a concurrent `stop()` either
+        // finishes first (NotFound here) or waits for the record.
+        let _membership = self.inner.membership.lock().await;
         if !self.inner.registry.contains(origin_hash) {
             return Err(DaemonError::Core(CoreDaemonError::NotFound(origin_hash)));
         }
@@ -1261,16 +1295,23 @@ impl DaemonRuntime {
         if !self.inner.registry.contains(origin_hash) {
             return Err(DaemonError::Core(CoreDaemonError::NotFound(origin_hash)));
         }
-        self.inner
-            .mesh
-            .inner()
-            .unsubscribe_channel(publisher, channel.clone())
-            .await
-            .map_err(|e| {
-                DaemonError::Core(CoreDaemonError::ProcessFailed(format!(
-                    "unsubscribe_channel failed: {e}"
-                )))
-            })?;
+        // Membership is per NODE on the wire. Only leave the publisher's
+        // roster when no other daemon on this runtime still holds the
+        // same (publisher, channel) — otherwise one daemon's unsubscribe
+        // silently cut off its co-located siblings (SDK audit 2026-10-11).
+        let _membership = self.inner.membership.lock().await;
+        if !subscription_held_elsewhere(&self.inner, origin_hash, publisher, &channel) {
+            self.inner
+                .mesh
+                .inner()
+                .unsubscribe_channel(publisher, channel.clone())
+                .await
+                .map_err(|e| {
+                    DaemonError::Core(CoreDaemonError::ProcessFailed(format!(
+                        "unsubscribe_channel failed: {e}"
+                    )))
+                })?;
+        }
         let _ = self.inner.registry.with_host(origin_hash, |host| {
             host.forget_subscription(publisher, &channel);
         });
@@ -1848,8 +1889,25 @@ async fn replay_subscriptions(inner: Arc<Inner>, origin_hash: u64) {
 /// publisher so rosters drop the source without waiting for
 /// session-timeout (~30 s). Fire-and-forget: we don't block the
 /// cutover dispatch on acks.
-async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBinding>) {
+async fn teardown_subscriptions(
+    inner: Arc<Inner>,
+    leaving: u64,
+    bindings: Vec<SubscriptionBinding>,
+) {
+    // Against a sibling's in-flight subscribe (see `Inner::membership`).
+    let _membership = inner.membership.lock().await;
+    leave_unheld_channels(&inner, leaving, bindings).await;
+}
+
+/// [`teardown_subscriptions`]'s body, for a caller already holding
+/// `Inner::membership`.
+async fn leave_unheld_channels(inner: &Inner, leaving: u64, bindings: Vec<SubscriptionBinding>) {
     for sub in bindings {
+        // Node-level membership: keep it while a co-located daemon still
+        // holds the same subscription.
+        if subscription_held_elsewhere(inner, leaving, sub.publisher, &sub.channel) {
+            continue;
+        }
         if let Err(e) = inner
             .mesh
             .inner()
@@ -1865,6 +1923,34 @@ async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBin
             );
         }
     }
+}
+
+/// Whether a daemon OTHER than `except` on this runtime still has
+/// `(publisher, channel)` in its subscription ledger. Channel membership is
+/// per node on the wire, so the node must stay on the publisher's roster
+/// while any local daemon still wants it.
+fn subscription_held_elsewhere(
+    inner: &Inner,
+    except: u64,
+    publisher: u64,
+    channel: &ChannelName,
+) -> bool {
+    inner
+        .registry
+        .list()
+        .into_iter()
+        .filter(|(origin, _)| *origin != except)
+        .any(|(origin, _)| {
+            inner
+                .registry
+                .with_host(origin, |host| {
+                    host.bindings_snapshot()
+                        .subscriptions
+                        .iter()
+                        .any(|b| b.publisher == publisher && b.channel == *channel)
+                })
+                .unwrap_or(false)
+        })
 }
 
 /// Options for [`DaemonRuntime::start_migration_with`].
@@ -2094,7 +2180,10 @@ impl MigrationHandle {
                     // `start_migration_with`'s send-failure path)
                     // return `Err` to the caller *before* the wait
                     // loop can observe the None status, so they
-                    // don't trip this branch.
+                    // don't trip this branch; `cancel()` records its
+                    // failure under the `recent_failures` lock in the
+                    // same critical section as the abort, so it is
+                    // caught above.
                     return Ok(());
                 }
             }
@@ -2128,9 +2217,17 @@ impl MigrationHandle {
             .map_err(DaemonError::Migration)?;
 
         let msgs = if self.opts.transport_identity {
-            self.runtime
+            match self
+                .runtime
                 .maybe_seal_chunked_snapshot(self.origin_hash, self.target_node, msgs)
-                .await?
+                .await
+            {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    self.abort_retry("retry seal failed");
+                    return Err(e);
+                }
+            }
         } else {
             msgs
         };
@@ -2160,20 +2257,45 @@ impl MigrationHandle {
         };
 
         for msg in &msgs {
-            self.runtime.send_migration_message(dest_node, msg).await?;
+            if let Err(e) = self.runtime.send_migration_message(dest_node, msg).await {
+                // Mirror `start_migration_with`: a record the retry created
+                // but never got onto the wire is aborted, or every later
+                // `start_migration` answered `AlreadyMigrating` until restart
+                // (SDK audit 2026-10-11).
+                self.abort_retry("retry send failed");
+                return Err(e);
+            }
         }
         Ok(())
     }
 
-    /// Pop the most recent `MigrationFailureReason` the dispatcher
-    /// observed for this migration (if any). Consumed: subsequent
-    /// calls see `None` until the next failure arrives.
-    fn take_recent_failure(&self) -> Option<MigrationFailureReason> {
-        self.runtime
+    /// Abort the orchestrator record a failed retry created.
+    fn abort_retry(&self, reason: &str) {
+        let _ = self
+            .runtime
             .inner
-            .recent_failures
-            .lock()
-            .remove(&self.origin_hash)
+            .orchestrator
+            .abort_migration(self.origin_hash, reason.into());
+    }
+
+    /// The most recent `MigrationFailureReason` the dispatcher observed
+    /// for this migration (if any).
+    ///
+    /// A TERMINAL reason is left in place: every clone of the handle that
+    /// waits must see it. Consuming it made only the first waiter observe
+    /// the failure — the rest read "record gone + no failure" as success
+    /// (cubic review of PR #1228). The next `start_migration_with` for this
+    /// origin clears it. A RETRIABLE reason is consumed, so exactly one
+    /// waiter re-initiates the attempt (and a stale retriable reason never
+    /// fails the attempt that replaces it).
+    fn take_recent_failure(&self) -> Option<MigrationFailureReason> {
+        let mut failures = self.runtime.inner.recent_failures.lock();
+        let retriable = failures.get(&self.origin_hash)?.is_retriable();
+        if retriable {
+            failures.remove(&self.origin_hash)
+        } else {
+            failures.get(&self.origin_hash).cloned()
+        }
     }
 
     /// Request abort. The orchestrator emits a `MigrationFailed`
@@ -2182,12 +2304,35 @@ impl MigrationHandle {
     /// past `Cutover` cannot be undone cleanly because routing has
     /// already flipped.
     pub async fn cancel(&self) -> Result<(), DaemonError> {
-        let msg = self
-            .runtime
-            .inner
-            .orchestrator
-            .abort_migration(self.origin_hash, "cancel requested".into())
-            .map_err(DaemonError::Migration)?;
+        // Record the abort in the same critical section that drops the
+        // orchestrator's record. The wait loop reads "record gone + no
+        // recorded failure" as success, and a local abort never comes back
+        // through the dispatcher's failure callback (the MigrationFailed it
+        // emits goes to the source and target, not to this node) — so
+        // without a recorded reason a concurrent or later `wait()` on a
+        // clone reported an aborted migration as completed (SDK audit
+        // 2026-10-11). Holding the map's lock across the (synchronous)
+        // abort means a waiter that sees the record gone then blocks on
+        // this lock and finds the reason.
+        //
+        // Never overwrite or delete a reason already recorded: a migration
+        // the target already failed has no record left to abort, and the
+        // pre-fix error path's `remove` erased that genuine failure, so
+        // `wait()` reported the failed migration as completed (code review
+        // 2026-10-11, RUST-1).
+        let msg = {
+            let mut failures = self.runtime.inner.recent_failures.lock();
+            let msg = self
+                .runtime
+                .inner
+                .orchestrator
+                .abort_migration(self.origin_hash, "cancel requested".into())
+                .map_err(DaemonError::Migration)?;
+            failures
+                .entry(self.origin_hash)
+                .or_insert_with(|| MigrationFailureReason::StateFailed("cancel requested".into()));
+            msg
+        };
         // Best-effort notify — ignore send errors, the orchestrator
         // record is already gone on our side.
         let _ = self

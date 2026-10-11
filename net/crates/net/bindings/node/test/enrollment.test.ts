@@ -65,6 +65,18 @@ describe.skipIf(!HAS_ENROLLMENT)('enrollment', () => {
     expect(parsed.rootFingerprint()).toBe(binding.fingerprint(root.entityId))
   })
 
+  // SDK audit 2026-10-11: TTLs were napi-coerced u32s — `-1` minted a
+  // 136-year invite, `2 ** 32` one born expired, `1.5` became `1`.
+  it('refuses a TTL that is not a whole number of seconds in u32 range', async () => {
+    const { op } = operator()
+    for (const bad of [-1, 0, 1.5, 2 ** 32, Number.NaN, Infinity]) {
+      expect(() => op.invite('relay://rv', bad), String(bad)).toThrow(/^enrollment: ttlSeconds/)
+    }
+    const invite = op.invite('relay://rv', 300)
+    const req = JoinRequest.create(Identity.generate(), 'pc', [], invite)
+    await expect(op.approve(req, -1)).rejects.toThrow(/^enrollment: grantTtlSeconds/)
+  })
+
   it('signs and verifies a join request', () => {
     const { op } = operator()
     const invite = op.invite('relay://rv', 300)
@@ -261,6 +273,66 @@ describe.skipIf(!HAS_ENROLLMENT)('enrollment', () => {
       expect(handle.serving).toBe(false)
     } finally {
       await devMesh.shutdown().catch(() => {})
+      await opMesh.shutdown().catch(() => {})
+    }
+  })
+
+  // SDK audit 2026-10-11: the approver-gated mode existed only in Rust. A
+  // denial refuses WITHOUT burning the invite; the same invite then admits.
+  it.each([
+    ['sync', (admit: () => boolean) => () => admit()],
+    ['async', (admit: () => boolean) => async () => admit()],
+  ])('gates enrollment on a %s approver', async (_kind, make) => {
+    const root = Identity.generate()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const meshes: any[] = []
+    const mesh = async () => {
+      const m = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
+      meshes.push(m)
+      await m.start()
+      return m
+    }
+    try {
+      const opMesh = await mesh()
+      const { op } = operator(root)
+      let yes = false
+      let asked = 0
+      const handle = await opMesh.serveEnrollment(
+        op,
+        make(() => {
+          asked += 1
+          return yes
+        }),
+        3600,
+      )
+      const invite = op.invite(opMesh.rendezvousString(), 300).encode()
+      const device = Identity.generate()
+
+      await expect((await mesh()).join(device, invite, 'pc')).rejects.toThrow()
+      expect(asked).toBe(1)
+      expect((await op.devices()).length).toBe(0)
+
+      yes = true // a fresh node: the first holds a session with the operator
+      const chain = await (await mesh()).join(device, invite, 'pc')
+      expect(chain.leaf.equals(device.entityId)).toBe(true)
+      expect(asked).toBe(2)
+      handle.stop()
+    } finally {
+      for (const m of meshes.reverse()) await m.shutdown().catch(() => {})
+    }
+  })
+
+  // Code review 2026-10-11 NODE-2: approveTimeoutMs was a raw u32 — `-1`
+  // became ~49.7 days and `0` denied every request.
+  it.each([-1, 0, 1.5, Number.NaN, 2 ** 32])('refuses approveTimeoutMs %s', async (ms) => {
+    const root = Identity.generate()
+    const opMesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
+    try {
+      const { op } = operator(root)
+      await expect(
+        Promise.resolve().then(() => opMesh.serveEnrollment(op, () => true, 3600, null, ms)),
+      ).rejects.toThrow(/approveTimeoutMs/)
+    } finally {
       await opMesh.shutdown().catch(() => {})
     }
   })

@@ -242,6 +242,14 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
   let closed = false;
   let upstream: TransportStream | null = null;
   let opening: Promise<TransportStream> | null = null;
+  /**
+   * Bumped by `reconnect()`. An open started under an older epoch belongs
+   * to the lost session: it never publishes `upstream` and never clears a
+   * newer `opening`, so `reconnect()` can start fresh instead of inheriting
+   * that open's late rejection — or waiting on one that never settles
+   * (code review 2026-10-11, BROWSER-2).
+   */
+  let openEpoch = 0;
   const readyWaiters: { resolve: () => void; reject: (error: StoreError) => void }[] = [];
   /** The transition in flight and its callers (§2). */
   let transition: Transition | null = null;
@@ -265,6 +273,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     // the relay is installed before the direct half is even tried, so
     // the open below is the thing that decides, and its refusal is
     // typed.
+    const epoch = openEpoch;
     opening = Promise.resolve(options.transport.connectPeer?.(hostHex))
       .catch(() => undefined)
       .then(() =>
@@ -275,6 +284,15 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         }),
       )
       .then(open => {
+      if (epoch !== openEpoch) {
+        // Superseded by `reconnect()`: reclaim, never publish.
+        try {
+          open.close();
+        } catch {
+          // Already gone.
+        }
+        throw new StoreError('aborted', 'the stream open was superseded by reconnect()');
+      }
       opening = null;
       // An open that resolves after `close()` is reclaimed, never
       // published.
@@ -295,7 +313,7 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         // answered from it with the same stale error until the caller
         // happens to call `reconnect()`. A transient failure is a retry,
         // not a verdict on the peer.
-        opening = null;
+        if (epoch === openEpoch) opening = null;
         throw error;
       });
     return opening;
@@ -781,9 +799,24 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
     },
     reconnect: async () => {
       if (closed) throw new StoreError('closed', 'this store handle is closed');
-      // The old stream belongs to the lost session.
+      // The old stream belongs to the lost session: CLOSE it, never just
+      // drop it — a dropped LeafStream stays registered with the node and
+      // its wasm listener, so every reconnect leaked one (SDK audit
+      // 2026-10-11). An open still in flight is detached by the epoch
+      // bump: it can no longer overwrite the new stream (it is closed on
+      // arrival instead), and this reconnect no longer inherits its
+      // rejection or its hang.
+      const old = upstream;
       upstream = null;
+      openEpoch += 1;
       opening = null;
+      if (old !== null) {
+        try {
+          old.close();
+        } catch {
+          // Already gone with its session.
+        }
+      }
       let requests: readonly Request[];
       try {
         requests = replica.reconnect();

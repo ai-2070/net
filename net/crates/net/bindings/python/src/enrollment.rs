@@ -656,8 +656,103 @@ pub(crate) fn mesh_serve_enrollment_auto(
         .serve_renewal_auto(operator, grant_ttl, max_depth)
         .map_err(enroll_err)?;
     Ok(PyEnrollmentServeHandle {
-        inner: Some((mesh, vec![enroll, renew])),
+        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll, renew]))),
     })
+}
+
+/// Operator-side, **approver-gated** enrollment on the live `node`: every
+/// valid join request is handed to `approver` before it is admitted. Serves
+/// enrollment only (no renewal). Added by the SDK audit (2026-10-11): the
+/// approver-gated mode existed only in Rust.
+pub(crate) fn mesh_serve_enrollment(
+    node: Arc<MeshNode>,
+    runtime: &Runtime,
+    operator: Arc<OperatorEnrollment>,
+    grant_ttl: Duration,
+    max_depth: u8,
+    approver: Py<PyAny>,
+    budget: Duration,
+) -> PyResult<PyEnrollmentServeHandle> {
+    let mesh = mesh_over(node, None);
+    let _guard = runtime.enter();
+    let approver = Arc::new(approver);
+    let approve = move |request: JoinRequest| {
+        let approver = Arc::clone(&approver);
+        async move {
+            tokio::time::timeout(budget, ask_py_approver(approver, request))
+                .await
+                .unwrap_or(false)
+        }
+    };
+    let enroll = mesh
+        .serve_enrollment(operator, grant_ttl, max_depth, approve)
+        .map_err(enroll_err)?;
+    Ok(PyEnrollmentServeHandle {
+        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll]))),
+    })
+}
+
+type PendingAnswer =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<Py<PyAny>>> + Send>>;
+
+enum Answer {
+    Now(bool),
+    Pending(PendingAnswer),
+}
+
+/// `awaitable` as a coroutine object. The dispatcher hands it to
+/// `asyncio.run_coroutine_threadsafe`, which accepts only coroutines: an
+/// approver returning another `Awaitable[bool]` (a Future, a Task, an object
+/// with `__await__`) was rejected and the request failed closed (cubic review
+/// of PR #1228). Wrap those in `async def _(aw): return await aw`.
+fn as_coroutine<'py>(
+    py: Python<'py>,
+    awaitable: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let is_coro: bool = py
+        .import("asyncio")?
+        .call_method1("iscoroutine", (awaitable,))?
+        .extract()?;
+    if is_coro {
+        return Ok(awaitable.clone());
+    }
+    let helper = pyo3::types::PyModule::from_code(
+        py,
+        c"async def await_any(aw):\n    return await aw\n",
+        c"net_enrollment_await.py",
+        c"net_enrollment_await",
+    )?;
+    helper.getattr("await_any")?.call1((awaitable,))
+}
+
+/// Ask the Python approver about one request. Fails closed: anything but an
+/// explicit `True` (returned, or awaited from a coroutine) is a denial, which
+/// leaves the invite unburned. The call runs on a blocking thread, so a sync
+/// approver that prompts a human never stalls the runtime; a coroutine runs
+/// on the async bridge's dispatcher loop.
+async fn ask_py_approver(approver: Arc<Py<PyAny>>, request: JoinRequest) -> bool {
+    let called = tokio::task::spawn_blocking(move || {
+        Python::attach(|py| -> PyResult<Answer> {
+            let result = approver.call1(py, (PyJoinRequest { inner: request },))?;
+            let bound = result.bind(py);
+            if bound.hasattr("__await__")? {
+                let coro = as_coroutine(py, bound)?;
+                let fut = crate::async_bridge::dispatch_handler_coro(py, coro)?;
+                Ok(Answer::Pending(Box::pin(fut)))
+            } else {
+                Ok(Answer::Now(bound.extract::<bool>().unwrap_or(false)))
+            }
+        })
+    })
+    .await;
+    match called {
+        Ok(Ok(Answer::Now(admit))) => admit,
+        Ok(Ok(Answer::Pending(fut))) => match fut.await {
+            Ok(value) => Python::attach(|py| value.bind(py).extract::<bool>().unwrap_or(false)),
+            Err(_) => false,
+        },
+        _ => false,
+    }
 }
 
 /// Keeps the served enrollment services alive. Dropping it (or calling
@@ -667,23 +762,28 @@ pub struct PyEnrollmentServeHandle {
     // The `Mesh` holds the channel registry the services registered against and
     // each `ServeHandle` holds one dispatcher registration (enroll + renew) —
     // all must outlive the services.
-    inner: Option<(Mesh, Vec<ServeHandle>)>,
+    // A lock, not `&mut self` (SDK audit 2026-10-11): see `NetMesh.node`.
+    inner: parking_lot::Mutex<Option<(Mesh, Vec<ServeHandle>)>>,
 }
 
 #[pymethods]
 impl PyEnrollmentServeHandle {
     /// Stop serving enrollment (unregister the service).
-    fn stop(&mut self) {
-        self.inner = None;
+    fn stop(&self) {
+        let taken = self.inner.lock().take();
+        drop(taken);
     }
 
     /// Whether the service is still registered.
     #[getter]
     fn serving(&self) -> bool {
-        self.inner.is_some()
+        self.inner.lock().is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("EnrollmentServeHandle(serving={})", self.inner.is_some())
+        format!(
+            "EnrollmentServeHandle(serving={})",
+            self.inner.lock().is_some()
+        )
     }
 }

@@ -155,7 +155,7 @@ async fn call_js_handler(
             "local tool handler: TSFN enqueue status {status:?}"
         )));
     }
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = crate::common::deadline_after(timeout);
     let promise = match tokio::time::timeout_at(deadline, rx).await {
         Ok(Ok(Ok(p))) => p,
         Ok(Ok(Err(e))) => {
@@ -289,9 +289,13 @@ pub(crate) fn build_tool_invoker(
     handler: Function<'_, ToolInvokeArgs, Promise<ToolCallResultJs>>,
     handler_timeout_ms: Option<u32>,
 ) -> Result<Arc<dyn ToolInvoker>> {
-    let timeout = handler_timeout_ms
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(DEFAULT_TOOL_HANDLER_TIMEOUT);
+    // `0` disables the cap, as on every `serve*` verb; it used to time
+    // every invocation out at 0 ms (SDK audit 2026-10-11).
+    let timeout = match handler_timeout_ms {
+        Some(0) => crate::common::UNCAPPED_WAIT,
+        Some(ms) => Duration::from_millis(ms as u64),
+        None => DEFAULT_TOOL_HANDLER_TIMEOUT,
+    };
     let tsfn: InvokeTsfn = handler.build_threadsafe_function().build()?;
     Ok(Arc::new(NodeToolInvoker {
         handler: tsfn,

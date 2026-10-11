@@ -139,13 +139,18 @@ export interface StoreTransport {
 export function peerHexOf(peer: string): string | null {
   const decimal = /^\d+$/.test(peer);
   const hex = /^(0x)?[0-9a-f]{1,16}$/i.test(peer);
+  let out: string;
   try {
-    if (decimal) return BigInt(peer).toString(16).padStart(16, '0');
-    if (hex) return BigInt(peer.startsWith('0x') ? peer : `0x${peer}`).toString(16).padStart(16, '0');
+    if (decimal) out = BigInt(peer).toString(16).padStart(16, '0');
+    else if (hex) out = BigInt(peer.startsWith('0x') ? peer : `0x${peer}`).toString(16).padStart(16, '0');
+    else return null;
   } catch {
     return null;
   }
-  return null;
+  // A decimal above u64 renders as 17+ hex digits: no node has that id, so
+  // it is not one — `kick('18446744073709551616')` used to target nobody
+  // without an error (cubic review of PR #1228).
+  return out.length === 16 ? out : null;
 }
 
 /**

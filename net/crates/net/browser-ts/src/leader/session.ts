@@ -59,6 +59,7 @@ import {
 } from '../org.js';
 import {
   buildConnectRequest,
+  identityLockName,
   parseAttemptStatus,
   parseCounters,
   parseDescriptors,
@@ -113,7 +114,10 @@ export interface SessionOptions extends ConnectOptions {
   dbName?: string;
   /**
    * Override the Web Lock and `BroadcastChannel` name. Defaults to
-   * `net-mesh/<origin>/<identity-fingerprint>`.
+   * `net-mesh/<origin>/<identity-fingerprint>`, or — with a custodial
+   * `entitySecretHex` — to the identity lock `connect()` takes for that
+   * secret, so a `connect()` tab and an `openSession()` tab cannot both run
+   * the identity. Setting it opts out of that contention.
    *
    * For tests that need two independent elections inside one origin.
    * A page should not set it: two scopes on one identity is two nodes
@@ -123,6 +127,14 @@ export interface SessionOptions extends ConnectOptions {
 }
 
 /** The origin's Net node, as this tab sees it. */
+/**
+ * What a send on a stream ended by a leader change fails with. Worded
+ * the way the leaf words a stale handle, because `isStaleStream` (the
+ * store's reopen test) matches exactly that: a store over a session
+ * reopens on the new leader rather than counting `send-failed` forever.
+ */
+const STALE_AFTER_HANDOFF = 'stale stream handle: the leader changed; reopen the stream';
+
 export class MeshSession {
   /**
    * The same fan-out the direct surface uses, instantiated over the
@@ -186,7 +198,7 @@ export class MeshSession {
         // The generation that owned the calls is the one they were
         // issued under — typed `LeaderLost`, never resumed.
         this.orgHandles.retireAll(new OrgLeaderLostError(this.streamGeneration));
-        this.endStreams();
+        this.endStreams(STALE_AFTER_HANDOFF);
         return;
       }
       // And the abrupt case: a generation that moved under us. Read
@@ -199,7 +211,7 @@ export class MeshSession {
       const previous = this.streamGeneration;
       this.streamGeneration = current;
       this.orgHandles.retireAll(new OrgLeaderLostError(previous));
-      this.endStreams();
+      this.endStreams(STALE_AFTER_HANDOFF);
     });
   }
 
@@ -910,10 +922,15 @@ export class MeshSession {
    * on close; idempotent, because a page may have closed a stream
    * itself.
    */
-  private endStreams(): void {
+  private endStreams(staleReason?: string): void {
     const open = [...this.streams];
     this.streams.clear();
-    for (const stream of open) stream.close();
+    for (const stream of open) {
+      // A leader change retires with the reopenable wording; closing the
+      // session is permanent.
+      if (staleReason === undefined) stream.close();
+      else stream.retire(staleReason);
+    }
   }
 
   /**
@@ -962,6 +979,16 @@ export async function openSession(options: SessionOptions): Promise<MeshSession>
     ...(options.dbName === undefined ? {} : { dbName: options.dbName }),
     ...(options.lockScope === undefined ? {} : { lockScope: options.lockScope }),
   };
+  // A custodial identity elects under the same lock name `connect()` takes
+  // for it, so mixed connect()/openSession() tabs with one secret cannot
+  // both run a node (cubic review of PR #1228). The scope also names the
+  // `BroadcastChannel`, and every session tab with that secret derives the
+  // same name, so the leader and its followers still meet.
+  // `lockIdentity: false` keeps the leaf's own default scope.
+  if (request.lockScope === undefined && request.entitySecretHex !== undefined && options.lockIdentity !== false) {
+    const shared = await identityLockName(request.entitySecretHex);
+    if (shared !== null) request.lockScope = shared;
+  }
 
   try {
     return new MeshSession(await module.MeshSession.open(request));

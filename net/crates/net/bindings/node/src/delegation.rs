@@ -6,11 +6,13 @@
 //! [`RevocationRegistry`], and [`derive_child_identity`] to derive a
 //! stable child `Identity` handle from a parent.
 //!
-//! **H8 (no key material, ever).** Every function here takes and returns
-//! opaque `Identity` handles and *public* entity-ids / chain bytes.
-//! Private ed25519 seeds never cross into JS: `deriveChildIdentity`
-//! derives the child keypair inside Rust and hands back a handle; the
-//! chain is a blob of ed25519-signed public tokens. The one and only
+//! **H8 (no key material from this module).** Every function here takes and
+//! returns opaque `Identity` handles and *public* entity-ids / chain bytes:
+//! `deriveChildIdentity` derives the child keypair inside Rust and hands back
+//! a handle; the chain is a blob of ed25519-signed public tokens. The handle
+//! is an ordinary `Identity`, though — its own `toBytes()` /
+//! `toStateBytes()` DO export the private seed, so treat a derived handle
+//! with the same care as its parent. The one and only
 //! implementation of derivation + verification lives in the Rust SDK
 //! (bridge doctrine H2) — this file just forwards.
 
@@ -72,8 +74,10 @@ pub(crate) fn u64_arg(name: &str, value: BigInt) -> Result<u64> {
 /// Deterministic (blake3 KDF over the parent seed), so a machine / gateway
 /// identity is reproducible across restarts from the root alone — no extra
 /// persistence, and every process that holds the root derives the same
-/// child. The returned handle owns its keypair; the private seed is never
-/// exposed (H8). `label` namespaces siblings, e.g. `"machine:hostA"` vs
+/// child. The returned handle owns its keypair; this function never returns
+/// the seed itself, but the handle's `toBytes()` does (H8 applies to this
+/// module's surface, not to the `Identity` class). `label` namespaces
+/// siblings, e.g. `"machine:hostA"` vs
 /// `"gateway:hostA:hermes"`.
 #[napi]
 pub fn derive_child_identity(parent: &Identity, label: String) -> Identity {
@@ -208,9 +212,19 @@ impl DelegationChain {
         root: &Identity,
         machine: &Identity,
         gateway: &Identity,
-        ttl_seconds: u32,
+        ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<DelegationChain> {
+        // Zero keeps its established `token: zero_ttl` discriminator; the
+        // validator's untagged message replaced it (cubic review of PR
+        // #1228). Every other invalid number is the validator's to refuse.
+        if ttl_seconds == 0.0 {
+            return Err(token_err_for(
+                ::net::adapter::net::identity::TokenError::ZeroTtl,
+            ));
+        }
+        let ttl_seconds = crate::common::validate_ttl_seconds("ttlSeconds", ttl_seconds)
+            .map_err(Error::from_reason)?;
         let root_sdk = root.to_sdk_identity();
         let machine_sdk = machine.to_sdk_identity();
         let depth = max_depth.unwrap_or(DEFAULT_DELEGATION_DEPTH);
@@ -218,7 +232,7 @@ impl DelegationChain {
             &root_sdk,
             &machine_sdk,
             gateway.entity_id_ref(),
-            Duration::from_secs(u64::from(ttl_seconds)),
+            Duration::from_secs(ttl_seconds),
             depth,
         )
         .map_err(token_err_for)?;

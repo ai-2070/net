@@ -2274,7 +2274,49 @@ impl RpcStream {
     /// `window/2` after every `window/2` chunks consumed) when
     /// `auto_grant`-style amortization isn't enough.
     pub fn grant(&self, amount: u32) {
-        if !self.flow_controlled() || amount == 0 {
+        self.grant_handle().grant(amount);
+    }
+
+    /// A cloneable handle that grants credits to this stream's server
+    /// pump without borrowing the stream.
+    ///
+    /// For bindings that park a consumer inside the stream's `next()` while
+    /// another thread grants: with the stream taken out for the await, a
+    /// grant routed through the stream was dropped, and on a
+    /// flow-controlled stream whose window was exhausted that stalled the
+    /// call for good (SDK audit 2026-10-11).
+    pub fn grant_handle(&self) -> RpcStreamGrant {
+        RpcStreamGrant {
+            mesh: Arc::clone(&self.mesh),
+            target_node_id: self.target_node_id,
+            request_channel_hash: self.request_channel_hash,
+            request_stream_id: self.request_stream_id,
+            self_origin: self.self_origin,
+            call_id: self.call_id,
+            flow_controlled: self.flow_controlled(),
+        }
+    }
+}
+
+/// Grants credits to one [`RpcStream`]'s server pump — see
+/// [`RpcStream::grant_handle`]. Must be used inside a tokio runtime context
+/// (the grant is a spawned fire-and-forget publish).
+#[derive(Clone)]
+pub struct RpcStreamGrant {
+    mesh: Arc<MeshNode>,
+    target_node_id: u64,
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
+    self_origin: u64,
+    call_id: u64,
+    flow_controlled: bool,
+}
+
+impl RpcStreamGrant {
+    /// Grant `amount` more credits; a no-op when the stream is not flow
+    /// controlled or `amount == 0` — exactly [`RpcStream::grant`].
+    pub fn grant(&self, amount: u32) {
+        if !self.flow_controlled || amount == 0 {
             return;
         }
         spawn_grant_publish(
@@ -2650,9 +2692,12 @@ impl ClientStreamCallRaw {
         }
         // Gate on credit when flow control is opted into.
         if let Some(sem) = self.credit_sem.as_ref() {
-            let permit = sem.clone().acquire_owned().await.map_err(|_| {
-                RpcError::Transport(AdapterError::Connection("credit semaphore closed".into()))
-            })?;
+            // Closed only by the cancel watcher.
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| RpcError::Cancelled)?;
             permit.forget();
         }
         self.observer.add_request_bytes(body.len() as u32);
@@ -3012,9 +3057,12 @@ impl DuplexSink {
             _ => {}
         }
         if let Some(sem) = self.credit_sem.as_ref() {
-            let permit = sem.clone().acquire_owned().await.map_err(|_| {
-                RpcError::Transport(AdapterError::Connection("credit semaphore closed".into()))
-            })?;
+            // Closed only by the cancel watcher.
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| RpcError::Cancelled)?;
             permit.forget();
         }
         self.inner.observer.add_request_bytes(body.len() as u32);
@@ -4346,6 +4394,7 @@ fn spawn_stream_cancel_watcher(
     cancel_registry: Arc<crate::adapter::net::cancel_registry::CancelRegistry>,
     pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
     call_id: u64,
+    credit_sem: Option<Arc<tokio::sync::Semaphore>>,
 ) -> StreamCancelKeepAlive {
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     if cancel_token == 0 {
@@ -4366,6 +4415,16 @@ fn spawn_stream_cancel_watcher(
                 // used to read as). The handle's Drop will then fire
                 // CANCEL on the wire via its existing per-shape Drop impl.
                 pending.cancel(call_id);
+                // A `send` parked on request-side flow-control credit
+                // waits on this semaphore, not on the response channel
+                // `pending.cancel` signals — close it so that send
+                // returns `Cancelled` too. Without this a cancel (a Go
+                // `Close()` / ctx-cancel wake) left the send, and the
+                // handle it borrows, parked for good (code review
+                // 2026-10-11, GO-2).
+                if let Some(sem) = credit_sem {
+                    sem.close();
+                }
                 cancel_registry.release(cancel_token);
             }
             _ = done_rx => {
@@ -4381,6 +4440,36 @@ fn spawn_stream_cancel_watcher(
     done_tx
 }
 
+/// Await one of a streaming constructor's setup steps (the reply-channel
+/// subscription, the opening publish) against the caller's cancel token.
+///
+/// The token's watcher is armed only once the stream exists, so a cancel
+/// landing while the constructor waited on a silent peer was merely
+/// remembered: the constructor still blocked for the full setup budget and
+/// returned an already-cancelled stream (cubic review of PR #1228). A cancel
+/// now ends the wait with [`RpcError::Cancelled`] and releases the token.
+/// When the step completes first, nothing is consumed: a later cancel still
+/// pre-arms the stream's watcher.
+async fn until_cancelled<T>(
+    mesh: &Arc<MeshNode>,
+    opts: &CallOptions,
+    step: impl std::future::Future<Output = Result<T, RpcError>>,
+) -> Result<T, RpcError> {
+    let token = opts.cancel_token.unwrap_or(0);
+    if token == 0 {
+        return step.await;
+    }
+    let notify = mesh.cancel_registry().register_notify(token);
+    tokio::select! {
+        biased;
+        _ = notify.notified() => {
+            mesh.cancel_registry().release(token);
+            Err(RpcError::Cancelled)
+        }
+        r = step => r,
+    }
+}
+
 /// One-call helper that registers a cancel-notify against the
 /// caller's `opts.cancel_token` and spawns the stream cancel
 /// watcher. Used by every streaming call shape (`call_streaming`,
@@ -4394,6 +4483,7 @@ fn arm_stream_cancel(
     opts: &CallOptions,
     pending: &Arc<crate::adapter::net::cortex::RpcClientPending>,
     call_id: u64,
+    credit_sem: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> StreamCancelKeepAlive {
     let cancel_token = opts.cancel_token.unwrap_or(0);
     let cancel_notify = mesh.cancel_registry().register_notify(cancel_token);
@@ -4403,6 +4493,7 @@ fn arm_stream_cancel(
         Arc::clone(mesh.cancel_registry()),
         Arc::clone(pending),
         call_id,
+        credit_sem.cloned(),
     )
 }
 
@@ -6356,11 +6447,15 @@ impl MeshNode {
         // 2 format! + 2 ChannelName::new + xxhash per call.
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
-        self.ensure_reply_subscription(
-            target_node_id,
-            service,
-            route.reply_channel.clone(),
-            route.reply_hash,
+        until_cancelled(
+            self,
+            &opts,
+            self.ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            ),
         )
         .await?;
 
@@ -6403,7 +6498,8 @@ impl MeshNode {
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
-        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        let cancel_keep_alive =
+            arm_stream_cancel(self, &opts, &pending, call_id, credit_sem.as_ref());
         // See `remember_cancel_publish_runtime`.
         remember_cancel_publish_runtime();
         Ok(ClientStreamCallRaw {
@@ -7005,11 +7101,15 @@ impl MeshNode {
         // 2 format! + 2 ChannelName::new + xxhash per call.
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
-        self.ensure_reply_subscription(
-            target_node_id,
-            service,
-            route.reply_channel.clone(),
-            route.reply_hash,
+        until_cancelled(
+            self,
+            &opts,
+            self.ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            ),
         )
         .await?;
 
@@ -7055,7 +7155,8 @@ impl MeshNode {
         // so it survives into_split — the watcher exits only when
         // BOTH the sink AND stream halves drop, matching the
         // existing CANCEL-on-drop semantics.
-        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        let cancel_keep_alive =
+            arm_stream_cancel(self, &opts, &pending, call_id, credit_sem.as_ref());
         // This handle may be dropped by a foreign thread — a Python
         // object freed by GC, an FFI release — so record the runtime now,
         // while we are certainly on one.
@@ -7130,11 +7231,15 @@ impl MeshNode {
         // xxhash per call.
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
-        self.ensure_reply_subscription(
-            target_node_id,
-            service,
-            route.reply_channel.clone(),
-            route.reply_hash,
+        until_cancelled(
+            self,
+            &opts,
+            self.ensure_reply_subscription(
+                target_node_id,
+                service,
+                route.reply_channel.clone(),
+                route.reply_hash,
+            ),
         )
         .await?;
 
@@ -7200,8 +7305,8 @@ impl MeshNode {
         req.encode_into(&mut buf);
 
         let payload_bytes = Bytes::from(buf);
-        if let Err(e) = self
-            .publish_to_peer(
+        let published = until_cancelled(self, &opts, async {
+            self.publish_to_peer(
                 target_node_id,
                 route.request_channel_hash,
                 route.request_stream_id,
@@ -7209,15 +7314,18 @@ impl MeshNode {
                 std::slice::from_ref(&payload_bytes),
             )
             .await
-        {
+            .map_err(RpcError::Transport)
+        })
+        .await;
+        if let Err(e) = published {
             pending.cancel(call_id);
-            return Err(RpcError::Transport(e));
+            return Err(e);
         }
 
         let request_bytes_len = payload_bytes.len() as u32;
         // Cancel keep-alive lives on the returned RpcStream so the
         // watcher exits cleanly when the stream drops without cancel.
-        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id, None);
         // See `remember_cancel_publish_runtime` — a stream handed to a
         // binding can be dropped off-runtime.
         remember_cancel_publish_runtime();

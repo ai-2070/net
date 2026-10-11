@@ -74,6 +74,16 @@ export const MAX_PENDING_ACTIONS = 32;
 /** Handles one owner will hold (brief §2). */
 export const MAX_HANDLES = 256;
 
+/**
+ * Handles one authenticated peer may hold at once. Room for siblings and
+ * for a reconnect that overlaps its predecessor's lease, but never the
+ * whole table: one peer could otherwise take all {@link MAX_HANDLES} and
+ * lock every other player out — the lobby's capacity rule counts distinct
+ * peers, so a seated player's repeat joins bypassed it (SDK audit
+ * 2026-10-11).
+ */
+export const MAX_HANDLES_PER_PEER = 16;
+
 /** How long a handle lives without an accepted authenticated message. */
 export const HANDLE_LEASE_MS = 60_000;
 
@@ -225,6 +235,8 @@ export interface OwnerHandle {
   /** The authenticated peer this handle is bound to (§1.3). */
   readonly peer: string;
   readonly audience: readonly string[];
+  /** The opaque key the `join` carried; every read decision passes it on. */
+  readonly key?: string;
   /** Highest generation allocated for this handle; monotone (§1.7a). */
   readonly generation: number;
   /**
@@ -510,7 +522,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       // having been checked once at admission. The handle goes with the
       // refusal here because the feed is the grant: leaving it alive would
       // let `alive` renew the lease of a peer the policy now forbids.
-      if (!this.permitsRead(handle.peer, handle.audience)) {
+      if (!this.permitsRead(handle.peer, handle.audience, handle.key)) {
         this.forget(handle.h, 'refused');
         // `closed`, the wire's legal unsolicited refusal (§1.12 admits
         // exactly `closed` and `owner-lost` without a `q`): it closes
@@ -783,7 +795,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         // must not be served because the handle is still warm. The
         // handle survives the refusal: the request was refused, not
         // the subscription.
-        if (!this.permitsRead(peer, bound.audience)) {
+        if (!this.permitsRead(peer, bound.audience, bound.key)) {
           return this.refuse(
             'resync-forbidden',
             [this.no(peer, bound.h, 'forbidden', message.q)]
@@ -816,7 +828,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         // `audience-too-many` at rung 6 (wire.ts, witnessed in
         // wire.test.ts), so a frame carrying more than the bound never
         // reaches dispatch. Re-checking it would be a claim.
-        if (!this.permitsRead(peer, message.aud)) {
+        if (!this.permitsRead(peer, message.aud, bound.key)) {
           return this.refuse(
             `${message.k}-forbidden`,
             [this.no(peer, bound.h, 'forbidden', message.q)]
@@ -1322,7 +1334,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
   reauthorize(): Dispatched {
     const out: Outbound[] = [];
     for (const handle of [...this.handles.values()]) {
-      if (this.permitsRead(handle.peer, handle.audience)) continue;
+      if (this.permitsRead(handle.peer, handle.audience, handle.key)) continue;
       this.forget(handle.h, 'refused');
       out.push(this.no(handle.peer, handle.h, 'closed', null));
     }
@@ -1484,10 +1496,15 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     if (this.handles.size >= MAX_HANDLES) {
       return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);
     }
+    let held = 0;
+    for (const existing of this.handles.values()) if (existing.peer === peer) held += 1;
+    if (held >= MAX_HANDLES_PER_PEER) {
+      return this.refuse('join-capacity', [this.no(peer, null, 'capacity', message.q)]);
+    }
 
     // `authorize` receives the AUTHENTICATED peer and the audience it
     // asked to read. A refusal is `forbidden` and allocates nothing.
-    if (!this.permitsRead(peer, message.aud)) {
+    if (!this.permitsRead(peer, message.aud, message.key)) {
       return this.refuse('join-forbidden', [this.no(peer, null, 'forbidden', message.q)]);
     }
 
@@ -1501,6 +1518,7 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
       inc: this.incarnation,
       peer,
       audience: [...message.aud],
+      key: message.key,
       interest: message.int === undefined ? null : [...message.int],
       generation: 0,
       revision: this.core.revision,
@@ -1573,8 +1591,13 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    *
    * A throwing policy is a refusal, never an admission.
    */
-  private permitsRead(peer: string, audience: readonly string[]): boolean {
-    const request = { type: 'read', peer, audience: [...audience] } as AccessRequest<A, I>;
+  private permitsRead(peer: string, audience: readonly string[], key?: string): boolean {
+    // `key` is the join's opaque key, which `joinStore({ key })` documents
+    // as read by the host's policy; it was dropped here, so a key-gated
+    // room refused everyone (SDK audit 2026-10-11).
+    const request = (
+      key === undefined ? { type: 'read', peer, audience: [...audience] } : { type: 'read', peer, audience: [...audience], key }
+    ) as AccessRequest<A, I>;
     try {
       return this.deps.authorize(request) === true;
     } catch {

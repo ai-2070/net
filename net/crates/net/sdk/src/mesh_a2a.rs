@@ -2573,9 +2573,15 @@ impl Mesh {
             let state = state.clone();
             handle.spawn(async move {
                 let _owner = keep_owner;
-                let _ = store
-                    .record_terminal(task_owner, &task_id, state, now_secs())
-                    .await;
+                // Retried on a transient I/O failure: a lost terminal write
+                // leaves the row `Launched`, and `Launched` holds a
+                // `max_in_flight` slot until an operator resolves it — two
+                // writes lost to a briefly full disk left a service
+                // answering `Busy` forever (SDK audit 2026-10-11).
+                let _ = retry_transient_journal_write(TERMINAL_WRITE_BACKOFF, || {
+                    store.record_terminal(task_owner, &task_id, state.clone(), now_secs())
+                })
+                .await;
             });
         });
 
@@ -2897,8 +2903,100 @@ impl Mesh {
     }
 }
 
+/// Backoff between attempts of a terminal-state journal write.
+const TERMINAL_WRITE_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(400),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(15),
+];
+
+/// Run `write`, retrying after each delay in `backoff` while it fails with a
+/// transient [`A2aJournalError::Io`] (the file is unchanged, so a retry is
+/// safe). Every other outcome is final: a conflict or supersession is an
+/// answer, not a hiccup, and a published-but-unconfirmed write must never
+/// be re-applied as if it had not happened.
+async fn retry_transient_journal_write<F, Fut>(
+    backoff: &[std::time::Duration],
+    mut write: F,
+) -> Result<(), A2aJournalError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), A2aJournalError>>,
+{
+    let mut delays = backoff.iter();
+    loop {
+        match write().await {
+            Err(e @ A2aJournalError::Io { .. }) => match delays.next() {
+                Some(delay) => tokio::time::sleep(*delay).await,
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// SDK audit 2026-10-11: a terminal write that fails with a transient
+    /// I/O error is retried (a lost one left the row `Launched`, holding a
+    /// capacity slot forever); any other refusal is final.
+    #[tokio::test]
+    async fn terminal_writes_retry_io_and_nothing_else() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let io = || A2aJournalError::Io {
+            path: "j".into(),
+            reason: "disk full".into(),
+        };
+        let zero = [std::time::Duration::ZERO; 3];
+
+        let calls = AtomicUsize::new(0);
+        let r = retry_transient_journal_write(&zero, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(io())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two Io failures, then success"
+        );
+
+        let calls = AtomicUsize::new(0);
+        let r = retry_transient_journal_write(&zero, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(A2aJournalError::Conflict {
+                    reason: "not launched".into(),
+                })
+            }
+        })
+        .await;
+        assert!(matches!(r, Err(A2aJournalError::Conflict { .. })));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a conflict is never retried"
+        );
+
+        let calls = AtomicUsize::new(0);
+        let r = retry_transient_journal_write(&zero, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(io()) }
+        })
+        .await;
+        assert!(matches!(r, Err(A2aJournalError::Io { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "1 + one per backoff step");
+    }
+
     use super::*;
     use crate::a2a::{CancelToken, TaskState};
     use crate::mesh::MeshBuilder;

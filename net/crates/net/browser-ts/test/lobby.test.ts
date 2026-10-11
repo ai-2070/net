@@ -136,6 +136,30 @@ describe('lobbies', () => {
     expect(() => lobby.kick(lobby.host.authority)).toThrow(LobbyError);
   });
 
+  it('kicks a player named by the decimal peer id an event carries', async () => {
+    const mesh = createLocalMesh();
+    const lobby = await lobbyOn(mesh);
+    // A fixed id whose decimal form is 20 digits: a random one was, about
+    // one time in 2,000, a 16-digit decimal, which reads as hex by design
+    // (cubic review of PR #1228).
+    const node = mesh.node('beefcafe00000001');
+    const world = await joinLobby({ node, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    const decimal = BigInt(`0x${node.nodeIdHex()}`).toString();
+    expect(decimal.length).toBeGreaterThan(16);
+    lobby.kick(decimal);
+    await settle();
+    expect(lobby.players()).toEqual([lobby.host.authority]);
+  });
+
+  // cubic review of PR #1228: a decimal above u64 rendered as 17 hex digits
+  // and kicked nobody, silently.
+  it('refuses to kick a decimal id above u64', async () => {
+    const mesh = createLocalMesh();
+    const lobby = await lobbyOn(mesh);
+    expect(() => lobby.kick('18446744073709551616')).toThrow(LobbyError);
+  });
+
   it("tells onEvent a kicked player left because they were refused", async () => {
     const mesh = createLocalMesh();
     const events: unknown[] = [];

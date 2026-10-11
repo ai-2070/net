@@ -343,8 +343,28 @@ fn generate_net_keypair() -> NetKeypair {
 /// ```
 #[pyclass]
 pub struct Net {
-    bus: Arc<RwLock<Option<EventBus>>>,
+    // The bus sits behind its own `Arc` so the I/O-bound calls (`poll`,
+    // `flush`, `shutdown`) clone it out and drop the lock guard BEFORE
+    // releasing the GIL. Holding a guard across `py.detach` deadlocks:
+    // the detached thread reacquires the GIL with the read guard held
+    // while `shutdown` waits for the write guard with the GIL held.
+    bus: RwLock<Option<Arc<EventBus>>>,
     runtime: Arc<GuardedRuntime>,
+    /// Held (without the GIL) across a whole `shutdown`, so a concurrent
+    /// second call waits for the drain instead of finding the bus already
+    /// taken and returning at once (cubic review of PR #1228).
+    shutdown_gate: parking_lot::Mutex<()>,
+}
+
+impl Net {
+    /// The live bus, or the shut-down error. Clones the `Arc` so the
+    /// caller holds no lock guard while it waits.
+    fn live_bus(&self) -> PyResult<Arc<EventBus>> {
+        self.bus
+            .read()
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))
+    }
 }
 
 #[pymethods]
@@ -684,8 +704,9 @@ impl Net {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         Ok(Net {
-            bus: Arc::new(RwLock::new(Some(bus))),
+            bus: RwLock::new(Some(Arc::new(bus))),
             runtime,
+            shutdown_gate: parking_lot::Mutex::new(()),
         })
     }
 
@@ -764,15 +785,13 @@ impl Net {
     #[pyo3(signature = (limit, cursor=None, filter=None, ordering=None))]
     fn poll(
         &self,
+        py: Python<'_>,
         limit: usize,
         cursor: Option<&str>,
         filter: Option<&str>,
         ordering: Option<&str>,
     ) -> PyResult<PollResponse> {
-        let bus_guard = self.bus.read();
-        let bus = bus_guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
+        let bus = self.live_bus()?;
 
         let mut request = ConsumeRequest::new(limit);
 
@@ -800,9 +819,9 @@ impl Net {
             request = request.ordering(ordering_mode);
         }
 
-        let response = self
-            .runtime
-            .block_on(bus.poll(request))
+        // GIL released across the bus round trip (SDK audit 2026-10-11).
+        let response = py
+            .detach(|| self.runtime.block_on(bus.poll(request)))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let events: Vec<StoredEvent> = response
@@ -863,29 +882,33 @@ impl Net {
     /// in-flight batches short of `shutdown()`, which is terminal —
     /// so "publish, make sure it landed, keep publishing" was
     /// inexpressible here while Rust, Node, Go and C all had it.
-    fn flush(&self) -> PyResult<()> {
-        // Holds the read guard across `block_on`, matching `shutdown`
-        // below (which holds the write guard). A concurrent shutdown
-        // waits for the flush rather than racing it, which is the
-        // ordering a caller flushing before teardown wants anyway.
-        let bus_guard = self.bus.read();
-        let bus = bus_guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("EventBus has been shut down"))?;
-        self.runtime
-            .block_on(bus.flush())
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        // No lock guard is held across the wait (see `Net::bus`). A
+        // concurrent shutdown drains the same batches this flush waits
+        // on, so the flush still returns once they have landed.
+        let bus = self.live_bus()?;
+        py.detach(|| self.runtime.block_on(bus.flush()))
             .map_err(|e| PyRuntimeError::new_err(format!("flush: {}", e)))
     }
 
     /// Gracefully shutdown the event bus.
-    fn shutdown(&self) -> PyResult<()> {
-        let mut bus_guard = self.bus.write();
-        if let Some(bus) = bus_guard.take() {
-            self.runtime
-                .block_on(bus.shutdown())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
+    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+        // Take the bus out under the write guard, then drop the guard and
+        // the GIL for the (I/O-bound) shutdown itself. An in-flight
+        // `poll` / `flush` may still hold an `Arc` clone, hence the
+        // by-reference shutdown.
+        //
+        // The gate makes it a completion barrier: a second, concurrent
+        // shutdown waits here until the first has drained.
+        py.detach(|| {
+            let _gate = self.shutdown_gate.lock();
+            let bus = self.bus.write().take();
+            match bus {
+                Some(bus) => self.runtime.block_on(bus.shutdown_via_ref()),
+                None => Ok(()),
+            }
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -903,11 +926,12 @@ impl Net {
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<&Bound<'_, pyo3::types::PyType>>,
         _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
         _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
-        self.shutdown()?;
+        self.shutdown(py)?;
         Ok(false)
     }
 }
@@ -1348,7 +1372,17 @@ mod mesh_bindings {
         /// socket or handshake table. Shutdown drops this Arc —
         /// any remaining clones held by a `DaemonRuntime` observe
         /// a shut-down node the next time they call into it.
-        node: Option<Arc<MeshNode>>,
+        ///
+        /// Behind a lock (not `Option` on `&mut self`) so `shutdown()` /
+        /// `__exit__` are `&self`: with `&mut self` they raised "Already
+        /// borrowed" whenever another thread was parked in a blocking
+        /// `&self` call (SDK audit 2026-10-11). Calls clone the `Arc` out.
+        node: parking_lot::RwLock<Option<Arc<MeshNode>>>,
+        /// Held (without the GIL) across a whole `shutdown`, so a concurrent
+        /// second call waits for the teardown instead of returning while the
+        /// first is still joining background tasks (cubic review of PR
+        /// #1228).
+        shutdown_gate: parking_lot::Mutex<()>,
         runtime: Arc<GuardedRuntime>,
         /// The immutable named-export map resolved at construction
         /// (SSDK §3.3) — the checked map this binding retains beside its
@@ -1702,7 +1736,8 @@ mod mesh_bindings {
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {
-                node: Some(Arc::new(node)),
+                node: parking_lot::RwLock::new(Some(Arc::new(node))),
+                shutdown_gate: parking_lot::Mutex::new(()),
                 runtime,
                 #[cfg(feature = "org")]
                 subnet_exports: subnet_exports_map,
@@ -1819,11 +1854,7 @@ mod mesh_bindings {
             // holding the GIL, and our blocking connect on this
             // thread would otherwise deadlock that thread's GIL
             // acquire at the end of handshake.
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -1839,11 +1870,7 @@ mod mesh_bindings {
             // without this, a caller running `accept` in a thread
             // would pin the GIL and starve a concurrent `connect` on
             // the main thread (same reason as `connect` above).
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let (addr, _) = runtime
@@ -1861,10 +1888,7 @@ mod mesh_bindings {
         /// re-classify trigger) and — when `auto_direct_upgrade`
         /// is set — the background direct-path upgrade.
         fn start(&self) -> PyResult<()> {
-            let node = self
-                .node
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             // `MeshNode::start` uses `tokio::spawn` internally, so
             // it must run inside a tokio runtime context. Enter
             // our owned runtime for the duration of the call.
@@ -1928,6 +1952,52 @@ mod mesh_bindings {
                 operator.arc(),
                 std::time::Duration::from_secs(grant_ttl_seconds),
                 depth,
+            )
+        }
+
+        /// Operator-side, **approver-gated** enrollment: every valid join
+        /// request is passed to `approver(request: JoinRequest)` — a callable
+        /// or coroutine function — before it is admitted; return `True` to
+        /// admit. A denial (anything but `True`, a raise, or no answer within
+        /// `approve_timeout_ms`, default 300 000) answers the device a coded
+        /// rejection and does not burn the single-use invite. Safer than
+        /// `serve_enrollment_auto`: a leaked invite lets its holder ask, never
+        /// admits them. Serves enrollment only (no renewal). Same node
+        /// requirements as `serve_enrollment_auto`.
+        ///
+        /// The timeout denies the request; it cannot stop a SYNCHRONOUS
+        /// approver already running (Python threads are not interruptible),
+        /// which keeps its worker thread until it returns and whose late
+        /// answer is ignored. An approver that prompts a human should be a
+        /// coroutine function — it is cancelled at the timeout.
+        #[cfg(feature = "delegation")]
+        #[pyo3(signature = (operator, approver, grant_ttl_seconds, max_depth=None, approve_timeout_ms=None))]
+        fn serve_enrollment(
+            &self,
+            operator: &crate::enrollment::PyOperatorEnrollment,
+            approver: Py<PyAny>,
+            grant_ttl_seconds: u64,
+            max_depth: Option<u8>,
+            approve_timeout_ms: Option<u64>,
+        ) -> PyResult<crate::enrollment::PyEnrollmentServeHandle> {
+            let depth = max_depth.unwrap_or(net_sdk::delegation::DEFAULT_DELEGATION_DEPTH);
+            // A zero budget times out every approval before the approver
+            // can answer: every device refused, silently (code review
+            // 2026-10-11, NODE-2 — the Node binding's twin).
+            let approve_timeout_ms = approve_timeout_ms.unwrap_or(300_000);
+            if approve_timeout_ms == 0 {
+                return Err(PyValueError::new_err(
+                    "approve_timeout_ms must be at least 1 (0 would deny every request)",
+                ));
+            }
+            crate::enrollment::mesh_serve_enrollment(
+                self.node_arc_clone()?,
+                &self.runtime,
+                operator.arc(),
+                std::time::Duration::from_secs(grant_ttl_seconds),
+                depth,
+                approver,
+                std::time::Duration::from_millis(approve_timeout_ms),
             )
         }
 
@@ -2138,7 +2208,7 @@ mod mesh_bindings {
         }
 
         /// Send raw JSON to a direct peer.
-        fn push_to(&self, peer_addr: &str, json: &str) -> PyResult<bool> {
+        fn push_to(&self, py: Python<'_>, peer_addr: &str, json: &str) -> PyResult<bool> {
             let node = self.get_node()?;
             let addr: std::net::SocketAddr = peer_addr
                 .parse()
@@ -2155,8 +2225,7 @@ mod mesh_bindings {
                 process_nonce: net::event::batch_process_nonce(),
             };
 
-            self.runtime
-                .block_on(node.send_to_peer(addr, &batch))
+            py.detach(|| self.runtime.block_on(node.send_to_peer(addr, &batch)))
                 .map_err(|e| PyRuntimeError::new_err(format!("send: {}", e)))?;
             Ok(true)
         }
@@ -2178,11 +2247,18 @@ mod mesh_bindings {
         ///
         /// Pair with ``shard_for_stream`` when you want one stream
         /// rather than a merge across all of them.
-        fn poll_shard(&self, shard_id: u16, limit: usize) -> PyResult<Vec<StoredEvent>> {
+        fn poll_shard(
+            &self,
+            py: Python<'_>,
+            shard_id: u16,
+            limit: usize,
+        ) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
-            let result = self
-                .runtime
-                .block_on(node.poll_shard(shard_id, None, limit))
+            let result = py
+                .detach(|| {
+                    self.runtime
+                        .block_on(node.poll_shard(shard_id, None, limit))
+                })
                 .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
             Ok(Self::map_events(result.events))
         }
@@ -2198,7 +2274,7 @@ mod mesh_bindings {
         /// The sweep starts from a rotating shard, so no shard can be
         /// starved by a busier one and events are not returned in
         /// shard order.
-        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+        fn poll(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<StoredEvent>> {
             let node = self.get_node()?;
             let shards = node.num_shards().max(1);
             // Rotate the starting shard so a saturated shard 0 cannot
@@ -2216,9 +2292,11 @@ mod mesh_bindings {
                 }
                 let shard = net::shard::rotating_shard(start, offset, shards);
                 let remaining = limit - events.len();
-                let result = self
-                    .runtime
-                    .block_on(node.poll_shard(shard, None, remaining))
+                let result = py
+                    .detach(|| {
+                        self.runtime
+                            .block_on(node.poll_shard(shard, None, remaining))
+                    })
                     .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
                 events.extend(result.events);
             }
@@ -2328,11 +2406,7 @@ mod mesh_bindings {
         ///     RuntimeError: the stream already has a receiver.
         #[pyo3(signature = (stream_id, capacity=4096))]
         fn open_stream_inbox(&self, stream_id: u64, capacity: usize) -> PyResult<StreamInbox> {
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let inner = node.open_stream_inbox(stream_id, capacity).ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
                     "open_stream_inbox: stream {stream_id:#x} already has a receiver"
@@ -2557,6 +2631,7 @@ mod mesh_bindings {
         #[pyo3(signature = (publisher_node_id, channel, token = None))]
         fn subscribe_channel(
             &self,
+            py: Python<'_>,
             publisher_node_id: u64,
             channel: &str,
             token: Option<&[u8]>,
@@ -2569,31 +2644,42 @@ mod mesh_bindings {
                 Some(bytes) => {
                     let parsed = net::adapter::net::identity::PermissionToken::from_bytes(bytes)
                         .map_err(super::identity::token_err)?;
-                    self.runtime
-                        .block_on(node.subscribe_channel_with_token(
+                    // Waits for the membership ack: GIL released.
+                    py.detach(|| {
+                        self.runtime.block_on(node.subscribe_channel_with_token(
                             publisher_node_id,
                             name,
                             parsed,
                         ))
-                        .map_err(adapter_to_channel_pyerr)
+                    })
+                    .map_err(adapter_to_channel_pyerr)
                 }
-                None => self
-                    .runtime
-                    .block_on(node.subscribe_channel(publisher_node_id, name))
+                None => py
+                    .detach(|| {
+                        self.runtime
+                            .block_on(node.subscribe_channel(publisher_node_id, name))
+                    })
                     .map_err(adapter_to_channel_pyerr),
             }
         }
 
         /// Mirror of `subscribe_channel`. Idempotent on the publisher
         /// side — unsubscribing a non-member returns `None`.
-        fn unsubscribe_channel(&self, publisher_node_id: u64, channel: &str) -> PyResult<()> {
+        fn unsubscribe_channel(
+            &self,
+            py: Python<'_>,
+            publisher_node_id: u64,
+            channel: &str,
+        ) -> PyResult<()> {
             let node = self.get_node()?;
             let name = InnerChannelName::new(channel).map_err(|e| {
                 super::ChannelError::new_err(format!("channel: invalid name: {}", e))
             })?;
-            self.runtime
-                .block_on(node.unsubscribe_channel(publisher_node_id, name))
-                .map_err(adapter_to_channel_pyerr)
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.unsubscribe_channel(publisher_node_id, name))
+            })
+            .map_err(adapter_to_channel_pyerr)
         }
 
         /// Publish one payload to every subscriber of `channel`.
@@ -2652,9 +2738,13 @@ mod mesh_bindings {
             }
             let publisher = ChannelPublisher::new(name, pub_cfg);
             let payload_bytes = bytes::Bytes::copy_from_slice(payload);
-            let report: InnerPublishReport = self
-                .runtime
-                .block_on(node.publish(&publisher, payload_bytes))
+            // A reliable publish waits for per-subscriber acks: GIL released
+            // (SDK audit 2026-10-11).
+            let report: InnerPublishReport = py
+                .detach(|| {
+                    self.runtime
+                        .block_on(node.publish(&publisher, payload_bytes))
+                })
                 .map_err(adapter_to_channel_pyerr)?;
             publish_report_to_pydict(py, report)
         }
@@ -3209,11 +3299,7 @@ mod mesh_bindings {
         /// Requires the `nat-traversal` build.
         #[cfg(feature = "nat-traversal")]
         fn probe_reflex(&self, py: Python<'_>, peer_node_id: u64) -> PyResult<String> {
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -3231,11 +3317,7 @@ mod mesh_bindings {
         /// Requires the `nat-traversal` build.
         #[cfg(feature = "nat-traversal")]
         fn reclassify_nat(&self, py: Python<'_>) -> PyResult<()> {
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime.block_on(node.reclassify_nat());
@@ -3326,11 +3408,7 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -3366,11 +3444,7 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            let node = self
-                .node
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let node = self.get_node()?;
             let runtime = self.runtime.clone();
             py.detach(move || {
                 runtime
@@ -3418,19 +3492,22 @@ mod mesh_bindings {
             Ok(())
         }
 
-        /// Shutdown the mesh node. Idempotent — a second call is a no-op.
-        fn shutdown(&mut self) -> PyResult<()> {
-            let Some(node) = self.node.take() else {
-                return Ok(());
-            };
-            self.runtime
-                .block_on(node.shutdown())
-                .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))?;
-            Ok(())
+        /// Shutdown the mesh node. Idempotent; a call concurrent with a
+        /// shutdown in progress returns once that shutdown has finished.
+        fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+            // Joins every background task (seconds): GIL released.
+            py.detach(|| {
+                let _gate = self.shutdown_gate.lock();
+                let Some(node) = self.node.write().take() else {
+                    return Ok(());
+                };
+                self.runtime.block_on(node.shutdown())
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))
         }
 
         fn __repr__(&self) -> String {
-            if let Some(node) = &self.node {
+            if let Some(node) = self.node.read().as_ref() {
                 format!(
                     "NetMesh(addr={}, peers={}, nodes={})",
                     node.local_addr(),
@@ -3447,20 +3524,22 @@ mod mesh_bindings {
         }
 
         fn __exit__(
-            &mut self,
+            &self,
+            py: Python<'_>,
             _exc_type: Option<&Bound<'_, PyAny>>,
             _exc_val: Option<&Bound<'_, PyAny>>,
             _exc_tb: Option<&Bound<'_, PyAny>>,
         ) -> PyResult<bool> {
-            self.shutdown()?;
+            self.shutdown(py)?;
             Ok(false)
         }
     }
 
     impl NetMesh {
-        fn get_node(&self) -> PyResult<&MeshNode> {
+        fn get_node(&self) -> PyResult<Arc<MeshNode>> {
             self.node
-                .as_deref()
+                .read()
+                .clone()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
@@ -3503,8 +3582,8 @@ mod mesh_bindings {
         #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
         pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
             self.node
-                .as_ref()
-                .cloned()
+                .read()
+                .clone()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
@@ -3672,6 +3751,13 @@ mod mesh_bindings {
         /// Shared with the source `NetMesh`, so the sync and async
         /// `poll` rotate through the shards together.
         recv_cursor: Arc<std::sync::atomic::AtomicU16>,
+        /// The source `NetMesh`'s runtime. The node was built inside it,
+        /// so its UDP socket and background tasks live on that runtime's
+        /// driver: holding only the node let a collected `NetMesh` shut
+        /// the runtime down under a live `AsyncNetMesh` (dead reactor,
+        /// dead receive loop). Held, never used directly (SDK audit
+        /// 2026-10-11) — the same keep-alive `AsyncMeshRpc` carries.
+        _runtime: Arc<GuardedRuntime>,
     }
 
     #[pymethods]
@@ -3682,12 +3768,13 @@ mod mesh_bindings {
         fn new(mesh: &NetMesh) -> PyResult<Self> {
             let node = mesh
                 .node
-                .as_ref()
-                .cloned()
+                .read()
+                .clone()
                 .ok_or_else(|| PyRuntimeError::new_err("NetMesh has been shut down"))?;
             Ok(Self {
                 node,
                 recv_cursor: mesh.recv_cursor.clone(),
+                _runtime: mesh.runtime_arc(),
             })
         }
 

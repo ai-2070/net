@@ -11,9 +11,8 @@
 //! ```ignore
 //! let group = StandbyGroup::spawn(&rt, "counter", cfg)?;
 //!
-//! // Every event deliver:
+//! // Every event deliver — this ALSO buffers it for replay:
 //! rt.deliver(group.active_origin(), &event)?;
-//! group.on_event_delivered(event);    // buffer for replay
 //!
 //! // Periodic catchup:
 //! group.sync_standbys()?;
@@ -22,9 +21,15 @@
 //! group.on_node_failure(failed_node)?;  // may auto-promote
 //! ```
 //!
-//! The `on_event_delivered` call is manual — SDK doesn't
-//! auto-hook into `DaemonRuntime::deliver`. See the plan doc's
-//! "Open questions" section for the rationale.
+//! **Replay buffering is automatic.** The group installs a
+//! post-delivery observer on its active member's origin at spawn and
+//! re-points it on promote / failover, so every
+//! `DaemonRuntime::deliver` to the active feeds the replay buffer.
+//! Do NOT also call `on_event_delivered`: the buffer does not dedup,
+//! so a paired manual call buffers each event twice and promotion
+//! replays it twice — silently diverging stateful daemons. That
+//! method exists for tests that simulate a gap without a live
+//! runtime. (Same contract as the Node and TS SDKs.)
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -192,14 +197,19 @@ impl StandbyGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let new_origin = {
-            let mut guard = self.inner.lock();
-            guard.promote(move || (factory)(), &registry, &scheduler)?
-        };
-        // Re-point the post-delivery observer at the new active so
-        // future `DaemonRuntime::deliver(new_origin, ...)` calls
-        // populate the replay buffer without caller cooperation.
+        // Re-point the post-delivery observer at the new active BEFORE the
+        // group lock is released, so future `DaemonRuntime::deliver(
+        // new_origin, ...)` calls populate the replay buffer without caller
+        // cooperation. After the release (`active_origin()` waits on this
+        // lock) a delivery could reach the new active before its observer
+        // existed and escape the buffer (cubic review of PR #1228).
+        // Safe under the lock: `deliver` snapshots observers and fires them
+        // outside the observer map's lock, and registering one does not
+        // take the group lock.
+        let mut guard = self.inner.lock();
+        let new_origin = guard.promote(move || (factory)(), &registry, &scheduler)?;
         self.rebind_observer(new_origin);
+        drop(guard);
         Ok(new_origin)
     }
 
@@ -214,16 +224,17 @@ impl StandbyGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let result = {
-            let mut guard = self.inner.lock();
-            guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?
-        };
+        let mut guard = self.inner.lock();
+        let result =
+            guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?;
         // If the active was the one that failed, the core returns
         // the promoted member's new origin — rebind the observer so
-        // replay buffering follows the new active.
+        // replay buffering follows the new active, under the group lock
+        // for the same reason as `promote`.
         if let Some(new_origin) = result {
             self.rebind_observer(new_origin);
         }
+        drop(guard);
         Ok(result)
     }
 

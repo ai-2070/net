@@ -228,8 +228,8 @@ impl Identity {
 
     /// Alias for `from_seed` — the persisted form IS the 32-byte seed.
     #[staticmethod]
-    fn from_bytes(bytes: &[u8]) -> PyResult<Self> {
-        Self::from_seed(bytes)
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        Self::from_seed(data)
     }
 
     /// Serialize as the 32-byte ed25519 seed. Treat as secret.
@@ -349,8 +349,8 @@ impl Identity {
     /// `from_seed` restore the key only and come back at generation
     /// zero, which for a rotated issuer is below its own floor.
     #[staticmethod]
-    fn from_state_bytes(bytes: &[u8]) -> PyResult<Self> {
-        let state = IdentityState::from_bytes(bytes).map_err(state_err)?;
+    fn from_state_bytes(data: &[u8]) -> PyResult<Self> {
+        let state = IdentityState::from_bytes(data).map_err(state_err)?;
         Ok(Self::wrap_at(
             EntityKeypair::from_bytes(state.seed),
             state.generation,

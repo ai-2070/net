@@ -336,6 +336,11 @@ pub struct BootstrapConfig {
     /// that sends nothing for this long is closed, so idle pools and
     /// slow senders cannot pile up until the process runs out of file
     /// descriptors.
+    ///
+    /// It also bounds each request once its headers are in — handler and
+    /// body read together; an overrun is answered `408`. The header
+    /// deadline alone stopped at the headers, so a client could announce
+    /// a body and dribble it forever.
     pub http_idle_timeout: Duration,
     /// Anonymous visitor credentials, served as `POST /credential`.
     /// `None` (the default) serves no such route: credentials are then
@@ -680,7 +685,32 @@ struct Attempt {
     /// successor's live attempt. Only the CURRENT socket generation
     /// may end the dialog.
     socket: u64,
+    /// When the token was minted — for [`Attempts::prune`].
+    minted: std::time::Instant,
+    /// True from mint until the core has finished accepting the offer.
+    /// [`Attempts::prune`] never drops an accepting token: an acceptance
+    /// that ran past [`ATTEMPT_PRUNE_GRACE`] (a long ICE deadline) had its
+    /// token pruned by a concurrent offer before the core registered the
+    /// attempt (cubic review of PR #1228).
+    accepting: bool,
 }
+
+/// How long a minted attempt token survives without a live core attempt
+/// before [`Attempts::prune`] reclaims it. The window only has to cover the
+/// gap between minting and the core accepting the offer.
+const ATTEMPT_PRUNE_GRACE: Duration = Duration::from_secs(30);
+
+/// Largest trickle WebSocket message the anchor buffers: a candidate frame is
+/// a few hundred bytes. The library default (64 MiB) let one socket make the
+/// anchor buffer a huge message before parsing it.
+const MAX_TRICKLE_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// How often an idle trickle socket rechecks that its attempt is still live
+/// and still its own.
+const TRICKLE_LIVENESS_TICK: Duration = Duration::from_secs(2);
+
+/// Largest request body any bootstrap route reads (offers are a few KB).
+const MAX_BOOTSTRAP_BODY_BYTES: usize = 64 * 1024;
 
 /// The live attempts, keyed by token.
 #[derive(Default)]
@@ -729,9 +759,39 @@ impl Attempts {
                 incarnation,
                 budget_id,
                 socket: 0,
+                minted: std::time::Instant::now(),
+                accepting: true,
             },
         );
         Some((token, budget_id))
+    }
+
+    /// The core accepted the offer: the token is now prunable once its
+    /// attempt is no longer live.
+    fn accepted(&self, token: &str) {
+        if let Some(a) = self.by_token.lock().get_mut(token) {
+            a.accepting = false;
+        }
+    }
+
+    /// Drop tokens whose core attempt is gone (expired, rejected or
+    /// completed) once past [`ATTEMPT_PRUNE_GRACE`]. Tokens were removed only
+    /// on an offer failure or a trickle-socket close, so every accepted offer
+    /// from a browser that never opened the socket stayed in the map for the
+    /// life of the process (SDK audit 2026-10-11).
+    fn prune(&self, is_live: impl Fn(&Attempt) -> bool) {
+        let now = std::time::Instant::now();
+        self.by_token.lock().retain(|_, a| {
+            a.accepting || now.duration_since(a.minted) < ATTEMPT_PRUNE_GRACE || is_live(a)
+        });
+    }
+
+    /// Whether socket generation `socket` still owns `token`'s attempt.
+    fn owned_by(&self, token: &str, socket: u64) -> bool {
+        self.by_token
+            .lock()
+            .get(token)
+            .is_some_and(|a| a.socket == socket)
     }
 
     /// The attempt this token authorizes, if it names exactly this
@@ -937,6 +997,7 @@ impl RateLimiter {
 /// plain TCP without standing up a certificate authority — the TLS
 /// layer is `serve_bootstrap`'s, and is witnessed separately.
 pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router {
+    let request_deadline = config.http_idle_timeout;
     // `AllowOrigin::list`, not repeated `allow_origin(value)` calls:
     // the latter REPLACES, and a single static value is echoed to
     // every caller — which is a wildcard wearing one origin's name.
@@ -1106,7 +1167,34 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
     } else {
         router
     };
-    router.layer(cors).with_state(state)
+    router
+        .layer(axum::extract::DefaultBodyLimit::max(
+            MAX_BOOTSTRAP_BODY_BYTES,
+        ))
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                bounded_request(request_deadline, request, next)
+            },
+        ))
+        .layer(cors)
+        .with_state(state)
+}
+
+/// Bound one request — handler and body read — by `deadline`
+/// ([`BootstrapConfig::http_idle_timeout`]); an overrun gets `408`. hyper's
+/// header timeout stopped at the headers, so a client could announce a body
+/// and dribble it forever, never reaching the size checks or the rate
+/// limiter (SDK audit 2026-10-11). A WebSocket upgrade returns its response
+/// at once, so a trickle socket's own lifetime is bounded elsewhere.
+async fn bounded_request(
+    deadline: Duration,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match tokio::time::timeout(deadline, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 /// `POST /credential` — `{"game": "<id>"}` in, a fresh anonymous
@@ -1866,18 +1954,32 @@ async fn post_offer(
     // Mint FIRST: the token's random bytes are what the offer's
     // signalling budget is charged to (R2), so it has to exist
     // before the offer is accepted.
+    let node = Arc::clone(&state.node);
+    state
+        .attempts
+        .prune(|a| node.bootstrap_attempt_is_live(a.node_id, a.dialog, a.budget_id));
     let Some((attempt_token, budget_id)) = state.attempts.mint(node_id, dialog, incarnation) else {
         return refuse(
             BootstrapRefusal::OfferRefused,
             "the anchor could not mint an attempt token",
         );
     };
-    match state
+    // Retires the token if this handler is dropped mid-acceptance (the
+    // request deadline in `bounded_request` drops it): an accepting token
+    // is exempt from pruning, so without this it would never go (cubic
+    // review of PR #1228).
+    let mut minted = RetireTokenOnDrop {
+        attempts: Arc::clone(&state.attempts),
+        token: Some(attempt_token.clone()),
+    };
+    let accepted = state
         .node
         .accept_bootstrap_offer_keyed(budget_id, node_id, dialog, request.sdp)
-        .await
-    {
+        .await;
+    minted.token = None;
+    match accepted {
         Ok(sdp) => {
+            state.attempts.accepted(&attempt_token);
             let candidate = state.node.bootstrap_host_candidate().unwrap_or_default();
             tracing::debug!(
                 dialog,
@@ -1910,6 +2012,20 @@ async fn post_offer(
             } else {
                 refuse(BootstrapRefusal::OfferRefused, message)
             }
+        }
+    }
+}
+
+/// Retires a minted attempt token when dropped while still armed.
+struct RetireTokenOnDrop {
+    attempts: Arc<Attempts>,
+    token: Option<String>,
+}
+
+impl Drop for RetireTokenOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.attempts.retire(&token);
         }
     }
 }
@@ -1997,6 +2113,8 @@ async fn get_trickle(
     let Authorized { attempt, token } = authorized;
     let protocol = format!("{ATTEMPT_SUBPROTOCOL_PREFIX}{token}");
     ws.protocols([protocol])
+        .max_message_size(MAX_TRICKLE_MESSAGE_BYTES)
+        .max_frame_size(MAX_TRICKLE_MESSAGE_BYTES)
         .on_upgrade(move |socket| trickle_socket(socket, state, attempt, token))
 }
 
@@ -2068,7 +2186,33 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
         }
     }
 
-    while let Some(Ok(message)) = socket.recv().await {
+    loop {
+        // Bounded (SDK audit 2026-10-11): the loop used to end only on a
+        // client close or a rejected candidate, so a silent socket — or one
+        // superseded by a re-upgrade on the same token — lived forever,
+        // holding the node. Every tick re-checks that this generation still
+        // owns a live core attempt.
+        let message = match tokio::time::timeout(TRICKLE_LIVENESS_TICK, socket.recv()).await {
+            Ok(Some(Ok(message))) => Some(message),
+            Ok(_) => break,
+            Err(_) => None,
+        };
+        if !state.attempts.owned_by(&token, socket_gen) {
+            // Superseded (or already retired): the successor owns the
+            // attempt's lifecycle; end only this socket.
+            return;
+        }
+        if !state
+            .node
+            .bootstrap_attempt_is_live(node_id, dialog, attempt.budget_id)
+        {
+            // The core attempt expired, failed or completed: nothing is
+            // left to trickle into. Drop the token; the dialog is not ours
+            // to end any more.
+            state.attempts.retire_socket(&token, socket_gen);
+            return;
+        }
+        let Some(message) = message else { continue };
         let text = match message {
             Message::Text(text) => text,
             Message::Close(_) => break,
@@ -2134,6 +2278,80 @@ async fn trickle_socket(mut socket: WebSocket, state: AppState, attempt: Attempt
 
 fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod attempt_prune_tests {
+    use super::{Attempt, Attempts, ATTEMPT_PRUNE_GRACE};
+    use std::time::{Duration, Instant};
+
+    fn attempt(dialog: u64, age: Duration) -> Attempt {
+        Attempt {
+            node_id: 1,
+            dialog,
+            incarnation: dialog,
+            budget_id: dialog,
+            socket: 0,
+            minted: Instant::now() - age,
+            accepting: false,
+        }
+    }
+
+    /// SDK audit 2026-10-11: tokens for attempts the core no longer holds
+    /// are reclaimed once past the grace window; fresh ones and live ones
+    /// stay. Pre-fix nothing ever removed a token whose browser never
+    /// opened its trickle socket.
+    #[test]
+    fn dead_attempts_past_the_grace_window_are_pruned() {
+        let attempts = Attempts::default();
+        let old = ATTEMPT_PRUNE_GRACE + Duration::from_secs(1);
+        {
+            let mut map = attempts.by_token.lock();
+            map.insert("dead-old".into(), attempt(1, old));
+            map.insert("live-old".into(), attempt(2, old));
+            map.insert("dead-fresh".into(), attempt(3, Duration::ZERO));
+        }
+        attempts.prune(|a| a.dialog == 2);
+        let map = attempts.by_token.lock();
+        assert!(!map.contains_key("dead-old"));
+        assert!(map.contains_key("live-old"));
+        assert!(map.contains_key("dead-fresh"));
+    }
+
+    /// cubic review of PR #1228: an offer still being accepted is not live
+    /// in the core yet; past the grace window a concurrent offer's prune
+    /// dropped its token before the acceptance finished.
+    #[test]
+    fn an_accepting_token_is_never_pruned() {
+        let attempts = Attempts::default();
+        let old = ATTEMPT_PRUNE_GRACE + Duration::from_secs(1);
+        {
+            let mut map = attempts.by_token.lock();
+            let mut accepting = attempt(4, old);
+            accepting.accepting = true;
+            map.insert("accepting-old".into(), accepting);
+        }
+        attempts.prune(|_| false);
+        assert!(attempts.by_token.lock().contains_key("accepting-old"));
+        attempts.accepted("accepting-old");
+        attempts.prune(|_| false);
+        assert!(!attempts.by_token.lock().contains_key("accepting-old"));
+    }
+
+    /// The drop guard retires the token of an acceptance that never
+    /// finished (the request deadline dropped the handler).
+    #[test]
+    fn a_dropped_acceptance_retires_its_token() {
+        let attempts = std::sync::Arc::new(Attempts::default());
+        let (token, _) = attempts.mint(1, 7, 7).expect("mint");
+        {
+            let _guard = super::RetireTokenOnDrop {
+                attempts: std::sync::Arc::clone(&attempts),
+                token: Some(token.clone()),
+            };
+        }
+        assert!(!attempts.by_token.lock().contains_key(&token));
+    }
 }
 
 #[cfg(test)]

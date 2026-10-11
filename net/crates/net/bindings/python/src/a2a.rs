@@ -364,7 +364,9 @@ fn flow_err(e: A2aFlowError) -> PyErr {
 pub struct PyA2aServeHandle {
     // The `Mesh` holds the channel registry the services registered against,
     // and the registrations themselves are whatever the serving path returned.
-    inner: Option<(Mesh, Registered)>,
+    // A lock, not `&mut self`: `stop()` raced any concurrent borrow into
+    // "Already borrowed" (SDK audit 2026-10-11).
+    inner: parking_lot::Mutex<Option<(Mesh, Registered)>>,
 }
 
 /// What a serve call registered — held opaquely, because dropping it is the
@@ -401,7 +403,7 @@ impl PyA2aServeHandle {
     /// Wrap what a serving call registered.
     pub(crate) fn new(mesh: Mesh, registered: Registered) -> Self {
         Self {
-            inner: Some((mesh, registered)),
+            inner: parking_lot::Mutex::new(Some((mesh, registered))),
         }
     }
 }
@@ -409,14 +411,16 @@ impl PyA2aServeHandle {
 #[pymethods]
 impl PyA2aServeHandle {
     /// Stop accepting A2A tasks (unregister the services).
-    fn stop(&mut self) {
-        self.inner = None;
+    fn stop(&self) {
+        // Drop outside the lock: unregistering runs the services' drops.
+        let taken = self.inner.lock().take();
+        drop(taken);
     }
 
     /// Whether the services are still registered.
     #[getter]
     fn serving(&self) -> bool {
-        self.inner.is_some()
+        self.inner.lock().is_some()
     }
 
     /// How many nRPC services are registered: three on the free
@@ -425,14 +429,20 @@ impl PyA2aServeHandle {
     /// ``net.a2a.prepare`` and ``net.a2a.describe``). ``0`` once stopped.
     #[getter]
     fn services(&self) -> usize {
-        self.inner.as_ref().map_or(0, |(_, r)| r.services())
+        self.inner.lock().as_ref().map_or(0, |(_, r)| r.services())
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "A2aServeHandle(serving={}, services={})",
-            self.inner.is_some(),
-            self.services()
-        )
+        // One lock, read once: `services()` locks `inner` itself, and a
+        // guard temporary inside `format!` lives to the end of the
+        // statement, so calling both here re-locked a held mutex.
+        let (serving, services) = {
+            let inner = self.inner.lock();
+            (
+                inner.is_some(),
+                inner.as_ref().map_or(0, |(_, r)| r.services()),
+            )
+        };
+        format!("A2aServeHandle(serving={serving}, services={services})")
     }
 }

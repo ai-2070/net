@@ -232,7 +232,12 @@ func (e *EventTooLargeError) Unwrap() error { return ErrEventTooLarge }
 type MeshConfig struct {
 	BindAddr string `json:"bind_addr"`
 	// Hex-encoded 32-byte pre-shared key.
-	PskHex           string `json:"psk_hex"`
+	PskHex string `json:"psk_hex"`
+	// HeartbeatMs / SessionTimeoutMs: 0 means "use the default" (5 s /
+	// 30 s) — a Go zero value cannot say "unset", so it is omitted from
+	// the config. There is no way to request a zero interval, which every
+	// other binding now refuses at node construction anyway (a zero
+	// heartbeat busy-loops; a zero session timeout expires every session).
 	HeartbeatMs      uint64 `json:"heartbeat_ms,omitempty"`
 	SessionTimeoutMs uint64 `json:"session_timeout_ms,omitempty"`
 	NumShards        uint16 `json:"num_shards,omitempty"`
@@ -242,8 +247,12 @@ type MeshConfig struct {
 	// default.
 	CapabilityGCIntervalMs uint64 `json:"capability_gc_interval_ms,omitempty"`
 	// RequireSignedCapabilities rejects unsigned announcements when
-	// true. Leave nil/false for the core default (accept unsigned in v1).
-	RequireSignedCapabilities bool `json:"require_signed_capabilities,omitempty"`
+	// true. Leave nil for the core default, which is true (reject
+	// unsigned). A pointer for the same reason as AutoDirectUpgrade: a
+	// plain bool with omitempty could never send false, so a Go node
+	// could not accept legacy unsigned peers the way Node and Python can
+	// (SDK audit 2026-10-11).
+	RequireSignedCapabilities *bool `json:"require_signed_capabilities,omitempty"`
 
 	// SubnetExports is this provider's named-export map (SSDK §3.3): the
 	// provider-local labels ServeSubnetExported resolves against. A name is
@@ -405,6 +414,12 @@ type ChannelConfig struct {
 	// authorization when token enforcement is on and no roots are
 	// installed, so `RequireToken: true` on its own does not produce a
 	// token-gated channel — it produces a permanently closed one.
+	//
+	// A nil slice means "not set". A non-nil EMPTY slice is sent as
+	// `[]`, which core treats as token enforcement with no trusted
+	// roots — a locked channel, exactly as in every other binding. (A
+	// plain `omitempty` dropped it, so an empty roots list loaded from
+	// config registered an OPEN channel; see MarshalJSON.)
 	TokenRoots []string `json:"token_roots,omitempty"`
 
 	Priority   uint8  `json:"priority,omitempty"`
@@ -418,6 +433,21 @@ type ChannelConfig struct {
 	// announced caps miss this filter are rejected with
 	// `ErrChannelAuth`.
 	SubscribeCaps *CapabilityFilter `json:"subscribe_caps,omitempty"`
+}
+
+// MarshalJSON keeps `omitempty` for a nil TokenRoots but emits `[]` for
+// an empty non-nil one, so `TokenRoots: []string{}` fails closed (core's
+// `with_token_roots([])` requires a token and trusts no root) instead of
+// silently registering an unauthenticated channel (SDK audit 2026-10-11).
+func (c ChannelConfig) MarshalJSON() ([]byte, error) {
+	type plain ChannelConfig
+	if c.TokenRoots == nil || len(c.TokenRoots) > 0 {
+		return json.Marshal(plain(c))
+	}
+	return json.Marshal(struct {
+		plain
+		TokenRoots []string `json:"token_roots"`
+	}{plain: plain(c), TokenRoots: []string{}})
 }
 
 // PublishConfig mirrors the core `PublishConfig`.
@@ -456,6 +486,37 @@ type RecvdEvent struct {
 type MeshNode struct {
 	mu     sync.RWMutex
 	handle *C.net_meshnode_t
+	// ctorMu + shuttingDown gate the constructors of objects that bind
+	// to this node (withHandleForChild) against Shutdown. Shutdown runs
+	// its native call under the READ lock, so a constructor could slip in
+	// beside it and hand back a client bound to a stopped node; it now
+	// marks the node shutting down — waiting out any constructor already
+	// in progress — before that call (code review 2026-10-11).
+	ctorMu       sync.RWMutex
+	shuttingDown bool
+}
+
+// withHandleForChild runs fn with the live handle for a constructor that
+// binds a long-lived object (an RPC / org / registry / fold-query client,
+// a daemon runtime) to this node. Returns false — fn not run — once
+// Shutdown has begun or the node is freed. fn must not block: Shutdown
+// waits for every constructor in progress before it starts.
+//
+// The handle crosses as unsafe.Pointer because each cgo file declares its
+// own C types (aggregator.go's TU has no net_meshnode_t).
+func (m *MeshNode) withHandleForChild(fn func(h unsafe.Pointer)) bool {
+	m.ctorMu.RLock()
+	defer m.ctorMu.RUnlock()
+	if m.shuttingDown {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return false
+	}
+	fn(unsafe.Pointer(m.handle))
+	return true
 }
 
 // NewMeshNode opens a mesh node. Call Shutdown to cleanly tear down.
@@ -488,16 +549,42 @@ func (m *MeshNode) free() {
 }
 
 // Shutdown gracefully tears down the node. Idempotent.
+//
+// Two phases. The native shutdown runs under the READ lock, alongside
+// any in-flight call: it is what makes a SendBlocking parked in its
+// backpressure retry loop fail and return. Only then is the write lock
+// taken to free the handle. Taking the write lock first queued Shutdown
+// behind that send — up to ~13 minutes — and, by RWMutex writer
+// preference, froze every other method on the node meanwhile (SDK audit
+// 2026-10-11).
 func (m *MeshNode) Shutdown() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// From here on no constructor binds a new object to this node; one
+	// already in progress finishes first (see withHandleForChild).
+	m.ctorMu.Lock()
+	m.shuttingDown = true
+	m.ctorMu.Unlock()
+
+	m.mu.RLock()
 	if m.handle == nil {
+		m.mu.RUnlock()
 		return nil
 	}
 	code := C.net_mesh_shutdown(m.handle)
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return nil // a concurrent Shutdown freed it
+	}
 	C.net_mesh_free(m.handle)
 	m.handle = nil
 	runtime.SetFinalizer(m, nil)
+	if code == -8 { // NET_ERR_SHUTTING_DOWN
+		// A concurrent Shutdown's native call won the guard; the node is
+		// shut down either way.
+		return nil
+	}
 	return meshErrorFromCode(code)
 }
 
@@ -538,12 +625,11 @@ func (m *MeshNode) NodeID() uint64 {
 // `Box<Arc<MeshNode>>`). The consumer takes ownership; callers MUST
 // NOT free it directly.
 func (m *MeshNode) arcClonePtr() unsafe.Pointer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.handle == nil {
-		return nil
-	}
-	return unsafe.Pointer(C.net_mesh_arc_clone(m.handle))
+	var p unsafe.Pointer
+	m.withHandleForChild(func(h unsafe.Pointer) {
+		p = unsafe.Pointer(C.net_mesh_arc_clone((*C.net_meshnode_t)(h)))
+	})
+	return p
 }
 
 // EntityID returns this node's 32-byte ed25519 entity id. Matches

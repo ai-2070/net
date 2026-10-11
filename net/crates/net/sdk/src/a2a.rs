@@ -1407,12 +1407,21 @@ impl TaskRegistry {
     }
 
     /// Drop `owner`'s record for `task_id` (housekeeping once the
-    /// requester has the result). Returns whether a record existed.
+    /// requester has the result). Returns whether a record was dropped.
+    ///
+    /// Only a TERMINAL record goes — the journal's `forget` contract.
+    /// Dropping a running one discarded the only handle to its cancel token
+    /// (the executor kept running, uncancellable) and let a retransmitted
+    /// submit launch a second run of the same id (SDK audit 2026-10-11).
     pub fn forget(&self, owner: TaskOwner, task_id: &str) -> bool {
-        self.inner
-            .lock()
-            .remove(&(owner, task_id.to_string()))
-            .is_some()
+        let mut inner = self.inner.lock();
+        let key = (owner, task_id.to_string());
+        if inner.get(&key).is_some_and(|e| e.state.is_terminal()) {
+            inner.remove(&key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Evict terminal records whose last state change is more than their
@@ -1784,6 +1793,32 @@ mod tests {
         // Terminal: cancel is a no-op, the record can be forgotten.
         assert!(!reg.cancel(TaskOwner::Local, &id));
         assert!(reg.forget(TaskOwner::Local, &id));
+    }
+
+    /// SDK audit 2026-10-11: `forget` refuses a running task. It used to
+    /// drop the only handle to the cancel token, leaving the executor
+    /// running and uncancellable.
+    #[tokio::test]
+    async fn a_running_task_cannot_be_forgotten() {
+        let reg = TaskRegistry::new();
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let id = reg
+            .submit(
+                TaskOwner::Local,
+                TaskBrief::new("long"),
+                Arc::new(MockExecutor {
+                    result: String::new(),
+                    saw_cancel: saw_cancel.clone(),
+                    wait_for_cancel: true,
+                }),
+            )
+            .expect("submit");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!reg.forget(TaskOwner::Local, &id), "running: not forgotten");
+        assert!(reg.cancel(TaskOwner::Local, &id), "still cancellable");
+        wait_terminal(&reg, &id).await;
+        assert!(saw_cancel.load(Ordering::SeqCst));
+        assert!(reg.forget(TaskOwner::Local, &id), "terminal: forgotten");
     }
 
     #[tokio::test]

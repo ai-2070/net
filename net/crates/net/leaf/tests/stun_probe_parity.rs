@@ -31,6 +31,9 @@ fn event(value: &serde_json::Value) -> ProbeEvent {
     if value.get("ice").and_then(serde_json::Value::as_str) == Some("failed") {
         return ProbeEvent::ConnectionFailed;
     }
+    if value.get("gathering").and_then(serde_json::Value::as_str) == Some("complete") {
+        return ProbeEvent::GatheringComplete;
+    }
     let code = value
         .get("error")
         .and_then(serde_json::Value::as_u64)

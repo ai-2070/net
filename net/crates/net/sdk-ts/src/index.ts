@@ -108,6 +108,7 @@ export type {
   JoinResult,
   TriggerAction,
 } from './cortex';
+export type { WatchIterable } from './watch-iter';
 
 // Identity + tokens (security surface).
 export {

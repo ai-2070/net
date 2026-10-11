@@ -210,6 +210,7 @@ pub struct CallOptions {
     /// races a `tokio::time::sleep`; whichever fires first wins.
     /// On timeout the caller emits CANCEL to the server so the
     /// in-flight handler observes its `ctx.cancellation` token.
+    /// `0` (or omitted) means no deadline, as in the Go / C ABI.
     pub deadline_ms: Option<u32>,
     /// Streaming-only: initial credit window for per-streaming-
     /// response flow control. `Some(n)` means "the server pump
@@ -269,9 +270,12 @@ impl CallOptions {
     ///
     /// `None` / `Some(0)` cancel-token → the SDK observes the
     /// "no token" sentinel and does no registry work.
-    fn into_inner(self) -> InnerCallOptions {
+    fn into_inner(self) -> Result<InnerCallOptions> {
         let mut opts = InnerCallOptions::default();
-        if let Some(ms) = self.deadline_ms {
+        // `0` means "no deadline", as in the Go / C ABI. It used to become
+        // `Instant::now()` — a call that failed instantly, which no caller
+        // means (SDK audit 2026-10-11).
+        if let Some(ms) = self.deadline_ms.filter(|&ms| ms > 0) {
             opts.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
         }
         opts.stream_window_initial = self.stream_window_initial;
@@ -283,14 +287,16 @@ impl CallOptions {
                 .map(|h| (h.name, h.value.to_vec()))
                 .collect();
         }
+        // A malformed token REJECTS the call. It used to be discarded,
+        // leaving the call uncancellable while the caller believed its
+        // AbortSignal was wired (SDK audit 2026-10-11).
         let token = self
             .cancel_token
             .map(crate::common::bigint_u64)
             .transpose()
-            .ok()
-            .flatten();
+            .map_err(|e| Error::from_reason(format!("nrpc:invalid_cancel_token: {e}")))?;
         opts.cancel_token = token.filter(|t| *t != 0);
-        opts
+        Ok(opts)
     }
 }
 
@@ -409,10 +415,14 @@ impl RpcHandler for NodeRpcHandler {
         }
 
         // 2. Wait for JS to invoke the handler and return a Promise.
-        //    Bounded: a JS handler that doesn't respond within the
-        //    timeout surfaces as Internal so the in-flight slot
-        //    doesn't leak.
-        let promise = match tokio::time::timeout(self.timeout, rx).await {
+        //    ONE deadline spans this stage AND the promise below, as in
+        //    the streaming / duplex / org bridges: an `async` handler
+        //    returns its Promise immediately, so a timeout on this stage
+        //    alone never bounded anything, and a never-settling handler
+        //    held its task and in-flight slot forever (SDK audit
+        //    2026-10-11).
+        let deadline = crate::common::deadline_after(self.timeout);
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
                 // A handler that validates its input before doing any
@@ -445,11 +455,20 @@ impl RpcHandler for NodeRpcHandler {
             }
         };
 
-        // 3. Await the JS-returned promise. napi-rs's Promise<T>
-        //    is `Send + 'static` and implements Future via an
-        //    internal "promise resolved" callback that completes a
-        //    oneshot — no main-thread polling required.
-        let resp_buf = match promise.await {
+        // 3. Await the JS-returned promise under the SAME deadline.
+        //    napi-rs's Promise<T> is `Send + 'static` and implements
+        //    Future via an internal "promise resolved" callback that
+        //    completes a oneshot — no main-thread polling required.
+        let settled = match tokio::time::timeout_at(deadline, promise).await {
+            Ok(settled) => settled,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS handler promise did not settle within {} ms",
+                    self.timeout.as_millis()
+                )))
+            }
+        };
+        let resp_buf = match settled {
             Ok(buf) => buf,
             Err(e) => {
                 // Inspect the rejection message — a JS handler that
@@ -670,7 +689,21 @@ impl RpcMetricsSnapshotJs {
 // in `::net::adapter::net::cortex::ObserverChannel`.
 // ----------------------------------------------------------------------
 
-type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, napi::Status, false>;
+/// Most observer events queued for the JS thread. The substrate's bounded
+/// `ObserverChannel` drained straight into an UNBOUNDED threadsafe function,
+/// so its documented drop policy never fired and a wedged event loop grew
+/// memory without bound (SDK audit 2026-10-11).
+const OBSERVER_QUEUE: usize = 1024;
+
+type RpcObserverTsfn = ThreadsafeFunction<
+    RpcCallEventJs,
+    (),
+    RpcCallEventJs,
+    napi::Status,
+    false,
+    false,
+    OBSERVER_QUEUE,
+>;
 
 // ============================================================================
 // ServeHandle — RAII wrapper around the inner ServeHandle.
@@ -1673,7 +1706,7 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         }
         // Single deadline spans both TSFN dispatch and Promise
         // resolution — matches the duplex / client-streaming bridges.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -1771,7 +1804,7 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
         // Previously only the first phase was bounded — a hung JS
         // handler that returned a Promise that never resolved
         // would pin the Rust task for the full call lifetime.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -1883,7 +1916,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         // Single deadline spans both TSFN dispatch and Promise
         // resolution — see the equivalent comment in the
         // client-streaming bridge.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
@@ -2038,7 +2071,7 @@ impl MeshRpc {
     ) -> Result<ServeHandle> {
         let tsfn: RpcHandlerTsfn = handler.build_threadsafe_function().build()?;
         let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(0) => crate::common::UNCAPPED_WAIT,
             Some(ms) => Duration::from_millis(ms as u64),
             None => DEFAULT_HANDLER_TIMEOUT,
         };
@@ -2104,7 +2137,7 @@ impl MeshRpc {
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let inner_opts = opts.unwrap_or_default().into_inner();
+        let inner_opts = opts.unwrap_or_default().into_inner()?;
         let req_bytes = Bytes::copy_from_slice(request.as_ref());
         // cancel_token lives on inner_opts; substrate handles cancel
         // uniformly across shapes. RpcError::Cancelled maps to
@@ -2126,7 +2159,7 @@ impl MeshRpc {
         request: Buffer,
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
-        let inner_opts = opts.unwrap_or_default().into_inner();
+        let inner_opts = opts.unwrap_or_default().into_inner()?;
         let req_bytes = Bytes::copy_from_slice(request.as_ref());
         self.node()?
             .call_service(&service, req_bytes, inner_opts)
@@ -2149,7 +2182,7 @@ impl MeshRpc {
         opts: Option<CallOptions>,
     ) -> Result<RpcStream> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let opts = opts.unwrap_or_default().into_inner();
+        let opts = opts.unwrap_or_default().into_inner()?;
         let inner = self
             .node()?
             .call_streaming(
@@ -2184,7 +2217,7 @@ impl MeshRpc {
         request: Buffer,
         opts: Option<CallOptions>,
     ) -> Result<RpcStream> {
-        let opts = opts.unwrap_or_default().into_inner();
+        let opts = opts.unwrap_or_default().into_inner()?;
         let inner = self
             .node()?
             .call_service_streaming(&service, Bytes::copy_from_slice(request.as_ref()), opts)
@@ -2213,7 +2246,7 @@ impl MeshRpc {
         opts: Option<CallOptions>,
     ) -> Result<ClientStreamCall> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let opts = opts.unwrap_or_default().into_inner();
+        let opts = opts.unwrap_or_default().into_inner()?;
         let inner = self
             .node()?
             .call_client_stream(target, &service, opts)
@@ -2241,7 +2274,7 @@ impl MeshRpc {
         opts: Option<CallOptions>,
     ) -> Result<DuplexCall> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let opts = opts.unwrap_or_default().into_inner();
+        let opts = opts.unwrap_or_default().into_inner()?;
         let inner = self
             .node()?
             .call_duplex(target, &service, opts)
@@ -2424,7 +2457,10 @@ impl MeshRpc {
     pub fn set_observer(&self, observer: Option<Function<'_, RpcCallEventJs, ()>>) -> Result<()> {
         match observer {
             Some(f) => {
-                let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
+                let tsfn: RpcObserverTsfn = f
+                    .build_threadsafe_function()
+                    .max_queue_size::<OBSERVER_QUEUE>()
+                    .build()?;
                 // Same defect as the serve seams, one method over:
                 // `ObserverChannel::install` spawns a drain task, and
                 // this is a sync `#[napi]` method with no current
@@ -2433,7 +2469,15 @@ impl MeshRpc {
                 let channel =
                     ::net::adapter::net::cortex::ObserverChannel::install(handle, move |evt| {
                         let js_evt = RpcCallEventJs::from(evt.as_ref());
-                        let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                        let status = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                        // The bounded TSFN is a second drop point after the
+                        // substrate channel; count it in the same counter so
+                        // `observerDroppedTotal` reports every lost event
+                        // (cubic review of PR #1228).
+                        if status == napi::Status::QueueFull {
+                            ::net::adapter::net::cortex::rpc_observer::OBSERVER_DROPPED_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     });
                 let obs: Arc<dyn RpcObserver> = Arc::new(channel);
                 self.node()?.set_rpc_observer(Some(obs));
@@ -2547,7 +2591,7 @@ mod tests {
             cancel_token: None,
             request_headers: None,
         };
-        let inner = opts.into_inner();
+        let inner = opts.into_inner().expect("valid options");
         assert!(inner.deadline.is_some(), "deadline must be Some when set");
         assert_eq!(inner.stream_window_initial, Some(8));
         assert!(
@@ -2555,7 +2599,7 @@ mod tests {
             "no headers expected when None"
         );
 
-        let empty = CallOptions::default().into_inner();
+        let empty = CallOptions::default().into_inner().expect("valid options");
         assert!(empty.deadline.is_none());
         assert!(empty.stream_window_initial.is_none());
         assert!(empty.request_headers.is_empty());
@@ -2586,7 +2630,7 @@ mod tests {
                 },
             ]),
         };
-        let inner = opts.into_inner();
+        let inner = opts.into_inner().expect("valid options");
         assert_eq!(inner.request_headers.len(), 2);
         assert_eq!(inner.request_headers[0].0, "net-where");
         assert_eq!(inner.request_headers[0].1, b"json");

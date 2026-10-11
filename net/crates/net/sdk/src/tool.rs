@@ -544,7 +544,14 @@ impl Mesh {
                     let mut seen_terminal = false;
                     while let Some(event) = stream.next().await {
                         let terminal = event.is_terminal();
-                        sink.send(&event)
+                        // Backpressured: the drop-on-full `send` silently
+                        // lost events under a slow consumer — including the
+                        // terminal one, after which `seen_terminal` was set
+                        // and no `missing_terminal` was synthesized, so the
+                        // stream ended cleanly with no result (SDK audit
+                        // 2026-10-11).
+                        sink.send_wait(&event)
+                            .await
                             .map_err(|e| format!("tool event send: {e}"))?;
                         if terminal {
                             seen_terminal = true;
@@ -559,7 +566,8 @@ impl Mesh {
                                     .to_string(),
                             details: None,
                         };
-                        sink.send(&synthesized)
+                        sink.send_wait(&synthesized)
+                            .await
                             .map_err(|e| format!("synthesized terminal send: {e}"))?;
                     }
                     Ok(())

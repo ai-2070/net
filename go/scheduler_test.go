@@ -2,6 +2,7 @@ package net
 
 import (
 	"testing"
+	"time"
 )
 
 // Task-lifecycle (WorkflowAdapter) + Tier-2 trigger engine round-trips.
@@ -171,5 +172,47 @@ func TestTriggerOnTaskChangeFiresAfterDone(t *testing.T) {
 	}
 	if n, _ := eng.ArmedCount(); n != 0 {
 		t.Fatalf("ArmedCount after fire = %d; want 0", n)
+	}
+}
+
+// Code review 2026-10-11: WaitForSeq truncated its remaining budget to
+// whole milliseconds, so a positive sub-millisecond remainder became 0 and
+// WaitForSeq(seq, 1) reported a timeout without ever checking the fold —
+// even for a seq that had long since folded.
+func TestWaitSliceMsRoundsUpSubMillisecondRemainders(t *testing.T) {
+	cases := []struct {
+		left time.Duration
+		want uint32
+	}{
+		{time.Nanosecond, 1},
+		{600 * time.Microsecond, 1},
+		{time.Millisecond, 1},
+		{1500 * time.Microsecond, 2},
+		{199*time.Millisecond + time.Microsecond, 200},
+		{time.Hour, 200},
+	}
+	for _, c := range cases {
+		if got := waitSliceMs(c.left, 200); got != c.want {
+			t.Errorf("waitSliceMs(%v, 200) = %d, want %d", c.left, got, c.want)
+		}
+	}
+}
+
+func TestWorkflowWaitForSeqOneMillisecondChecksTheFold(t *testing.T) {
+	r, wf := openWorkflow(t)
+	defer r.Free()
+	defer wf.Free()
+
+	seq, err := wf.Submit(1)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if err := wf.WaitForSeq(seq, 5000); err != nil {
+		t.Fatalf("WaitForSeq(5000): %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if err := wf.WaitForSeq(seq, 1); err != nil {
+			t.Fatalf("WaitForSeq(already-folded seq, 1ms) #%d = %v, want nil", i, err)
+		}
 	}
 }

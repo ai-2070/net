@@ -3,6 +3,7 @@ package net
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // TestMeshOsDefaultDaemonImplementsInterface confirms the embed-this
@@ -243,4 +244,123 @@ func TestHandleNilSafety(t *testing.T) {
 	}
 	// Free on nil should be a no-op (not panic).
 	h.Free()
+}
+
+// SDK audit 2026-10-11: a registration that fails AFTER the C call was
+// made (duplicate seed in the registry, or the SDK already shut down)
+// used to run the Rust-side user-ctx destructor — deleting the
+// cgo.Handle — and then the Go wrapper's own failure path deleted it
+// again, which panics ("misuse of an invalid Handle") in the caller.
+// Ownership now passes only on success.
+func TestRegisterDaemonWithCallbacksFailureDoesNotDoubleDeleteHandle(t *testing.T) {
+	sdk, err := StartMeshOsDaemonSdk(MeshOsConfig{
+		ThisNode:            1,
+		TickIntervalMs:      50,
+		EventQueueCapacity:  16,
+		ActionQueueCapacity: 16,
+		ControlCapacity:     16,
+	})
+	if err != nil {
+		t.Fatalf("StartMeshOsDaemonSdk: %v", err)
+	}
+	defer sdk.Free()
+
+	seed := make([]byte, 32)
+	seed[0] = 0x42
+	first, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "dup"}, seed)
+	if err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	defer first.Free()
+	if _, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "dup"}, seed); err == nil {
+		t.Fatal("a second registration under the same seed must fail")
+	}
+
+	if err := sdk.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	seed[0] = 0x43
+	if _, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "late"}, seed); err == nil {
+		t.Fatal("registration after Shutdown must fail")
+	}
+	// Reaching here without a panic is the assertion.
+}
+
+// SDK audit 2026-10-11: NextControl(0) held the native handle mutex
+// across an unbounded wait, so every other op on the handle — including
+// GracefulShutdown, the call that would deliver the Shutdown event —
+// blocked forever behind it. The wait now runs in short slices.
+func TestNextControlUnboundedDoesNotBlockGracefulShutdown(t *testing.T) {
+	sdk, err := StartMeshOsDaemonSdk(MeshOsConfig{
+		ThisNode:            1,
+		TickIntervalMs:      50,
+		EventQueueCapacity:  16,
+		ActionQueueCapacity: 16,
+		ControlCapacity:     16,
+	})
+	if err != nil {
+		t.Fatalf("StartMeshOsDaemonSdk: %v", err)
+	}
+	defer sdk.Free()
+	defer sdk.Shutdown()
+
+	seed := make([]byte, 32)
+	seed[0] = 0x51
+	h, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "parked"}, seed)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	defer h.Free()
+
+	// Capture the parked call's outcome: if NextControl(0) returned early
+	// (an error, or an event) the rest of this test would pass without the
+	// parked-call regression ever being exercised.
+	type nextResult struct {
+		ctl MeshOsDaemonControl
+		err error
+	}
+	parked := make(chan nextResult, 1)
+	go func() {
+		ctl, err := h.NextControl(0) // parks: no control event yet
+		parked <- nextResult{ctl, err}
+	}()
+	select {
+	case r := <-parked:
+		t.Fatalf("NextControl(0) returned before shutdown (%+v, %v): nothing was parked", r.ctl, r.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	logDone := make(chan error, 1)
+	go func() { logDone <- h.PublishLog(LogInfo, "still reachable") }()
+	select {
+	case <-logDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PublishLog blocked behind a parked NextControl(0)")
+	}
+
+	select {
+	case r := <-parked:
+		t.Fatalf("NextControl(0) returned before shutdown (%+v, %v): nothing was parked", r.ctl, r.err)
+	default:
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- h.GracefulShutdown(200) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("GracefulShutdown blocked behind a parked NextControl(0)")
+	}
+	// The parked call must not outlive the shutdown that ends the daemon.
+	select {
+	case r := <-parked:
+		// The shutdown is signalled before the handle is consumed, so the
+		// parked reader receives the event (cubic review of PR #1228: the
+		// FFI used to consume the handle first and the reader got NONE).
+		if r.err != nil || r.ctl.Kind != ControlShutdown {
+			t.Fatalf("parked NextControl(0) = %+v, %v; want the Shutdown event", r.ctl, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("NextControl(0) stayed parked after GracefulShutdown")
+	}
 }

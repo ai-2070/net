@@ -78,3 +78,15 @@ def test_python_reencodes_go_refs_byte_for_byte(vector: dict[str, Any]) -> None:
     ref = BlobRef.from_encoded(encoded)
     assert ref is not None
     assert bytes(ref.encode()) == encoded
+
+
+@pytest.mark.parametrize("vector", VECTORS, ids=[v["name"] for v in VECTORS])
+def test_chunked_ref_has_no_single_hash(vector: dict[str, Any]) -> None:
+    # SDK audit 2026-10-11: a chunked ref's `hash` was 32 zero bytes,
+    # collapsing every chunked blob onto one key; C and Go refuse it.
+    ref = BlobRef.from_encoded(bytes.fromhex(vector["encoded_hex"]))
+    assert ref is not None
+    if ref.is_chunked:
+        assert ref.hash is None
+    else:
+        assert ref.hash is not None and len(ref.hash) == 32

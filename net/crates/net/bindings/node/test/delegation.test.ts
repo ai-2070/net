@@ -47,6 +47,14 @@ describe.skipIf(!HAS_DELEGATION)('delegation', () => {
     expect(chain.verify(gateway.entityId, root.entityId, reg)).toBe(true)
   })
 
+  // cubic review of PR #1228: zero keeps its `token: zero_ttl`
+  // discriminator; other invalid numbers are refused by the validator.
+  it('refuses a zero TTL with the zero_ttl token error', () => {
+    const { root, gateway, machine } = rootMachineGateway()
+    expect(() => DelegationChain.deriveGateway(root, machine, gateway, 0)).toThrow(/zero_ttl/)
+    expect(() => DelegationChain.deriveGateway(root, machine, gateway, -1)).toThrow(/ttlSeconds/)
+  })
+
   it('rejects the wrong presenter', () => {
     const { root, machine, gateway } = rootMachineGateway()
     const chain = DelegationChain.deriveGateway(root, machine, gateway, 3600)

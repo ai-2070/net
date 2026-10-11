@@ -68,6 +68,11 @@ export interface TagKey {
  * there; we surface as a thrown error here).
  */
 export function tagKey(axis: TaxonomyAxis, key: string): TagKey {
+  // A plain-JS caller can pass any string; reject axes outside the closed
+  // taxonomy (cubic review of PR #1228).
+  if (!(TAXONOMY_AXES as readonly string[]).includes(axis)) {
+    throw new Error(`tagKey: unknown axis '${String(axis)}'`);
+  }
   if (!key) {
     throw new Error(`tagKey: key must be non-empty (axis=${axis})`);
   }
@@ -502,6 +507,7 @@ function nodeFromWire(
     }
     return prior[idx];
   };
+  validateWireNode(n, selfIdx);
   switch (n.kind) {
     case 'exists':
       return { type: 'exists', key: n.key };
@@ -552,6 +558,87 @@ function nodeFromWire(
       };
     case 'not':
       return { type: 'not', child: checkChild(n.child) };
+  }
+}
+
+/**
+ * Reject a malformed wire node at DECODE time, as the substrate does — the
+ * doc always promised "throws on malformed nodes". An unknown `kind` used to
+ * decode to `undefined` and crash later at evaluation; a mistyped field
+ * (`threshold: null`) decoded fine and evaluated `n >= null`, true for any
+ * non-negative value. These headers come from remote callers (`net-where`)
+ * (SDK audit 2026-10-11).
+ */
+function validateWireNode(n: PredicateNode, idx: number): void {
+  const bad = (what: string): never => {
+    throw new Error(`predicateFromWire: node ${idx} ${what}`);
+  };
+  if (n === null || typeof n !== 'object') bad('is not an object');
+  const node = n as unknown as Record<string, unknown>;
+  const str = (field: string) => {
+    if (typeof node[field] !== 'string') bad(`field '${field}' must be a string`);
+  };
+  const num = (field: string) => {
+    if (typeof node[field] !== 'number' || !Number.isFinite(node[field])) {
+      bad(`field '${field}' must be a finite number`);
+    }
+  };
+  const tagKey = () => {
+    const k = node.key as Record<string, unknown> | null;
+    if (k === null || typeof k !== 'object' || typeof k.axis !== 'string' || typeof k.key !== 'string') {
+      bad("field 'key' must be a tag key { axis, key }");
+    }
+    // The axis is a closed enum on the substrate side; an unknown axis
+    // string would build a predicate that can never match a typed tag
+    // (cubic review of PR #1228).
+    if (axisFromPrefix((k as Record<string, unknown>).axis as string) === undefined) {
+      bad(`field 'key.axis' must be one of ${TAXONOMY_AXES.join(', ')}`);
+    }
+  };
+  switch (node.kind) {
+    case 'exists':
+      return tagKey();
+    case 'equals':
+      tagKey();
+      return str('value');
+    case 'numeric_at_least':
+    case 'numeric_at_most':
+      tagKey();
+      return num('threshold');
+    case 'numeric_in_range':
+      tagKey();
+      num('min');
+      return num('max');
+    case 'semver_at_least':
+    case 'semver_at_most':
+    case 'semver_compatible':
+      tagKey();
+      return str('version');
+    case 'string_prefix':
+      tagKey();
+      return str('prefix');
+    case 'string_matches':
+      tagKey();
+      return str('pattern');
+    case 'metadata_exists':
+      return str('key');
+    case 'metadata_equals':
+      str('key');
+      return str('value');
+    case 'metadata_matches':
+      str('key');
+      return str('pattern');
+    case 'metadata_numeric_at_least':
+      str('key');
+      return num('threshold');
+    case 'and':
+    case 'or':
+      if (!Array.isArray(node.children)) bad("field 'children' must be an array");
+      return;
+    case 'not':
+      return;
+    default:
+      bad(`has unknown kind ${JSON.stringify(node.kind)}`);
   }
 }
 

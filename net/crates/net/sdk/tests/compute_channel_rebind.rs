@@ -442,3 +442,83 @@ async fn empty_ledger_produces_no_bindings_bytes_overhead() {
         "empty ledger must serialize to zero bytes, not a wire trailer",
     );
 }
+
+/// SDK audit 2026-10-11: channel membership is per NODE on the wire, but
+/// subscriptions are recorded per daemon. One daemon's unsubscribe sent a
+/// node-level leave and silently cut off a co-located daemon still
+/// subscribed to the same `(publisher, channel)`; and `stop()` never left
+/// at all. The runtime now leaves only when the last local daemon goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_daemons_unsubscribe_keeps_a_colocated_subscriber_on_the_roster() {
+    let trio = build_trio().await;
+    let Trio {
+        source_rt,
+        publisher,
+        ..
+    } = &trio;
+    source_rt
+        .register_factory("echo-counter", echo_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    source_rt.mesh().start();
+    publisher.start();
+    sleep(Duration::from_millis(100)).await;
+
+    let channel = ChannelName::new("sensors/shared").unwrap();
+    let channel_id = ChannelId::new(channel.clone());
+    publisher.register_channel(
+        ChannelConfig::new(channel_id.clone()).with_visibility(Visibility::Global),
+    );
+    let pub_id = publisher.inner().node_id();
+    let node = source_rt.mesh().inner().node_id();
+
+    let a = source_rt
+        .spawn(
+            "echo-counter",
+            Identity::generate(),
+            DaemonHostConfig::default(),
+        )
+        .await
+        .expect("spawn a");
+    let b = source_rt
+        .spawn(
+            "echo-counter",
+            Identity::generate(),
+            DaemonHostConfig::default(),
+        )
+        .await
+        .expect("spawn b");
+    for d in [&a, &b] {
+        source_rt
+            .subscribe_channel(d.origin_hash, pub_id, channel.clone(), None)
+            .await
+            .expect("subscribe");
+    }
+    let on_roster = || {
+        publisher
+            .inner()
+            .roster()
+            .members(&channel_id)
+            .contains(&node)
+    };
+    assert!(on_roster());
+
+    source_rt
+        .unsubscribe_channel(a.origin_hash, pub_id, channel.clone())
+        .await
+        .expect("unsubscribe a");
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        on_roster(),
+        "b still subscribes: the node must stay on the publisher's roster"
+    );
+
+    source_rt.stop(b.origin_hash).await.expect("stop b");
+    assert!(
+        wait_until(Duration::from_secs(2), Duration::from_millis(50), || {
+            !on_roster()
+        })
+        .await,
+        "stopping the last subscribed daemon must leave the roster"
+    );
+}

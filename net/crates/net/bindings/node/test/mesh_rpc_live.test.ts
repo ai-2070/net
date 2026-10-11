@@ -422,3 +422,40 @@ describe('forced drop releases handler handles on every public serve bridge', ()
     handle.close()
   }, 60_000)
 })
+
+// SDK audit 2026-10-11: `handlerTimeoutMs` bounded only the TSFN dispatch,
+// and an `async` handler returns its Promise at once — so a handler whose
+// promise never settled held its task and in-flight slot forever.
+describe('unary handler timeout bounds the promise, not just the dispatch', () => {
+  it('cuts off a never-settling async handler at handlerTimeoutMs', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve(
+      'live.never',
+      async () => new Promise<Buffer>(() => {}),
+      300,
+    )
+    const started = Date.now()
+    await expect(
+      clientRpc.call(server.nodeId(), 'live.never', Buffer.from('x'), { deadlineMs: 10_000 }),
+      // The handler timeout's own message, not just any failure (cubic
+      // review of PR #1228: a bare toThrow() passed on unrelated errors).
+    ).rejects.toThrow(/did not settle within 300 ms/)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    handle.close()
+  }, 30_000)
+})
+
+// cubic review of PR #1228: `handlerTimeoutMs: 0` ("no cap") was a
+// ~584-million-year duration, and `Instant::now() + timeout` overflowed —
+// the first invocation panicked inside the native handler bridge.
+describe('handlerTimeoutMs: 0 disables the cap without overflowing', () => {
+  it('serves a call with no handler timeout', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.nocap', async (req: Buffer) => req, 0)
+    const reply = await clientRpc.call(server.nodeId(), 'live.nocap', Buffer.from('ok'), {
+      deadlineMs: 10_000,
+    })
+    expect(Buffer.from(reply).toString()).toBe('ok')
+    handle.close()
+  }, 30_000)
+})

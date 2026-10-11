@@ -13873,6 +13873,23 @@ impl MeshNode {
     ) -> Result<Self, AdapterError> {
         let node_id = identity.node_id();
 
+        // A zero heartbeat interval busy-loops the heartbeat task (a
+        // pegged core) and a zero session timeout expires every session
+        // at once. Only the C ABI refused them; Node, Python and the Rust
+        // SDK passed them straight through and Go silently swapped in the
+        // defaults — one config, three behaviours (SDK audit 2026-10-11).
+        // Refusing here gives every surface the C ABI's answer.
+        if config.heartbeat_interval.is_zero() {
+            return Err(AdapterError::Fatal(
+                "heartbeat interval must be greater than zero".into(),
+            ));
+        }
+        if config.session_timeout.is_zero() {
+            return Err(AdapterError::Fatal(
+                "session timeout must be greater than zero".into(),
+            ));
+        }
+
         // Review-10 P1-6: freeze the NAMED EXPORT map before any
         // networking starts. Empty and duplicate labels are
         // configuration mistakes, and a node must never come up holding
@@ -25416,7 +25433,25 @@ impl MeshNode {
         // `accept_in_flight` (so `start()` refuses) for that whole
         // time. See `try_handshake_responder`'s doc for why that is
         // the right trade and what to tune.
-        let (keys, handshake_hash, peer_endpoint) = self.handshake_responder(peer_node_id).await?;
+        //
+        // Raced against node shutdown: the responder otherwise sat out that
+        // whole budget (~15 s by default) after `shutdown()`, so a binding's
+        // thread blocked in `accept` outlived the node it was accepting for
+        // (cubic review of PR #1228). `enable` before the flag re-check, so a
+        // shutdown landing in between is never missed.
+        let shut_down =
+            || AdapterError::Connection("the node shut down while accept() was waiting".into());
+        let shutdown_signal = self.shutdown_notify.notified();
+        tokio::pin!(shutdown_signal);
+        shutdown_signal.as_mut().enable();
+        if self.shutdown.load(AtOrd::Acquire) {
+            return Err(shut_down());
+        }
+        let (keys, handshake_hash, peer_endpoint) = tokio::select! {
+            biased;
+            _ = &mut shutdown_signal => return Err(shut_down()),
+            responded = self.handshake_responder(peer_node_id) => responded?,
+        };
 
         // The responder side of a handshake is the SAME lifecycle
         // operation as the initiator side, so it runs through the same
@@ -27661,6 +27696,17 @@ impl MeshNode {
                 sdp: sdp.clone(),
             },
         )?;
+        // Releases THIS call's take if the future is dropped before a
+        // terminal outcome names an owner for it (an HTTP request deadline
+        // drops the handler mid-ICE). Disarmed on every outcome below, each
+        // of which hands the reservation to its owner or releases it itself
+        // (cubic review of PR #1228).
+        let mut take_guard = BootstrapOfferTakeGuard {
+            node: self,
+            admitted: Some(admitted),
+            budget_key,
+            dialog,
+        };
         let outcome = {
             let mut table = self.rtc_dialogs.lock().await;
             super::rtc::handle_signal(
@@ -27672,6 +27718,9 @@ impl MeshNode {
             )
             .await
         };
+        // Disarm: every outcome below hands the take to its owner or
+        // releases it itself. (`SignalAdmit` is `Copy`; the guard held a copy.)
+        take_guard.admitted = None;
         match outcome {
             super::rtc::SignalOutcome::Answer {
                 dialog, sdp, peer, ..
@@ -66297,5 +66346,26 @@ mod component_reclaim_tests {
             alive(&wa),
             alive(&wb)
         );
+    }
+}
+
+/// Releases a bootstrap offer's signal-budget take if
+/// [`MeshNode::accept_bootstrap_offer_keyed`] is dropped before an outcome
+/// names an owner for it. Disarmed by taking `admitted`.
+#[cfg(feature = "webrtc")]
+struct BootstrapOfferTakeGuard<'a> {
+    node: &'a MeshNode,
+    admitted: Option<super::rtc::SignalAdmit>,
+    budget_key: u64,
+    dialog: u64,
+}
+
+#[cfg(feature = "webrtc")]
+impl Drop for BootstrapOfferTakeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(admitted) = self.admitted.take() {
+            self.node
+                .release_bootstrap_offer_take(admitted, self.budget_key, self.dialog);
+        }
     }
 }

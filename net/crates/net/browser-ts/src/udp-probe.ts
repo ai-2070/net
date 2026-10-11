@@ -45,7 +45,12 @@ export type StunProbeOutcome =
   | { readonly type: 'stunError'; readonly code: number; readonly detail: string }
   /** Nothing came back inside the deadline. */
   | { readonly type: 'unanswered'; readonly detail: string }
-  /** The probe was not run — no address to aim at, or it was disabled. */
+  /**
+   * The probe established nothing either way: it was not run (no address
+   * to aim at, disabled, or the connection failed before gathering), or
+   * it ran and was inconclusive (gathering completed with neither an
+   * answer nor a "no response" report). Never evidence of blocked UDP.
+   */
   | { readonly type: 'notRun'; readonly reason: string }
   /** This engine could not run the probe at all. */
   | { readonly type: 'unsupported'; readonly detail: string };
@@ -59,7 +64,9 @@ export type ProbeEvent =
   | { readonly candidate: string }
   | { readonly error: number }
   /** The probe connection's ICE state became `failed`. */
-  | { readonly ice: 'failed' };
+  | { readonly ice: 'failed' }
+  /** Gathering completed (the end-of-candidates signal). */
+  | { readonly gathering: 'complete' };
 
 /**
  * Is this candidate line server-reflexive? The `typ` token followed by
@@ -91,14 +98,64 @@ export function probeEventAnswers(event: ProbeEvent): boolean {
  * event answers, `notRun` when the engine failed the connection before
  * gathering a single candidate (nothing was sent, so silence is not
  * evidence — measured: Firefox without a media permission on an
- * IPv6-only network with no IPv4 route), `unanswered` otherwise. The
- * Rust probe's `probe_verdict`, the same three answers.
+ * IPv6-only network with no IPv4 route) or when gathering completed with
+ * neither an answer nor a "no response" report (inconclusive),
+ * `unanswered` otherwise. The Rust probe's `probe_verdict`, the same
+ * three answers.
  */
 export function stunProbeVerdict(events: readonly ProbeEvent[]): 'answered' | 'unanswered' | 'notRun' {
   if (events.some(probeEventAnswers)) return 'answered';
   const gathered = events.some((event) => 'candidate' in event);
   const failed = events.some((event) => 'ice' in event && event.ice === 'failed');
-  return failed && !gathered ? 'notRun' : 'unanswered';
+  if (failed && !gathered) return 'notRun';
+  // Gathering that COMPLETED with no reflexive candidate and no "no
+  // response" report is inconclusive ONLY when a host candidate carried a
+  // literal public address: an engine may suppress a srflx equal to it, so
+  // a host with no NAT would otherwise read as `udp-blocked` (SDK audit
+  // 2026-10-11). Behind NAT the srflx is never suppressed, so its absence
+  // is silence — what blocked UDP looks like in Chromium (browser matrix,
+  // PR #1228). Same rule as the Rust `probe_verdict`.
+  const completed = events.some((event) => 'gathering' in event);
+  const reportedNoResponse = events.some((event) => 'error' in event && event.error >= STUN_NO_RESPONSE_CODE);
+  const publicHost = events.some((event) => 'candidate' in event && hostCandidateIsPublic(event.candidate));
+  return completed && !reportedNoResponse && publicHost ? 'notRun' : 'unanswered';
+}
+
+/**
+ * Is this a `typ host` candidate whose address is a literal publicly
+ * routable IP (not private, loopback, link-local, CGNAT, unique-local or
+ * unspecified)? An obfuscated `.local` address is not known public. Mirrors
+ * the Rust `host_candidate_is_public`.
+ */
+export function hostCandidateIsPublic(line: string): boolean {
+  const tokens = line.trim().split(/\s+/);
+  let host = false;
+  for (let i = 0; i + 1 < tokens.length; i += 1) {
+    if (tokens[i] === 'typ' && tokens[i + 1] === 'host') host = true;
+  }
+  const addr = tokens[4];
+  if (!host || addr === undefined) return false;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
+  if (v4 !== null) {
+    const o = v4.slice(1).map(Number);
+    if (o.some((n) => n > 255)) return false;
+    const [a, b] = o as [number, number, number, number];
+    const isPrivate = a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+    const loopback = a === 127;
+    const linkLocal = a === 169 && b === 254;
+    const unspecified = o.every((n) => n === 0);
+    const broadcast = o.every((n) => n === 255);
+    const cgnat = a === 100 && (b & 0xc0) === 64;
+    return !(isPrivate || loopback || linkLocal || unspecified || broadcast || cgnat);
+  }
+  if (!addr.includes(':') || !/^[0-9a-f:.]+$/i.test(addr)) return false;
+  const lower = addr.toLowerCase();
+  if (lower === '::' || lower === '::1') return false;
+  const first = Number.parseInt(lower.startsWith(':') ? '0' : lower.split(':')[0] ?? '0', 16);
+  if (Number.isNaN(first)) return false;
+  const uniqueLocal = (first & 0xfe00) === 0xfc00;
+  const linkLocalV6 = (first & 0xffc0) === 0xfe80;
+  return !(uniqueLocal || linkLocalV6);
 }
 
 /** {@link probeEventAnswers} over everything one probe reported. */
@@ -231,10 +288,19 @@ export async function probeStunBinding(
     timeoutMs,
   );
 
+  // Completion settles `unanswered` only on the engine's own "no
+  // response" report. Without one it is inconclusive: libwebrtc drops a
+  // reflexive candidate equal to a public host address, so the anchor
+  // can have answered with nothing visible (`stunProbeVerdict`, the same
+  // rule).
   const gatheringDone = (): void => {
+    if (noResponse !== null) {
+      settle({ type: 'unanswered', detail: noResponse });
+      return;
+    }
     settle({
-      type: 'unanswered',
-      detail: noResponse ?? 'gathering completed with no reflexive candidate',
+      type: 'notRun',
+      reason: 'gathering completed with no reflexive candidate and no "no response" report: inconclusive',
     });
   };
 

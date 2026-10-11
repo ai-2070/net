@@ -832,6 +832,11 @@ impl BundleIssuer for MembershipIssuer {
         intent: &RedemptionIntent,
     ) -> Result<Vec<u8>, Refusal> {
         self.check(invite)?;
+        // The bundle always carries the mesh PSK, so only a Mesh invite may
+        // produce one; standalone links are honoured by `standalone` alone.
+        if !invite.relations().contains(&Relation::Mesh) {
+            return Err(Refusal::Invalid);
+        }
         // Never deliver a PSK from a trust domain other than the one signed.
         invite
             .check_trust_domain(self.psk.trust_domain())

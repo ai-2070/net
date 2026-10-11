@@ -574,7 +574,16 @@ pub fn scope_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<ScopeFilterOwned>
         )))
     }
 
-    let kind = get_opt_str(d, "kind")?.unwrap_or_else(|| "any".to_string());
+    // `kind` is required, as on Go, C and Node: defaulting it to `any`
+    // turned `{"tenant": "acme"}` (kind forgotten) into the broadest
+    // filter — the widening this function exists to refuse (SDK audit
+    // 2026-10-11). Unscoped is spelled `{"kind": "any"}`.
+    let Some(kind) = get_opt_str(d, "kind")? else {
+        return Err(PyValueError::new_err(
+            "scope filter requires a 'kind' (any, global_only, same_subnet, tenant, \
+             tenants, region, regions); refusing to widen the query to the whole mesh",
+        ));
+    };
     Ok(match kind.as_str() {
         "any" => ScopeFilterOwned::Any,
         "global_only" | "globalOnly" => ScopeFilterOwned::GlobalOnly,

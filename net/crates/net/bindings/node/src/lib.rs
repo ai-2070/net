@@ -1148,6 +1148,16 @@ mod mesh_bindings {
         stream_id: u64,
         registration_id: u64,
         closed: std::sync::atomic::AtomicBool,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    /// A subscription garbage-collected without `close()` used to keep its
+    /// registration (and the stream id) for the node's lifetime, and its
+    /// referenced callback kept the process alive (SDK audit 2026-10-11).
+    impl Drop for StreamDataSubscription {
+        fn drop(&mut self) {
+            let _ = self.close();
+        }
     }
 
     #[napi]
@@ -1156,6 +1166,13 @@ mod mesh_bindings {
         #[napi(getter)]
         pub fn stream_id(&self) -> BigInt {
             BigInt::from(self.stream_id)
+        }
+
+        /// Events dropped because the JS callback fell
+        /// [`STREAM_DATA_QUEUE`] events behind the peers feeding it.
+        #[napi(getter)]
+        pub fn dropped_events(&self) -> BigInt {
+            BigInt::from(self.dropped.load(std::sync::atomic::Ordering::Relaxed))
         }
 
         /// Stop delivering. Idempotent; `true` only for the call that
@@ -1172,12 +1189,22 @@ mod mesh_bindings {
         }
     }
 
+    /// Most events an `onStreamData` callback may have queued. The sink
+    /// runs on the mesh receive path, fed by remote peers; an unbounded
+    /// queue let a peer flooding a subscribed stream grow the process
+    /// without limit while the JS thread was busy (SDK audit 2026-10-11).
+    /// Past the bound, events are dropped and counted (`droppedEvents`) —
+    /// the same disposition the core's bounded `open_stream_inbox` takes.
+    const STREAM_DATA_QUEUE: usize = 1024;
+
     type StreamDataTsfn = napi::threadsafe_function::ThreadsafeFunction<
         StreamDataEvent,
         (),
         StreamDataEvent,
         napi::Status,
         false,
+        false,
+        STREAM_DATA_QUEUE,
     >;
 
     /// Handle to an open stream. Opaque to JS callers; pass back to
@@ -2045,7 +2072,8 @@ mod mesh_bindings {
         #[napi]
         pub fn shard_for_stream(&self, stream_id: BigInt) -> Result<u32> {
             let guard = self.load_node()?;
-            let (_, id, _) = stream_id.get_u64();
+            // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
+            let id = crate::common::bigint_u64(stream_id)?;
             Ok(guard.as_ref().unwrap().shard_for_stream(id) as u32)
         }
 
@@ -2228,6 +2256,10 @@ mod mesh_bindings {
         /// called on the JS thread, once per event, in delivery order.
         /// One subscription per stream id: a second one throws until the
         /// first is closed.
+        ///
+        /// Hold the returned subscription: when it is garbage-collected it
+        /// unregisters, exactly as `close()` does. The `@net-mesh/sdk`
+        /// `MeshNode` holds it for you until `close()`.
         #[napi]
         pub fn on_stream_data(
             &self,
@@ -2237,9 +2269,14 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let stream_u64 = crate::common::bigint_u64(stream_id)?;
-            let tsfn: StreamDataTsfn = handler.build_threadsafe_function().build()?;
+            let tsfn: StreamDataTsfn = handler
+                .build_threadsafe_function()
+                .max_queue_size::<STREAM_DATA_QUEUE>()
+                .build()?;
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let sink_dropped = std::sync::Arc::clone(&dropped);
             let sink: ::net::adapter::net::StreamInboundSink = std::sync::Arc::new(move |event| {
-                let _ = tsfn.call(
+                let status = tsfn.call(
                     StreamDataEvent {
                         peer_node_id: BigInt::from(event.from_node),
                         stream_id: BigInt::from(event.stream_id),
@@ -2247,6 +2284,9 @@ mod mesh_bindings {
                     },
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
+                if status == napi::Status::QueueFull {
+                    sink_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             });
             let registration_id =
                 node.register_stream_inbound(stream_u64, sink)
@@ -2260,6 +2300,7 @@ mod mesh_bindings {
                 stream_id: stream_u64,
                 registration_id,
                 closed: std::sync::atomic::AtomicBool::new(false),
+                dropped,
             })
         }
 

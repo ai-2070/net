@@ -107,19 +107,35 @@ export interface OpenStreamOptions {
   lossy?: boolean;
 }
 
+/** Most frames a {@link LeafStream} buffers before its first consumer. */
+export const LEAF_STREAM_PENDING_MAX_FRAMES = 1024;
+/** Most bytes a {@link LeafStream} buffers before its first consumer. */
+export const LEAF_STREAM_PENDING_MAX_BYTES = 1 << 20;
+
 /**
  * One open stream.
  *
  * Inbound payloads are delivered to `for await` consumers and to
  * {@link LeafStream.onMessage} listeners. Payloads that arrive before
  * anyone consumes them are buffered in arrival order, so a page that
- * opens a stream and awaits it a tick later loses nothing.
+ * opens a stream and awaits it a tick later loses nothing — up to
+ * {@link LEAF_STREAM_PENDING_MAX_FRAMES} frames and
+ * {@link LEAF_STREAM_PENDING_MAX_BYTES} bytes. Past either bound the
+ * OLDEST buffered frame is dropped and counted in
+ * {@link LeafStream.droppedBeforeConsumer} (a single frame larger than the
+ * byte bound is never buffered, and is counted there too): a stream used only to send
+ * (the store, netcode and region-link layers read inbound traffic
+ * elsewhere) must not keep every frame the peer sends for its lifetime.
  */
 export class LeafStream implements AsyncIterable<Uint8Array> {
   private readonly queues = new Set<AsyncQueue<Uint8Array>>();
   private readonly listeners = new Set<(payload: Uint8Array) => void>();
   private readonly pending: Uint8Array[] = [];
+  private pendingBytes = 0;
+  private dropped = 0;
   private closed = false;
+  /** Why the SESSION closed this stream, when it did so for a leader change. */
+  private retiredBy: string | null = null;
   /**
    * This stream's wire id as a number, or `null` when the inner
    * object's `stream_id_hex()` was not hex.
@@ -188,6 +204,14 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     inner.on_message((event) => this.receive(event));
   }
 
+  /**
+   * Frames dropped from the pre-consumer buffer because no `for await`
+   * consumer or `onMessage` listener was attached and it was full.
+   */
+  get droppedBeforeConsumer(): number {
+    return this.dropped;
+  }
+
   /** The authenticated peer this stream is with, 16 lowercase hex. */
   get peerNode(): string {
     return this.inner.peer_node_hex();
@@ -209,7 +233,7 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
 
   /** Send one payload. Fragmentation at `MAX_PAYLOAD_SIZE` is the leaf's. */
   async send(payload: Uint8Array): Promise<void> {
-    if (this.closed) throw new SessionError('the stream is closed');
+    if (this.closed) throw new SessionError(this.retiredBy ?? 'the stream is closed');
     try {
       await this.inner.send(payload);
     } catch (error) {
@@ -220,7 +244,7 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   /** Listen for payloads. Returns a cancel handle. */
   onMessage(listener: (payload: Uint8Array) => void): () => void {
     this.listeners.add(listener);
-    const buffered = this.pending.splice(0, this.pending.length);
+    const buffered = this.drainPending();
     for (const payload of buffered) listener(payload);
     return () => {
       this.listeners.delete(listener);
@@ -230,10 +254,23 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array> {
     const queue: AsyncQueue<Uint8Array> = new AsyncQueue(() => this.queues.delete(queue));
     this.queues.add(queue);
-    const buffered = this.pending.splice(0, this.pending.length);
+    const buffered = this.drainPending();
     for (const payload of buffered) queue.push(payload);
     if (this.closed) queue.end();
     return queue;
+  }
+
+  /**
+   * @internal — the session closing this stream because the leader it
+   * was opened on is gone. Later sends fail with the leaf's own
+   * reopenable wording ("stale stream handle"), so a store that cached
+   * the stream reopens it on the new leader instead of failing every
+   * frame forever (SDK audit 2026-10-11).
+   */
+  retire(reason: string): void {
+    if (this.closed) return;
+    this.retiredBy = reason;
+    this.close();
   }
 
   /** Close the stream and end every consumer. */
@@ -257,11 +294,41 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
    * taken as an already-decoded payload, which is what a
    * host-supplied {@link LeafWasmStreamLike} may deliver.
    */
+  /**
+   * Hand the pre-consumer buffer over, emptying it — count included. The
+   * byte count stayed at the drained total, so after a consumer drained the
+   * buffer and detached, rebuffering tripped the byte cap almost at once
+   * and evicted all but the newest frame on nearly every arrival (code
+   * review 2026-10-11, BROWSER-1).
+   */
+  private drainPending(): Uint8Array[] {
+    this.pendingBytes = 0;
+    return this.pending.splice(0, this.pending.length);
+  }
+
   private receive(event: StreamCallbackPayload): void {
     const payload = this.decode(event);
     if (payload === null || this.closed) return;
     if (this.queues.size === 0 && this.listeners.size === 0) {
+      // A single frame over the byte cap is dropped and counted rather
+      // than buffered: the eviction loop below stops at one frame, so it
+      // would otherwise sit there past the cap (cubic review of PR #1228).
+      if (payload.byteLength > LEAF_STREAM_PENDING_MAX_BYTES) {
+        this.dropped += 1;
+        return;
+      }
       this.pending.push(payload);
+      this.pendingBytes += payload.byteLength;
+      // Bounded (SDK audit 2026-10-11): unbounded, an unread stream grew
+      // at the peer's send rate until the tab ran out of memory.
+      while (
+        this.pending.length > LEAF_STREAM_PENDING_MAX_FRAMES ||
+        this.pendingBytes > LEAF_STREAM_PENDING_MAX_BYTES
+      ) {
+        const oldest = this.pending.shift()!;
+        this.pendingBytes -= oldest.byteLength;
+        this.dropped += 1;
+      }
       return;
     }
     for (const listener of this.listeners) {

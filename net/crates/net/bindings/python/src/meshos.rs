@@ -686,10 +686,17 @@ impl MeshDaemon for PyDaemonBridge {
 /// first.
 #[pyclass(name = "MeshOsDaemonHandle", module = "net._net")]
 pub struct PyMeshOsDaemonHandle {
-    /// `Option` because `graceful_shutdown` consumes the handle
-    /// by value — after a successful shutdown the pyclass holds
-    /// `None` and every subsequent method raises `already_shutdown`.
-    inner: Option<CoreHandle>,
+    /// `None` once `graceful_shutdown` / `close` consumed the handle;
+    /// every later method raises `already_shutdown`.
+    ///
+    /// Behind a mutex, with every method on `&self`, so one thread can wait
+    /// in `next_control` while another signals or shuts the daemon down.
+    /// The methods used to take `&mut self`: PyO3 then held the object's
+    /// mutable borrow across `next_control`'s whole wait, and any other
+    /// call from another thread failed with a borrow error — including the
+    /// shutdown that would deliver the event it waited for (cubic review of
+    /// PR #1228). `next_control` holds the lock one short slice at a time.
+    inner: parking_lot::Mutex<Option<CoreHandle>>,
     runtime: Arc<GuardedRuntime>,
     /// Cached identity so `daemon_id`/`daemon_name` work after
     /// shutdown (when `inner` is `None`).
@@ -697,32 +704,29 @@ pub struct PyMeshOsDaemonHandle {
     daemon_name: String,
 }
 
-impl PyMeshOsDaemonHandle {
-    fn require_inner_mut(&mut self) -> PyResult<&mut CoreHandle> {
-        if let Some(h) = self.inner.as_mut() {
-            Ok(h)
-        } else {
-            Python::attach(|py| {
-                Err(sdk_err(
-                    py,
-                    "already_shutdown",
-                    "daemon handle was already consumed by graceful_shutdown",
-                ))
-            })
-        }
-    }
+/// Longest single wait `next_control` makes holding the handle lock.
+const NEXT_CONTROL_SLICE: Duration = Duration::from_millis(50);
+/// How often `graceful_shutdown` checks whether the daemon already left.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
-    fn require_inner(&self) -> PyResult<&CoreHandle> {
-        if let Some(h) = self.inner.as_ref() {
-            Ok(h)
-        } else {
-            Python::attach(|py| {
-                Err(sdk_err(
-                    py,
-                    "already_shutdown",
-                    "daemon handle was already consumed by graceful_shutdown",
-                ))
-            })
+fn already_shutdown(py: Python<'_>) -> PyErr {
+    sdk_err(
+        py,
+        "already_shutdown",
+        "daemon handle was already consumed by graceful_shutdown",
+    )
+}
+
+impl PyMeshOsDaemonHandle {
+    /// Run `f` on the live handle under its lock, or raise `already_shutdown`.
+    fn with_inner<R>(&self, py: Python<'_>, f: impl FnOnce(&mut CoreHandle) -> R) -> PyResult<R> {
+        // Held with the GIL: a `next_control` slice holds the lock with the
+        // GIL released and never needs it to let go, so this waits at most
+        // one slice.
+        let mut guard = self.inner.lock();
+        match guard.as_mut() {
+            Some(h) => Ok(f(h)),
+            None => Err(already_shutdown(py)),
         }
     }
 }
@@ -747,15 +751,14 @@ impl PyMeshOsDaemonHandle {
     /// `refresh_metadata()` for fresh peer counts / maintenance
     /// state.
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self.require_inner()?;
-        metadata_view_to_dict(py, inner.metadata())
+        let view = self.with_inner(py, |h| h.metadata().clone())?;
+        metadata_view_to_dict(py, &view)
     }
 
     /// Rebuild the metadata view from the runtime's latest
     /// snapshot. Cheap.
-    fn refresh_metadata<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self.require_inner_mut()?;
-        let view = inner.refresh_metadata().clone();
+    fn refresh_metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let view = self.with_inner(py, |h| h.refresh_metadata().clone())?;
         metadata_view_to_dict(py, &view)
     }
 
@@ -763,46 +766,82 @@ impl PyMeshOsDaemonHandle {
     /// elapses, or the runtime shuts down. Returns the event as a
     /// dict `{kind: "...", ...}` on success, or `None` on
     /// timeout / runtime shutdown.
+    ///
+    /// Waits in short slices, releasing the handle between them, so other
+    /// threads can use the handle meanwhile — a `graceful_shutdown` from
+    /// another thread delivers its `Shutdown` event here.
     #[pyo3(signature = (timeout_ms=None))]
     fn next_control<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         timeout_ms: Option<u64>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        // Pull the channel receiver out across the GIL release.
-        // `require_inner_mut` errors out before we get here if the
-        // handle was consumed by `graceful_shutdown`.
         let runtime = self.runtime.clone();
-        let result: Option<CoreDaemonControl> = {
-            let handle = self.require_inner_mut()?;
-            // Borrow the handle across the awaited recv. Use
-            // `py.detach` so other Python threads can run while we
-            // park.
-            py.detach(|| {
-                runtime.block_on(async {
-                    let next: Option<CoreDaemonControl> = match timeout_ms {
-                        Some(ms) => {
-                            tokio::time::timeout(Duration::from_millis(ms), handle.next_control())
-                                .await
-                                .unwrap_or_default()
-                        }
-                        None => handle.next_control().await,
-                    };
-                    next
-                })
-            })
-        };
-        match result {
-            Some(ev) => Ok(Some(daemon_control_to_dict(py, ev)?)),
-            None => Ok(None),
+        let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+        let mut first = true;
+        loop {
+            let slice = match deadline {
+                None => NEXT_CONTROL_SLICE,
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    // One receive always runs: `timeout_ms=0` is a
+                    // non-blocking receive that still returns a queued event.
+                    if left.is_zero() && !first {
+                        return Ok(None);
+                    }
+                    left.min(NEXT_CONTROL_SLICE)
+                }
+            };
+            // `Err(())` = the handle was consumed.
+            let got: Result<Option<CoreDaemonControl>, ()> = py.detach(|| {
+                let mut guard = self.inner.lock();
+                let Some(h) = guard.as_mut() else {
+                    return Err(());
+                };
+                Ok(runtime.block_on(async {
+                    tokio::time::timeout(slice, h.next_control())
+                        .await
+                        .unwrap_or_default()
+                }))
+            });
+            match got {
+                Err(()) if first => return Err(already_shutdown(py)),
+                // Consumed mid-wait (a graceful shutdown finished).
+                Err(()) => return Ok(None),
+                Ok(Some(ev)) => return Ok(Some(daemon_control_to_dict(py, ev)?)),
+                Ok(None) => {}
+            }
+            first = false;
+            if py.detach(|| {
+                self.inner
+                    .lock()
+                    .as_ref()
+                    .is_none_or(|h| h.control_closed())
+            }) {
+                return Ok(None); // the runtime shut down: nothing will arrive
+            }
+            py.check_signals()?;
         }
+    }
+
+    /// Whether no control event can ever arrive again: the runtime shut
+    /// down (or the handle was unregistered) and every queued event was
+    /// read. Tells a `None` from `next_control` / `try_next_control`
+    /// that means "never" from one that means "not yet". `True` once the
+    /// handle was consumed by `graceful_shutdown`.
+    fn control_closed(&self, py: Python<'_>) -> bool {
+        py.detach(|| {
+            self.inner
+                .lock()
+                .as_ref()
+                .is_none_or(|h| h.control_closed())
+        })
     }
 
     /// Non-blocking control-event receive. Returns the next event
     /// as a dict, or `None` if the channel is empty / closed.
-    fn try_next_control<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let inner = self.require_inner_mut()?;
-        match inner.try_next_control() {
+    fn try_next_control<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match self.with_inner(py, |h| h.try_next_control())? {
             Some(ev) => Ok(Some(daemon_control_to_dict(py, ev)?)),
             None => Ok(None),
         }
@@ -817,9 +856,7 @@ impl PyMeshOsDaemonHandle {
     /// (case-insensitive).
     fn publish_log(&self, py: Python<'_>, level: &str, message: &str) -> PyResult<()> {
         let lvl = parse_log_level(level)?;
-        let inner = self.require_inner()?;
-        inner
-            .publish_log(lvl, message)
+        self.with_inner(py, |h| h.publish_log(lvl, message))?
             .map_err(|e| sdk_err_from(py, e))
     }
 
@@ -840,43 +877,84 @@ impl PyMeshOsDaemonHandle {
         py: Python<'_>,
         caps: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let inner = self.require_inner()?;
         let cap_set = match caps {
             Some(d) => crate::capabilities::capability_set_from_py(d)
                 .map_err(|e| sdk_err(py, "invalid_capabilities", &format!("{e}")))?,
             None => CapabilitySet::default(),
         };
-        inner
-            .publish_capabilities(cap_set)
+        self.with_inner(py, |h| h.publish_capabilities(cap_set))?
             .map_err(|e| sdk_err_from(py, e))
     }
 
     /// Drive a graceful shutdown. Sends
     /// `Shutdown { grace_period_ms }` on the daemon's control
-    /// channel, parks for `grace_ms`, then unregisters. Consumes
-    /// the handle — subsequent method calls raise
+    /// channel, waits up to `grace_ms` for the daemon to leave, then
+    /// unregisters. Consumes the handle — subsequent method calls raise
     /// `MeshOsSdkError(kind="already_shutdown")`.
+    ///
+    /// The handle stays readable during the grace period, so a thread
+    /// waiting in `next_control` receives the `Shutdown` event and can
+    /// drain. (The native one-shot consumed the handle first, leaving the
+    /// event in a channel nobody could read.) A `close()` during the wait —
+    /// typically the daemon's own exit — ends it early.
     #[pyo3(signature = (grace_ms=None))]
-    fn graceful_shutdown(&mut self, py: Python<'_>, grace_ms: Option<u64>) -> PyResult<()> {
-        let handle = match self.inner.take() {
-            Some(h) => h,
-            None => {
-                return Err(sdk_err(
-                    py,
-                    "already_shutdown",
-                    "daemon handle was already consumed by graceful_shutdown",
-                ));
-            }
-        };
+    fn graceful_shutdown(&self, py: Python<'_>, grace_ms: Option<u64>) -> PyResult<()> {
         let grace = grace_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN);
-        let runtime = self.runtime.clone();
-        py.detach(move || {
-            runtime
-                .block_on(async move { handle.graceful_shutdown(grace).await })
-                .map_err(|e| Python::attach(|py| sdk_err_from(py, e)))
+        self.with_inner(py, |h| h.signal_shutdown(grace))?;
+        py.detach(|| {
+            let deadline = std::time::Instant::now() + grace;
+            loop {
+                {
+                    let guard = self.inner.lock();
+                    match guard.as_ref() {
+                        Some(h) if h.is_registered() => {}
+                        _ => break, // left, or consumed by another caller
+                    }
+                }
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(SHUTDOWN_POLL));
+            }
+            // Failsafe unregister (the core handle's Drop), outside the lock.
+            let handle = self.inner.lock().take();
+            drop(handle);
+        });
+        Ok(())
+    }
+
+    /// Step one of a graceful shutdown the caller drives itself: send
+    /// `Shutdown { grace_period_ms }` on the control channel and return
+    /// at once, WITHOUT consuming the handle. Wait on `registered` (up to
+    /// the grace), then call `close()`.
+    #[pyo3(signature = (grace_ms=None))]
+    fn signal_shutdown(&self, py: Python<'_>, grace_ms: Option<u64>) -> PyResult<()> {
+        let grace = grace_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN);
+        self.with_inner(py, |h| h.signal_shutdown(grace))
+    }
+
+    /// Whether the daemon is still registered. `False` once the handle
+    /// was consumed or closed.
+    #[getter]
+    fn registered(&self, py: Python<'_>) -> bool {
+        py.detach(|| {
+            self.inner
+                .lock()
+                .as_ref()
+                .is_some_and(|h| h.is_registered())
         })
+    }
+
+    /// Unregister and consume the handle now (the failsafe step of a
+    /// graceful shutdown). Idempotent.
+    fn close(&self, py: Python<'_>) {
+        let handle = py.detach(|| self.inner.lock().take());
+        drop(handle);
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -885,24 +963,28 @@ impl PyMeshOsDaemonHandle {
 
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _exc_traceback=None))]
     fn __exit__(
-        &mut self,
+        &self,
         py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_value: Option<Py<PyAny>>,
         _exc_traceback: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
-        if self.inner.is_some() {
-            self.graceful_shutdown(py, None)?;
+        if py.detach(|| self.inner.lock().is_some()) {
+            match self.graceful_shutdown(py, None) {
+                Ok(()) => {}
+                // Consumed concurrently: nothing left to shut down.
+                Err(_) if py.detach(|| self.inner.lock().is_none()) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(false)
     }
 
-    fn __repr__(&self) -> String {
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let active = py.detach(|| self.inner.lock().is_some());
         format!(
             "MeshOsDaemonHandle(daemon_id={:#x}, name={:?}, active={})",
-            self.daemon_id,
-            self.daemon_name,
-            self.inner.is_some(),
+            self.daemon_id, self.daemon_name, active,
         )
     }
 }
@@ -1038,7 +1120,7 @@ impl PyMeshOsDaemonSdk {
         let daemon_id = handle.daemon_id();
         let daemon_name = handle.daemon_name().to_string();
         Ok(PyMeshOsDaemonHandle {
-            inner: Some(handle),
+            inner: parking_lot::Mutex::new(Some(handle)),
             runtime: self.runtime.clone(),
             daemon_id,
             daemon_name,
@@ -1175,8 +1257,8 @@ impl PyAsyncMeshOsDaemonHandle {
     /// `already_shutdown` afterward (calling any of its methods
     /// raises that error).
     #[staticmethod]
-    fn from_sync(handle: &mut PyMeshOsDaemonHandle) -> PyResult<Self> {
-        let core = handle.inner.take().ok_or_else(|| {
+    fn from_sync(handle: &PyMeshOsDaemonHandle) -> PyResult<Self> {
+        let core = handle.inner.lock().take().ok_or_else(|| {
             Python::attach(|py| {
                 sdk_err(py, "already_shutdown", "daemon handle was already consumed")
             })
@@ -1196,6 +1278,16 @@ impl PyAsyncMeshOsDaemonHandle {
     #[getter]
     fn daemon_name(&self) -> String {
         self.daemon_name.clone()
+    }
+
+    /// Whether no control event can ever arrive again (the runtime shut
+    /// down, or the handle was consumed). `False` while another task
+    /// holds the handle's lock — poll again.
+    fn control_closed(&self) -> bool {
+        match self.inner.try_lock() {
+            Ok(guard) => guard.as_ref().is_none_or(|h| h.control_closed()),
+            Err(_) => false,
+        }
     }
 
     /// Non-blocking control-event receive. Sync — no awaiting.

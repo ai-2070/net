@@ -288,10 +288,9 @@ impl BlobRef {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&hash);
-        let (signed, size_u64, _losses) = size.get_u64();
-        if signed {
-            return Err(blob_err("BlobRef", "size must be non-negative"));
-        }
+        // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
+        let size_u64 = crate::common::bigint_u64(size)
+            .map_err(|e| blob_err("BlobRef", format!("size: {e}")))?;
         Ok(Self {
             inner: InnerBlobRef::small(uri, arr, size_u64),
         })
@@ -307,13 +306,15 @@ impl BlobRef {
         self.inner.uri()
     }
 
-    /// 32-byte BLAKE3 hash. For Small (the only variant the Node
-    /// constructor produces today); v0.2 will surface chunked
-    /// manifests via a separate accessor.
+    /// 32-byte BLAKE3 content hash of a `Small` ref; `null` for a
+    /// chunked (`Manifest` / `Tree`) ref, which has no single content
+    /// hash. It used to be 32 zero bytes, collapsing every chunked blob
+    /// onto one cache key; C and Go refuse it (SDK audit 2026-10-11).
     #[napi(getter)]
-    pub fn hash(&self) -> Buffer {
-        let hash = self.inner.small_hash().copied().unwrap_or([0; 32]);
-        Buffer::from(hash.to_vec())
+    pub fn hash(&self) -> Option<Buffer> {
+        self.inner
+            .small_hash()
+            .map(|hash| Buffer::from(hash.to_vec()))
     }
 
     #[napi(getter)]
@@ -808,9 +809,13 @@ pub fn register_blob_adapter(
     let fetch: FetchTsfn = fetch_fn.build_threadsafe_function().build()?;
     let fetch_range: FetchRangeTsfn = fetch_range_fn.build_threadsafe_function().build()?;
     let exists: ExistsTsfn = exists_fn.build_threadsafe_function().build()?;
-    let timeout = timeout_ms
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(DEFAULT_JS_ADAPTER_TIMEOUT);
+    // `0` disables the cap, as on every `serve*` verb; it used to fail
+    // every adapter call at 0 ms (SDK audit 2026-10-11).
+    let timeout = match timeout_ms {
+        Some(0) => crate::common::UNCAPPED_WAIT,
+        Some(ms) => Duration::from_millis(ms as u64),
+        None => DEFAULT_JS_ADAPTER_TIMEOUT,
+    };
     let wrapper =
         NodeBlobAdapter::new_with_timeout(id.clone(), store, fetch, fetch_range, exists, timeout);
     let arc: Arc<dyn BlobAdapter> = Arc::new(wrapper);
@@ -916,7 +921,7 @@ where
     // 2*timeout. Without this an async adapter waiting on a slow
     // Promise after the TSFN stage already consumed most of the
     // budget would see effective `2*timeout`.
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = crate::common::deadline_after(timeout);
     let promise_step = tokio::time::timeout_at(deadline, rx).await;
     let promise = match promise_step {
         Ok(Ok(Ok(p))) => p,
@@ -1079,9 +1084,13 @@ pub fn register_async_blob_adapter(
     let fetch: FetchAsyncTsfn = fetch_fn.build_threadsafe_function().build()?;
     let fetch_range: FetchRangeAsyncTsfn = fetch_range_fn.build_threadsafe_function().build()?;
     let exists: ExistsAsyncTsfn = exists_fn.build_threadsafe_function().build()?;
-    let timeout = timeout_ms
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(DEFAULT_JS_ADAPTER_TIMEOUT);
+    // `0` disables the cap, as on every `serve*` verb; it used to fail
+    // every adapter call at 0 ms (SDK audit 2026-10-11).
+    let timeout = match timeout_ms {
+        Some(0) => crate::common::UNCAPPED_WAIT,
+        Some(ms) => Duration::from_millis(ms as u64),
+        None => DEFAULT_JS_ADAPTER_TIMEOUT,
+    };
     let wrapper = NodeAsyncBlobAdapter::new_with_timeout(
         id.clone(),
         store,
@@ -1346,8 +1355,12 @@ impl MeshBlobAdapter {
     ) -> Result<Buffer> {
         let adapter = self.inner.clone();
         let blob = blob_ref.inner.clone();
-        let (_, start_u, _) = start.get_u64();
-        let (_, end_u, _) = end.get_u64();
+        // via bigint_u64: a raw get_u64() reinterprets -5n as 5 and 2n**64n+3n as 3 (SDK audit 2026-10-11).
+        // Through `blob_err`, so a bad bound carries the documented `blob:`
+        // discriminator like every other failure here (cubic review of PR
+        // #1228).
+        let start_u = crate::common::bigint_u64(start).map_err(|e| blob_err("fetch_range", e))?;
+        let end_u = crate::common::bigint_u64(end).map_err(|e| blob_err("fetch_range", e))?;
         let bytes = adapter
             .fetch_range(&blob, start_u..end_u)
             .await

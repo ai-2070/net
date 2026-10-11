@@ -232,3 +232,27 @@ def test_describe_a2a_against_the_free_path_fails_fast():
                 m.shutdown()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def test_a2a_serve_handle_repr_does_not_deadlock():
+    # Code review 2026-10-11 PY-2: `__repr__` locked `inner` inside
+    # `format!` and then called `services()`, which re-locked the same
+    # non-reentrant mutex — `repr(handle)` hung with the GIL held.
+    mesh = _mesh_unstarted()
+
+    async def run_task(task_id, prompt, context_refs, tags):
+        return "blob://done"
+
+    done = []
+    try:
+        mesh.start()
+        handle = mesh.serve_a2a(run_task)
+        t = threading.Thread(target=lambda: done.append(repr(handle)), daemon=True)
+        t.start()
+        t.join(timeout=5)
+        assert done, "repr(A2aServeHandle) deadlocked"
+        assert "serving=true" in done[0].lower()
+        handle.stop()
+        assert "services=0" in repr(handle)
+    finally:
+        mesh.shutdown()

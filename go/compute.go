@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -72,6 +73,73 @@ type DaemonRuntime struct {
 	// runtime's callbacks don't leak.
 	runtimeID uint64
 	mu        sync.RWMutex
+	// pins counts native calls running on a pinned handle WITHOUT rt.mu
+	// held (see pin) — the group spawns, which call the user's factory
+	// synchronously. pendingFree holds the handle a Close detached while a
+	// pin was live; the last unpin frees it. Both are guarded by mu
+	// (pins is atomic so pin can bump it under the READ lock).
+	pins        atomic.Int64
+	pendingFree *C.net_compute_runtime_t
+}
+
+// pin returns the live handle with its lifetime extended past rt.mu: the
+// caller runs a native call on it with NO lock held and MUST call the
+// returned unpin afterwards. Returns (nil, nil) on a closed runtime.
+//
+// Group spawns invoke the user's factory synchronously from inside the
+// native call. Holding rt.mu's read lock there deadlocked a factory that
+// called rt.Close() (Close waits for the write lock the spawn's own read
+// lock blocks), and a factory calling any rt method while another
+// goroutine's Close was queued (code review 2026-10-11). A Close that
+// lands while a pin is live detaches the handle at once — every later
+// method sees a closed runtime — and leaves the free to the last unpin, so
+// the native spawn never runs on a freed runtime.
+func (rt *DaemonRuntime) pin() (*C.net_compute_runtime_t, func()) {
+	rt.mu.RLock()
+	h := rt.handle
+	if h != nil {
+		rt.pins.Add(1)
+	}
+	rt.mu.RUnlock()
+	if h == nil {
+		return nil, nil
+	}
+	return h, func() {
+		if rt.pins.Add(-1) != 0 {
+			return
+		}
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		if rt.pendingFree != nil && rt.pins.Load() == 0 {
+			shutdownDetached(rt.pendingFree)
+			rt.freeDetached(rt.pendingFree)
+			rt.pendingFree = nil
+		}
+	}
+}
+
+// shutdownDetached best-effort shuts down a handle Close already detached
+// (the error is discarded, as Close always has).
+func shutdownDetached(h *C.net_compute_runtime_t) {
+	var errOut *C.char
+	_ = C.net_compute_runtime_shutdown(h, &errOut)
+	if errOut != nil {
+		C.net_compute_free_cstring(errOut)
+	}
+}
+
+// freeDetached frees a handle Close already detached and purges the
+// runtime's factories. Called with rt.mu held for writing.
+func (rt *DaemonRuntime) freeDetached(h *C.net_compute_runtime_t) {
+	C.net_compute_runtime_free(h)
+	// Drop every factory registered against this runtime's id. Safe to
+	// call with `runtimeID == 0` (a never-initialized struct, e.g. from a
+	// test that zero-values the type): the purge is a no-op in that case.
+	// Deferred with the free so an in-flight pinned spawn still resolves
+	// the factories it needs.
+	if rt.runtimeID != 0 {
+		purgeFactoryFuncsForRuntime(rt.runtimeID)
+	}
 }
 
 // NewDaemonRuntime builds a DaemonRuntime bound to the given
@@ -85,37 +153,31 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 		return nil, &DaemonError{Message: "mesh is nil"}
 	}
 
-	// Hold the mesh's read lock across the Arc-clone FFI calls.
+	// Clone the Arcs with the mesh handle held live (withHandleForChild:
+	// the mesh's read lock, so a concurrent Shutdown cannot free the
+	// handle between the load and the clones). Once cloned, the Arcs keep
+	// the node alive by refcount, so nothing is held past the clones.
 	//
-	// TOCTOU guard: releasing the lock after the `mesh.handle` load
-	// but before `net_mesh_arc_clone` would let a concurrent
-	// `mesh.Shutdown()` (which takes the write lock, frees the
-	// native handle, and nils `mesh.handle`) slip in between — the
-	// captured `meshHandle` local would then be a dangling pointer,
-	// and the Arc-clone would dereference freed memory.
+	// withHandleForChild also refuses once mesh.Shutdown has BEGUN, not
+	// only once it has freed the handle: a runtime built beside the
+	// in-progress native shutdown was bound to a stopped node (code review
+	// 2026-10-11).
 	//
-	// Once we've cloned the Arcs they keep the underlying object
-	// alive by refcount, so there's no need to hold the lock past
-	// the clones. `Shutdown` on another goroutine will simply wait
-	// for our read lock to release, which is a short, bounded window
-	// dominated by two Arc increments.
-	mesh.mu.RLock()
-	meshHandle := mesh.handle
-	if meshHandle == nil {
-		mesh.mu.RUnlock()
+	// These pointers are consumed by net_compute_runtime_new on success —
+	// we only need to free them on the error path.
+	var nodeArc *C.net_compute_mesh_arc_t
+	var ccArc *C.net_compute_cc_arc_t
+	if !mesh.withHandleForChild(func(h unsafe.Pointer) {
+		nodeArc = C.net_mesh_arc_clone((*C.net_meshnode_t)(h))
+		if nodeArc != nil {
+			ccArc = C.net_mesh_channel_configs_arc_clone((*C.net_meshnode_t)(h))
+		}
+	}) {
 		return nil, &DaemonError{Message: "mesh has been closed"}
 	}
-
-	// Clone Arcs from the mesh. These pointers are consumed by
-	// net_compute_runtime_new on success — we only need to free
-	// them on the error path.
-	nodeArc := C.net_mesh_arc_clone(meshHandle)
 	if nodeArc == nil {
-		mesh.mu.RUnlock()
 		return nil, &DaemonError{Message: "failed to clone mesh Arc"}
 	}
-	ccArc := C.net_mesh_channel_configs_arc_clone(meshHandle)
-	mesh.mu.RUnlock()
 	if ccArc == nil {
 		C.net_mesh_arc_free(nodeArc)
 		return nil, &DaemonError{Message: "failed to clone channel configs Arc"}
@@ -123,9 +185,9 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 
 	handle := C.net_compute_runtime_new(nodeArc, ccArc)
 	if handle == nil {
-		// Constructor consumed the Arcs on success only. On a NULL
-		// return they'd still be intact — but we can't tell which
-		// input Rust faulted on, so we conservatively free both.
+		// The constructor consumes the Arcs on success only; a NULL
+		// return (including a panic caught mid-construction in an
+		// unwind build) leaves both intact, so they are ours to free.
 		C.net_mesh_arc_free(nodeArc)
 		C.net_mesh_channel_configs_arc_free(ccArc)
 		return nil, &DaemonError{Message: "failed to build runtime"}
@@ -143,13 +205,18 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 // already-ready runtime; returns an error if the runtime has been
 // shut down.
 func (rt *DaemonRuntime) Start() error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return ErrRuntimeShutDown
 	}
+	defer release()
 	var errOut *C.char
-	code := C.net_compute_runtime_start(rt.handle, &errOut)
+	code := C.net_compute_runtime_start(rh, &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -161,13 +228,18 @@ func (rt *DaemonRuntime) Start() error {
 // After Shutdown, the native handle is still allocated — call
 // Close to release it, or let the finalizer do so.
 func (rt *DaemonRuntime) Shutdown() error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return ErrRuntimeShutDown
 	}
+	defer release()
 	var errOut *C.char
-	code := C.net_compute_runtime_shutdown(rt.handle, &errOut)
+	code := C.net_compute_runtime_shutdown(rh, &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -230,6 +302,21 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 	// discriminator; per-runtime duplicate-kind rejection is the
 	// Rust layer's job (it returns `DUPLICATE_KIND` from the FFI
 	// when a given DaemonRuntime already has `kind` registered).
+	// A kind this runtime already holds is refused HERE, before the swap:
+	// swapping first briefly installed the factory Rust was about to reject,
+	// and a migration landing in that window was built with it (SDK audit
+	// 2026-10-11). Rust's DUPLICATE_KIND below still covers a kind
+	// registered through RegisterFactory.
+	//
+	// Check, swap and native call run with the (runtime, kind) key held,
+	// so a concurrent registration of the same kind cannot slip its
+	// factory in between and briefly displace the winner's (code review
+	// 2026-10-11). Lookups from the trampoline never take this lock.
+	release := lockFactoryRegistration(rt.runtimeID, kind)
+	defer release()
+	if lookupFactoryFunc(rt.runtimeID, kind) != nil {
+		return &DuplicateKindError{Kind: kind}
+	}
 	prev, existed, ourEpoch := swapFactoryFunc(rt.runtimeID, kind, factory)
 
 	kindBytes := []byte(kind)
@@ -323,19 +410,20 @@ func (rt *DaemonRuntime) Close() {
 	if rt.handle == nil {
 		return
 	}
-	var errOut *C.char
-	_ = C.net_compute_runtime_shutdown(rt.handle, &errOut)
-	if errOut != nil {
-		C.net_compute_free_cstring(errOut)
-	}
-	C.net_compute_runtime_free(rt.handle)
+	h := rt.handle
 	rt.handle = nil
-	// Drop every factory registered against this runtime's id.
-	// Safe to call with `runtimeID == 0` (a never-initialized
-	// struct, e.g. from a test that zero-values the type): the
-	// purge is a no-op in that case.
-	if rt.runtimeID != 0 {
-		purgeFactoryFuncsForRuntime(rt.runtimeID)
+	if rt.pins.Load() > 0 {
+		// A pinned native call (a group spawn, a Deliver — possibly the
+		// very one whose callback is waiting on this Close) still runs on
+		// h: the last unpin shuts it down and frees it. The native
+		// shutdown is deferred too: it drains daemons, so it waits for
+		// that in-flight call, and running it here blocked this Close
+		// behind the call — a deadlock when the call waited on the Close
+		// (cubic review of PR #1228). See pin.
+		rt.pendingFree = h
+	} else {
+		shutdownDetached(h)
+		rt.freeDetached(h)
 	}
 	runtime.SetFinalizer(rt, nil)
 }
@@ -410,11 +498,16 @@ func (rt *DaemonRuntime) Spawn(
 	daemon MeshDaemon,
 	cfg *DaemonHostConfig,
 ) (*DaemonHandle, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 	if daemon == nil {
 		return nil, &DaemonError{Message: "daemon is nil"}
 	}
@@ -451,7 +544,7 @@ func (rt *DaemonRuntime) Spawn(
 	var nativeHandle *C.net_compute_daemon_handle_t
 	var errOut *C.char
 	code := C.net_compute_spawn(
-		rt.handle,
+		rh,
 		kindPtr,
 		C.size_t(len(kindBytes)),
 		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
@@ -487,13 +580,18 @@ func (rt *DaemonRuntime) Spawn(
 // Stop removes the daemon identified by originHash from the
 // runtime's registry. Idempotent during ShuttingDown.
 func (rt *DaemonRuntime) Stop(originHash uint64) error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return ErrRuntimeShutDown
 	}
+	defer release()
 	var errOut *C.char
-	code := C.net_compute_runtime_stop(rt.handle, C.uint64_t(originHash), &errOut)
+	code := C.net_compute_runtime_stop(rh, C.uint64_t(originHash), &errOut)
 	return computeErr(code, errOut)
 }
 
@@ -505,14 +603,19 @@ func (rt *DaemonRuntime) Stop(originHash uint64) error {
 // The returned bytes round-trip through SpawnFromSnapshot; callers
 // treat the slice as opaque.
 func (rt *DaemonRuntime) Snapshot(originHash uint64) ([]byte, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 	var outputs *C.net_compute_outputs_t
 	var errOut *C.char
-	code := C.net_compute_runtime_snapshot(rt.handle, C.uint64_t(originHash), &outputs, &errOut)
+	code := C.net_compute_runtime_snapshot(rh, C.uint64_t(originHash), &outputs, &errOut)
 	if code != C.NET_COMPUTE_OK {
 		return nil, computeErr(code, errOut)
 	}
@@ -550,11 +653,16 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 	daemon MeshDaemon,
 	cfg *DaemonHostConfig,
 ) (*DaemonHandle, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 	if daemon == nil {
 		return nil, &DaemonError{Message: "daemon is nil"}
 	}
@@ -592,7 +700,7 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 	var nativeHandle *C.net_compute_daemon_handle_t
 	var errOut *C.char
 	code := C.net_compute_spawn_from_snapshot(
-		rt.handle,
+		rh,
 		kindPtr,
 		C.size_t(len(kindBytes)),
 		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
@@ -630,11 +738,16 @@ func (rt *DaemonRuntime) SpawnFromSnapshot(
 // originHash. Returns the daemon's output payloads (each a fresh
 // []byte).
 func (rt *DaemonRuntime) Deliver(originHash uint64, event CausalEvent) ([][]byte, error) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if rt.handle == nil {
+	// Pinned, not read-locked: this call can run user daemon code
+	// (Process / Snapshot / Restore), and a callback that closes the
+	// runtime deadlocked against a read lock held across it. A Close
+	// landing meanwhile defers the free until this call unpins (cubic
+	// review of PR #1228).
+	rh, release := rt.pin()
+	if rh == nil {
 		return nil, ErrRuntimeShutDown
 	}
+	defer release()
 
 	var payloadPtr *C.uint8_t
 	if len(event.Payload) > 0 {
@@ -644,7 +757,7 @@ func (rt *DaemonRuntime) Deliver(originHash uint64, event CausalEvent) ([][]byte
 	var outputs *C.net_compute_outputs_t
 	var errOut *C.char
 	code := C.net_compute_runtime_deliver(
-		rt.handle,
+		rh,
 		C.uint64_t(originHash),
 		C.uint64_t(event.OriginHash),
 		C.uint64_t(event.Sequence),

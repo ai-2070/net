@@ -192,6 +192,16 @@ extern int net_rpc_call_client_stream(
     ClientStreamCallHandleC** out_handle,
     char** out_err
 );
+extern int net_rpc_call_client_stream_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint64_t cancel_token,
+    ClientStreamCallHandleC** out_handle,
+    char** out_err
+);
 extern int net_rpc_client_stream_send(
     ClientStreamCallHandleC* handle,
     const uint8_t* body_ptr, size_t body_len,
@@ -213,6 +223,17 @@ extern int net_rpc_call_duplex(
     uint64_t deadline_ms,
     uint32_t request_window,
     uint32_t stream_window,
+    DuplexCallHandleC** out_handle,
+    char** out_err
+);
+extern int net_rpc_call_duplex_cancellable(
+    MeshRpcHandle* handle,
+    uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    uint64_t deadline_ms,
+    uint32_t request_window,
+    uint32_t stream_window,
+    uint64_t cancel_token,
     DuplexCallHandleC** out_handle,
     char** out_err
 );
@@ -268,6 +289,7 @@ int go_net_rpc_handler_trampoline(
 );
 
 // ABI 0x0002 — server-side dispatcher hooks.
+extern int net_rpc_request_stream_retire(RpcRequestStreamHandleC* handle);
 extern int net_rpc_request_stream_next(
     RpcRequestStreamHandleC* handle,
     uint8_t** out_chunk_ptr, size_t* out_chunk_len
@@ -361,6 +383,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/cgo"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -385,7 +408,12 @@ const (
 	RpcKindCodecEncode      RpcKind = "codec_encode"
 	RpcKindCodecDecode      RpcKind = "codec_decode"
 	RpcKindCapabilityDenied RpcKind = "capability_denied"
-	RpcKindUnknown          RpcKind = "unknown"
+	// RpcKindCancelled: the call was cancelled — by this caller's ctx
+	// (surfaced as ctx.Err() when ctx is done) or by a mesh-side cancel
+	// or teardown. Node and Python type it as RpcCancelledError; Go used
+	// to report it as Unknown (SDK audit 2026-10-11).
+	RpcKindCancelled RpcKind = "cancelled"
+	RpcKindUnknown   RpcKind = "unknown"
 )
 
 // RpcError is the typed error surfaced from any Call / CallService
@@ -394,6 +422,11 @@ const (
 type RpcError struct {
 	Kind    RpcKind
 	Message string
+	// Status is the handler's status code for a server_error (for
+	// example 0x0009, the org admission denial), parsed from the
+	// `status=0xNNNN` field; nil for every other kind. Node and Python
+	// expose the same value as `.status`.
+	Status *uint16
 }
 
 func (e *RpcError) Error() string {
@@ -413,12 +446,37 @@ func parseRpcError(raw string) *RpcError {
 	kind := RpcKind(strings.TrimSpace(raw[:colon]))
 	detail := strings.TrimSpace(raw[colon+1:])
 	switch kind {
-	case RpcKindNoRoute, RpcKindTimeout, RpcKindServerError,
+	case RpcKindServerError:
+		return &RpcError{Kind: kind, Message: detail, Status: parseServerStatus(detail)}
+	case RpcKindNoRoute, RpcKindTimeout,
 		RpcKindTransport, RpcKindCodecEncode, RpcKindCodecDecode,
-		RpcKindCapabilityDenied:
+		RpcKindCapabilityDenied, RpcKindCancelled:
 		return &RpcError{Kind: kind, Message: detail}
 	}
 	return &RpcError{Kind: RpcKindUnknown, Message: raw}
+}
+
+// parseServerStatus reads the `status=0xNNNN` field `format_rpc_error`
+// writes first in a server_error detail; nil when it is absent or
+// malformed.
+func parseServerStatus(detail string) *uint16 {
+	field, ok := strings.CutPrefix(detail, "status=")
+	if !ok {
+		return nil
+	}
+	if end := strings.IndexByte(field, ' '); end >= 0 {
+		field = field[:end]
+	}
+	hex, ok := strings.CutPrefix(field, "0x")
+	if !ok {
+		return nil
+	}
+	v, err := strconv.ParseUint(hex, 16, 16)
+	if err != nil {
+		return nil
+	}
+	status := uint16(v)
+	return &status
 }
 
 // =====================================================================
@@ -676,6 +734,13 @@ var ErrRpcClosed = errors.New("net.MeshRpc: handle is closed")
 // release the handle.
 var ErrStreamDone = errors.New("net.RpcStream: stream is done")
 
+// ErrSplitWhileReceiving is returned by DuplexCall.Split when a Recv is
+// parked on the same call. The native side holds the stream across a
+// parked Recv, so Split used to block until that Recv returned — forever,
+// on a quiet stream. Split before handing the call to goroutines, or
+// stop the reader first (SDK audit 2026-10-11).
+var ErrSplitWhileReceiving = errors.New("net.DuplexCall: Split while a Recv is in flight")
+
 // ABIVersion returns the C-ABI version exported by the linked
 // `libnet_rpc`. Compare against `ExpectedABIVersion` at process
 // init to detect drift.
@@ -760,7 +825,7 @@ func (r *MeshRpc) Call(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installCancelWatcher(ctx, r)
+	cancelToken, inflight, stopWatcher := installCancelWatcher(ctx, r)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -768,6 +833,8 @@ func (r *MeshRpc) Call(
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_rpc_call(
 			h,
 			C.uint64_t(targetNodeID),
@@ -798,7 +865,7 @@ func (r *MeshRpc) CallService(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installCancelWatcher(ctx, r)
+	cancelToken, inflight, stopWatcher := installCancelWatcher(ctx, r)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -806,6 +873,8 @@ func (r *MeshRpc) CallService(
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		inflight.enter(unsafe.Pointer(h))
+		defer inflight.leave()
 		code = C.net_rpc_call_service(
 			h,
 			(*C.char)(cService.ptr), cService.len,
@@ -895,14 +964,11 @@ func readCancellableResult(
 	if err == nil {
 		return out, nil
 	}
-	// The Rust side emits "cancelled: call cancelled by caller"
-	// for our cancel-token path. parseRpcError tags those as
-	// kind=unknown (the canonical kind set doesn't include
-	// "cancelled" yet — adding it is a follow-up). Detect by
-	// substring and surface the user's ctx.Err() if it fired.
+	// A cancellation while the caller's ctx is done is that ctx firing:
+	// surface ctx.Err() so `errors.Is(err, context.Canceled)` works. A
+	// cancellation ctx did not cause stays RpcKindCancelled.
 	if ctx != nil && ctx.Err() != nil {
-		if rpcErr, ok := err.(*RpcError); ok &&
-			strings.Contains(rpcErr.Message, "cancelled by caller") {
+		if rpcErr, ok := err.(*RpcError); ok && rpcErr.Kind == RpcKindCancelled {
 			return nil, ctx.Err()
 		}
 	}
@@ -921,48 +987,30 @@ func readCancellableResult(
 // call runs in the non-cancellable fast path.
 //
 // ABI 0x0004: token reservation and cancel routing are scoped to
-// the mesh, so both calls go through `r.withHandle`. If the mesh
-// is closed before the watcher fires, the cancel is a quiet no-op.
-func installCancelWatcher(ctx context.Context, r *MeshRpc) (uint64, func()) {
+// the mesh. Reservation goes through `r.withHandle`; the cancel fires
+// through the returned inflightCancel, which the call arms with its
+// live handle (enter/leave) for the span it is inside native code. If
+// the call is not in flight, the cancel is remembered or dropped.
+func installCancelWatcher(ctx context.Context, r *MeshRpc) (uint64, *inflightCancel, func()) {
 	if ctx == nil || ctx.Done() == nil || r == nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	var token uint64
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
 		token = uint64(C.net_rpc_reserve_cancel_token(h))
 	}); err != nil {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
 	if token == 0 {
-		return 0, func() {}
+		return 0, nil, func() {}
 	}
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		select {
-		case <-ctx.Done():
-			// Re-acquire the read lock for the cancel call so a
-			// concurrent Close can't free the handle out from under
-			// us. ErrRpcClosed is a quiet drop — substrate's cancel
-			// is best-effort.
-			_ = r.withHandle(func(h *C.MeshRpcHandle) {
-				C.net_rpc_cancel_call(h, C.uint64_t(token))
-			})
-		case <-stop:
-		}
-	}()
-	return token, func() {
-		// Idempotent stop. The watcher exits on either branch of
-		// the select; closing `stop` is safe to call once.
-		select {
-		case <-stop:
-			// already closed
-		default:
-			close(stop)
-		}
-		<-done
-	}
+	// The cancel fires against the handle the call itself published while
+	// inside native code (see inflightCancel) — never via r.withHandle,
+	// which deadlocks against a queued Close.
+	ic := newInflightCancel(token, func(h unsafe.Pointer, t uint64) {
+		C.net_rpc_cancel_call((*C.MeshRpcHandle)(h), C.uint64_t(t))
+	})
+	return token, ic, ic.watchCtx(ctx.Done())
 }
 
 // =====================================================================
@@ -1016,10 +1064,21 @@ type streamHandleGuard struct {
 	state atomic.Int64
 	// free performs the actual FFI teardown; invoked exactly once.
 	free func()
+	// wake, when set, fires the call's substrate cancel token. The
+	// first requestFree runs it BEFORE waiting on in-flight ops: an op
+	// parked inside native code (Recv / Send / Finish) never returns on
+	// its own, so without the cancel the deferred free — and the CANCEL
+	// on the wire — never happened (SDK audit 2026-10-11).
+	wake func()
 }
 
 func newStreamHandleGuard(free func()) *streamHandleGuard {
 	return &streamHandleGuard{free: free}
+}
+
+// closing reports whether teardown has been requested.
+func (g *streamHandleGuard) closing() bool {
+	return g.state.Load()&1 != 0
 }
 
 // enter registers an in-flight op. Returns false if teardown has
@@ -1056,6 +1115,20 @@ func (g *streamHandleGuard) leave() {
 // caller wins). Frees immediately if no op is in flight, otherwise the
 // last op to leave() will. Never blocks.
 func (g *streamHandleGuard) requestFree() {
+	g.requestFreeWaking(true)
+}
+
+// requestFreeQuiet is requestFree without the wake: for a terminal op
+// that hands the call on rather than ending it. DuplexCall.Split is the
+// one caller — its own enter() is still counted in flight, so
+// requestFree would always see an op in flight and fire the substrate
+// cancel, killing the very call the split halves now own (code review
+// 2026-10-11, GO-1).
+func (g *streamHandleGuard) requestFreeQuiet() {
+	g.requestFreeWaking(false)
+}
+
+func (g *streamHandleGuard) requestFreeWaking(wake bool) {
 	for {
 		s := g.state.Load()
 		if s&1 != 0 {
@@ -1064,6 +1137,9 @@ func (g *streamHandleGuard) requestFree() {
 		if g.state.CompareAndSwap(s, s|1) {
 			if s>>1 == 0 { // no ops in flight
 				g.free()
+			} else if wake && g.wake != nil {
+				// Wake the parked op; its leave() then runs the free.
+				g.wake()
 			}
 			return
 		}
@@ -1095,6 +1171,69 @@ func spawnCtxCancelWatcher(
 		close(watcherDone)
 	}()
 	return cancel, watcherDone
+}
+
+// reserveStreamCancel reserves a substrate cancel token for a streaming
+// call and returns it with the wake hook its streamHandleGuard fires on
+// teardown. Token 0 (closed MeshRpc / reservation failed) yields a nil
+// hook and the non-cancellable constructor path.
+//
+// The hook captures only `r`, never the call struct (finalizers stay
+// live). It takes r.mu with TryRLock: a MeshRpc whose own Close is
+// already queued is being torn down anyway, and blocking here behind it
+// is exactly the deadlock the unary path had.
+func (r *MeshRpc) reserveStreamCancel() (uint64, func()) {
+	var token uint64
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		token = uint64(C.net_rpc_reserve_cancel_token(h))
+	}); err != nil || token == 0 {
+		return 0, nil
+	}
+	return token, func() {
+		if !r.mu.TryRLock() {
+			return
+		}
+		defer r.mu.RUnlock()
+		if r.handle != nil {
+			C.net_rpc_cancel_call(r.handle, C.uint64_t(token))
+		}
+	}
+}
+
+// watchStreamConstruction arms ctx cancellation for the span a streaming
+// constructor is inside native code. The constructor's block_on awaits the
+// peer's initial-frame ACK; spawnCtxCancelWatcher only exists once the
+// handle does, so without this a ctx cancelled mid-construction could not
+// abort that wait — the constructor sat out the full call deadline (code
+// review 2026-10-11).
+//
+// The cancel fires the substrate token the constructor was given, against
+// the handle the call publishes via inflightCancel (enter/leave inside
+// withHandle) — never via r.withHandle, which deadlocks against a queued
+// Close. The returned stop MUST run on every exit path (defer it); it joins
+// the watcher. Token 0 or a ctx without Done yields (nil, noop).
+func watchStreamConstruction(ctx context.Context, token uint64) (*inflightCancel, func()) {
+	if token == 0 || ctx == nil || ctx.Done() == nil {
+		return nil, func() {}
+	}
+	ic := newInflightCancel(token, func(h unsafe.Pointer, t uint64) {
+		C.net_rpc_cancel_call((*C.MeshRpcHandle)(h), C.uint64_t(t))
+	})
+	return ic, ic.watchCtx(ctx.Done())
+}
+
+// streamConstructError classifies a failed streaming construction. A
+// cancellation while the caller's ctx is done is that ctx firing: surface
+// ctx.Err() so `errors.Is(err, context.Canceled)` works, as the unary
+// paths do (readCancellableResult).
+func streamConstructError(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		var rpcErr *RpcError
+		if errors.As(err, &rpcErr) && rpcErr.Kind == RpcKindCancelled {
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 // RpcStream is an open streaming RPC call. Recv blocks until the
@@ -1150,17 +1289,24 @@ func (r *MeshRpc) CallStreaming(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
+	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
-		code = C.net_rpc_call_streaming(
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
+		code = C.net_rpc_call_streaming_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.Window),
+			C.uint64_t(cancelToken),
 			&outStream,
 			&outErr,
 		)
@@ -1169,13 +1315,14 @@ func (r *MeshRpc) CallStreaming(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outStream
 	guard := newStreamHandleGuard(func() {
 		C.net_rpc_stream_close(handlePtr)
 		C.net_rpc_stream_free(handlePtr)
 	})
+	guard.wake = wake
 	stream := &RpcStream{
 		rpc:    r,
 		handle: outStream,
@@ -1210,17 +1357,23 @@ func (r *MeshRpc) CallServiceStreaming(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
+	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outStream *C.RpcStreamHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
 		code = C.net_rpc_call_service_streaming(
 			h,
 			(*C.char)(cService.ptr), cService.len,
 			cReq.ptr, cReq.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.Window),
-			C.uint64_t(0), // cancel_token=0 — ctx-watcher path
+			C.uint64_t(cancelToken),
 			&outStream,
 			&outErr,
 		)
@@ -1229,13 +1382,14 @@ func (r *MeshRpc) CallServiceStreaming(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outStream
 	guard := newStreamHandleGuard(func() {
 		C.net_rpc_stream_close(handlePtr)
 		C.net_rpc_stream_free(handlePtr)
 	})
+	guard.wake = wake
 	stream := &RpcStream{
 		rpc:    r,
 		handle: outStream,
@@ -1614,16 +1768,23 @@ func (r *MeshRpc) CallClientStream(
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
+	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outHandle *C.ClientStreamCallHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
-		code = C.net_rpc_call_client_stream(
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
+		code = C.net_rpc_call_client_stream_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
 			(*C.char)(cService.ptr), cService.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.RequestWindow),
+			C.uint64_t(cancelToken),
 			&outHandle,
 			&outErr,
 		)
@@ -1632,12 +1793,13 @@ func (r *MeshRpc) CallClientStream(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outHandle
 	guard := newStreamHandleGuard(func() {
 		C.net_rpc_client_stream_free(handlePtr)
 	})
+	guard.wake = wake
 	call := &ClientStreamCall{
 		rpc:    r,
 		handle: outHandle,
@@ -1774,6 +1936,12 @@ type DuplexCall struct {
 	guard       *streamHandleGuard
 	cancel      context.CancelFunc
 	watcherDone chan struct{}
+	// Split/Recv handshake (sequentially consistent atomics): Split raises
+	// splitting, then backs out if a Recv is in flight; a Recv counts
+	// itself in, then backs out if a Split has started. One of the two
+	// always sees the other, so Split never parks behind a Recv.
+	recvActive atomic.Int32
+	splitting  atomic.Bool
 }
 
 // CallDuplex opens a duplex call. ctx semantics same as
@@ -1788,17 +1956,24 @@ func (r *MeshRpc) CallDuplex(
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
 
+	cancelToken, wake := r.reserveStreamCancel()
+	// Arm ctx for the blocking construction itself; stopped on every exit.
+	constructing, stopConstructing := watchStreamConstruction(ctx, cancelToken)
+	defer stopConstructing()
 	var outHandle *C.DuplexCallHandleC
 	var outErr *C.char
 	var code C.int
 	if err := r.withHandle(func(h *C.MeshRpcHandle) {
-		code = C.net_rpc_call_duplex(
+		constructing.enter(unsafe.Pointer(h))
+		defer constructing.leave()
+		code = C.net_rpc_call_duplex_cancellable(
 			h,
 			C.uint64_t(targetNodeID),
 			(*C.char)(cService.ptr), cService.len,
 			C.uint64_t(deadlineMs),
 			C.uint32_t(opts.RequestWindow),
 			C.uint32_t(opts.StreamWindow),
+			C.uint64_t(cancelToken),
 			&outHandle,
 			&outErr,
 		)
@@ -1807,12 +1982,13 @@ func (r *MeshRpc) CallDuplex(
 	}
 	if code != 0 {
 		msg := readCError(outErr)
-		return nil, parseRpcError(msg)
+		return nil, streamConstructError(ctx, parseRpcError(msg))
 	}
 	handlePtr := outHandle
 	guard := newStreamHandleGuard(func() {
 		C.net_rpc_duplex_free(handlePtr)
 	})
+	guard.wake = wake
 	call := &DuplexCall{
 		rpc:    r,
 		handle: outHandle,
@@ -1875,6 +2051,19 @@ func (d *DuplexCall) FinishSending() error {
 // Recv blocks until the next response chunk arrives or the
 // stream terminates. Returns ErrStreamDone on clean end.
 func (d *DuplexCall) Recv() ([]byte, error) {
+	d.recvActive.Add(1)
+	defer d.recvActive.Add(-1)
+	// A Split under way either backs out (it saw this Recv counted in)
+	// or completes and closes the guard — both promptly, as Split never
+	// waits. Wait for whichever: returning ErrStreamDone on sight told a
+	// reader a live call had ended cleanly when the Split backed out
+	// (code review 2026-10-11, GO-4).
+	for d.splitting.Load() {
+		if d.guard.closing() {
+			return nil, ErrStreamDone // split: the halves own the call now
+		}
+		runtime.Gosched()
+	}
 	if !d.guard.enter() {
 		return nil, ErrStreamDone
 	}
@@ -1907,7 +2096,19 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 // "done" — Send / FinishSending / Recv / Close on it become
 // no-ops. CANCEL fires only when BOTH split halves drop without
 // a clean close.
+//
+// Split does not wait for a Recv on the same call: with one in flight it
+// returns ErrSplitWhileReceiving and leaves the call usable (the native
+// side holds the stream across a parked Recv, so waiting could block
+// forever). A Recv that starts while a Split is under way waits for its
+// outcome: ErrStreamDone once the split succeeds, a normal Recv if it
+// backs out. Split before handing the call to goroutines.
 func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
+	d.splitting.Store(true)
+	if d.recvActive.Load() != 0 {
+		d.splitting.Store(false)
+		return nil, nil, ErrSplitWhileReceiving
+	}
 	// Split is the terminal op. enter() fails (ErrStreamDone) if
 	// Close/the watcher already requested teardown.
 	if !d.guard.enter() {
@@ -1921,7 +2122,8 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 	// Terminal: request teardown and leave so the empty shell is freed
 	// once this op (and any draining Send/Recv) has left. The split
 	// halves below use the new outSink/outStream handles, not d.handle.
-	d.guard.requestFree()
+	// Quiet: the call lives on in the halves, so no substrate cancel.
+	d.guard.requestFreeQuiet()
 	d.guard.leave()
 	if d.cancel != nil {
 		d.cancel()
@@ -2119,22 +2321,26 @@ func (s *DuplexStream) finalize() { s.Close() }
 // be retained past the callback.
 type RequestStreamRecv struct {
 	handle *C.RpcRequestStreamHandleC
-	// invalidated is flipped to 1 by the trampoline after the
-	// handler returns; Recv checks it before any cgo call so a
-	// user goroutine that captures the wrapper past the callback
-	// returns ErrStreamDone instead of dereferencing a freed C
-	// handle. Use atomic.Int32 — the Go runtime guarantees
-	// happens-before between the trampoline's Store and the
-	// reader's Load.
-	invalidated atomic.Int32
+	// gate brackets every Recv's cgo call. The trampoline retires it
+	// before returning to Rust (which then frees the handle): a
+	// goroutine the handler spawned sees ErrStreamDone afterwards, and
+	// one parked in native next is woken and waited for first. See
+	// serverHandleGate.
+	gate serverHandleGate
+}
+
+// retire is called by the trampoline once the handler has returned.
+func (r *RequestStreamRecv) retire() {
+	r.gate.retire(func() { C.net_rpc_request_stream_retire(r.handle) })
 }
 
 // Recv blocks until the next inbound chunk arrives. Returns
 // ErrStreamDone on caller-side REQUEST_END or CANCEL.
 func (r *RequestStreamRecv) Recv() ([]byte, error) {
-	if r == nil || r.handle == nil || r.invalidated.Load() != 0 {
+	if r == nil || r.handle == nil || !r.gate.enter() {
 		return nil, ErrStreamDone
 	}
+	defer r.gate.leave()
 	var outChunk *C.uint8_t
 	var outChunkLen C.size_t
 	code := C.net_rpc_request_stream_next(r.handle, &outChunk, &outChunkLen)
@@ -2163,20 +2369,23 @@ func (r *RequestStreamRecv) Recv() ([]byte, error) {
 // lifetime contract as *RequestStreamRecv.
 type ResponseSinkSend struct {
 	handle *C.RpcResponseSinkHandleC
-	// Same invalidation gate as RequestStreamRecv: flipped after
-	// the handler returns so a goroutine that captures the sink
-	// can't UAF on the freed C handle.
-	invalidated atomic.Int32
+	// Same gate as RequestStreamRecv. Send never parks (try_send), so
+	// retiring only has to wait for an in-flight Send to leave.
+	gate serverHandleGate
 }
+
+// retire is called by the trampoline once the handler has returned.
+func (s *ResponseSinkSend) retire() { s.gate.retire(nil) }
 
 // Send emits one response chunk. Non-blocking — the SDK's
 // underlying try_send drops on overflow. Returns ErrStreamDone
 // only if the sink has already been torn down (caller cancelled
 // mid-stream).
 func (s *ResponseSinkSend) Send(body []byte) error {
-	if s == nil || s.handle == nil || s.invalidated.Load() != 0 {
+	if s == nil || s.handle == nil || !s.gate.enter() {
 		return ErrStreamDone
 	}
+	defer s.gate.leave()
 	cBody, freeBody := bytesToCBytes(body)
 	defer freeBody()
 	code := C.net_rpc_response_sink_send(s.handle, cBody.ptr, cBody.len)
@@ -2272,7 +2481,7 @@ func go_net_rpc_client_streaming_trampoline(
 	// the handler captured into a goroutine will now see
 	// ErrStreamDone on Recv instead of dereferencing the C handle
 	// that Rust is about to free.
-	stream.invalidated.Store(1)
+	stream.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -2326,8 +2535,8 @@ func go_net_rpc_duplex_trampoline(
 	// to free the underlying handles, and any goroutine the
 	// handler spawned that captured them must see ErrStreamDone
 	// on subsequent Recv / Send instead of UAF.
-	stream.invalidated.Store(1)
-	sink.invalidated.Store(1)
+	stream.retire()
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -2390,7 +2599,7 @@ func go_net_rpc_streaming_trampoline(
 	err := safeCallStreamingHandler(handler, req, sink)
 	// Invalidate the sink wrapper before returning — Rust is about
 	// to free the underlying handle.
-	sink.invalidated.Store(1)
+	sink.retire()
 	if err != nil {
 		writeCError(outErr, err.Error())
 		return -1
@@ -2643,7 +2852,7 @@ func newDuplexCallFromOrg(p unsafe.Pointer) *DuplexCall {
 // newRequestStreamRecvFromPtr wraps a per-call request-stream handle the
 // org shape dispatchers borrowed across one callback. Same
 // lifetime contract as the nRPC trampolines' wrappers: bounded by the
-// callback; the org trampoline flips `invalidated` before returning.
+// callback; the org trampoline retires the wrapper (serverHandleGate) before returning.
 func newRequestStreamRecvFromPtr(p unsafe.Pointer) *RequestStreamRecv {
 	return &RequestStreamRecv{handle: (*C.RpcRequestStreamHandleC)(p)}
 }

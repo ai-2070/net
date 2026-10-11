@@ -94,9 +94,15 @@ class EventStream:
 
             response = self._poll()
 
+            # Adopt the core's cursor on EVERY poll: a filtered poll whose
+            # whole window was filtered out still advances ``next_id`` past
+            # it (and sets ``has_more``). Dropping it re-read the same window
+            # forever (SDK audit 2026-10-11). ``None`` keeps the cursor.
+            if response.next_id is not None:
+                self._cursor = response.next_id
+
             if len(response) > 0:
                 backoff = poll_interval
-                self._cursor = response.next_id
 
                 for event in response:
                     yield event
@@ -109,6 +115,9 @@ class EventStream:
                 # and loop tight to keep up.
                 if len(response) < self._opts.limit:
                     time.sleep(poll_interval)
+            elif response.has_more:
+                # All fetched events were filtered out; keep paging forward.
+                backoff = poll_interval
             else:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
@@ -127,17 +136,32 @@ class EventStream:
                 if elapsed >= self._opts.timeout:
                     return
 
-            response = self._poll()
+            # Off the event loop: a poll is a synchronous native call (a
+            # network round trip on Redis / JetStream), and running it on
+            # the loop stalled every other task for its duration (SDK
+            # audit 2026-10-11).
+            response = await asyncio.to_thread(self._poll)
+
+            # Adopt the core's cursor on EVERY poll: a filtered poll whose
+            # whole window was filtered out still advances ``next_id`` past
+            # it (and sets ``has_more``). Dropping it re-read the same window
+            # forever (SDK audit 2026-10-11). ``None`` keeps the cursor.
+            if response.next_id is not None:
+                self._cursor = response.next_id
 
             if len(response) > 0:
                 backoff = poll_interval
-                self._cursor = response.next_id
 
                 for event in response:
                     yield event
 
                 if len(response) < self._opts.limit:
                     await asyncio.sleep(poll_interval)
+            elif response.has_more:
+                # All fetched events were filtered out; keep paging forward.
+                # Yield to the loop so a long filtered run stays cooperative.
+                backoff = poll_interval
+                await asyncio.sleep(0)
             else:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)

@@ -1,5 +1,5 @@
 {
-  "doc": "One rule, two probes (ANCHOR_DUAL_STACK_PLAN.md, defect 3). Each case is what one diagnostic probe connection reported before its deadline, in order, and the verdict: `answered` (a STUN response came back), `unanswered` (the probe ran and nothing came back) or `notRun` (the engine failed the connection before gathering a single candidate, so nothing was sent). Read by leaf/tests/stun_probe_parity.rs (Rust: probe_verdict) and browser-ts/test/classification.test.ts (TypeScript: stunProbeVerdict). A case that one side answers differently fails that side's test.",
+  "doc": "One rule, two probes (ANCHOR_DUAL_STACK_PLAN.md, defect 3). Each case is what one diagnostic probe connection reported before its deadline, in order, and the verdict: `answered` (a STUN response came back), `unanswered` (the probe ran and nothing came back) or `notRun` (the engine failed the connection before gathering a single candidate, so nothing was sent; or gathering completed with no answer and no no-response report while a host candidate carried a literal PUBLIC address, so the engine may have suppressed an answered srflx equal to it: inconclusive). Read by leaf/tests/stun_probe_parity.rs (Rust: probe_verdict) and browser-ts/test/classification.test.ts (TypeScript: stunProbeVerdict). A case that one side answers differently fails that side's test.",
   "cases": [
     {
       "name": "a server-reflexive candidate is an answer",
@@ -158,6 +158,96 @@
         },
         {
           "ice": "failed"
+        }
+      ],
+      "verdict": "answered"
+    },
+    {
+      "name": "gathering that completed with only a private host candidate is unanswered (what blocked UDP looks like)",
+      "events": [
+        {
+          "candidate": "candidate:2 1 udp 2122260223 192.168.1.2 50001 typ host generation 0"
+        },
+        {
+          "gathering": "complete"
+        }
+      ],
+      "verdict": "unanswered"
+    },
+    {
+      "name": "gathering that completed with a public IPv4 host candidate is inconclusive (srflx may be suppressed)",
+      "events": [
+        {
+          "candidate": "candidate:2 1 udp 2122260223 198.51.100.7 50001 typ host generation 0"
+        },
+        {
+          "gathering": "complete"
+        }
+      ],
+      "verdict": "notRun"
+    },
+    {
+      "name": "gathering that completed with a global IPv6 host candidate is inconclusive",
+      "events": [
+        {
+          "candidate": "candidate:2 1 udp 2122260223 2001:db8::7 50001 typ host generation 0"
+        },
+        {
+          "gathering": "complete"
+        }
+      ],
+      "verdict": "notRun"
+    },
+    {
+      "name": "gathering that completed with an mDNS host candidate is unanswered (an obfuscated address is not known public)",
+      "events": [
+        {
+          "candidate": "candidate:3 1 udp 2122260223 9f1c2a3b-4d5e.local 50002 typ host"
+        },
+        {
+          "gathering": "complete"
+        }
+      ],
+      "verdict": "unanswered"
+    },
+    {
+      "name": "gathering that completed with link-local and CGNAT host candidates is unanswered",
+      "events": [
+        {
+          "candidate": "candidate:5 1 udp 2122260223 fe80::1 50003 typ host"
+        },
+        {
+          "candidate": "candidate:6 1 udp 2122260223 100.64.1.2 50004 typ host"
+        },
+        {
+          "gathering": "complete"
+        }
+      ],
+      "verdict": "unanswered"
+    },
+    {
+      "name": "a no-response report before completion is still unanswered",
+      "events": [
+        {
+          "candidate": "candidate:2 1 udp 2122260223 192.168.1.2 50001 typ host generation 0"
+        },
+        {
+          "error": 701
+        },
+        {
+          "gathering": "complete"
+        }
+      ],
+      "verdict": "unanswered"
+    },
+    {
+      "name": "an answer before completion is still an answer",
+      "events": [
+        {
+          "candidate": "candidate:1 1 udp 1686052607 203.0.113.9 50000 typ srflx"
+        },
+        {
+          "gathering": "complete"
         }
       ],
       "verdict": "answered"

@@ -123,24 +123,6 @@ from net_sdk.mesh import (
     Visibility,
 )
 from net_sdk.node import NetNode
-from net_sdk.org import (
-    HANDLER_DROP_CONTRACT,
-    AsyncOrgClient,
-    OrgAdmissionDeniedError,
-    OrgClient,
-    OrgCredentials,
-    OrgCredentialsError,
-    OrgDiscoveryError,
-    OrgError,
-    OrgServeHandle,
-    OrgUnclassifiedError,
-    install_org_authority,
-    install_provider_grant_audience,
-    serve_org,
-    serve_org_client_stream,
-    serve_org_duplex,
-    serve_org_streaming,
-)
 from net_sdk.types import Receipt
 from net_sdk.stream import EventStream, TypedEventStream
 
@@ -171,26 +153,6 @@ __all__ = [
     "PublishReport",
     "Visibility",
     "OnFailure",
-    # Organization capability auth (the §4.4 facade — thin forwarding over
-    # the wheel's org surface; the typed wrappers + the `org:` vocabulary
-    # mirror live at `net_sdk.org.TypedOrgClient` / `.serve_org_typed` /
-    # `.parse_org_error` / `.classify_org_error` / `.ParsedOrgError`).
-    "HANDLER_DROP_CONTRACT",
-    "OrgCredentials",
-    "OrgClient",
-    "AsyncOrgClient",
-    "OrgServeHandle",
-    "install_org_authority",
-    "install_provider_grant_audience",
-    "serve_org",
-    "serve_org_streaming",
-    "serve_org_client_stream",
-    "serve_org_duplex",
-    "OrgError",
-    "OrgCredentialsError",
-    "OrgDiscoveryError",
-    "OrgAdmissionDeniedError",
-    "OrgUnclassifiedError",
     # Capability-aggregation surface (Phase 6c).
     "Aggregation",
     "AggregationCls",
@@ -383,6 +345,64 @@ __all__ += [
     "credential_requires_consent",
     "default_pin_store_path",
 ]
+
+# Organization capability auth (the §4.4 facade — thin forwarding over the
+# wheel's org surface; the typed wrappers + the `org:` vocabulary mirror live
+# at `net_sdk.org.TypedOrgClient` / `.serve_org_typed` / `.parse_org_error` /
+# `.classify_org_error` / `.ParsedOrgError`). `org` is an optional wheel
+# feature: guarded like every other optional surface, so a build without it
+# (a plain `maturin develop`, an sdist install) still imports the package
+# instead of failing on `NetNode` itself (SDK audit 2026-10-11).
+try:
+    from net_sdk.org import (  # noqa: E402
+        HANDLER_DROP_CONTRACT,
+        AsyncOrgClient,
+        OrgAdmissionDeniedError,
+        OrgClient,
+        OrgCredentials,
+        OrgCredentialsError,
+        OrgDiscoveryError,
+        OrgError,
+        OrgServeHandle,
+        OrgUnclassifiedError,
+        install_org_authority,
+        install_provider_grant_audience,
+        serve_org,
+        serve_org_client_stream,
+        serve_org_duplex,
+        serve_org_streaming,
+    )
+except ImportError as _org_err:
+    # Only "the wheel was built without `org`" is swallowed: the native
+    # `net` module then lacks the whole org surface (`OrgClient` included)
+    # and the failure is `from net import ...` naming `net`. Anything else —
+    # a wheel that HAS the org surface but is missing one symbol, or a
+    # failure inside `net_sdk.org` itself — is a broken org surface and
+    # must not silently remove the names from the package.
+    import net as _net_native
+
+    if _org_err.name != "net" or hasattr(_net_native, "OrgClient"):
+        raise
+    del _net_native
+else:
+    __all__ += [
+        "HANDLER_DROP_CONTRACT",
+        "OrgCredentials",
+        "OrgClient",
+        "AsyncOrgClient",
+        "OrgServeHandle",
+        "install_org_authority",
+        "install_provider_grant_audience",
+        "serve_org",
+        "serve_org_streaming",
+        "serve_org_client_stream",
+        "serve_org_duplex",
+        "OrgError",
+        "OrgCredentialsError",
+        "OrgDiscoveryError",
+        "OrgAdmissionDeniedError",
+        "OrgUnclassifiedError",
+    ]
 
 try:
     from net_sdk.consent import (  # noqa: E402

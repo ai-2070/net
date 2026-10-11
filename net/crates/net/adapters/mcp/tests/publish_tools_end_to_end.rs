@@ -925,3 +925,70 @@ async fn a_refreshed_priced_local_tool_still_enforces_payment() {
         host.shutdown().await.ok();
     }
 }
+
+/// SDK audit 2026-10-11: two INDEPENDENT `ServerPublisher`s over the same
+/// node (the bindings built a fresh one per `publish_tools` call, so a free
+/// plus a paid publication was enough) must join one merge. Before the fix
+/// the second announced only its own tools — wiping the first's — then
+/// failed on the already-served describe service and rolled back to an
+/// empty announcement, leaving the first publication undiscoverable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_publishers_on_one_node_merge_into_one_announcement() {
+    let caller = build_mesh(&[0x5Au8; 32]).await;
+    let host = Arc::new(build_mesh(&[0x5Au8; 32]).await);
+    handshake(&caller, &host).await;
+    let b_id = host.inner().node_id();
+    let config = || WrapConfig::owner_only(hermes_impl(), caller.origin_hash());
+    let invoker = Arc::new(LocalTools::default());
+
+    let first = ServerPublisher::new(Arc::clone(&host))
+        .publish_tools(
+            &local_tools()[..1], // echo
+            Arc::clone(&invoker) as Arc<dyn ToolInvoker>,
+            ctx(),
+            config(),
+        )
+        .await
+        .expect("first publication");
+    let second = ServerPublisher::new(Arc::clone(&host))
+        .publish_tools(
+            &local_tools()[1..], // add
+            Arc::clone(&invoker) as Arc<dyn ToolInvoker>,
+            ctx(),
+            config(),
+        )
+        .await
+        .expect("a second, independent publisher on the same node must succeed");
+
+    // The second publication re-announces within the core's
+    // `min_announce_interval` (10 s default), which coalesces and flushes
+    // the merged set on the trailing edge — so allow for that window.
+    //
+    // Both tags in ONE filter: checked one at a time, `echo` could be seen
+    // on the first announcement and `add` on a later one even if no single
+    // announcement carried both (cubic review of PR #1228).
+    let filter = CapabilityFilter::new()
+        .require_tag("echo")
+        .require_tag("add");
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(15),
+        )
+        .await,
+        "one merged announcement carries the tags of both publications",
+    );
+    let reply = call_retry(&caller, b_id, DESCRIBE_SERVICE, || {
+        Bytes::from_static(b"{}")
+    })
+    .await
+    .expect("describe succeeds");
+    let described: DescribeResponse =
+        serde_json::from_slice(reply.body.as_ref()).expect("decode DescribeResponse");
+    let names: Vec<_> = described.tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        names.contains(&"echo") && names.contains(&"add"),
+        "{names:?}"
+    );
+    drop((first, second));
+}

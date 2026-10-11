@@ -583,6 +583,18 @@ are the *same* player — and a player can't join itself. (Without it, every tab
 player.) To test with two players on one machine, use two browser profiles, or
 two different browsers.
 
+**A second tab with the same identity is refused.** Two live nodes under one
+identity would evict each other at the anchor, so `connect()` holds a Web Lock
+for its identity while the node is open: a second tab's `connect()` rejects
+with an `IdentityError` (kind `identity`) until the first node closes. Catch it
+and tell the player the game is already open, or run the page through
+`openSession()`, which elects one node per origin and shares it across tabs.
+A `connect()` tab and an `openSession()` tab given the same `entitySecretHex`
+contend for the same lock, so they cannot both run the identity either.
+(`lockIdentity: false` opts out. Where Web Locks are unavailable `connect()`
+takes no lock, and `openSession()` is not a fallback there: it needs Web Locks
+to elect a leader, so it rejects with an `IdentityError`.)
+
 **Announcements expire.** A host that announces once disappears from searches
 a few seconds later. Keep re-announcing on a timer, as in step 3a.
 
