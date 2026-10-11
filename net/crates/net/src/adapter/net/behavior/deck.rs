@@ -1630,6 +1630,33 @@ pub struct SimulatedIceProposal<'a> {
 }
 
 impl<'a> SimulatedIceProposal<'a> {
+    /// Rebuild a simulated proposal from the exact parts an earlier
+    /// [`IceProposal::simulate`] produced — the action, its
+    /// `issued_at_ms` and the [`BlastRadius`] operators reviewed and
+    /// signed over.
+    ///
+    /// For bindings that keep those parts across the FFI boundary between
+    /// simulate and commit. They used to rebuild a FRESH proposal and
+    /// re-simulate at commit, which stamps a new `issued_at_ms` and a new
+    /// blast radius: the commit then executed something nobody reviewed,
+    /// and a multi-signature commit could never verify (the signatures
+    /// cover the original triple). Signature verification is unchanged —
+    /// [`Self::commit`] still checks every signature against these parts.
+    #[doc(hidden)]
+    pub fn from_simulated_parts(
+        client: &'a DeckClient,
+        action: IceActionProposal,
+        issued_at_ms: u64,
+        blast: BlastRadius,
+    ) -> Self {
+        Self {
+            client,
+            action,
+            issued_at_ms,
+            blast,
+        }
+    }
+
     /// Borrow the simulator's pre-execution preview.
     pub fn blast_radius(&self) -> &BlastRadius {
         &self.blast

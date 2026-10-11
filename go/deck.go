@@ -526,6 +526,10 @@ func (c *DeckClient) ClearAvoidList(node uint64) (ChainCommit, error) {
 type DeckSnapshotStream struct {
 	mu     sync.RWMutex
 	handle *C.NetDeckSnapshotStream
+	// nextMu serializes Next: the C contract (net_deck.h) forbids
+	// concurrent calls on one handle, and two concurrent Next calls
+	// each took a `&mut` to the same Rust stream (SDK audit 2026-10-11).
+	nextMu sync.Mutex
 }
 
 // SubscribeSnapshots opens a live snapshot stream.
@@ -549,6 +553,8 @@ func (c *DeckClient) SubscribeSnapshots() (*DeckSnapshotStream, error) {
 // `(nil, nil)` on timeout. Returns `ErrDeckEndOfStream` when the
 // stream has been drained. Pass 0 for an unbounded wait.
 func (s *DeckSnapshotStream) Next(timeoutMs uint64) (map[string]any, error) {
+	s.nextMu.Lock()
+	defer s.nextMu.Unlock()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.handle == nil {
@@ -594,6 +600,10 @@ func (s *DeckSnapshotStream) Free() {
 type DeckStatusSummaryStream struct {
 	mu     sync.RWMutex
 	handle *C.NetDeckStatusSummaryStream
+	// nextMu serializes Next: the C contract (net_deck.h) forbids
+	// concurrent calls on one handle, and two concurrent Next calls
+	// each took a `&mut` to the same Rust stream (SDK audit 2026-10-11).
+	nextMu sync.Mutex
 }
 
 // SubscribeStatusSummaries opens a live status-summary stream.
@@ -616,6 +626,8 @@ func (c *DeckClient) SubscribeStatusSummaries() (*DeckStatusSummaryStream, error
 // Next blocks up to `timeoutMs` for the next status summary. Returns
 // `(nil, nil)` on timeout. Returns `ErrDeckEndOfStream` when drained.
 func (s *DeckStatusSummaryStream) Next(timeoutMs uint64) (*StatusSummary, error) {
+	s.nextMu.Lock()
+	defer s.nextMu.Unlock()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.handle == nil {

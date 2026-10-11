@@ -1630,11 +1630,20 @@ impl PySimulatedIceProposal {
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
         self.action = None;
         self.committed = true;
+        let issued_at_ms = self.issued_at_ms;
+        let blast = self.blast.clone();
         let commit_result = py.detach(move || {
             runtime.block_on(async move {
-                let proposal = build_core_proposal(&client, action)?;
-                let simulated = proposal.simulate().await?;
-                simulated.commit(&sigs).await
+                // Commit exactly what was simulated and signed, never a
+                // re-simulation (SDK audit 2026-10-11).
+                net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+                    &client,
+                    action,
+                    issued_at_ms,
+                    blast,
+                )
+                .commit(&sigs)
+                .await
             })
         });
         match commit_result {
@@ -2523,13 +2532,18 @@ impl PyAsyncSimulatedIceProposal {
         // synchronously.
         build_core_proposal(&client, action.clone())
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
+        let issued_at_ms = self.issued_at_ms;
+        let blast = self.blast.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let proposal = build_core_proposal(&client, action)
-                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
-            let simulated = proposal
-                .simulate()
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            // Commit exactly what was simulated and signed, never a
+            // re-simulation (SDK audit 2026-10-11).
+            let simulated =
+                net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+                    &client,
+                    action,
+                    issued_at_ms,
+                    blast,
+                );
             let commit = simulated
                 .commit(&sigs)
                 .await

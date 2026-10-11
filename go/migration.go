@@ -139,24 +139,31 @@ func migrationErr(code C.int, errOut *C.char) error {
 	return err
 }
 
-// MigrationOptions configures StartMigrationWith. Zero values
-// take the SDK defaults (TransportIdentity=true,
-// RetryNotReadyMs=30_000).
+// MigrationOptions configures StartMigrationWith.
+//
+// Fields are taken LITERALLY: the zero value `MigrationOptions{}` means
+// no identity transport and no NotReady retry — NOT the SDK defaults
+// (a Go bool cannot say "unset", unlike the Node binding's optional
+// field). Start from DefaultMigrationOptions() and change only what you
+// need:
+//
+//	opts := DefaultMigrationOptions()
+//	opts.RetryNotReadyMs = 5_000 // identity transport stays on
+//
+// (SDK audit 2026-10-11: this doc used to promise that zero values take
+// the defaults, which the code never did — `MigrationOptions{RetryNotReadyMs:
+// 5000}` silently migrated without the identity envelope.)
 type MigrationOptions struct {
 	// TransportIdentity: seal the daemon's ed25519 seed in the
 	// snapshot envelope so the target keeps signing capability.
-	// Defaults to true.
+	// true in DefaultMigrationOptions; false (the zero value)
+	// migrates without the envelope, which needs a matching
+	// pre-registered identity on the target.
 	TransportIdentity bool
 	// RetryNotReadyMs: backoff budget in milliseconds on target
-	// `NotReady`. 0 disables retry; otherwise the source
-	// re-initiates up to this total elapsed time.
+	// `NotReady`. 0 (the zero value) disables retry; otherwise the
+	// source re-initiates up to this total elapsed time.
 	RetryNotReadyMs uint64
-
-	// defaultsSet is flipped when the caller constructed the
-	// options via `DefaultMigrationOptions`. Lets us distinguish
-	// "user explicitly set fields to zero" from "struct was just
-	// `MigrationOptions{}`" at the call site.
-	defaultsSet bool
 }
 
 // DefaultMigrationOptions returns the SDK-recommended defaults —
@@ -165,7 +172,6 @@ func DefaultMigrationOptions() MigrationOptions {
 	return MigrationOptions{
 		TransportIdentity: true,
 		RetryNotReadyMs:   30_000,
-		defaultsSet:       true,
 	}
 }
 

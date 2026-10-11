@@ -3,6 +3,7 @@ package net
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // TestMeshOsDefaultDaemonImplementsInterface confirms the embed-this
@@ -283,4 +284,50 @@ func TestRegisterDaemonWithCallbacksFailureDoesNotDoubleDeleteHandle(t *testing.
 		t.Fatal("registration after Shutdown must fail")
 	}
 	// Reaching here without a panic is the assertion.
+}
+
+// SDK audit 2026-10-11: NextControl(0) held the native handle mutex
+// across an unbounded wait, so every other op on the handle — including
+// GracefulShutdown, the call that would deliver the Shutdown event —
+// blocked forever behind it. The wait now runs in short slices.
+func TestNextControlUnboundedDoesNotBlockGracefulShutdown(t *testing.T) {
+	sdk, err := StartMeshOsDaemonSdk(MeshOsConfig{
+		ThisNode:            1,
+		TickIntervalMs:      50,
+		EventQueueCapacity:  16,
+		ActionQueueCapacity: 16,
+		ControlCapacity:     16,
+	})
+	if err != nil {
+		t.Fatalf("StartMeshOsDaemonSdk: %v", err)
+	}
+	defer sdk.Free()
+	defer sdk.Shutdown()
+
+	seed := make([]byte, 32)
+	seed[0] = 0x51
+	h, err := sdk.RegisterDaemonWithCallbacks(namedTestDaemon{name: "parked"}, seed)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	defer h.Free()
+
+	go func() { _, _ = h.NextControl(0) }() // parks: no control event yet
+	time.Sleep(200 * time.Millisecond)
+
+	logDone := make(chan error, 1)
+	go func() { logDone <- h.PublishLog(LogInfo, "still reachable") }()
+	select {
+	case <-logDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PublishLog blocked behind a parked NextControl(0)")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- h.GracefulShutdown(200) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("GracefulShutdown blocked behind a parked NextControl(0)")
+	}
 }

@@ -1447,16 +1447,15 @@ impl SimulatedIceProposal {
     #[napi]
     pub async fn commit(&self, signatures: Vec<OperatorSignatureJs>) -> Result<ChainCommitJs> {
         let mut guard = self.state.lock().await;
-        let action = guard
+        let (action, blast) = guard
             .as_ref()
+            .map(|st| (st.action.clone(), st.blast.clone()))
             .ok_or_else(|| {
                 deck_err(
                     "already_committed",
                     "SimulatedIceProposal was already consumed by commit()",
                 )
-            })?
-            .action
-            .clone();
+            })?;
         let mut sigs = Vec::with_capacity(signatures.len());
         for s in signatures {
             sigs.push(s.into_core()?);
@@ -1465,12 +1464,20 @@ impl SimulatedIceProposal {
         // Validate the variant before taking the state out of
         // the mutex; an unknown-variant rejection leaves the
         // husk retry-able.
-        let proposal = build_core_proposal(&client, action)?;
+        build_core_proposal(&client, action.clone())?;
         // Variant accepted: this husk now represents a real
         // commit attempt and must refuse retries.
         guard.take();
         drop(guard);
-        let simulated = proposal.simulate().await.map_err(deck_err_from)?;
+        // Commit exactly what was simulated and signed, never a
+        // re-simulation (SDK audit 2026-10-11).
+        let simulated =
+            net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+                &client,
+                action,
+                self.issued_at_ms,
+                blast,
+            );
         simulated
             .commit(&sigs)
             .await

@@ -1491,6 +1491,15 @@ func joinKindString(k int) string {
 
 // FanOut submits every shard task. Returns the last append seq.
 func (w *WorkflowAdapter) FanOut(group *ShardGroup) (uint64, error) {
+	// Hold the group's lock across the native call: a concurrent Free (or
+	// the finalizer, if this is the group's last use) must not free it
+	// mid-call (SDK audit 2026-10-11).
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if group.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	defer runtime.KeepAlive(group)
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if w.handle == nil {
@@ -1507,6 +1516,15 @@ func (w *WorkflowAdapter) FanOut(group *ShardGroup) (uint64, error) {
 // TryJoin submits the reduce once every shard is done, surfaces failed
 // shards, or reports pending. Idempotent.
 func (w *WorkflowAdapter) TryJoin(group *ShardGroup) (JoinResult, error) {
+	// Hold the group's lock across the native call: a concurrent Free (or
+	// the finalizer, if this is the group's last use) must not free it
+	// mid-call (SDK audit 2026-10-11).
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if group.handle == nil {
+		return JoinResult{}, ErrShuttingDown
+	}
+	defer runtime.KeepAlive(group)
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if w.handle == nil {
@@ -1591,17 +1609,44 @@ func (e *TriggerEngine) free() {
 // concurrent finalizer; the engine must not be used afterwards.
 func (e *TriggerEngine) Free() { e.free() }
 
+// acquire locks the engine for one native call and returns its live
+// handle plus the release func. Holding e.mu across the cgo call is what
+// keeps a concurrent Free — or the finalizer, when the call is the last use
+// of e — from freeing the engine mid-call (SDK audit 2026-10-11: these
+// methods read e.handle with no lock and no KeepAlive).
+func (e *TriggerEngine) acquire() (*C.net_trigger_engine_t, func(), error) {
+	e.mu.Lock()
+	if e.handle == nil {
+		e.mu.Unlock()
+		return nil, nil, ErrShuttingDown
+	}
+	return e.handle, func() {
+		runtime.KeepAlive(e)
+		e.mu.Unlock()
+	}, nil
+}
+
 // ArmAfterTask arms AfterTask(task) -> action (fires when task is done).
 func (e *TriggerEngine) ArmAfterTask(task uint64, action TriggerAction) error {
+	h, release, err := e.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	code := C.net_trigger_arm_after_task(
-		e.handle, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
+		h, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
 	return cortexErrorFromCode(code)
 }
 
 // ArmAfterTerminal arms AfterTerminal(task) -> action (done OR failed).
 func (e *TriggerEngine) ArmAfterTerminal(task uint64, action TriggerAction) error {
+	h, release, err := e.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	code := C.net_trigger_arm_after_terminal(
-		e.handle, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
+		h, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
 	return cortexErrorFromCode(code)
 }
 
@@ -1609,23 +1654,33 @@ func (e *TriggerEngine) ArmAfterTerminal(task uint64, action TriggerAction) erro
 // `task` is done AND its recorded result `key` equals `value`. Record the
 // result first via RecordResult.
 func (e *TriggerEngine) ArmIfResult(task uint64, key, value string, action TriggerAction) error {
+	h, release, err := e.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	ckey := C.CString(key)
 	defer C.free(unsafe.Pointer(ckey))
 	cval := C.CString(value)
 	defer C.free(unsafe.Pointer(cval))
 	code := C.net_trigger_arm_if_result(
-		e.handle, C.uint64_t(task), ckey, cval,
+		h, C.uint64_t(task), ckey, cval,
 		actionKindCode(action.Kind), C.uint64_t(action.ID))
 	return cortexErrorFromCode(code)
 }
 
 // RecordResult records `task`'s result key = value for IfResult evaluation.
 func (e *TriggerEngine) RecordResult(task uint64, key, value string) error {
+	h, release, err := e.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	ckey := C.CString(key)
 	defer C.free(unsafe.Pointer(ckey))
 	cval := C.CString(value)
 	defer C.free(unsafe.Pointer(cval))
-	code := C.net_trigger_record_result(e.handle, C.uint64_t(task), ckey, cval)
+	code := C.net_trigger_record_result(h, C.uint64_t(task), ckey, cval)
 	return cortexErrorFromCode(code)
 }
 
@@ -1661,7 +1716,12 @@ func collectTriggerActions(kinds []C.int, ids []uint64, count int) []TriggerActi
 // fired ⊆ armed) and make a single call. The engine is driven by a single
 // goroutine, so no concurrent arm grows the set between the two FFI calls.
 func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error) {
-	n, err := e.ArmedCount()
+	h, release, err := e.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	n, err := armedCountLocked(h)
 	if err != nil {
 		return nil, err
 	}
@@ -1672,7 +1732,7 @@ func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error)
 	ids := make([]uint64, n)
 	var count C.size_t
 	code := C.net_trigger_on_task_change(
-		e.handle, C.uint64_t(task), C.uint64_t(tick),
+		h, C.uint64_t(task), C.uint64_t(tick),
 		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), C.size_t(n), &count)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
@@ -1682,8 +1742,13 @@ func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error)
 
 // ArmAtTick arms AtTick(tick) -> action (fires once the clock reaches tick).
 func (e *TriggerEngine) ArmAtTick(tick uint64, action TriggerAction) error {
+	h, release, err := e.acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
 	code := C.net_trigger_arm_at_tick(
-		e.handle, C.uint64_t(tick), actionKindCode(action.Kind), C.uint64_t(action.ID))
+		h, C.uint64_t(tick), actionKindCode(action.Kind), C.uint64_t(action.ID))
 	return cortexErrorFromCode(code)
 }
 
@@ -1694,7 +1759,12 @@ func (e *TriggerEngine) ArmAtTick(tick uint64, action TriggerAction) error {
 // NULL-buffer probe + fill — a probe pass would drain the due triggers and
 // throw the actions away. See OnTaskChange for the full rationale.
 func (e *TriggerEngine) OnTick(now uint64) ([]TriggerAction, error) {
-	n, err := e.ArmedCount()
+	h, release, err := e.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	n, err := armedCountLocked(h)
 	if err != nil {
 		return nil, err
 	}
@@ -1705,7 +1775,7 @@ func (e *TriggerEngine) OnTick(now uint64) ([]TriggerAction, error) {
 	ids := make([]uint64, n)
 	var count C.size_t
 	code := C.net_trigger_on_tick(
-		e.handle, C.uint64_t(now),
+		h, C.uint64_t(now),
 		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), C.size_t(n), &count)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
@@ -1715,8 +1785,25 @@ func (e *TriggerEngine) OnTick(now uint64) ([]TriggerAction, error) {
 
 // ArmedCount returns the number of armed (not-yet-fired) triggers.
 func (e *TriggerEngine) ArmedCount() (int, error) {
+	h, release, err := e.acquire()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	var c C.size_t
-	code := C.net_trigger_armed_count(e.handle, &c)
+	code := C.net_trigger_armed_count(h, &c)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return int(c), nil
+}
+
+// armedCountLocked is ArmedCount for a caller already holding e.mu: the
+// consuming calls size their buffer from it and must not let an arm
+// interleave between the count and the call.
+func armedCountLocked(h *C.net_trigger_engine_t) (int, error) {
+	var c C.size_t
+	code := C.net_trigger_armed_count(h, &c)
 	if err := cortexErrorFromCode(code); err != nil {
 		return 0, err
 	}

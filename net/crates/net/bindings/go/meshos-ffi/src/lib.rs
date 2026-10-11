@@ -1117,6 +1117,10 @@ pub extern "C" fn net_meshos_try_next_control(
     })
 }
 
+/// Longest single wait `net_meshos_next_control` makes while holding the
+/// handle mutex.
+const NEXT_CONTROL_SLICE: Duration = Duration::from_millis(50);
+
 /// Block until the next control event arrives, the runtime shuts
 /// down, or `timeout_ms` elapses. On timeout or shutdown writes
 /// `kind = NET_MESHOS_CONTROL_NONE`. Pass `0` for an unbounded
@@ -1137,24 +1141,41 @@ pub extern "C" fn net_meshos_next_control(
             return NET_MESHOS_ERR_INVALID_ARG;
         }
         clear_last_error_inner();
-        let ev = {
+        // Wait in short slices, dropping the handle mutex between them.
+        // Holding it across one unbounded `block_on(next_control())` —
+        // which only returns on a control event — deadlocked every other
+        // op on the handle, including `graceful_shutdown`, the very call
+        // that would deliver the Shutdown event (SDK audit 2026-10-11).
+        let deadline = (timeout_ms != 0)
+            .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms));
+        let mut first = true;
+        let ev = loop {
+            let slice = match deadline {
+                None => NEXT_CONTROL_SLICE,
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break None;
+                    }
+                    left.min(NEXT_CONTROL_SLICE)
+                }
+            };
             let mut guard = h_ref.inner.lock();
-            let h = match guard.as_mut() {
-                Some(h) => h,
-                None => {
+            let Some(h) = guard.as_mut() else {
+                if first {
                     set_last_error("already_shutdown", "daemon handle was already consumed");
                     return NET_MESHOS_ERR_ALREADY_SHUTDOWN;
                 }
+                // Consumed mid-wait (graceful shutdown): report it as the
+                // documented shutdown outcome, kind = NONE.
+                break None;
             };
-            runtime().block_on(async {
-                if timeout_ms == 0 {
-                    h.next_control().await
-                } else {
-                    tokio::time::timeout(Duration::from_millis(timeout_ms), h.next_control())
-                        .await
-                        .unwrap_or_default()
-                }
-            })
+            first = false;
+            match runtime().block_on(async { tokio::time::timeout(slice, h.next_control()).await })
+            {
+                Ok(ev) => break ev,
+                Err(_) => continue, // slice elapsed: release the lock, go again
+            }
         };
         unsafe {
             *out = match ev {

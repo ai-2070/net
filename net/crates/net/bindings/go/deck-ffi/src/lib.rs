@@ -2277,21 +2277,25 @@ pub extern "C" fn net_deck_simulated_commit(
         let core_sigs: Vec<CoreOperatorSignature> = sigs.iter().map(|x| x.to_core()).collect();
         // Validate the variant before flipping `committed` so an
         // unknown-variant rejection leaves the husk retry-able.
-        let proposal = match build_core_proposal(inner, action) {
-            Ok(p) => p,
-            Err(msg) => {
-                set_last_error("unknown_action", &msg);
-                return NET_DECK_ERR_CALL_FAILED;
-            }
-        };
+        if let Err(msg) = build_core_proposal(inner, action.clone()) {
+            set_last_error("unknown_action", &msg);
+            return NET_DECK_ERR_CALL_FAILED;
+        }
         // From here on the husk represents a real commit attempt;
         // refusing a retry is the correct behaviour even if the
         // substrate-side commit later errors.
         s.committed = true;
-        let commit = runtime().block_on(async move {
-            let simulated = proposal.simulate().await?;
-            simulated.commit(&core_sigs).await
-        });
+        // Commit EXACTLY what was simulated and signed — the stored
+        // issued_at_ms and blast radius — never a re-simulation
+        // (SDK audit 2026-10-11).
+        let simulated =
+            net::adapter::net::behavior::deck::SimulatedIceProposal::from_simulated_parts(
+                inner,
+                action,
+                s.issued_at_ms,
+                s.blast.clone(),
+            );
+        let commit = runtime().block_on(async move { simulated.commit(&core_sigs).await });
         match commit {
             Ok(c) => {
                 unsafe { *out = chain_commit_to_c(&c) };

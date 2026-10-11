@@ -397,7 +397,28 @@ type MeshOsConfig struct {
 
 // MeshOsDaemonSdk is the Go-side handle for the daemon-author SDK.
 type MeshOsDaemonSdk struct {
+	// mu guards ptr: every method holds the read lock across its cgo call
+	// and Free takes the write lock, so neither an explicit Free nor the
+	// finalizer (when a call is the SDK's last use) can drop the native
+	// SDK mid-call (SDK audit 2026-10-11).
+	mu  sync.RWMutex
 	ptr *C.NetMeshOsSdk
+}
+
+// acquire read-locks the SDK for one native call; nil when freed.
+func (s *MeshOsDaemonSdk) acquire() (*C.NetMeshOsSdk, func()) {
+	if s == nil {
+		return nil, func() {}
+	}
+	s.mu.RLock()
+	if s.ptr == nil {
+		s.mu.RUnlock()
+		return nil, func() {}
+	}
+	return s.ptr, func() {
+		runtime.KeepAlive(s)
+		s.mu.RUnlock()
+	}
 }
 
 // StartMeshOsDaemonSdk starts the MeshOS SDK with the substrate's
@@ -425,17 +446,19 @@ func StartMeshOsDaemonSdk(cfg MeshOsConfig) (*MeshOsDaemonSdk, error) {
 // router dropped across every registered daemon because the daemon's
 // channel was full.
 func (s *MeshOsDaemonSdk) DroppedControlEvents() uint64 {
-	if s == nil || s.ptr == nil {
+	ptr, release := s.acquire()
+	defer release()
+	if ptr == nil {
 		return 0
 	}
-	return uint64(C.net_meshos_sdk_dropped_control_events(s.ptr))
+	return uint64(C.net_meshos_sdk_dropped_control_events(ptr))
 }
 
 // RegisterDaemon registers a daemon under the supplied 32-byte ed25519
 // seed. The substrate uses an internal no-op daemon — user-supplied
 // dispatch lands via RegisterDaemonWithCallbacks.
 func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemonHandle, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
 	}
 	if len(seed) != 32 {
@@ -450,7 +473,12 @@ func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemo
 		nameLen = C.size_t(len(nameBytes))
 	}
 	seedPtr := (*C.uint8_t)(unsafe.Pointer(&seed[0]))
-	status := C.net_meshos_register_daemon(s.ptr, namePtr, nameLen, seedPtr, &raw)
+	ptr, release := s.acquire()
+	defer release()
+	if ptr == nil {
+		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
+	}
+	status := C.net_meshos_register_daemon(ptr, namePtr, nameLen, seedPtr, &raw)
 	if err := meshosStatusToError(status); err != nil {
 		return nil, err
 	}
@@ -464,15 +492,22 @@ func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemo
 // Shutdown drives a clean shutdown. Consumes the SDK — subsequent ops
 // return ErrMeshOsAlreadyShutdown.
 func (s *MeshOsDaemonSdk) Shutdown() error {
-	if s == nil || s.ptr == nil {
+	ptr, release := s.acquire()
+	defer release()
+	if ptr == nil {
 		return ErrMeshOsInvalidArg
 	}
-	return meshosStatusToError(C.net_meshos_sdk_shutdown(s.ptr))
+	return meshosStatusToError(C.net_meshos_sdk_shutdown(ptr))
 }
 
-// Free releases the SDK handle. Idempotent.
+// Free releases the SDK handle. Idempotent; waits for in-flight calls.
 func (s *MeshOsDaemonSdk) Free() {
-	if s == nil || s.ptr == nil {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
 		return
 	}
 	C.net_meshos_sdk_free(s.ptr)
@@ -720,7 +755,7 @@ func (MeshOsDefaultDaemon) Saturation() float32             { return 0 }
 // //export'd trampolines, and hands ownership of the cgo.Handle to
 // the returned MeshOsDaemonHandle.
 func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed []byte) (*MeshOsDaemonHandle, error) {
-	if s == nil || s.ptr == nil {
+	if s == nil {
 		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
 	}
 	if daemon == nil {
@@ -736,6 +771,11 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 
 	// The cgo.Handle points at a context carrying the daemon. Rust
 	// releases it via `goMeshOsDestroyUserCtx`; nothing here does.
+	ptr, release := s.acquire()
+	defer release()
+	if ptr == nil {
+		return nil, wrapMeshOsError(ErrMeshOsInvalidArg)
+	}
 	cgoHandle := cgo.NewHandle(&meshosCallbackCtx{daemon: daemon})
 	vt := C.topGoMeshOsBuildVtable()
 
@@ -755,7 +795,7 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 	// v2: Rust owns the moment the cgo.Handle dies. See
 	// `bridgeMeshOsDestroyUserCtx` and `meshosCallbackCtx`.
 	status := C.net_meshos_register_daemon_with_vtable_v2(
-		s.ptr, namePtr, nameLen, seedPtr, &vt, userCtx,
+		ptr, namePtr, nameLen, seedPtr, &vt, userCtx,
 		C.NetMeshOsUserCtxDestroyFn(C.bridgeMeshOsDestroyUserCtx), &raw,
 	)
 	if err := meshosStatusToError(status); err != nil {

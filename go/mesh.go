@@ -509,16 +509,36 @@ func (m *MeshNode) free() {
 }
 
 // Shutdown gracefully tears down the node. Idempotent.
+//
+// Two phases. The native shutdown runs under the READ lock, alongside
+// any in-flight call: it is what makes a SendBlocking parked in its
+// backpressure retry loop fail and return. Only then is the write lock
+// taken to free the handle. Taking the write lock first queued Shutdown
+// behind that send — up to ~13 minutes — and, by RWMutex writer
+// preference, froze every other method on the node meanwhile (SDK audit
+// 2026-10-11).
 func (m *MeshNode) Shutdown() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	if m.handle == nil {
+		m.mu.RUnlock()
 		return nil
 	}
 	code := C.net_mesh_shutdown(m.handle)
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return nil // a concurrent Shutdown freed it
+	}
 	C.net_mesh_free(m.handle)
 	m.handle = nil
 	runtime.SetFinalizer(m, nil)
+	if code == -8 { // NET_ERR_SHUTTING_DOWN
+		// A concurrent Shutdown's native call won the guard; the node is
+		// shut down either way.
+		return nil
+	}
 	return meshErrorFromCode(code)
 }
 
