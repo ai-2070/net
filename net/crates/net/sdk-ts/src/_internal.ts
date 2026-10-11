@@ -162,3 +162,118 @@ export function reportHandlerError(error: unknown): void {
   const message = error instanceof Error ? error.stack ?? error.message : String(error);
   process.emitWarning(`stream handler threw: ${message}`, 'NetStreamHandlerError');
 }
+
+/**
+ * `JSON.parse` that keeps full-range integers: an integer literal outside
+ * `Number.MAX_SAFE_INTEGER` comes back as a `bigint` instead of a silently
+ * rounded `number`. Everything else matches `JSON.parse`.
+ *
+ * The native layer serializes u64 node ids, daemon origin hashes and epoch
+ * ids as JSON numbers, and those are mostly > 2^53: plain `JSON.parse` rounded
+ * them by up to ~2^11, so an id read from a deck snapshot named the wrong
+ * daemon and never compared equal to `mesh.nodeId()` (SDK audit 2026-10-11).
+ * Node 20 has no reviver source-text access, hence a small parser.
+ */
+export function parseJsonLossless(text: string): unknown {
+  let i = 0;
+  const fail = (what: string): never => {
+    throw new SyntaxError(`parseJsonLossless: ${what} at position ${i}`);
+  };
+  const ws = () => {
+    while (i < text.length && ' \t\n\r'.includes(text[i])) i += 1;
+  };
+  const value = (): unknown => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i += 1;
+      const obj: Record<string, unknown> = {};
+      ws();
+      if (text[i] === '}') {
+        i += 1;
+        return obj;
+      }
+      for (;;) {
+        ws();
+        if (text[i] !== '"') fail('expected a string key');
+        const key = str();
+        ws();
+        if (text[i] !== ':') fail("expected ':'");
+        i += 1;
+        obj[key] = value();
+        ws();
+        if (text[i] === ',') {
+          i += 1;
+          continue;
+        }
+        if (text[i] === '}') {
+          i += 1;
+          return obj;
+        }
+        fail("expected ',' or '}'");
+      }
+    }
+    if (c === '[') {
+      i += 1;
+      const arr: unknown[] = [];
+      ws();
+      if (text[i] === ']') {
+        i += 1;
+        return arr;
+      }
+      for (;;) {
+        arr.push(value());
+        ws();
+        if (text[i] === ',') {
+          i += 1;
+          continue;
+        }
+        if (text[i] === ']') {
+          i += 1;
+          return arr;
+        }
+        fail("expected ',' or ']'");
+      }
+    }
+    if (c === '"') return str();
+    if (text.startsWith('true', i)) {
+      i += 4;
+      return true;
+    }
+    if (text.startsWith('false', i)) {
+      i += 5;
+      return false;
+    }
+    if (text.startsWith('null', i)) {
+      i += 4;
+      return null;
+    }
+    return num();
+  };
+  const str = (): string => {
+    // Find the closing quote, honouring escapes, then let JSON.parse
+    // decode the literal (escapes, \u sequences) exactly.
+    const start = i;
+    i += 1;
+    while (i < text.length && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+    if (i >= text.length) fail('unterminated string');
+    i += 1;
+    return JSON.parse(text.slice(start, i)) as string;
+  };
+  const num = (): number | bigint => {
+    const m = /^-?(?:0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/.exec(text.slice(i));
+    if (!m) fail('unexpected token');
+    const literal = m![0];
+    i += literal.length;
+    if (m![1] === undefined && m![2] === undefined) {
+      const asNumber = Number(literal);
+      if (!Number.isSafeInteger(asNumber)) return BigInt(literal);
+      return asNumber;
+    }
+    return Number(literal);
+  };
+  const out = value();
+  ws();
+  if (i !== text.length) fail('trailing characters');
+  return out;
+}

@@ -62,6 +62,7 @@ import {
 } from '@net-mesh/core';
 
 import { MeshOsDaemonSdk, type MeshOsConfig } from './meshos.js';
+import { parseJsonLossless } from './_internal.js';
 
 // ----------------------------------------------------------------------------
 // Typed error envelope (mirrors MeshOS SDK's MeshOsSdkError)
@@ -258,7 +259,7 @@ function snapshotsToAsyncIterable(
           try {
             const json = await raw.nextSnapshot();
             if (json === null) return { value: undefined, done: true };
-            return { value: JSON.parse(json), done: false };
+            return { value: parseJsonLossless(json), done: false };
           } catch (e) {
             throw DeckSdkError.fromCaught(e);
           }
@@ -411,7 +412,7 @@ export class DeckClient {
    */
   status(): unknown {
     try {
-      return JSON.parse(this.raw.status());
+      return parseJsonLossless(this.raw.status());
     } catch (e) {
       throw DeckSdkError.fromCaught(e);
     }
@@ -618,7 +619,7 @@ function auditStreamToAsyncIterable(
           try {
             const json = await raw.nextRecord();
             if (json === null) return { value: undefined, done: true };
-            return { value: JSON.parse(json) as AdminAuditRecord, done: false };
+            return { value: parseJsonLossless(json) as AdminAuditRecord, done: false };
           } catch (e) {
             throw DeckSdkError.fromCaught(e);
           }
@@ -688,7 +689,7 @@ export class AuditQuery {
   async collect(): Promise<AdminAuditRecord[]> {
     return rethrowAsync(async () => {
       const raw = this.raw.collect();
-      return raw.map((s) => JSON.parse(s) as AdminAuditRecord);
+      return raw.map((s) => parseJsonLossless(s) as AdminAuditRecord);
     });
   }
 
@@ -813,7 +814,7 @@ export class SimulatedIceProposal {
 
   /** Pre-execution blast radius, parsed from the binding's JSON. */
   async blastRadius(): Promise<BlastRadius> {
-    return rethrowAsync(async () => JSON.parse(await this.raw.blastRadius()) as BlastRadius);
+    return rethrowAsync(async () => parseJsonLossless(await this.raw.blastRadius()) as BlastRadius);
   }
 
   /** Blake3 digest of the blast radius (32 bytes). */
