@@ -434,6 +434,12 @@ export interface StreamData {
 /** Returned by {@link MeshNode.onStreamData}. */
 export interface StreamDataSubscription {
   readonly streamId: bigint;
+  /**
+   * Events dropped because the handler fell more than 1024 events behind
+   * the peers feeding the stream (the queue is bounded so a flooding peer
+   * cannot grow the process without limit).
+   */
+  readonly droppedEvents: bigint;
   /** Stop delivering; the stream's events go back to `recv`. Idempotent. */
   close(): boolean;
 }
@@ -736,6 +742,9 @@ export class MeshNode {
     return {
       get streamId() {
         return native.streamId;
+      },
+      get droppedEvents() {
+        return native.droppedEvents;
       },
       close: () => native.close(),
     };

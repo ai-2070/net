@@ -422,3 +422,23 @@ describe('forced drop releases handler handles on every public serve bridge', ()
     handle.close()
   }, 60_000)
 })
+
+// SDK audit 2026-10-11: `handlerTimeoutMs` bounded only the TSFN dispatch,
+// and an `async` handler returns its Promise at once — so a handler whose
+// promise never settled held its task and in-flight slot forever.
+describe('unary handler timeout bounds the promise, not just the dispatch', () => {
+  it('cuts off a never-settling async handler at handlerTimeoutMs', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve(
+      'live.never',
+      async () => new Promise<Buffer>(() => {}),
+      300,
+    )
+    const started = Date.now()
+    await expect(
+      clientRpc.call(server.nodeId(), 'live.never', Buffer.from('x'), { deadlineMs: 10_000 }),
+    ).rejects.toThrow()
+    expect(Date.now() - started).toBeLessThan(5_000)
+    handle.close()
+  }, 30_000)
+})

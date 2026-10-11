@@ -409,10 +409,14 @@ impl RpcHandler for NodeRpcHandler {
         }
 
         // 2. Wait for JS to invoke the handler and return a Promise.
-        //    Bounded: a JS handler that doesn't respond within the
-        //    timeout surfaces as Internal so the in-flight slot
-        //    doesn't leak.
-        let promise = match tokio::time::timeout(self.timeout, rx).await {
+        //    ONE deadline spans this stage AND the promise below, as in
+        //    the streaming / duplex / org bridges: an `async` handler
+        //    returns its Promise immediately, so a timeout on this stage
+        //    alone never bounded anything, and a never-settling handler
+        //    held its task and in-flight slot forever (SDK audit
+        //    2026-10-11).
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
             Ok(Ok(Err(e))) => {
                 // A handler that validates its input before doing any
@@ -445,11 +449,20 @@ impl RpcHandler for NodeRpcHandler {
             }
         };
 
-        // 3. Await the JS-returned promise. napi-rs's Promise<T>
-        //    is `Send + 'static` and implements Future via an
-        //    internal "promise resolved" callback that completes a
-        //    oneshot — no main-thread polling required.
-        let resp_buf = match promise.await {
+        // 3. Await the JS-returned promise under the SAME deadline.
+        //    napi-rs's Promise<T> is `Send + 'static` and implements
+        //    Future via an internal "promise resolved" callback that
+        //    completes a oneshot — no main-thread polling required.
+        let settled = match tokio::time::timeout_at(deadline, promise).await {
+            Ok(settled) => settled,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS handler promise did not settle within {} ms",
+                    self.timeout.as_millis()
+                )))
+            }
+        };
+        let resp_buf = match settled {
             Ok(buf) => buf,
             Err(e) => {
                 // Inspect the rejection message — a JS handler that
