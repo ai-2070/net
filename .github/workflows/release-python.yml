@@ -51,7 +51,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.15"
 
       # `--profile python-release`, not `--release`: same optimisation
       # settings, but `panic = "unwind"`. A Python extension is a guest in
@@ -105,7 +105,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.15"
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -140,7 +140,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.15"
           architecture: ${{ matrix.py-arch }}
 
       - name: Build wheels
