@@ -219,3 +219,29 @@ ids; Rust breaker, delegation-gate ordering, token TTL clamp, blob cap,
 
 | ID | Status | Commit |
 |----|--------|--------|
+| GO-1 | FIXED — `Split` uses `requestFreeQuiet`; test fails with the old call (`nrpc:cancelled … after Split`) | `e38414477` |
+| GO-2 | FIXED (core) — the stream cancel watcher closes the credit semaphore; parked `send` returns `Cancelled`; two core tests, both RED without the fix | `e38414477` |
+| GO-3 | FIXED — shipped baseline + `SURFACE.md` updated; `check-ffi-exports` / `c-surface-record --check` pass locally | `e38414477` |
+| GO-4 | FIXED — `Recv` waits out a Split under way (no native test: the race needs a scheduler hook) | `e38414477` |
+| PY-1 | FIXED — bus behind its own `Arc`, guard dropped before `detach`; `test_net_poll_shutdown.py` | `57152af8b` |
+| PY-2 | FIXED — one lock in `__repr__`; live repr test | `57152af8b` |
+| PY-3 | FIXED — always one native call | `57152af8b` |
+| PY-4 | FIXED — core `signal_shutdown` / `is_registered`, PyO3 `signal_shutdown` / `registered` / `close`, wrapper waits the grace without the lock; fake now mirrors native consumption | `57152af8b` |
+| NODE-1 | FIXED (SDK) — `MeshNode` holds each subscription until `close()` / shutdown; raw napi doc says to hold it | `d645b38f3` |
+| NODE-2 | FIXED — `approveTimeoutMs` validated as a whole f64 in `1..=u32::MAX`; Python twin refuses `0` | `d645b38f3` |
+| TS-1 | FIXED — `callIsolated` routes sync throws and rejections | `3be9aba13` |
+| TS-2 | FIXED — `__proto__` becomes an own property | `3be9aba13` |
+| TS-3 | DOCUMENTED — number-or-bigint by magnitude is inherent to lossless parse of untyped JSON | `3be9aba13` |
+| BROWSER-1 | FIXED — `drainPending()` zeroes the count | `3ecf60c10` |
+| BROWSER-2 | FIXED — open epoch detaches a lost session's in-flight open | `3ecf60c10` |
+| BROWSER-3 | FIXED — lock name hashes the lowercased secret | `3ecf60c10` |
+| BROWSER-4 | OPEN — design trade-off; needs a Firefox/Safari `icecandidateerror` check before changing | — |
+| RUST-1 | FIXED — reason recorded with `or_insert` under the lock that spans the abort; never removed | `b36695848` |
+| RUST-2 | FIXED — revoked subjects in core `RevocationRegistry`; `apply_to` carries them; CLI `--subject` | `b36695848` |
+| RUST-3 | FIXED — runtime membership lock serializes join+record against leave | `b36695848` |
+| RUST-4 | DOCUMENTED — the runtime cannot see host-app subscriptions (core keeps no per-node record) | `b36695848` |
+| RUST-5 | FIXED | `b36695848` |
+
+Found during the repair pass: `sdk-ts/test/mesh_node_surface.test.ts` was
+failing on the branch (the approver-gated `serveEnrollment` forwarder was
+missing from its table) — fixed in `3be9aba13`.
