@@ -586,6 +586,11 @@ pub enum ProbeEvent {
     /// (`ANCHOR_DUAL_STACK_PLAN.md`, slice 4). Such a probe sent
     /// nothing, so it did not run.
     ConnectionFailed,
+    /// Gathering completed (the end-of-candidates signal). With no
+    /// answer and no "no response" error it is inconclusive: an engine
+    /// may suppress a reflexive candidate equal to a public host
+    /// address, so the endpoint can have answered invisibly.
+    GatheringComplete,
 }
 
 /// What probing one endpoint established.
@@ -626,7 +631,7 @@ pub fn probe_event_answers(event: &ProbeEvent) -> bool {
             tokens.windows(2).any(|pair| pair == ["typ", "srflx"])
         }
         ProbeEvent::CandidateError(code) => *code < STUN_NO_RESPONSE_CODE,
-        ProbeEvent::ConnectionFailed => false,
+        ProbeEvent::ConnectionFailed | ProbeEvent::GatheringComplete => false,
     }
 }
 
@@ -649,6 +654,18 @@ pub fn probe_verdict(events: &[ProbeEvent]) -> ProbeOutcome {
         .iter()
         .any(|event| matches!(event, ProbeEvent::ConnectionFailed));
     if failed && !gathered {
+        return ProbeOutcome::NotRun;
+    }
+    // Completed with no answer and no "no response" report is
+    // inconclusive, not silence (SDK audit 2026-10-11): a host with no
+    // NAT would otherwise be typed `udp-blocked`.
+    let completed = events
+        .iter()
+        .any(|event| matches!(event, ProbeEvent::GatheringComplete));
+    let reported_no_response = events.iter().any(
+        |event| matches!(event, ProbeEvent::CandidateError(code) if *code >= STUN_NO_RESPONSE_CODE),
+    );
+    if completed && !reported_no_response {
         ProbeOutcome::NotRun
     } else {
         ProbeOutcome::Unanswered
@@ -939,10 +956,12 @@ fn build_probe(rtc_addr: &str) -> Result<StunProbe> {
     let events = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
     let candidates = std::rc::Rc::clone(&events);
     let closure = Closure::wrap(Box::new(move |event: RtcPeerConnectionIceEvent| {
-        if let Some(candidate) = event.candidate() {
-            candidates
+        match event.candidate() {
+            Some(candidate) => candidates
                 .borrow_mut()
-                .push(ProbeEvent::Candidate(candidate.candidate()));
+                .push(ProbeEvent::Candidate(candidate.candidate())),
+            // The end-of-candidates signal: gathering completed.
+            None => candidates.borrow_mut().push(ProbeEvent::GatheringComplete),
         }
     }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
     connection.set_onicecandidate(Some(closure.as_ref().unchecked_ref()));

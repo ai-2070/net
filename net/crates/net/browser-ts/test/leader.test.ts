@@ -16,6 +16,7 @@ import { openSession, type MeshSession } from '../src/leader/session.js';
 import { asSessionModule } from '../src/leader/wasm.js';
 import { isLifecycleEvent, parseSessionEvent } from '../src/leader/events.js';
 import { NotLeaderError, RpcError, type LeafError } from '../src/errors.js';
+import { isStaleStream } from '../src/store/errors.js';
 import type { SessionEvent } from '../src/leader/events.js';
 import type { LeafWasmSessionOptions } from '../src/leader/wasm.js';
 import {
@@ -281,6 +282,23 @@ describe('MeshSession', () => {
     // interruption.
     expect(await waiting).toEqual({ value: undefined, done: true });
     expect(fake.streams[0]?.closed).toBe(true);
+  });
+
+  // SDK audit 2026-10-11: a store over a MeshSession cached the stream,
+  // and after a handoff every send failed with a non-reopenable error,
+  // forever. A leader change now fails sends the way `isStaleStream`
+  // repairs; closing the session stays permanent.
+  it('fails a send on a handed-off stream as stale, so a store reopens it', async () => {
+    const { session, fake } = await opened();
+    const stream = await session.openStream({ reliability: 'reliable', label: 'app' });
+    fake.emit('{"type":"leader_lost","generation":"1","failed":"0"}');
+    const handedOff = await stream.send(new Uint8Array([1])).catch((error: unknown) => error);
+    expect(isStaleStream(handedOff)).toBe(true);
+
+    const other = await session.openStream({ reliability: 'reliable', label: 'app2' });
+    session.close();
+    const closed = await other.send(new Uint8Array([1])).catch((error: unknown) => error);
+    expect(isStaleStream(closed)).toBe(false);
   });
 
   it('ends a waiting stream iterator when this tab discovers it was superseded', async () => {

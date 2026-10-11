@@ -133,6 +133,8 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
   private pendingBytes = 0;
   private dropped = 0;
   private closed = false;
+  /** Why the SESSION closed this stream, when it did so for a leader change. */
+  private retiredBy: string | null = null;
   /**
    * This stream's wire id as a number, or `null` when the inner
    * object's `stream_id_hex()` was not hex.
@@ -230,7 +232,7 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
 
   /** Send one payload. Fragmentation at `MAX_PAYLOAD_SIZE` is the leaf's. */
   async send(payload: Uint8Array): Promise<void> {
-    if (this.closed) throw new SessionError('the stream is closed');
+    if (this.closed) throw new SessionError(this.retiredBy ?? 'the stream is closed');
     try {
       await this.inner.send(payload);
     } catch (error) {
@@ -255,6 +257,19 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     for (const payload of buffered) queue.push(payload);
     if (this.closed) queue.end();
     return queue;
+  }
+
+  /**
+   * @internal — the session closing this stream because the leader it
+   * was opened on is gone. Later sends fail with the leaf's own
+   * reopenable wording ("stale stream handle"), so a store that cached
+   * the stream reopens it on the new leader instead of failing every
+   * frame forever (SDK audit 2026-10-11).
+   */
+  retire(reason: string): void {
+    if (this.closed) return;
+    this.retiredBy = reason;
+    this.close();
   }
 
   /** Close the stream and end every consumer. */

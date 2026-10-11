@@ -110,14 +110,14 @@ function q(): Hex {
   return nextQ.toString(16).padStart(16, '0');
 }
 
-function joinFrame(aud: readonly string[], over: { def?: string; ver?: number } = {}): string {
+function joinFrame(aud: readonly string[], over: { def?: string; ver?: number; key?: string } = {}): string {
   return encodeMessage({
     k: 'join',
     q: q(),
     def: over.def ?? 'pirate.ship',
     ver: over.ver ?? 1,
     store: 'test-store',
-    key: 'black-petrel',
+    key: over.key ?? 'black-petrel',
     aud,
   });
 }
@@ -211,6 +211,23 @@ describe('a join is admitted and served', () => {
     expect(r.owner.handleCount).toBe(1);
   });
 
+  // SDK audit 2026-10-11: `joinStore({ key })` is documented as read by
+  // the host's policy, but the key never reached `authorize`.
+  it("hands the join's key to authorize, and keeps it for later reads", () => {
+    const r = rig({ authorize: (request) => request.type === 'read' && request.key === 'black-petrel' });
+    r.owner.commit(world());
+
+    const admitted = r.owner.receive(joinFrame(['crew']), PEER_A);
+    expect(r.owner.handleCount).toBe(1);
+    const refused = r.owner.receive(joinFrame(['crew'], { key: 'wrong' }), PEER_B);
+    expect(refusalCode(refused.out)).toBe('forbidden');
+
+    // The re-sweep rules on the key the handle joined with.
+    r.owner.reauthorize();
+    expect(r.owner.handle(handleOf(admitted.out))).toBeDefined();
+    expect(r.seen.at(-1)).toMatchObject({ type: 'read', peer: PEER_A, key: 'black-petrel' });
+  });
+
   it('serves each audience its own projection', () => {
     const r = rig();
     r.owner.commit(world());
@@ -231,7 +248,7 @@ describe('authorize receives the authenticated caller', () => {
     r.owner.receive(joinFrame(['crew', 'deck']), PEER_A);
 
     expect(r.seen).toHaveLength(1);
-    expect(r.seen[0]).toEqual({ type: 'read', peer: PEER_A, audience: ['crew', 'deck'] });
+    expect(r.seen[0]).toEqual({ type: 'read', peer: PEER_A, audience: ['crew', 'deck'], key: 'black-petrel' });
   });
 
   it('cannot be told a different caller by the frame', () => {

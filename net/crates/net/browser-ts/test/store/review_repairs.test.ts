@@ -298,7 +298,7 @@ describe('C — a solicited `resync` is a read', () => {
     // a read, and a read the policy has since revoked must not be
     // served.
     expect(seen).toHaveLength(2);
-    expect(seen[1]).toEqual({ type: 'read', peer: PEER, audience: ['crew'] });
+    expect(seen[1]).toEqual({ type: 'read', peer: PEER, audience: ['crew'], key: 'k' });
   });
 
   it('refuses a resync the policy now forbids, and keeps shipping nothing', () => {

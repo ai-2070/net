@@ -136,6 +136,17 @@ describe('lobbies', () => {
     expect(() => lobby.kick(lobby.host.authority)).toThrow(LobbyError);
   });
 
+  it('kicks a player named by the decimal peer id an event carries', async () => {
+    const mesh = createLocalMesh();
+    const lobby = await lobbyOn(mesh);
+    const node = mesh.node();
+    const world = await joinLobby({ node, definition: room, game: 'lobby-test', code: lobby.code });
+    await world.ready();
+    lobby.kick(BigInt(`0x${node.nodeIdHex()}`).toString());
+    await settle();
+    expect(lobby.players()).toEqual([lobby.host.authority]);
+  });
+
   it("tells onEvent a kicked player left because they were refused", async () => {
     const mesh = createLocalMesh();
     const events: unknown[] = [];

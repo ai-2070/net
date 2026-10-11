@@ -59,7 +59,9 @@ export type ProbeEvent =
   | { readonly candidate: string }
   | { readonly error: number }
   /** The probe connection's ICE state became `failed`. */
-  | { readonly ice: 'failed' };
+  | { readonly ice: 'failed' }
+  /** Gathering completed (the end-of-candidates signal). */
+  | { readonly gathering: 'complete' };
 
 /**
  * Is this candidate line server-reflexive? The `typ` token followed by
@@ -98,7 +100,14 @@ export function stunProbeVerdict(events: readonly ProbeEvent[]): 'answered' | 'u
   if (events.some(probeEventAnswers)) return 'answered';
   const gathered = events.some((event) => 'candidate' in event);
   const failed = events.some((event) => 'ice' in event && event.ice === 'failed');
-  return failed && !gathered ? 'notRun' : 'unanswered';
+  if (failed && !gathered) return 'notRun';
+  // Gathering that COMPLETED with no reflexive candidate and no "no
+  // response" report is inconclusive, not silence: an engine may
+  // suppress a srflx equal to a public host address, so a host with no
+  // NAT would otherwise read as `udp-blocked` (SDK audit 2026-10-11).
+  const completed = events.some((event) => 'gathering' in event);
+  const reportedNoResponse = events.some((event) => 'error' in event && event.error >= STUN_NO_RESPONSE_CODE);
+  return completed && !reportedNoResponse ? 'notRun' : 'unanswered';
 }
 
 /** {@link probeEventAnswers} over everything one probe reported. */
@@ -231,10 +240,19 @@ export async function probeStunBinding(
     timeoutMs,
   );
 
+  // Completion settles `unanswered` only on the engine's own "no
+  // response" report. Without one it is inconclusive: libwebrtc drops a
+  // reflexive candidate equal to a public host address, so the anchor
+  // can have answered with nothing visible (`stunProbeVerdict`, the same
+  // rule).
   const gatheringDone = (): void => {
+    if (noResponse !== null) {
+      settle({ type: 'unanswered', detail: noResponse });
+      return;
+    }
     settle({
-      type: 'unanswered',
-      detail: noResponse ?? 'gathering completed with no reflexive candidate',
+      type: 'notRun',
+      reason: 'gathering completed with no reflexive candidate and no "no response" report: inconclusive',
     });
   };
 

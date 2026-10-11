@@ -123,6 +123,14 @@ export interface SessionOptions extends ConnectOptions {
 }
 
 /** The origin's Net node, as this tab sees it. */
+/**
+ * What a send on a stream ended by a leader change fails with. Worded
+ * the way the leaf words a stale handle, because `isStaleStream` (the
+ * store's reopen test) matches exactly that: a store over a session
+ * reopens on the new leader rather than counting `send-failed` forever.
+ */
+const STALE_AFTER_HANDOFF = 'stale stream handle: the leader changed; reopen the stream';
+
 export class MeshSession {
   /**
    * The same fan-out the direct surface uses, instantiated over the
@@ -186,7 +194,7 @@ export class MeshSession {
         // The generation that owned the calls is the one they were
         // issued under — typed `LeaderLost`, never resumed.
         this.orgHandles.retireAll(new OrgLeaderLostError(this.streamGeneration));
-        this.endStreams();
+        this.endStreams(STALE_AFTER_HANDOFF);
         return;
       }
       // And the abrupt case: a generation that moved under us. Read
@@ -199,7 +207,7 @@ export class MeshSession {
       const previous = this.streamGeneration;
       this.streamGeneration = current;
       this.orgHandles.retireAll(new OrgLeaderLostError(previous));
-      this.endStreams();
+      this.endStreams(STALE_AFTER_HANDOFF);
     });
   }
 
@@ -910,10 +918,15 @@ export class MeshSession {
    * on close; idempotent, because a page may have closed a stream
    * itself.
    */
-  private endStreams(): void {
+  private endStreams(staleReason?: string): void {
     const open = [...this.streams];
     this.streams.clear();
-    for (const stream of open) stream.close();
+    for (const stream of open) {
+      // A leader change retires with the reopenable wording; closing the
+      // session is permanent.
+      if (staleReason === undefined) stream.close();
+      else stream.retire(staleReason);
+    }
   }
 
   /**
