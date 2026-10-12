@@ -1,0 +1,45 @@
+net/crates/net/examples/shard-topology/run.mjs
+  s_d71d2b607c2060::t_1ea0ced27dd809 94
+  s_d71d2b607c2060::t_ab43ef6df695f2 197
+  s_d71d2b607c2060::t_6d0f6592d5c087 331-333
+  s_d71d2b607c2060::t_6786e880e02b36 119-122
+  s_d71d2b607c2060::t_d1d689fc1d4191 358
+  s_d71d2b607c2060::t_95f0cbee36aa89 405-410
+  s_d71d2b607c2060::t_e2dc76a55dea2d 173
+  s_d71d2b607c2060::t_a8f84ade8f6d2c 306-307
+  s_d71d2b607c2060::t_4059156d7356ed 360
+  s_d71d2b607c2060::t_d9ff71e63f93dd 246
+  s_d71d2b607c2060::t_d6e17b0438d868 482
+net/crates/net/browser-ts/test/netcode/join.test.ts
+  s_d71d2b607c2060::t_9a6338ec6f6aa3 274-280
+  s_d71d2b607c2060::t_fe12745359c550 215-273,281-288
+net/crates/net/browser-ts/src/netcode/client.ts
+  s_d71d2b607c2060::t_362b3ababaf31a 349-350
+  s_d71d2b607c2060::t_5cd30b4b17c533 336-337
+  s_d71d2b607c2060::t_c1d8f37180db6b 281-296,300-301
+  s_d71d2b607c2060::t_fff23095f99de0 135-140
+  s_d71d2b607c2060::t_212b3c5c5846e6 134
+net/crates/net/examples/shard-topology/page/match.mjs
+  s_d71d2b607c2060::t_ab43ef6df695f2 169
+  s_d71d2b607c2060::t_5c49b835bdf59a 86,140,144,205,400
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_dc7d7fa52c798e 526-558
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d71d2b607c2060::t_2d2ed2ea82f4cf 33-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ff5e5fc263ccc6c5f488181f76474de168f777f8",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
