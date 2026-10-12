@@ -1,12 +1,17 @@
 # Sharded matches across player hosts — plan
 
 **Status:** in progress, as an **experiment**. Revised after review on
-2026-10-12 (§8). No release targeted. **S0 and S0c done (2026-10-12).**
-With the netcode codec, snapshots are ~7–8× smaller than JSON. **One host
-fits 128 players at 20 Hz (5.7 Mbit/s)**, and 4 hosts fit 300 NPCs
-(5.9 Mbit/s). A single host with 300 NPCs is CPU-bound (~17 ms/tick)
-(§3 S0 and S0c results). **Next: S0b** (real-browser topology, with the
-codec on). Whether sharding is needed at all is decided after S0b.
+2026-10-12 (§8). No release targeted. **S0 and S0c done; S0b harness
+built and passing single-machine runs (2026-10-12)**, with transport
+overhead (~160–170 B per frame) now the limiting term. The multi-machine
+S0b run is next.
+With the netcode codec, snapshots are ~7–8× smaller than JSON. One host's
+**payload** for 128 players at 20 Hz is 5.7 Mbit/s, but measured
+transport overhead projects its **wire** upload to ~9.9 Mbit/s, at the
+budget. 4 hosts fit 300 NPCs (5.9 Mbit/s payload). A single host with
+300 NPCs is CPU-bound (~17 ms/tick) (§3 S0, S0c and S0b results).
+Whether sharding is needed at all is decided after the multi-machine
+S0b run.
 **Scope:** `@net-mesh/browser`: the netcode module (`src/netcode/`), reuse of
 the world module's forwarded actions (`src/world/`), and the lobby store
 (`src/lobby.ts`). There is **no change to the leaf, the anchor or the core
@@ -458,6 +463,69 @@ bandwidth does.
   when the connection count is what breaks, not the bandwidth. B is then
   measured with the same harness.
 - Also records how long the coordinator's lease renewals take (for D10).
+
+**Progress — harness built, single-machine runs (2026-10-12).** The
+harness is `net/crates/net/examples/shard-topology/` (`node run.mjs
+coordinator …` plus `node run.mjs browsers …` on other machines; the
+coordinator prints the commands with its port and certificate pin).
+
+**How it measures:**
+
+- Upload is **wire** bytes, from Chrome's own `RTCPeerConnection.getStats()`
+  transport stats. That includes DTLS, SCTP and Noise. The page wraps the
+  constructor before the package loads, and the first connection (the
+  anchor's) is counted separately as "via anchor".
+- Payload is what `hostNetcode` hands the transport.
+- Main-thread busy time comes from CDP `Performance.getMetrics`.
+- Each host renders the merged world every frame, burning `--burn-ms`
+  (default 4) as a stand-in for a heavier scene.
+- The run passes only when every host holds `N + H − 1` netcode peers, all
+  of them direct, with upload ≤ `--budget-mbit` and a median frame rate
+  ≥ 90% of `--target-fps`.
+
+Release `net-mesh` built `--features rtc-bootstrap`, Chrome 155, compact
+codec, 20 Hz, one i9-14900K Windows machine running everything:
+
+| H × N | result | direct pairs per host | wire up Mbit/s per host | payload | overhead | first snapshot p50 / max | host fps | main thread busy |
+|---|---|---|---|---|---|---|---|---|
+| 2 × 2 (JSON) | pass | 3/3 | 0.22 / 0.15 | 0.12 / 0.05 | 1.9× / 3.0× | 632 / 635 ms | 60 | 0.26 |
+| 2 × 16 | pass | 17/17 | 0.77 / 0.76 | 0.25 / 0.24 | 3.1× / 3.2× | 635 / 747 ms | 60 | 0.34 |
+| 1 × 32 | pass | 32/32 | 2.19 | 1.15 | **1.9×** | 590 / 726 ms | 60 | 0.47 |
+| 1 × 64 | **inconclusive** | — | — | — | — | 7,969 / 28,600 ms | — | — |
+
+Findings:
+
+1. **Transport overhead is the next limit, not payload.** At these sizes it
+   is a fixed ~160–170 B per frame the host sends, including what it spends
+   acknowledging inbound inputs and pings. Example: at 1 × 32, wire minus
+   payload is ~130 KB/s over ~770 frames/s (640 snapshots + 128 pongs).
+   Projected to **1 host × 128 players: ~5.7 Mbit/s payload + ~4.2 Mbit/s
+   overhead ≈ 9.9 Mbit/s, at the budget with no margin.** The
+   multi-machine run must measure it. Levers, if it is confirmed: a lower
+   tick rate (both terms scale with it), fewer pongs once the clock has
+   settled, or 2 hosts.
+2. **1 × 64 on one machine is inconclusive, not a failure of the
+   protocol.** 65 Chrome renderers and the anchor shared one CPU. Joins
+   were slow; connect outcomes were 33 direct, 13 `iceTimeout` and
+   18 `error:session`. The host's reports never reached the measuring
+   window. Rerun it on several machines before drawing any conclusion.
+3. **Every page must announce to be reachable** (found building the
+   harness). A browser node accepts a handshake only from a peer whose
+   signed announcement it holds. The lobby announces for its users, but a
+   raw `joinNetcode` against a host that never received the player's
+   announcement waits forever: its internal `connectPeer` *resolves*
+   `noAnnouncement`, which nothing reports. **Defect, deferred:**
+   `joinNetcode` should surface the connect outcome (a stat, or a typed
+   error after a bounded wait).
+4. **The anchor's per-address limits** (10 bootstrap offers and 30
+   credentials per IP per minute) refuse a lab machine running many player
+   tabs (`429 rate_limited`). The harness raises them with
+   `--offers-per-minute` / `--credentials-per-minute` and records the value
+   in its results. Real players have their own addresses.
+
+**Still open for S0b:** the multi-machine run at 4 hosts × 127 players
+(and 1 × 128 for the single-host case the codec made plausible). It
+needs ≥ 3 machines.
 
 ### Phase 2 — player-only proof
 
