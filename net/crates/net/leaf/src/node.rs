@@ -1277,6 +1277,14 @@ impl LeafNode {
         core::mem::take(&mut self.verified_admissions)
     }
 
+    /// Whether `peer`'s establishment proof verified and is waiting to
+    /// be taken by [`Self::take_verified_admissions`] — so its
+    /// provisional entry is gone because it was PROMOTED, not because
+    /// it expired.
+    pub fn verified_admission_pending(&self, peer: NodeId) -> bool {
+        self.verified_admissions.contains(&peer)
+    }
+
     /// Retire every provisional establishment whose deadline has
     /// passed as of `now`.
     ///

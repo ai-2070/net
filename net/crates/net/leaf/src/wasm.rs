@@ -496,6 +496,19 @@ pub(crate) struct Inner {
     /// by [`Inner::on_handshake`] and consumed by [`Inner::pump`]
     /// when `take_verified_admissions` reports the proof verified.
     admissions: HashMap<NodeId, Attempt>,
+    /// The relay each pending admission's message 1 displaced, keyed by
+    /// peer: what the pair goes back to if the establishment is never
+    /// proven.
+    ///
+    /// Found by the sharded-match S0b run: the offerer's handshake ran
+    /// out its attempt deadline before the (slow) answerer's message 2
+    /// came back, so it settled `failed` and kept its routed session;
+    /// this answerer had already dropped the relay at message 1 and,
+    /// with nothing to undo it, reported `open`/`direct:true` and sent
+    /// on a channel the offerer had closed. Restored when the admission
+    /// expires unproven ([`Inner::pump`]) — §9 step 6, "the routed
+    /// session is simply never replaced".
+    displaced_relays: HashMap<NodeId, NodeId>,
     /// The session each open DataChannel's handshake installed, and
     /// the identity of the channel it installed it over, keyed by
     /// peer.
@@ -943,6 +956,13 @@ impl Inner {
             // recorded instead is the OWNER of the admission: the
             // attempt whose channel this message 1 arrived on, which
             // `pump` settles if and when the proof verifies.
+            // The relay this displaces is kept until the proof
+            // verifies: if it never does, the pair goes back to it.
+            // The FIRST displaced relay is the one the routed session
+            // uses; a repeated message 1 has nothing new to record.
+            if let Some(relay) = self.node.peer_relay(from) {
+                self.displaced_relays.entry(from).or_insert(relay);
+            }
             self.node.clear_peer_relay(from);
             if let Some(attempt) = self.attempt_of(from) {
                 self.admissions.insert(from, attempt);
@@ -975,6 +995,7 @@ impl Inner {
     fn direct_installed(&mut self, attempt: Attempt) {
         let peer = attempt.peer;
         self.node.clear_peer_relay(peer);
+        self.displaced_relays.remove(&peer);
         // What this channel's handshake just installed — the one
         // establishment the channel CARRIED — recorded WITH this
         // channel's own identity. When a channel dies, the
@@ -1169,7 +1190,44 @@ impl Inner {
             }
         }
         self.node.tick(clock::now());
+        self.retire_unproven_admissions();
         self.flush();
+    }
+
+    /// Admissions whose establishment expired unproven: the offerer
+    /// never completed it (typically it ran out its own deadline and
+    /// gave up). The pair goes back to the relay message 1 displaced,
+    /// keeping the routed session it never stopped using on the
+    /// offerer's side, and the attempt ends `Relayed` — §9 step 6's
+    /// supported disposition — never `direct`.
+    ///
+    /// Non-destructive on purpose, unlike a supersession or a close
+    /// ([`Inner::settle`] drops the routed session there): an expiry
+    /// leaves both ends holding that routed session, and dropping it
+    /// here would leave the offerer sending relayed packets this side
+    /// can no longer open. The retired establishment still installs
+    /// nothing — [`LeafNode::tick`] already destroyed its keys.
+    fn retire_unproven_admissions(&mut self) {
+        let expired: Vec<(NodeId, Attempt)> = self
+            .admissions
+            .iter()
+            .filter(|(peer, _)| {
+                self.node.provisional_attempt(**peer).is_none()
+                    && !self.node.verified_admission_pending(**peer)
+            })
+            .map(|(peer, attempt)| (*peer, *attempt))
+            .collect();
+        for (peer, attempt) in expired {
+            // Removed BEFORE the settle, so the settle's destructive
+            // branch (which keys on a live admission) is not taken.
+            self.admissions.remove(&peer);
+            if let Some(relay) = self.displaced_relays.remove(&peer) {
+                if self.node.has_session(peer) && self.node.peer_relay(peer).is_none() {
+                    self.node.set_peer_relay(peer, relay);
+                }
+            }
+            self.settle(attempt, IceTerm::Relayed, "failed");
+        }
     }
 
     /// Put everything the node queued on the wire and collect
@@ -1603,6 +1661,7 @@ impl Inner {
         // settles `Direct`, so this branch never sees a promotion.
         if self.admissions.get(&attempt.peer) == Some(&attempt) {
             self.admissions.remove(&attempt.peer);
+            self.displaced_relays.remove(&attempt.peer);
             self.node
                 .drop_session(attempt.peer, "the establishment's attempt was retired");
         }
@@ -1681,6 +1740,7 @@ impl Inner {
         self.offers.clear();
         self.handshakes.clear();
         self.admissions.clear();
+        self.displaced_relays.clear();
         self.channel_installations.clear();
         self.retry.forget_all();
         self.unregister_retry_listeners();
@@ -1911,6 +1971,7 @@ impl LeafNode {
             peers: HashMap::new(),
             handshakes: HashMap::new(),
             admissions: HashMap::new(),
+            displaced_relays: HashMap::new(),
             channel_installations: HashMap::new(),
             next_routed: 0,
             anchor_candidates: VecDeque::new(),
@@ -3476,6 +3537,18 @@ impl LeafNode {
             } else {
                 "gathering"
             }
+        } else if open
+            && with_node(&self.inner, |guard| {
+                guard.admissions.get(&peer) == Some(&attempt)
+            })
+        {
+            // The offerer's message 1 arrived and its proof is still
+            // in flight: settling here would take `settle`'s
+            // destructive branch and drop the routed session the
+            // offerer may still be using. The proof window is bounded
+            // ([`crate::establish::PROOF_DEADLINE_MS`]); it ends in a
+            // promotion or in [`Inner::retire_unproven_admissions`].
+            "open"
         } else if open {
             // ICE connected and the session did not install inside
             // the attempt's bound. `udp_blocked` is unclaimable — a
@@ -4070,9 +4143,17 @@ impl LeafNode {
 
     /// Is a direct session with `peer` installed — which is a
     /// different fact from an open channel?
+    ///
+    /// **Not while an establishment proof is pending.** An answerer
+    /// drops the relay at message 1, while the routed session is still
+    /// in the table; reading "session, no relay" as installed reported
+    /// `direct` before anything was proven — and, when the offerer gave
+    /// up, kept reporting it (S0b). Direct means PROVEN.
     fn installed(&self, peer: NodeId) -> bool {
         let guard = self.inner.borrow();
-        guard.node.has_session(peer) && guard.node.peer_relay(peer).is_none()
+        guard.node.has_session(peer)
+            && guard.node.peer_relay(peer).is_none()
+            && !guard.admissions.contains_key(&peer)
     }
 
     /// Settle `attempt` because its deadline passed with no session

@@ -215,6 +215,7 @@ fn pair() -> Pair {
         peers: HashMap::new(),
         handshakes: HashMap::new(),
         admissions: HashMap::new(),
+        displaced_relays: HashMap::new(),
         next_routed: 0,
         anchor_candidates: VecDeque::new(),
         // This leaf did not bootstrap through an anchor, so there
@@ -1098,6 +1099,96 @@ async fn a_retired_attempt_admits_no_late_establishment() {
         failed + 1,
         "and no second term is charged for it"
     );
+    p.leaf.close();
+}
+
+/// An answerer is not `direct` until the establishment is PROVEN, and
+/// an establishment its offerer abandons hands the pair back to the
+/// routed session — it does not leave this side sending on a channel
+/// the offerer closed.
+///
+/// Found by the sharded-match S0b run (1 host × 64 players, one busy
+/// machine): the offerer's handshake ran out its deadline before the
+/// slow answerer's message 2 returned, so it settled `failed` and kept
+/// its routed session; this side had dropped the relay at message 1,
+/// read "session, no relay" as installed, and reported `open` /
+/// `direct:true` for good — every snapshot went down a dead channel.
+///
+/// Inverse: drop the pending-admission term from `installed` — the
+/// first reading says `direct:true`; or skip
+/// `retire_unproven_admissions` — the relay is never restored and the
+/// attempt never ends.
+#[wasm_bindgen_test]
+async fn an_establishment_abandoned_by_its_offerer_returns_the_pair_to_its_relay() {
+    let p = pair();
+    // The pair already holds a ROUTED session, through the anchor.
+    p.install_session();
+    with_node(&p.leaf.inner, |guard| {
+        let anchor = guard.anchor;
+        guard.node.set_peer_relay(p.peer_id, anchor);
+    });
+    let d = p.offer(20_000).await;
+    let attempt = p.attempt(d);
+    let our_noise = *p.leaf.inner.borrow().node.identity().noise().public_key();
+    p.open_channel(d).await;
+
+    // The offerer's message 1 arrives over the direct channel.
+    let msg1 = p
+        .peer
+        .borrow_mut()
+        .begin_handshake(p.us, &PSK, &our_noise, 1)
+        .expect("the peer's message 1");
+    with_node(&p.leaf.inner, |guard| {
+        guard.on_handshake(p.peer_id, &msg1, false);
+    });
+    assert!(
+        p.leaf.inner.borrow().node.peer_relay(p.peer_id).is_none(),
+        "message 1 drops the relay, so message 2 goes back direct"
+    );
+    let reading = p
+        .leaf
+        .service_peer(attempt)
+        .await
+        .unwrap_or_else(|_| panic!("the attempt is live"));
+    assert!(
+        !reading.direct,
+        "an unproven establishment is not a direct pair, whatever the relay table says"
+    );
+
+    // The offerer gives up and never sends its proof. The node's own
+    // sweep expires the provisional establishment at the proof deadline.
+    let relayed = p.counter("ice_relayed");
+    with_node(&p.leaf.inner, |guard| {
+        let later = clock::now()
+            + core::time::Duration::from_millis(crate::establish::PROOF_DEADLINE_MS + 1_000);
+        guard.node.tick(later);
+        guard.pump();
+    });
+    assert!(
+        p.leaf.inner.borrow().admissions.is_empty(),
+        "the expired admission is retired"
+    );
+    assert_eq!(
+        p.leaf.inner.borrow().node.peer_relay(p.peer_id),
+        Some(ANCHOR),
+        "the pair is back on the relay the abandoned establishment displaced"
+    );
+    assert!(
+        p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "and on the routed session the offerer never stopped using"
+    );
+    assert_eq!(
+        p.counter("ice_relayed"),
+        relayed + 1,
+        "the attempt ends as §9 step 6's relayed disposition"
+    );
+    let reading = p
+        .leaf
+        .service_peer(attempt)
+        .await
+        .unwrap_or_else(|_| panic!("a settled attempt is still readable"));
+    assert_eq!(reading.state, "failed");
+    assert!(!reading.direct);
     p.leaf.close();
 }
 

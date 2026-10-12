@@ -583,6 +583,57 @@ The host page's reports stopped 65 s before that run's verdict. It's a
 harness gap: one `getStats()` that never resolves stalls every later
 report. Fixed with a per-connection timeout.
 
+**Split view of a pair, found and fixed (2026-10-13).** The per-pair
+dump (`node.peerAttempt` from both ends of each failed pair) showed 3 of
+10 failures with the SAME dialog seen two ways:
+
+- the player (offerer) had `failed`, `direct:false`;
+- the host (answerer) had `open`, `direct:true`, and was holding the
+  player in its netcode.
+
+Cause, in `leaf/src/wasm.rs`:
+
+1. The offerer's Noise wait shares its 10 s ICE deadline, so on a slow
+   host message 2 arrived late; the offerer settled `failed` and kept its
+   routed session.
+2. The answerer had cleared the relay at message 1, and `installed()` was
+   `has_session && no relay`. The routed session was still in the table,
+   so the answerer reported direct before anything was proven.
+3. Nothing rolled it back: the proof sweep destroyed only the keys, not
+   the attempt or the relay entry.
+
+That broke the transport plan's §9 steps 4 and 6 and §5.
+
+**Fix:**
+
+- `installed()` now requires no pending establishment proof.
+- An admission that expires unproven restores the relay its message 1
+  displaced, keeps the routed session, and ends the attempt `Relayed`.
+- The answerer's own deadline waits while a proof is pending, which the
+  5 s proof deadline bounds.
+- Supersession and close keep their designed destructive teardown; their
+  witnesses are unchanged.
+
+**Evidence:**
+
+- the witness
+  `an_establishment_abandoned_by_its_offerer_returns_the_pair_to_its_relay`,
+  run in headless Chrome with chromedriver 155, failing under both
+  mutations;
+- leaf wasm suites all green (lib 24, `wasm_leader` 38 at CI's 120 s
+  runner timeout, `wasm_leaf` 16);
+- leaf native 485.
+
+Rerun (staggered 1 × 64): 57/64 joined and **no split-view pair
+remains**. The 7 left:
+
+- 4 relayed pairs the host never hears (bug 2, both ends `iceTimeout`,
+  host not holding the player);
+- 3 of the last joiners never saw the host's announcement within 300 s.
+
+Both sit on a machine running 65 tabs; the multi-machine run separates
+them from load.
+
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It
 needs ≥ 3 machines.

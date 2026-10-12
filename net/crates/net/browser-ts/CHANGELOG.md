@@ -44,6 +44,13 @@ the README on why it is a sibling package rather than a sub-path.
   more yet`), and a reopen kept the drained state. Credit stalled for
   2 s with bytes outstanding is now written off as lost (`net-mesh-wire`,
   `FIRE_AND_FORGET_RECLAIM_AFTER`); reliable streams are unchanged.
+- **A peer pair can no longer end half-direct.** When a slow answerer's
+  handshake reply crossed the offerer's deadline, the offerer fell back to
+  the relay while the answerer reported `direct` and sent on a channel the
+  offerer had closed: `peerAttempt` read `failed` on one end and `open`
+  with `direct: true` on the other, for good. An answerer is now direct
+  only once the establishment is proven, and an establishment its offerer
+  abandons returns the pair to its relay (`net-mesh-leaf`).
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers
