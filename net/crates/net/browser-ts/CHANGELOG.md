@@ -30,6 +30,13 @@ the README on why it is a sibling package rather than a sub-path.
   to wait silently forever), `unreachable`, `timeout`, or `closed`. The
   client keeps retrying regardless. `stats()` gains `connectOutcome` and
   `lastError`.
+- **A pair left on the relay is no longer re-offered on every reopen.**
+  When `joinNetcode`'s direct attempt ended relayed (`iceTimeout`, …),
+  every stream reopen started a fresh ICE attempt, and one finishing late
+  replaced the session under the stream. That was a loop that, under
+  load, never delivered a snapshot. The stream now rides the relayed
+  session, and direct is retried at most every `directRetryMs` (default
+  30 s). Send failures now show in `stats().lastError`.
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers

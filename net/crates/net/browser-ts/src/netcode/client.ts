@@ -132,6 +132,13 @@ export interface JoinNetcodeOptions<E, I> {
   /** How long {@link NetcodeClient.ready} waits for the first snapshot, ms. Default 15 000. */
   readonly joinTimeoutMs?: number;
   /**
+   * After an attempt to go direct ended with the pair relayed
+   * (`iceTimeout`, `udpBlocked`, …), the least time before another, ms.
+   * Default 30 000. Until then a reopened stream rides the relayed
+   * session, which is a supported outcome, not a failure.
+   */
+  readonly directRetryMs?: number;
+  /**
    * Compact snapshots (`codec.ts`): the same codec the host uses. With a
    * matching fingerprint the host sends binary snapshots; otherwise JSON,
    * which this client still reads.
@@ -271,10 +278,27 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   let connectOutcome: string | null = null;
   let lastError: string | null = null;
   const message = (error: unknown) => String((error as Error)?.message ?? error);
+  // Whether a reopen should offer again. Found by the S0b topology run: a
+  // pair whose direct attempt ended relayed was re-offered on EVERY stream
+  // reopen. `connectPeer` is a no-op only on a healthy direct pair, so each
+  // reopen began a fresh ICE attempt, a late one bumped the session, the
+  // stream went stale, the next send failed and reopened — 44 attempts in
+  // five minutes and no snapshot. A relayed pair is a supported outcome:
+  // reopen the stream on it, and try direct again only after
+  // `directRetryMs`. `noAnnouncement` is retried at once (it is cheap and
+  // discovery needs it); a direct pair's call is the idempotent check.
+  const directRetryMs = Math.max(0, options.directRetryMs ?? 30_000);
+  let lastOfferAt = -Infinity;
+  const shouldOffer = (): boolean =>
+    connectOutcome === null ||
+    connectOutcome === 'noAnnouncement' ||
+    connectOutcome === 'direct' ||
+    now() - lastOfferAt >= directRetryMs;
   let opening: Promise<void> | null = null;
   const open = (): Promise<void> => {
     opening ??= (async () => {
-      if (options.transport.connectPeer !== undefined) {
+      if (options.transport.connectPeer !== undefined && shouldOffer()) {
+        lastOfferAt = now();
         try {
           const outcome = (await options.transport.connectPeer(host)) as { readonly type?: unknown } | undefined;
           if (outcome !== null && typeof outcome === 'object' && typeof outcome.type === 'string') connectOutcome = outcome.type;
@@ -309,7 +333,8 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       void open();
       return;
     }
-    const retire = () => {
+    const retire = (error?: unknown) => {
+      if (error !== undefined) lastError = message(error);
       if (stream === current) {
         stream = null;
         try {
@@ -321,8 +346,8 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     };
     try {
       void Promise.resolve(current.send(encodeFrame(frame))).catch(retire);
-    } catch {
-      retire();
+    } catch (error) {
+      retire(error);
     }
   };
 

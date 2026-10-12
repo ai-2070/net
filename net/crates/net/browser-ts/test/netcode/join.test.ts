@@ -212,3 +212,77 @@ describe('clock pings once the clock has settled', () => {
     server.close();
   });
 });
+
+describe('a pair left on the relay is not re-offered on every reopen', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Found by the S0b topology run (1 host × 64 players): a player whose
+  // direct attempt ended `iceTimeout` re-offered on every stream reopen; a
+  // late attempt replaced the session, the stream went stale, the next send
+  // failed and reopened — 44 attempts in five minutes, no snapshot.
+  it('one attempt, then the stream rides the relayed session; another only after directRetryMs', async () => {
+    const net = simNetwork({ latencyMs: 20 });
+    const applied: number[] = [];
+    const server = hostNetcode<Ship, { dx: number }>({
+      transport: net.node(HOST),
+      label: LABEL,
+      now: () => Date.now(),
+      step: ({ inputs }) => {
+        for (const list of inputs.values()) for (const input of list) applied.push(input.seq);
+      },
+      snapshot: () => ({ rock: { x: 1 } }),
+    });
+    const node = net.node(ALICE);
+    let offers = 0;
+    const leaf: NetcodeTransport = {
+      nodeIdHex: () => node.nodeIdHex(),
+      onEvent: handler => node.onEvent(handler),
+      // ICE times out after 1 s; the attempt's late end then replaces the
+      // session, as the leaf's did, fencing every stream opened before it.
+      connectPeer: peer =>
+        new Promise(resolve => {
+          offers += 1;
+          setTimeout(() => resolve({ type: 'iceTimeout', peer, dialog: String(offers) }), 1_000);
+          setTimeout(() => net.replaceSession(ALICE), 1_500);
+        }),
+      openStream: options => node.openStream(options),
+    };
+    const player = joinNetcode<Ship, { dx: number }>({
+      transport: leaf,
+      host: HOST,
+      label: LABEL,
+      now: () => Date.now(),
+      directRetryMs: 30_000,
+    });
+    for (let t = 0; t < 20_000; t += 100) {
+      player.input({ dx: 1 });
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(offers).toBe(1);
+    expect(player.stats().connectOutcome).toBe('iceTimeout');
+    expect(player.stats().snapshots).toBeGreaterThan(100);
+    // The stream survived the late session replacement by reopening on
+    // it: inputs from the second half all reached the host.
+    const lateSeqs = new Set(applied.filter(seq => seq > 100));
+    expect(lateSeqs.size).toBeGreaterThanOrEqual(95);
+
+    // A healthy relayed stream never reopens, so it never re-offers. A
+    // reopen past directRetryMs (the session replaced again) tries direct
+    // once more.
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(offers).toBe(1);
+    net.replaceSession(ALICE);
+    for (let t = 0; t < 3_000; t += 100) {
+      player.input({ dx: 1 });
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(offers).toBe(2);
+    player.close();
+    server.close();
+  });
+});

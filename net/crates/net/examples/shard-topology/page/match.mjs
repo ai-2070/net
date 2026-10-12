@@ -83,7 +83,7 @@ const frames = [];
 let lastFrame = null;
 const tickMs = [];
 let payloadBytes = 0;
-const outcomes = { connect: {}, accept: {} };
+const outcomes = { connect: {}, accept: {}, errors: [] };
 const note = (kind, outcome) => {
   outcomes[kind][outcome] = (outcomes[kind][outcome] ?? 0) + 1;
 };
@@ -137,9 +137,11 @@ let node;
 let index;
 const extra = {};
 async function start() {
+  const connectStarted = performance.now();
   const credential = await requestCredential({ anchorUrl: config.anchorUrl, game: config.game });
   node = await connect({ credentialB64: credential.credentialB64, bootstrapUrl: credential.bootstrapUrl, ...rememberedIdentity() });
   await until('enrollment', () => node.isEnrolled(), 60_000);
+  extra.connectMs = Math.round(performance.now() - connectStarted);
   status.node = node.nodeIdHex();
   ({ index } = await api('register', { role, node: status.node }));
   status.index = index;
@@ -164,7 +166,7 @@ async function start() {
   const tag = `${config.game}:${role}`;
   const announce = () => node.announce([tag]).catch(() => {});
   await announce();
-  setInterval(announce, 2_000);
+  setInterval(announce, config.announceMs);
 
   const hosts = await until('every host registered', async () => {
     const { hosts } = await api('hosts');
@@ -200,6 +202,7 @@ async function joinAll(hosts, self, local) {
           extra[`connect:${h}`] = { outcome: outcome.type, ms: Math.round(performance.now() - started) };
         } catch (error) {
           note('connect', `error:${error?.kind ?? 'unknown'}`);
+          if (outcomes.errors.length < 10) outcomes.errors.push({ host: h, ms: Math.round(performance.now() - started), message: String(error?.message ?? error) });
         }
       }
       const client = joinNetcode({
@@ -394,6 +397,7 @@ setInterval(async () => {
       dropped: typeof extra.dropped === 'function' ? extra.dropped() : null,
       netcode: typeof extra.netcode === 'function' ? extra.netcode() : null,
       joinedAt: extra.joinedAt ?? null,
+      connectMs: extra.connectMs ?? null,
       connect: Object.fromEntries(Object.entries(extra).filter(([key]) => key.startsWith('connect:'))),
     });
   } catch (error) {

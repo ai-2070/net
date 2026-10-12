@@ -91,7 +91,7 @@ function coordinatorApi(base, pin, path, body) {
   });
 }
 
-async function runBrowsers({ base, pin, hosts, players, chrome, headed }) {
+async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerMs = 0 }) {
   const browser = await chromium.launch({
     headless: !headed,
     ...(chrome ? { executablePath: chrome } : {}),
@@ -116,7 +116,10 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed }) {
     pages.push(entry);
   };
   for (let i = 0; i < hosts; i += 1) await open('host');
-  for (let i = 0; i < players; i += 1) await open('player');
+  for (let i = 0; i < players; i += 1) {
+    await open('player');
+    if (staggerMs > 0) await sleep(staggerMs);
+  }
 
   // Main-thread busy time for host pages, handed to the page's own report.
   const sampler = setInterval(async () => {
@@ -167,7 +170,7 @@ if (mode === 'browsers') {
   const base = arg('coordinator');
   const pin = arg('spki');
   if (!base || !pin) throw new Error('browsers: pass --coordinator <https url> and --spki <pin> (the coordinator prints both)');
-  await runBrowsers({ base, pin, hosts: num('hosts', 0), players: num('players', 0), chrome: arg('chrome'), headed: flag('headed') });
+  await runBrowsers({ base, pin, hosts: num('hosts', 0), players: num('players', 0), chrome: arg('chrome'), headed: flag('headed'), staggerMs: num('stagger-ms', 0) });
   process.exit(0);
 }
 
@@ -191,6 +194,7 @@ const config = {
   tickRate: num('tick-rate', 20),
   visible: num('visible', 30),
   burnMs: num('burn-ms', 4),
+  announceMs: num('announce-ms', 2000),
   relayed: flag('relayed'),
 };
 const measureSecs = num('measure-secs', 30);
@@ -239,6 +243,7 @@ const spkiPin = createHash('sha256').update(spki).digest('base64');
 const registered = { host: [], player: [] };
 const reports = []; // every report, in arrival order
 const latest = new Map(); // `${role}:${index}` → last report
+const failedLogged = new Set();
 let phase = 'joining';
 let measureFrom = null;
 let anchorStats = null;
@@ -298,6 +303,8 @@ function verdict() {
   });
   const playerRows = [...byPlayer].map(([index, rs]) => ({ index, last: rs.at(-1), down: mean(rs.map(r => mbit(r.wire.anchorReceived + r.wire.directReceived))) }));
   const joinMs = playerRows.flatMap(p => Object.values(p.last.joinedAt ?? {}));
+  const connectMs = playerRows.map(p => p.last.connectMs).filter(v => typeof v === 'number');
+  const errors = playerRows.flatMap(p => p.last.outcomes?.errors ?? []);
   const connects = {};
   for (const p of playerRows) for (const [outcome, n] of Object.entries(p.last.outcomes?.connect ?? {})) connects[outcome] = (connects[outcome] ?? 0) + n;
   const checks = [];
@@ -321,6 +328,9 @@ function verdict() {
       joinMsP95: quantile(joinMs, 0.95),
       joinMsMax: joinMs.length ? Math.max(...joinMs) : null,
       connectOutcomes: connects,
+      connectMsP50: quantile(connectMs, 0.5),
+      connectMsMax: connectMs.length ? Math.max(...connectMs) : null,
+      errors: errors.slice(0, 20),
     },
   };
 }
@@ -345,8 +355,9 @@ function printVerdict(result) {
   }
   const p = result.players;
   console.log(
-    `\nplayers: ${p.count}, down ${fmt(p.downMbitMean)} Mbit/s mean; first snapshot per host p50 ${fmt(p.joinMsP50, 0)} ms, p95 ${fmt(p.joinMsP95, 0)}, max ${fmt(p.joinMsMax, 0)}; connect outcomes ${JSON.stringify(p.connectOutcomes)}`,
+    `\nplayers: ${p.count}, anchor connect p50 ${fmt(p.connectMsP50, 0)} ms, max ${fmt(p.connectMsMax, 0)}; down ${fmt(p.downMbitMean)} Mbit/s mean; first snapshot per host p50 ${fmt(p.joinMsP50, 0)} ms, p95 ${fmt(p.joinMsP95, 0)}, max ${fmt(p.joinMsMax, 0)}; connect outcomes ${JSON.stringify(p.connectOutcomes)}`,
   );
+  for (const e of p.errors) console.log(`  connectPeer error, host ${e.host}, after ${e.ms} ms: ${e.message}`);
   console.log('');
   for (const c of result.checks) console.log(`${c.ok ? 'PASS' : 'FAIL'} ${c.name} — ${c.detail}`);
 }
@@ -391,7 +402,12 @@ const pages = createServer({ cert: readFileSync(certFile), key: readFileSync(key
       }
       reports.push(body);
       latest.set(`${body.role}:${body.index}`, body);
-      if (body.phase === 'failed') log(`${body.role} ${body.index} FAILED: ${body.error}`);
+      // Once per page: a failed page keeps reporting, without its error.
+      const key = `${body.role}:${body.index}`;
+      if (body.phase === 'failed' && body.error && !failedLogged.has(key)) {
+        failedLogged.add(key);
+        log(`${body.role} ${body.index} FAILED: ${body.error}`);
+      }
       return json(res, 200, { phase });
     }
     return json(res, 404, { error: 'unknown' });
@@ -463,7 +479,7 @@ log(`other machines:\n  node run.mjs browsers --coordinator ${origin} --spki ${s
 
 const local =
   localHosts + localPlayers > 0
-    ? runBrowsers({ base: origin, pin: spkiPin, hosts: localHosts, players: localPlayers, chrome: arg('chrome'), headed: flag('headed') }).catch(error => log(`local browsers: ${error.message}`))
+    ? runBrowsers({ base: origin, pin: spkiPin, hosts: localHosts, players: localPlayers, chrome: arg('chrome'), headed: flag('headed'), staggerMs: num('stagger-ms', 0) }).catch(error => log(`local browsers: ${error.message}`))
     : null;
 
 // Join → measure → verdict.

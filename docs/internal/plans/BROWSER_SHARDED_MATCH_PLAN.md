@@ -523,6 +523,39 @@ Findings:
    `--offers-per-minute` / `--credentials-per-minute` and records the value
    in its results. Real players have their own addresses.
 
+**Follow-up fixes (2026-10-12), each with tests:**
+
+- **Finding 3 fixed:** `joinNetcode().ready()` rejects with a typed
+  `NetcodeError` (`no-announcement`, `unreachable`, `timeout`, `closed`).
+  `stats()` gains `connectOutcome` and `lastError`
+  (`test/netcode/join.test.ts`).
+- **Fewer clock pings once the clock has settled** (4/s, then 1/s after
+  8 samples). Measured at 1 × 32: host wire upload 2.19 → 1.82 Mbit/s.
+- **Finding 4 fixed in the anchor:** offers are charged per (address,
+  credential), 10 a minute. The per-address ceiling is a backstop, 10 →
+  120, and credentials per address go 30 → 120. Witnesses are in
+  `sdk/tests/rtc_bootstrap_listener.rs`, three of them pinned in ci.yml.
+- **New defect, found and fixed: a re-offer storm.** At 1 × 64, one
+  player's direct attempt ended `iceTimeout`. `joinNetcode` then
+  re-offered on every stream reopen; each fresh ICE attempt that ended
+  late replaced the session, so the stream went stale. That was 44
+  attempts in five minutes, and no snapshot ever arrived. A relayed pair
+  now keeps its stream, and direct is retried at most every
+  `directRetryMs` (30 s). After the fix, all 64 players join.
+- **What `error:session` was:** "did not complete the relayed Noise
+  handshake inside 5000 ms". The host tab's main thread was 93% busy
+  during the 64-player join burst.
+
+**1 × 64 on one machine, after the fixes:** every player joined (first
+snapshot p50 6.4 s, max 20 s). But the host held only 46 of 64 peers in
+the measuring window, the host tab was 93% busy (tick p95 17.5 ms), and
+wire upload was 9.4 Mbit/s against 0.67 Mbit/s of payload (14×).
+**Announcement gossip was ruled out** as the cause: at 1 × 32, announcing
+every 30 s instead of every 2 s left the overhead unchanged (1.87× vs
+2.00×). The rest can't be separated from CPU saturation while one machine
+runs the host and all 64 players. Assume nothing about a browser host's
+capacity above 32 players until the multi-machine run measures it.
+
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It
 needs ≥ 3 machines.
