@@ -50,6 +50,12 @@ What exists today, checked in the code:
   authentication (`peerOf`).
 - **Lobby capacity is not the limit.** `MAX_LOBBY_CAPACITY` is 256
   (`src/lobby.ts`), and the host is one of the `capacity` slots.
+- **Nothing decides who runs an NPC.** `hostNetcode`'s `snapshot()` takes
+  any entity map (`host.ts`), so an NPC can be sent like a player. But
+  nothing assigns an NPC's AI to a host, nothing carries NPC↔player hits
+  between hosts, and every NPC adds to the upload estimate above. Sending a
+  distant NPC less often is not built either (lobbies plan §5, "update rate
+  by distance").
 
 ## 2. The design
 
@@ -63,9 +69,10 @@ upload load is the same on every host by construction.
 ```
             ┌──────── lobby node (coordinator; also a shard host) ────────┐
             │ store: roster, teams, score, phase, ASSIGNMENT (epoch,       │
-            │        shard → host, player → shard)                         │
+            │        shard → host, player → shard, npc → shard),           │
+            │        NPC paths (§2 "NPCs")                                 │
             └──────────────────────────────────────────────────────────────┘
- shard:0 host ── hostNetcode(label) ── snapshots of ITS 16 players ──► every player
+ shard:0 host ── hostNetcode(label) ── snapshots of ITS players + NPCs ──► every player
  shard:1 host ── hostNetcode(label) ── …                              ► every player
    …                    ▲ inputs only from the players it owns
    └─ host ↔ host: spectate each other (joinNetcode, no local entity)
@@ -73,8 +80,9 @@ upload load is the same on every host by construction.
 ```
 
 - **Simulation.** Each shard host runs one `hostNetcode`. `step` applies
-  inputs only from the players it owns, and `snapshot` returns only those
-  players. `visible` and `interest` filter per receiver, as they do today.
+  inputs only from the players it owns and runs the AI of the NPCs it owns.
+  `snapshot` returns only those players and NPCs. `visible` and `interest`
+  filter per receiver, as they do today.
 - **Players** join every shard host and merge the snapshots into one view
   (`joinShards`, S1). Each player has `local` prediction only on the shard
   that owns it and sends inputs only to that shard.
@@ -111,6 +119,8 @@ upload load is the same on every host by construction.
 | D4 | Number of hosts, tick rate | **8 hosts at 30 Hz, or 4 at 20 Hz**, both with interest filtering. Confirmed or replaced by S0 and S7. |
 | D5 | Rewind cap for cross-host hits | **300 ms** (default is 200). A forwarded hit is older by the time it reaches B: render delay + player→A + A→B. Each extra 100 ms is also more advantage a player can get by faking lag, so S3 measures the real age before this is fixed. |
 | D6 | Durability | **None.** A match lives only in memory. `regionHandoffs` runs without `persist`. A crash loses that host's part of the match (S6), and at-most-once still holds because B's action records die together with B's entities. |
+| D7 | Who owns an NPC | **Fixed at spawn: `hash(npcId) mod hosts`, recorded in the assignment. Fixed objectives belong to the lobby node.** Alternatives and reasons in §2 "NPCs". |
+| D8 | Where NPC paths live | **In the lobby store, written through a host-only action that `authorize` admits only from the NPC's current owner (checked against the assignment).** Path changes are rare, so the lobby node's upload barely notices them. The alternative, a small path store on every shard host, would make every player join 4–8 more stores. |
 
 ### Clocks: every shard has its own
 
@@ -120,6 +130,55 @@ A hit claim must therefore state the time in the **target's** clock:
 puts that value in the input data it sends to A. A forwards it unchanged, and
 B clamps it with its own `maxRewindMs`. `TickInput.seen` stays in A's clock,
 and A uses it to rewind the shooter's own position.
+
+### NPCs
+
+An NPC is an entity like a player, except that a host's AI drives it instead
+of inputs. Once its owner is decided, everything else carries over:
+
+- it runs in its owning host's `step` and is sent in that host's snapshots,
+  under the same `visible`/`interest` filtering;
+- `joinShards` merges and interpolates it like any remote player;
+- it is in its owner's rewind history, so lag-compensated hits on it work
+  the same way as hits on players.
+
+**Ownership (D7).** At spawn, an NPC is assigned to
+`hash(npcId) mod hosts` and recorded in the assignment under the same
+`epoch` as players. It keeps that owner for its whole life, except when a
+host leaves cleanly (S5) or crashes (S6), where NPCs are handled exactly like
+players. **Fixed objectives** (turrets, bosses, capture points) belong to the
+lobby node, which is a shard host too. A fixed objective is a match's center
+of gravity, and the lobby node already holds score and phase.
+
+| Alternative | Why rejected |
+|---|---|
+| **Follow the target**: hand the NPC to the host that owns the player it is attacking | Fights become local to one host, with no forwarding. But every target switch freezes the NPC for a handoff (at least one round trip, 250 ms per lost offer), and NPCs that switch targets often keep moving between hosts. Measure later as an optimization (§6). |
+| **By area**: NPCs belong to zones, like the `world/` regions | Natural for camps and turrets, but the busiest fight lands on one host again: the same reason area-based sharding was rejected for players. |
+
+**Interactions.**
+
+- **Player hits an NPC on another host:** the S3 path unchanged, with the
+  NPC's owner as B.
+- **NPC attacks a player on another host:** the NPC's host forwards `hit` to
+  the player's owner. The NPC's position at the time of the attack comes
+  from its host's own rewind history. The player's owner checks it against
+  its spectator view of that host, with the same tolerance check as S3.
+- **NPC perception:** the AI sees players on other hosts through its host's
+  spectator view, which is about one interpolation delay plus one hop old
+  (~100–150 ms). That is within normal AI reaction times. An NPC that needs
+  frame-exact aim is out of scope.
+
+**Bandwidth.** Every visible NPC costs as much upload as a visible player,
+so 200 NPCs can more than double each host's upload. In order of payoff:
+
+1. **Interest filtering**, as for players.
+2. **NPCs that follow a path don't need snapshots (S8).** A patrolling,
+   scripted or idle NPC is published once as a path record, and clients
+   compute its position from it. The NPC switches to netcode snapshots only
+   while it is in combat or off its path. Each NPC's mode is explicit in
+   its record (`'path' | 'live'`). Being absent from a snapshot is never the
+   signal, because interest filtering also removes entities from snapshots.
+3. **Sending distant NPCs less often.** Not built; out of scope here (§6).
 
 ## 3. The slices
 
@@ -134,7 +193,8 @@ interest/visibility. Report per host: ms/tick, bytes/s sent, number of
 streams. Report per player: bytes/s received.
 
 - Points: H = 1, 4, 8 × N = 16, 64, 128 × {everyone sees everyone, interest}
-  × {20, 30} Hz.
+  × {20, 30} Hz × NPCs = 0, 100, 300 (simulated moving entities owned by
+  the hosts, spread with D7's hash).
 - **Proves:** replaces the §1 estimates with recorded numbers (command and
   machine named, as in lobbies plan §5). **Stop rule:** if a single host at
   128 players with interest filtering already fits within 10 Mbit/s and
@@ -210,9 +270,26 @@ match.setAssignment({ epoch, shards, own });  // S5/S6 reassignment
   The age distribution of `seen` at B is recorded, and that measurement sets
   D5.
 
+### S3b — NPCs: ownership and hits across hosts
+
+- NPCs in the assignment (`npc → shard`, D7). A shard host runs the AI of
+  the NPCs it owns in `step` and returns them from `snapshot`, so its
+  `regionHandoffs` `load`/`commit` cover them as well.
+- Player→NPC hits take S3's path. NPC→player hits:
+  `forward(playerShard, 'hit', { shooter: npcId, pose, target, seen })`,
+  where `pose` comes from the NPC host's own `rewind` and `seen` is in the
+  player's owner's clock (the NPC host reads it from its spectator client
+  for that shard).
+- Fixed objectives are spawned by the lobby node and owned by it.
+- **Proves** (the S3 link simulator): a player's hit on an NPC owned by
+  another host is applied exactly once under drop, duplication and
+  reordering. An NPC's hit on a player on another host is applied exactly
+  once and refused when its `pose` is outside the tolerance. A test that
+  gives one NPC to two shards in the same epoch must fail validation.
+
 ### S4 — Lobby integration: roster, teams, assignment
 
-- Lobby store fields: `assignment: { epoch, hosts: { [shard]: hex }, owner: { [player]: shard } }`,
+- Lobby store fields: `assignment: { epoch, hosts: { [shard]: hex }, owner: { [player]: shard }, npcs: { [npc]: shard } }`,
   validated, and editable only by the lobby host.
 - Host selection: players volunteer, and each reports a measured uplink
   (S0's method in a 2 s probe). D1's ownership rule is applied when the
@@ -269,11 +346,35 @@ drops those entities.
 - **Proves:** the numbers are recorded in this plan with the command that
   produced them. A gate miss sends the plan to §5's fallbacks.
 
+### S8 — NPCs driven by paths in the store
+
+- Path record in the lobby store (D8):
+  `{ mode: 'path', path: [...waypoints], startedAt, speed }`, with
+  `startedAt` in the owner's clock, or `{ mode: 'live' }`. It is written
+  only by the NPC's owner. Records carry an interest key (store interest,
+  `store/interest.ts`), so a player receives only paths near it.
+- `joinShards` merges path-driven NPCs into `view()`. For `'path'`, the
+  position is computed from the record and `hostNow(ownerShard)`. For
+  `'live'`, the snapshot copy is used. Switching to `'live'` is written
+  before the NPC first appears in a snapshot. Switching back is written with
+  a `startedAt` that continues from the NPC's last live position.
+- **Hidden information:** a path record shows where the NPC will be. NPCs
+  whose position is secret (behind fog of war) stay `'live'`, so `visible`
+  keeps filtering them. Store visibility rules can hide their records, but
+  the safe default is that secret NPCs don't use paths.
+- **Proves:** a test drives an NPC through path → live → path. The
+  client's computed position stays within a stated tolerance of the host's
+  authoritative position the whole way, with no jump at either switch. An
+  NPC hidden by `visible` never appears in a player's view by way of a
+  path record (`assertHidden`). The S0 benchmark with 300 NPCs, 80% on
+  paths, records the upload saved.
+
 ## 4. Order
 
-S0 → (stop rule) → S1 → S2 → S3 → S4 → S7 (first gate) → S5 → S6.
+S0 → (stop rule) → S1 → S2 → S3 → S3b → S4 → S7 (first gate) → S5 → S6 → S8.
 S5 and S6 come after the gate on purpose: they only matter once the
-steady state is shown to work.
+steady state is shown to work. S8 is an optimization; S0's NPC dimension
+says how much it is worth before it is built.
 
 ## 5. Risks
 
@@ -286,6 +387,8 @@ steady state is shown to work.
 | **Hosting while playing.** The host tab simulates, sends snapshots *and* renders Three.js. | S7 records frame time. Move the node to a worker if the leader-tab design allows it (out of scope here). |
 | **Split ownership after a partition.** | Epoch fencing (S6). Its test runs the cut-off host live, not stopped. |
 | **The estimates are wrong.** | S0 runs first and has a stop rule. |
+| **NPC count outgrows the budget.** Every visible NPC costs as much as a visible player. | S0's NPC dimension sets a per-match NPC budget. Then S8's paths, then fewer NPCs alive at once (a game decision). |
+| **NPC AI reacts to stale positions.** Players on other hosts are ~100–150 ms old to the AI. | Accepted for normal AI. Games that need tighter NPCs give them to the target's host (the rejected alternative, §6). |
 
 ## 6. Not in scope
 
@@ -298,5 +401,9 @@ steady state is shown to work.
 - Matchmaking, skill rating, host selection beyond the volunteer and probe
   rule in S4.
 - Rollback, lockstep, and delta snapshots on the netcode wire.
+- Sending distant NPCs (or players) less often.
+- Handing an NPC to the host of the player it is attacking. Measure after
+  S7 if NPC→player hits across hosts feel slow.
+- NPC AI itself, pathfinding, and spawning rules: game code.
 - Bindings other than TypeScript (lobbies plan §1: this audience writes
   TS/JS).
