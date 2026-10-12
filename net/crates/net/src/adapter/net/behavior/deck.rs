@@ -1593,6 +1593,21 @@ impl<'a> IceProposal<'a> {
         }
     }
 
+    /// Pin `issued_at_ms` to a stamp taken earlier.
+    ///
+    /// For bindings whose proposal handle stamps `issued_at_ms` when the
+    /// caller creates it, reports that stamp, and rebuilds this core
+    /// proposal only at `simulate()`. Without the pin, the simulation (and
+    /// the provenance stamp over it) carried the rebuild's later clock
+    /// while the binding signed and committed the earlier one, so a commit
+    /// failed `provenance_mismatch` whenever a millisecond passed between
+    /// the two.
+    #[doc(hidden)]
+    pub fn with_issued_at_ms(mut self, issued_at_ms: u64) -> Self {
+        self.issued_at_ms = issued_at_ms;
+        self
+    }
+
     /// Borrow the underlying [`IceActionProposal`].
     pub fn action(&self) -> &IceActionProposal {
         &self.action
@@ -2939,6 +2954,47 @@ mod tests {
             SimulatedIceProposal::from_simulated_parts(&other, action, issued, blast, &stamp)
                 .is_err()
         );
+        let _ = runtime.shutdown().await;
+    }
+
+    /// The bindings stamp `issued_at_ms` when the caller creates a
+    /// proposal and rebuild the core proposal only at `simulate()`. The
+    /// rebuild's own clock used to reach the provenance stamp, so the
+    /// binding's commit (at its earlier stamp) failed `provenance_mismatch`
+    /// once a millisecond had passed: the Node `deck.test.ts` flake.
+    #[tokio::test]
+    async fn a_proposal_rebuilt_later_simulates_at_its_pinned_stamp() {
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let pinned = deck
+            .ice()
+            .freeze_cluster(Duration::from_secs(30))
+            .issued_at_ms();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let rebuilt = deck.ice().freeze_cluster(Duration::from_secs(30));
+        assert_ne!(
+            rebuilt.issued_at_ms(),
+            pinned,
+            "the rebuild has a later clock"
+        );
+
+        let simulated = rebuilt
+            .with_issued_at_ms(pinned)
+            .simulate()
+            .await
+            .expect("simulate");
+        assert_eq!(simulated.issued_at_ms(), pinned);
+        let stamp = simulated.provenance();
+        assert!(SimulatedIceProposal::from_simulated_parts(
+            &deck,
+            simulated.action().clone(),
+            pinned,
+            simulated.blast_radius().clone(),
+            &stamp,
+        )
+        .is_ok());
         let _ = runtime.shutdown().await;
     }
 

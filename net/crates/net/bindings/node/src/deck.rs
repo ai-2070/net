@@ -1349,7 +1349,10 @@ impl IceProposal {
         // Validate the variant before taking the action out of
         // the mutex; an unknown-variant rejection leaves the
         // husk retry-able instead of stranding it as consumed.
-        let proposal = build_core_proposal(&self.client, action.clone())?;
+        // Simulate at the husk's own stamp, the one `commit` and
+        // `signingPayload` use, not the rebuild's clock.
+        let proposal =
+            build_core_proposal(&self.client, action.clone())?.with_issued_at_ms(issued_at_ms);
         // From here the husk represents a real attempt.
         guard.take();
         drop(guard);
