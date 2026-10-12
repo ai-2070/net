@@ -23,6 +23,17 @@ the README on why it is a sibling package rather than a sub-path.
   page without a codec keeps working unchanged. Two new frames ride the
   JSON wire: the codec fingerprint on join and ping (`f`), and a request
   for entity names (`u`). New stats: `binaryFrames`, `unnamedEntities`.
+- **`joinNetcode` says why it has not joined.** `await net.ready()`
+  resolves at the first snapshot and rejects with a typed `NetcodeError`
+  after `joinTimeoutMs` (default 15 s): `no-announcement` (this node never
+  heard the host announce, so it cannot reach it — the failure that used
+  to wait silently forever), `unreachable`, `timeout`, or `closed`. The
+  client keeps retrying regardless. `stats()` gains `connectOutcome` and
+  `lastError`.
+- **Fewer clock pings once the clock has settled:** `pingRate` (default
+  4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
+  pays a packet's fixed transport overhead; measured in real browsers
+  (1 host × 32 players) host upload fell from 2.19 to 1.82 Mbit/s.
 
 ## 0.43.0 — one identity per origin, bounded streams
 

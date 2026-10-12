@@ -11,8 +11,8 @@
 
 export { hostNetcode } from './host.js';
 export type { HostNetcode, HostNetcodeOptions, Rewound, TickContext, TickInput } from './host.js';
-export { joinNetcode } from './client.js';
-export type { JoinNetcodeOptions, LocalEntity, NetcodeClient, NetcodeStats } from './client.js';
+export { NetcodeError, joinNetcode } from './client.js';
+export type { JoinNetcodeOptions, LocalEntity, NetcodeClient, NetcodeErrorKind, NetcodeStats } from './client.js';
 export { ClockEstimator, CLOCK_WINDOW } from './clock.js';
 export type { ClockEstimate, Millis } from './clock.js';
 export { SnapshotBuffer, lerpNumbers, SNAPSHOT_BUFFER } from './interpolate.js';

@@ -35,6 +35,32 @@ import {
 } from './wire.js';
 import { type EntityCodec, decodeBinarySnapshot, isBinaryFrame } from './codec.js';
 
+/** Why {@link NetcodeClient.ready} gave up. */
+export type NetcodeErrorKind =
+  /**
+   * This node holds no announcement from the host, so there is no key to
+   * reach it with. The host must announce (`createLobby` does), and this
+   * node must have heard it: query the host's tag before joining.
+   */
+  | 'no-announcement'
+  /** The host was found, but the stream to it would not open. */
+  | 'unreachable'
+  /** The stream opened, and no snapshot came within the deadline. */
+  | 'timeout'
+  /** {@link NetcodeClient.close} was called first. */
+  | 'closed';
+
+/** A typed join failure from {@link NetcodeClient.ready}. */
+export class NetcodeError extends Error {
+  constructor(
+    readonly kind: NetcodeErrorKind,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'NetcodeError';
+  }
+}
+
 /** A chunked snapshot being assembled. */
 interface Assembly<E> {
   readonly t: number;
@@ -76,8 +102,18 @@ export interface JoinNetcodeOptions<E, I> {
   readonly local?: LocalEntity<E, I>;
   /** Unacknowledged inputs repeated in each input frame. Default 8. */
   readonly inputRedundancy?: number;
-  /** Clock pings per second. Default 4. */
+  /**
+   * Clock pings per second until the clock estimate has settled (8
+   * samples). Default 4. Also the rate the join, the interest set and
+   * unacknowledged inputs are repeated at, which does not slow down.
+   */
   readonly pingRate?: number;
+  /**
+   * Clock pings per second once the estimate has settled. Default 1:
+   * clocks drift slowly, and every pong the host sends pays a packet's
+   * fixed transport overhead (S0b measured ~160–170 B per frame).
+   */
+  readonly settledPingRate?: number;
   /**
    * The interest keys to receive (the host's `interest` keys entities; an
    * entity keyed `null` always arrives). Omit to receive everything the host
@@ -93,6 +129,8 @@ export interface JoinNetcodeOptions<E, I> {
    * controls; it only closes the gap.
    */
   readonly correctionSmoothingMs?: number;
+  /** How long {@link NetcodeClient.ready} waits for the first snapshot, ms. Default 15 000. */
+  readonly joinTimeoutMs?: number;
   /**
    * Compact snapshots (`codec.ts`): the same codec the host uses. With a
    * matching fingerprint the host sends binary snapshots; otherwise JSON,
@@ -118,6 +156,14 @@ export interface NetcodeStats {
   readonly binaryFrames: number;
   /** Entities left out of a binary snapshot because their index had no name yet (asked for again). */
   readonly unnamedEntities: number;
+  /**
+   * The latest `connectPeer` outcome for the host (`'direct'`,
+   * `'iceTimeout'`, `'noAnnouncement'`, …), or `null` before the first
+   * attempt or on a transport without `connectPeer`.
+   */
+  readonly connectOutcome: string | null;
+  /** The last error opening the stream to the host, or `null`. */
+  readonly lastError: string | null;
 }
 
 /** The running client. */
@@ -132,6 +178,13 @@ export interface NetcodeClient<E, I> {
    * Throws `RangeError` over 256 keys or for a key over 64 characters.
    */
   setInterest(keys: readonly string[]): void;
+  /**
+   * Resolves at the first snapshot from the host. Rejects with a
+   * {@link NetcodeError} if none came within `joinTimeoutMs` — naming why
+   * (`no-announcement`, `unreachable`, `timeout`) — or on `close()`. The
+   * client keeps trying either way: a late announcement still joins it.
+   */
+  ready(): Promise<void>;
   /** The host clock, as estimated. `null` before the first pong. */
   hostNow(): number | null;
   stats(): NetcodeStats;
@@ -213,18 +266,33 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     return o === null ? null : now() + o;
   };
 
+  // What the last attempt to reach the host said, for `stats()` and for
+  // `ready()`'s typed failure: a join that never connects must say why.
+  let connectOutcome: string | null = null;
+  let lastError: string | null = null;
+  const message = (error: unknown) => String((error as Error)?.message ?? error);
   let opening: Promise<void> | null = null;
   const open = (): Promise<void> => {
     opening ??= (async () => {
-      await options.transport.connectPeer?.(host).catch(() => {});
+      if (options.transport.connectPeer !== undefined) {
+        try {
+          const outcome = (await options.transport.connectPeer(host)) as { readonly type?: unknown } | undefined;
+          if (outcome !== null && typeof outcome === 'object' && typeof outcome.type === 'string') connectOutcome = outcome.type;
+        } catch (error) {
+          lastError = message(error);
+        }
+      }
       const opened = await options.transport.openStream({ reliability: 'fireAndForget', peer: host, label, lossy: true });
       if (closed) {
         opened.close();
         return;
       }
       stream = opened;
+      lastError = null;
     })()
-      .catch(() => {})
+      .catch(error => {
+        lastError = message(error);
+      })
       .finally(() => {
         opening = null;
       });
@@ -276,6 +344,35 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   });
 
   /** One snapshot frame, JSON or decoded binary: whole, or a chunk. */
+  // `ready()`: settled once, at the first snapshot, the deadline, or close.
+  let readySettle: { resolve: () => void; reject: (error: NetcodeError) => void } | null = null;
+  let readyPromise: Promise<void> | null = null;
+  let readyTimer: ReturnType<typeof setTimeout> | null = null;
+  let readyFailure: NetcodeError | null = null;
+  const settleReady = (failure: NetcodeError | null) => {
+    if (readyTimer !== null) clearTimeout(readyTimer);
+    readyTimer = null;
+    const settle = readySettle;
+    readySettle = null;
+    if (failure === null) settle?.resolve();
+    else {
+      readyFailure = failure;
+      settle?.reject(failure);
+    }
+  };
+  const joinFailure = (): NetcodeError => {
+    const why = lastError === null ? '' : ` (${lastError})`;
+    if (connectOutcome === 'noAnnouncement') {
+      return new NetcodeError(
+        'no-announcement',
+        `no announcement from host ${host}: the host must announce, and this node must have heard it before it can connect${why}`,
+      );
+    }
+    if (stream === null) return new NetcodeError('unreachable', `could not open a stream to host ${host}${why}`);
+    return new NetcodeError('timeout', `no snapshot from host ${host} within ${String(joinTimeoutMs)} ms`);
+  };
+  const joinTimeoutMs = Math.max(0, options.joinTimeoutMs ?? 15_000);
+
   function onSnapshot(frame: {
     readonly tick: number;
     readonly t: number;
@@ -285,7 +382,10 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     readonly of?: number;
     readonly iv?: number;
   }): void {
-    joined = true;
+    if (!joined) {
+      joined = true;
+      settleReady(null);
+    }
     if (frame.iv !== undefined && frame.iv > interestAcked) interestAcked = frame.iv;
     if (frame.of === undefined || frame.c === undefined) {
       accept(frame.tick, frame.t, frame.ack, frame.e, frame.e);
@@ -410,10 +510,17 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
 
   // Join, and keep the clock honest. The codec fingerprint rides both.
   const fingerprint = options.codec === undefined ? {} : { f: options.codec.fingerprint };
-  const pingEvery = 1000 / Math.max(0.5, options.pingRate ?? 4);
+  const pingRate = Math.max(0.5, options.pingRate ?? 4);
+  const pingEvery = 1000 / pingRate;
+  // Once the clock has settled, ping on every Nth beat of the timer only.
+  const settledEvery = Math.max(1, Math.round(pingRate / Math.max(0.1, Math.min(pingRate, options.settledPingRate ?? 1))));
+  const SETTLED_SAMPLES = 8;
+  let beat = 0;
   const timer = setInterval(() => {
     if (!joined) send({ n: label, k: 'h', ...fingerprint });
-    send({ n: label, k: 'p', t0: now(), ...fingerprint });
+    const settled = (clock.estimate()?.samples ?? 0) >= SETTLED_SAMPLES;
+    beat += 1;
+    if (!settled || beat % settledEvery === 0) send({ n: label, k: 'p', t0: now(), ...fingerprint });
     sendInterest();
     // Unacknowledged inputs are repeated even with nothing new to send, so
     // a lost input frame is repaired without waiting for the next input.
@@ -451,6 +558,20 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       interestVersion += 1;
       if (!closed) sendInterest();
     },
+    ready() {
+      if (joined) return Promise.resolve();
+      if (readyFailure !== null && closed) return Promise.reject(readyFailure);
+      readyPromise ??= new Promise<void>((resolve, reject) => {
+        readySettle = { resolve, reject };
+        readyTimer = setTimeout(() => {
+          // Failed for THIS wait; a later call waits afresh, since the
+          // client keeps trying.
+          settleReady(joinFailure());
+          readyPromise = null;
+        }, joinTimeoutMs);
+      });
+      return readyPromise;
+    },
     hostNow,
     stats: () => ({
       clock: clock.estimate(),
@@ -461,11 +582,14 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       partialSnapshots,
       binaryFrames,
       unnamedEntities,
+      connectOutcome,
+      lastError,
     }),
     close() {
       if (closed) return;
       closed = true;
       clearInterval(timer);
+      settleReady(new NetcodeError('closed', 'the netcode client was closed before it joined'));
       stopEvents();
       stream?.close();
     },

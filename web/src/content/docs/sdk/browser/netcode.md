@@ -168,6 +168,13 @@ joinNetcode({ /* ... */, codec: shipCodec });
 
 ## Rules that bite
 
+- **A join that never connects says why.** `await net.ready()` rejects
+  with a `NetcodeError` after `joinTimeoutMs` (default 15 s):
+  `no-announcement` means this node never heard the host announce, so it
+  cannot reach it. A lobby announces for you; a page that joins a host
+  directly must make sure the host announces and query its tag first.
+  `stats().connectOutcome` shows the last `connectPeer` outcome.
+
 - **The lossy carrier is `connect()`-only.** A follower tab's `openSession()`
   refuses `lossy: true`. Games run on `connect()` anyway, as stores do.
 - **Keep snapshots small anyway.** Chunking stops one lost packet from losing
