@@ -14,6 +14,7 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/#install", label: "SDKS" },
   { href: "/#apps", label: "APPS" },
   { href: "/#wall", label: "BLACKWALL" },
+  { href: "/games", label: "GAMES" },
   { href: "/docs", label: "DOCS" },
 ];
 

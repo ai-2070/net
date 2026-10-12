@@ -51,6 +51,15 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "weekly",
       priority: 0.8,
     },
+    {
+      url: `${globals.site.href}/games`,
+      lastModified: fileLastModified(
+        resolve(APP_ROOT, "games", "page.tsx"),
+        now,
+      ),
+      changeFrequency: "weekly",
+      priority: 0.9,
+    },
   ];
 
   const docPages: MetadataRoute.Sitemap = getAllSlugs().map((slug) => ({

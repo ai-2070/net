@@ -1028,15 +1028,31 @@ function toClientFile(f: DocFile): ClientDocFile {
   return { kind: "file", slug: f.slug, title: f.title, languages: f.languages };
 }
 
+// An adaptive page is a folder on disk but ONE page to a reader: its parts are
+// deliberately dropped from `children`, and it has no README. Shipped to the
+// client as a folder, it reached the sidebar as an empty, README-less section,
+// which `filterFolder` prunes — so `start/install` vanished from the nav while
+// its URL served fine. Ship it as the page it is.
+function toClientNode(n: DocNode): ClientDocNode {
+  if (n.kind === "file") return toClientFile(n);
+  if (n.adaptive) {
+    return {
+      kind: "file",
+      slug: n.slug,
+      title: n.title,
+      languages: n.languages,
+    };
+  }
+  return toClientFolder(n);
+}
+
 function toClientFolder(f: DocFolder): ClientDocFolder {
   return {
     kind: "folder",
     slug: f.slug,
     title: f.title,
     hasReadme: f.readme !== null,
-    children: navChildren(f).map((c) =>
-      c.kind === "file" ? toClientFile(c) : toClientFolder(c),
-    ),
+    children: navChildren(f).map(toClientNode),
     languages: f.languages,
     singleEntry: f.singleEntry,
   };
