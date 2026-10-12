@@ -12,7 +12,7 @@
 //   2. `/docs/…` links pointing at a slug that doesn't exist.
 //   3. `#fragment` targets with no matching heading on the destination page.
 //
-// Run: `npm run check:docs`
+// Run: `bun run check:docs`
 
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, relative, dirname, resolve } from "node:path";

@@ -74,7 +74,7 @@ cargo test --lib --features "$UNIT_FEATURES"   # unit surface — see the featur
 cargo test --doc --features "$UNIT_FEATURES"   # doctests are a SEPARATE target; --lib does not run them
 
 go test ./...          # from go/ — cgo must actually be enabled (see Bindings)
-npm run check          # from web/ — docs links + releases sync + types
+bun run check          # from web/ — docs links + releases sync + types
 ```
 
 `TESTS.md` (repo root) is the guide to running tests without wasting time.
@@ -256,7 +256,7 @@ The rule: a new user-facing mesh capability is added to `net-mesh-sdk` first, an
 - Branch from `master`, PRs against `master`. Every CI job must be green. CLA required before first merge (bot comments on the PR).
 - Dual license MIT OR Apache-2.0; new files should carry both license headers where existing files do.
 - Published names vs. source names differ: crates.io `net-mesh*` / npm `@net-mesh/*` / PyPI `net-mesh-sdk`, but imports are `net_sdk` (Python), `@net-mesh/sdk` (TS), lib name `net` (Rust).
-- Release notes live in `net/crates/net/docs/releases/` with Cyberpunk-themed codenames and are **mirrored** to `web/src/content/docs/releases/` — sync with `npm run sync:releases` from `web/` (`npm run check:releases` gates CI). `docs/releases/RELEASE_STEPS.md` describes the process.
+- Release notes live in `net/crates/net/docs/releases/` with Cyberpunk-themed codenames and are **mirrored** to `web/src/content/docs/releases/` — sync with `bun run sync:releases` from `web/` (`bun run check:releases` gates CI). `docs/releases/RELEASE_STEPS.md` describes the process.
 - Security issues: report privately to makerseven7@gmail.com (see CONTRIBUTING.md), never via public issue.
 
 ## Where to look

@@ -23,7 +23,7 @@
 //      deploys and local dev to production. It's rewritten back to
 //      root-relative.
 //
-// Run: `npm run sync:releases`  (or `-- --check` to fail on drift, as CI does)
+// Run: `bun run sync:releases`  (or `--check` to fail on drift, as CI does)
 
 import { readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -233,7 +233,7 @@ if (check) {
     console.error(
       `✗ ${drifted.length} release note(s) out of sync with the crate:\n` +
         drifted.map((d) => `  ${d}`).join("\n") +
-        `\n\nRun \`npm run sync:releases\` and commit the result.`,
+        `\n\nRun \`bun run sync:releases\` and commit the result.`,
     );
     process.exit(1);
   }
