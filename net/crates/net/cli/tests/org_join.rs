@@ -97,6 +97,26 @@ impl Fx {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
+    /// `join TOKEN --yes`. The credentials are installed before the live
+    /// attach check, and re-running a redeemed token is idempotent for the
+    /// same device, so an attach that timed out on a loaded loopback (CI) is
+    /// asked again; every other failure fails the test.
+    fn join(&self, token: &str) -> Value {
+        let args = ["join", token, "--yes"];
+        for _ in 0..3 {
+            let out = self.run(&args);
+            if out.status.success() {
+                return serde_json::from_slice(&out.stdout).unwrap();
+            }
+            assert!(
+                stderr_of(&out).contains("the live attach failed"),
+                "{args:?} failed: {}",
+                stderr_of(&out)
+            );
+        }
+        self.json(&args)
+    }
+
     fn up(&self, extra: &[&str]) -> Up {
         self.up_on("127.0.0.1:0", extra)
     }
@@ -204,7 +224,7 @@ fn a_device_joins_an_org_only_with_the_operators_root_signed_approval() {
     let offer = created["offer_id"].as_str().unwrap().to_string();
 
     let agent = Fx::new();
-    let pending = agent.json(&["join", &token_of(&created), "--yes"]);
+    let pending = agent.join(&token_of(&created));
     assert_eq!(pending["state"], "pending_approval", "{pending}");
     let device = pending["device"].as_str().unwrap().to_string();
 
@@ -268,7 +288,7 @@ fn a_device_joins_an_org_only_with_the_operators_root_signed_approval() {
     assert_eq!(approved["audience"], true, "{approved}");
 
     // The device's join now completes and adopts the membership.
-    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    let joined = agent.join(&token_of(&created));
     assert_eq!(joined["state"], "joined", "{joined}");
     assert_eq!(joined["org"]["org"], org.as_str(), "{joined}");
     assert_eq!(joined["org"]["adopted"], true, "{joined}");
@@ -298,7 +318,7 @@ fn a_device_already_on_the_mesh_joins_an_org_with_a_standalone_link() {
     // A device joined the mesh only: no org yet.
     let created = operator.json(&["invite", "create"]);
     let agent = Fx::new();
-    let joined = agent.json(&["join", &token_of(&created), "--yes"]);
+    let joined = agent.join(&token_of(&created));
     let device = joined["device"].as_str().unwrap().to_string();
     let node = agent.up(&[]);
     assert!(node.ready["org"].is_null(), "{}", node.ready);
@@ -319,6 +339,11 @@ fn a_device_already_on_the_mesh_joins_an_org_with_a_standalone_link() {
     // The standalone link waits for the operator.
     let link = operator.json(&["org", "invite", &org]);
     assert_eq!(link["standalone"], true, "{link}");
+    // It is redeemed over the session, which a loaded `up` may still be
+    // re-attaching.
+    wait_for_status(&agent, "joined link attached", |s| {
+        s["link"]["attached"] == true
+    });
     let pending = agent.json(&["org", "join", &token_of(&link), "--yes"]);
     assert_eq!(pending["state"], "pending_approval", "{pending}");
     assert_eq!(
@@ -431,7 +456,7 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
     let created = operator.json(&["invite", "create", "--org", &org]);
     let offer = created["offer_id"].as_str().unwrap().to_string();
     let agent = Fx::new();
-    let pending = agent.json(&["join", &token_of(&created), "--yes"]);
+    let pending = agent.join(&token_of(&created));
     let device = pending["device"].as_str().unwrap().to_string();
     operator.json(&[
         "org",
@@ -442,17 +467,13 @@ fn org_remove_applies_a_root_signed_floor_at_each_named_node() {
         "--org-key",
         org_key.to_str().unwrap(),
     ]);
-    agent.json(&["join", &token_of(&created), "--yes"]);
+    agent.join(&token_of(&created));
     let node = agent.up(&[]);
     assert_eq!(node.ready["org"], org.as_str(), "{}", node.ready);
 
     // A mesh-only bystander.
     let bystander = Fx::new();
-    bystander.json(&[
-        "join",
-        &token_of(&operator.json(&["invite", "create"])),
-        "--yes",
-    ]);
+    bystander.join(&token_of(&operator.json(&["invite", "create"])));
     let other = bystander.up(&[]);
 
     let remove = |verifiers: &[String]| {
@@ -616,10 +637,10 @@ fn org_leave_holds_until_an_approved_rejoin() {
 
     let created = operator.json(&["invite", "create", "--org", &org]);
     let agent = Fx::new();
-    let pending = agent.json(&["join", &token_of(&created), "--yes"]);
+    let pending = agent.join(&token_of(&created));
     let device = pending["device"].as_str().unwrap().to_string();
     approve(created["offer_id"].as_str().unwrap(), &device);
-    agent.json(&["join", &token_of(&created), "--yes"]);
+    agent.join(&token_of(&created));
     let node = agent.up(&[]);
     assert_eq!(node.ready["org"], org.as_str(), "{}", node.ready);
 
@@ -640,13 +661,16 @@ fn org_leave_holds_until_an_approved_rejoin() {
     drop(node);
 
     // Re-running the original token does not restore the membership.
-    let again = agent.json(&["join", &token_of(&created), "--yes"]);
+    let again = agent.join(&token_of(&created));
     assert_eq!(again["org"]["state"], "left", "{again}");
     let node = agent.up(&[]);
     assert!(node.ready["org"].is_null(), "{}", node.ready);
 
     // A new link, approved with the org root, rejoins — live.
     let link = operator.json(&["org", "invite", &org]);
+    wait_for_status(&agent, "joined link attached", |s| {
+        s["link"]["attached"] == true
+    });
     let rejoin = agent.json(&["org", "join", &token_of(&link), "--yes"]);
     assert_eq!(rejoin["state"], "pending_approval", "{rejoin}");
     approve(link["offer_id"].as_str().unwrap(), &device);
