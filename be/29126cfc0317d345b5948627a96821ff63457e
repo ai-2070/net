@@ -1,0 +1,29 @@
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_3cb5cab677fd2d 292
+  s_d71d2b607c2060::t_4dd09e5d13bdae 273-289
+  s_d71d2b607c2060::t_cc928f03155ccb 72-73,75
+  s_d71d2b607c2060::t_872628925a304f 83-85
+  s_d71d2b607c2060::t_52378f0cd9ac7c 134-182
+  s_d71d2b607c2060::t_a40dc8b335b67a 53-58
+  s_d71d2b607c2060::t_56cfec09e6b446 196-197
+  s_d71d2b607c2060::t_cc0183f6dc0ac2 122-123
+  s_d71d2b607c2060::t_b0da2389a5112a 404-407
+  s_d71d2b607c2060::t_c662f1e800d26d 390-391
+  s_d71d2b607c2060::t_0ca431ef7b61b8 349-371,374,376-377
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be29126cfc0317d345b5948627a96821ff63457e",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
