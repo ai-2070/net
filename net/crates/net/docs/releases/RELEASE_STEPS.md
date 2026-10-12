@@ -30,7 +30,7 @@
 4. Draft release note
 
    `net/crates/net/docs/releases/RELEASE_vX.Y_<CODENAME>.md`, then mirror it
-   to the website: `npm run sync:releases` from `web/` (`npm run
+   to the website: `bun run sync:releases` from `web/` (`bun run
    check:releases` gates CI).
 
 5. Pull master

@@ -125,7 +125,7 @@ def run(docs_dir: str) -> int:
         for g in generated[:5]:
             print(f"      {DIM}{g}{OFF}")
         print(f"      {DIM}Fix upstream in net/crates/net/docs/releases/ and "
-              f"re-run `npm run sync:releases`.{OFF}")
+              f"re-run `bun run sync:releases`.{OFF}")
 
     if bad:
         print()

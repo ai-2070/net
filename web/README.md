@@ -5,12 +5,7 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 First, run the development server:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
+bun install
 bun dev
 ```
 
@@ -44,7 +39,7 @@ Add a term to `src/lib/keyword-links.ts`:
   rewritten; a page never links to itself.
 - `slug` must resolve. `assertKeywordLinksResolve` runs from
   `generateStaticParams`, so a renamed page fails the build instead of leaving a
-  dead keyword — the map is data, not markdown, so `npm run check:docs` cannot
+  dead keyword — the map is data, not markdown, so `bun run check:docs` cannot
   see it.
 
 The index that resolves a slug to its URL and title is `src/lib/doc-index.ts`;
