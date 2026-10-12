@@ -1,8 +1,12 @@
 # Sharded matches across player hosts — plan
 
-**Status:** planned as an **experiment**, revised after review on 2026-10-12
-(§8). No release targeted. Two gates come before anything else: S0 (CPU and
-bytes) and S0b (real-browser topology). The rest goes ahead only if both pass.
+**Status:** in progress, as an **experiment**. Revised after review on
+2026-10-12 (§8). No release targeted. **S0 done (2026-10-12).** With JSON,
+only 8 hosts at 20 Hz fit the budget. With a prototype compact codec,
+which is ~7× smaller, **one host fits 128 players at 20 Hz**, and 2–4
+hosts cover NPCs (§3 S0 results). **Next: S0c** (the compact codec in
+netcode), then **S0b** (real-browser topology) measuring it. Whether
+sharding is needed at all is decided after S0b.
 **Scope:** `@net-mesh/browser`: the netcode module (`src/netcode/`), reuse of
 the world module's forwarded actions (`src/world/`), and the lobby store
 (`src/lobby.ts`). There is **no change to the leaf, the anchor or the core
@@ -232,7 +236,7 @@ S7.
 | D1 | Which players a host owns | **One squad from each team, never the host player's own squad.** That makes the plain "god mode for my own character" exploit impossible. **Not** a security boundary (§5). |
 | D2 | How hosts are found | **The lobby store's assignment** (above). Not `announceRegions`: the lobby already owns its node's announcement, and an assignment can't be ambiguous. |
 | D3 | Where the code lives | **`joinShards` in `@net-mesh/browser/netcode`.** Host-side wiring is a demo under `browser-ts/demo/` plus a skill section, until a second game needs it as an API. |
-| D4 | Number of hosts, tick rate | **8 hosts at 20 Hz** by default. 30 Hz only if S0b measures room for it after overhead, because at 30 Hz the payload alone takes ~9.1 of 10 Mbit/s. |
+| D4 | Number of hosts, tick rate | **Changed 2026-10-12 (S0 encoding experiment): with compact snapshots (S0c), 1 host for player-only matches at 20 Hz, and 2–4 hosts with NPCs or at 30 Hz.** The earlier "8 hosts at 20 Hz" was sized for JSON, at ~8.9 Mbit/s with no margin. S0b sets the final number from measured overhead. |
 | D5 | Rewind cap for cross-host hits | **300 ms** (default 200), to be fixed by S3's measured age of `seenB` at B. |
 | D6 | Durability | **None, and crash recovery is a rollback** (S6). The match lives only in memory. Spectators' copies of a crashed host's entities survive it, so recovery from them is a policy, not a continuation. |
 | D7 | Who owns an NPC | **Fixed at spawn, `hash(npcId) mod hosts`.** Objectives belong to the lobby node. |
@@ -263,6 +267,128 @@ entities.
 - **Stop rule:** if a single host at 128 players with interest filtering
   fits the budget (payload + measured overhead ≤ 10 Mbit/s, ≤ 10 ms/tick),
   sharding isn't needed and the plan ends here.
+
+**Result — S0 built and run (2026-10-12).** `npm run bench:netcode`
+(`browser-ts/scripts/bench-netcode.mjs`, default sweep, 40 measured ticks
+per point), Node 24.19, i9-14900K, Windows. All 54 points ran with every
+client joined (`notReady` 0). Upload is netcode frame payload (JSON, frame
+envelope included) for the busiest host. Transport overhead (Noise,
+SCTP/DTLS, UDP/IP) is not included. "ctl" is clock pongs at the real 4/s
+per client. Selected rows, interest mode:
+
+| H | N | NPCs | host ms/tick med / p95 | receivers/host | B/host/tick → players / → hosts | Mbit/s/host @20 / @30 (incl. ctl) | entities/player/tick | B/entity |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 128 | 0 | 6.13 / 6.31 | 128 | 258,728 / 0 | 41.7 / 62.4 | 24.2 | 84 |
+| 4 | 128 | 0 | 1.85 / 1.95 | 131 | 74,511 / 7,931 | 14.4 / 21.4 | 25.3 | 92 |
+| 8 | 128 | 0 | 1.24 / 1.34 | 135 | 41,301 / 9,480 | **8.9** / 13.2 | 24.8 | 104 |
+| 8 | 128 | 100 | 1.76 / 1.91 | 135 | 57,607 / 14,684 | 12.4 / 18.5 | 42.2 | 85 |
+| 8 | 128 | 300 | 2.86 / 3.59 | 135 | 92,342 / 25,294 | 20.5 / 30.5 | 78.0 | 74 |
+| 1 | 128 | 0 (full) | 28.09 / 32.59 | 128 | 1,338,102 / 0 | 214 / 321 | 128 | 82 |
+| 8 | 128 | 0 (full) | 2.13 / 2.25 | 135 | 173,289 / 9,476 | 29.7 / 44.4 | 128 | 85 |
+
+What it says:
+
+1. **The stop rule does not fire.** A single host at 128 players with
+   interest filtering needs ~42 Mbit/s at 20 Hz. Sharding is needed.
+2. **Upload, not CPU, is the limit.** Every sharded point is under 4 ms/tick
+   at p95. Every budget miss is bandwidth.
+3. **Only one configuration fits, and barely: 8 hosts, 20 Hz, interest, no
+   NPCs, at ~8.9 Mbit/s.** That leaves ~1 Mbit/s for transport overhead,
+   which S0b measures. 4 hosts (14.4) and 30 Hz (13.2) are over budget
+   before overhead. D4 (8 hosts at 20 Hz) stands, with no margin.
+4. **Spectating between hosts is ~19% of a host's upload** at 8 hosts
+   (9.5 KB of 50.8 KB per tick), as the review predicted. Clock pongs add
+   ~0.3 Mbit/s.
+5. **NPCs don't fit as they are.** 100 visible-on-average NPCs take 8 hosts
+   to 12.4 Mbit/s, and 300 to 20.5.
+6. **The encoding is the cheapest lever.** An entity costs 74–104 B as
+   JSON, and its 16-hex-digit id key alone is ~19 B of that. A compact
+   binary snapshot encoding (short ids, quantized floats) is likely to cut
+   the dominant term by half or more without changing the topology. That
+   is a netcode-module change, not a leaf, anchor or core change. It is
+   recommended **before S1** if S0b confirms the overhead leaves no room.
+
+**Compact encoding experiment (2026-10-12).** The same harness now also
+encodes every snapshot frame it captures with a prototype binary codec,
+`compactCodec` in `bench-netcode.mjs`. It is measurement only; the wire is
+unchanged. The layout:
+
+- a 19 B frame header;
+- per entity, a 2 B match-local index instead of the 16-hex-digit key;
+- `x`/`z` quantized to 16 bits over the arena (~3 mm at its ~200-unit
+  side);
+- yaw in 8 bits (~1.4°), then hp, ammo and team (or an NPC's hp and kind)
+  at 1 B each;
+- 10 B per player, 9 per NPC.
+
+The first 200 frames of every point are decoded again and checked against
+the original. That check caught a codec bug on its first run: a position
+rounded after being clamped can sit a hair past the edge, and it wrapped
+to 0 in a u16. Fixed by clamping in the quantizer. Same command, flags
+`--players 128` and `--hosts 1|2|4|8`. Compact output is **0.13–0.15 of
+JSON at every point (~7× smaller)**. Busiest host, interest, pongs
+included:
+
+| H | NPCs | JSON Mbit/s @20 / @30 | compact Mbit/s @20 / @30 |
+|---|---|---|---|
+| 1 | 0 | 42.0 / 62.8 | **5.7** / 8.3 |
+| 1 | 100 | 61.9 / 92.8 | 8.8 / 13.0 |
+| 2 | 0 | 23.3 / 34.8 | 3.4 / 4.9 |
+| 2 | 100 | 36.1 / 54.0 | **5.3** / 7.8 |
+| 2 | 300 | 58.7 / 87.9 | 8.7 / 12.8 |
+| 4 | 300 | 35.4 / 52.9 | **5.4** / 8.0 |
+| 8 | 0 | 8.9 / 13.1 | 1.6 / 2.2 |
+
+**What changes:**
+
+1. **With compact snapshots, one host fits 128 players (no NPCs) at
+   20 Hz**, at ~5.7 Mbit/s, leaving ~4 Mbit/s for transport overhead. Once
+   the codec exists, the stop rule may fire for player-only matches. That
+   depends on S0b's overhead and connection numbers.
+2. **Sharding is then for NPCs, 30 Hz and headroom, and needs 2–4 hosts,
+   not 8.** Fewer hosts also means less spectating between hosts, fewer
+   connections per player (topology A), and fewer machines that can fail.
+   **D4 changed** (below).
+3. **The codec benefits every netcode game, sharded or not.** It is the
+   most valuable single change found so far, so it becomes the next slice
+   (**S0c**), and S0b measures it rather than JSON.
+
+Host CPU at a given point varies between runs by up to ~40%. For example,
+H=1 interest no-NPC measured 6.13 and 3.74 ms median. Treat ms/tick as an
+order of magnitude. CPU stays far from the 10 ms budget in every sharded
+point either way.
+
+The harness simplifies in three ways: hosts are separate nodes, not
+players (128 receivers + H − 1 spectators per host). With N = 16, squads of
+8 leave some hosts owning nothing. And the clients' ping timer runs in real
+time while ticks run as fast as possible, which is why pongs are computed
+rather than counted.
+
+#### S0c — Compact snapshot codec in the netcode module
+
+Added 2026-10-12 after the S0 encoding experiment.
+
+- **API:** an optional, game-supplied `codec` on `hostNetcode`/`joinNetcode`
+  (`encodeEntity`/`decodeEntity` with a fixed byte size, or a schema of
+  quantized fields). JSON stays the default, so every existing game keeps
+  working unchanged.
+- **Ids:** entities are named on the wire by a 16-bit index from a table
+  the host publishes reliably (in the store, or a reliable netcode frame).
+  An index is never reused within a match, so a late or reordered snapshot
+  can't refer to the wrong entity.
+- **Frames:** a binary `s` frame next to the JSON ones, with the frame kind
+  in the first byte. `decodeFrame` keeps refusing what it doesn't
+  recognize.
+- **Chunking:** sized from the binary length, so far fewer frames are
+  chunked.
+- **Proves:**
+  - a property test that encode → decode is exact within each field's
+    quantum, the arena edges included (the S0 bug, kept as a named case);
+  - a reused or unknown index is refused, not drawn;
+  - existing JSON netcode tests pass unchanged;
+  - `bench-netcode.mjs` measures the real codec, replacing the prototype,
+    within 10% of the prototype's bytes;
+  - host ms/tick no worse than JSON.
 
 #### S0b — Topology, in real browsers (the gate for D9)
 
@@ -471,8 +597,9 @@ duplication and reordering; an NPC→player hit with an out-of-tolerance
 
 ## 4. Order
 
-S0 → S0b (gates; D4 and D9 decided) → S1 → S2 → S3 → **S7** (player-only
-gate) → S4 → S5 → S6 → N1 → N2.
+S0 (done) → **S0c** (compact codec) → S0b (gates; D4, D9 and whether to
+shard at all decided) → S1 → S2 → S3 → **S7** (player-only gate) → S4 → S5
+→ S6 → N1 → N2.
 
 The point of this order: prove players → merged view → combat across hosts
 → measured 128-player topology **before** building ownership moves or NPC
@@ -546,3 +673,9 @@ rule, and the casual-only trust model. Changed:
    NPC load stays in S0. N2 gets a versioned path/live switching rule,
    because a reliable write followed by a lossy snapshot doesn't arrive in
    a guaranteed order.
+
+**2026-10-12, after S0.** S0's encoding experiment showed snapshots ~7×
+smaller with a game-supplied binary codec. New slice **S0c** puts that
+codec in the netcode module before S0b. **D4** moved from "8 hosts" to
+"1 host for players only, 2–4 with NPCs or at 30 Hz". Whether sharding
+is needed at all is re-decided after S0b.
