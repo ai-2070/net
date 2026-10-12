@@ -71,12 +71,34 @@ use tower_http::cors::CorsLayer;
 
 use crate::bootstrap_credential::{BrowserBootstrapCredential, Psk};
 
-/// Default ceiling on `POST /rtc/offer` per source IP per minute.
+/// Default ceiling on `POST /rtc/offer` per source IP per minute: the
+/// **backstop** across every credential presented from one address.
 ///
 /// The plan's §5 "bootstrap endpoint budget": a per-source-IP rate
 /// limit whose rejections are typed and fast. Every offer costs the
 /// anchor an ICE agent, so this is the cheapest place to say no.
-pub const DEFAULT_OFFERS_PER_IP_PER_MINUTE: u32 = 10;
+///
+/// It was 10, and was the only budget: one visitor's. That refused
+/// every visitor past the tenth behind one shared address (a carrier
+/// NAT, a campus, a LAN party) inside a minute, found by the
+/// sharded-match S0b run (`BROWSER_SHARDED_MATCH_PLAN.md`). The
+/// per-visitor budget is now
+/// [`DEFAULT_OFFERS_PER_CREDENTIAL_PER_MINUTE`], charged per
+/// (address, credential); this ceiling bounds what one address can
+/// spend across all of them.
+pub const DEFAULT_OFFERS_PER_IP_PER_MINUTE: u32 = 120;
+
+/// Default ceiling on `POST /rtc/offer` per (source IP, credential) per
+/// minute: one visitor's budget, the old per-IP ceiling.
+///
+/// Keyed by the pair, never by the credential alone: an operator may
+/// ship ONE minted credential to every visitor of a page, and charging
+/// that credential would make every visitor everywhere share ten offers
+/// a minute. By the pair, a shared credential behind one address gets
+/// exactly the old per-IP budget, and distinct credentials behind one
+/// address each get their own. Charged only after the credential's
+/// issuer signature verifies, so a forged one cannot spend it.
+pub const DEFAULT_OFFERS_PER_CREDENTIAL_PER_MINUTE: u32 = 10;
 
 /// Window the rate limit counts over.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -300,8 +322,13 @@ pub struct BootstrapConfig {
     /// an attempt token it was handed. A foreign page gains nothing a
     /// visitor of its own does not already have.
     pub any_origin: bool,
-    /// Per-source-IP `POST /rtc/offer` ceiling per minute.
+    /// Per-source-IP `POST /rtc/offer` ceiling per minute, across every
+    /// credential presented from that address.
     pub offers_per_ip_per_minute: u32,
+    /// Per-(source IP, credential) `POST /rtc/offer` ceiling per minute:
+    /// one visitor's budget. See
+    /// [`DEFAULT_OFFERS_PER_CREDENTIAL_PER_MINUTE`].
+    pub offers_per_credential_per_minute: u32,
     /// ACME challenge store; ignored unless [`BootstrapTls::Acme`].
     pub acme: AcmeState,
     /// Address for the **plaintext** HTTP-01 challenge ingress
@@ -369,6 +396,7 @@ impl BootstrapConfig {
             ws_allowed_origins: vec![origin],
             any_origin: false,
             offers_per_ip_per_minute: DEFAULT_OFFERS_PER_IP_PER_MINUTE,
+            offers_per_credential_per_minute: DEFAULT_OFFERS_PER_CREDENTIAL_PER_MINUTE,
             acme: AcmeState::new(),
             acme_challenge_addr: SocketAddr::from(([0, 0, 0, 0], 80)),
             additional_acme_challenge_addrs: Vec::new(),
@@ -386,7 +414,13 @@ pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default per-source-IP `POST /credential` ceiling per minute.
-pub const DEFAULT_CREDENTIALS_PER_IP_PER_MINUTE: u32 = 30;
+///
+/// It was 30, which refused the thirty-first visitor behind one shared
+/// address inside a minute (see [`DEFAULT_OFFERS_PER_IP_PER_MINUTE`]).
+/// Raised to the offer backstop. What caps issuance in total is the
+/// per-game ceiling ([`crate::game_anchor::DEFAULT_ISSUE_PER_MINUTE`]),
+/// which this does not touch.
+pub const DEFAULT_CREDENTIALS_PER_IP_PER_MINUTE: u32 = 120;
 /// Upper bound on a `POST /credential` body.
 const MAX_CREDENTIAL_REQUEST_BYTES: usize = 1024;
 
@@ -839,6 +873,8 @@ struct AppState {
     /// `BootstrapConfig::any_origin`.
     any_origin: bool,
     rate: Arc<RateLimiter>,
+    /// Offers per (source bucket, credential nonce): one visitor's budget.
+    credential_rate: Arc<RateLimiter<(IpAddr, [u8; 16])>>,
     acme: AcmeState,
     dialogs: Arc<AtomicU64>,
     attempts: Arc<Attempts>,
@@ -873,17 +909,30 @@ struct Issuance {
 /// What /64 does not buy: a client controlling many prefixes still
 /// gets a bucket per prefix. The per-game ceiling (`--game ID:N`)
 /// caps total issuance regardless.
+///
+/// Generic over its key: a source bucket ([`rate_key`]) for the per-IP
+/// ceilings, a (source bucket, credential nonce) pair for the
+/// per-visitor offer budget.
 #[derive(Debug)]
-struct RateLimiter {
+struct RateLimiter<K = IpAddr> {
     per_minute: u32,
     max_buckets: usize,
-    table: Mutex<RateTable>,
+    table: Mutex<RateTable<K>>,
 }
 
-#[derive(Debug, Default)]
-struct RateTable {
-    windows: HashMap<IpAddr, (Instant, u32)>,
+#[derive(Debug)]
+struct RateTable<K> {
+    windows: HashMap<K, (Instant, u32)>,
     last_sweep: Option<Instant>,
+}
+
+impl<K> Default for RateTable<K> {
+    fn default() -> Self {
+        Self {
+            windows: HashMap::new(),
+            last_sweep: None,
+        }
+    }
 }
 
 /// What one request's rate check decided.
@@ -920,7 +969,7 @@ fn rate_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-impl RateLimiter {
+impl<K: std::hash::Hash + Eq + Copy> RateLimiter<K> {
     fn new(per_minute: u32) -> Self {
         Self::with_max_buckets(per_minute, RATE_MAX_BUCKETS)
     }
@@ -933,9 +982,9 @@ impl RateLimiter {
         }
     }
 
-    /// Check one request from `ip` at `now`, charging it when allowed.
-    fn check(&self, ip: IpAddr, now: Instant) -> RateVerdict {
-        let key = rate_key(ip);
+    /// Check one request charged to `key` at `now`, charging it when
+    /// allowed.
+    fn check_key(&self, key: K, now: Instant) -> RateVerdict {
         let mut table = self.table.lock();
         let since_sweep = table.last_sweep.map(|t| now.saturating_duration_since(t));
         let is_new = !table.windows.contains_key(&key);
@@ -964,11 +1013,11 @@ impl RateLimiter {
         RateVerdict::Allowed
     }
 
-    /// [`Self::check`], counting every refusal on the anchor's RTC
+    /// [`Self::check_key`], counting every refusal on the anchor's RTC
     /// stats under its own cause. `true` when the request may
-    /// proceed.
-    fn admit(&self, ip: IpAddr, now: Instant, node: &MeshNode) -> bool {
-        match self.check(ip, now) {
+    /// proceed. `source` is only for the log line.
+    fn admit_key(&self, key: K, source: IpAddr, now: Instant, node: &MeshNode) -> bool {
+        match self.check_key(key, now) {
             RateVerdict::Allowed => true,
             RateVerdict::Limited => {
                 node.rtc_stats().note_bootstrap_rate_limited();
@@ -977,7 +1026,7 @@ impl RateLimiter {
             RateVerdict::TableFull => {
                 node.rtc_stats().note_bootstrap_rate_table_full();
                 tracing::warn!(
-                    source = %ip,
+                    source = %source,
                     buckets = self.max_buckets,
                     "bootstrap rate limiter is full of live sources; refusing a new one"
                 );
@@ -990,6 +1039,20 @@ impl RateLimiter {
     #[cfg(test)]
     fn buckets(&self) -> usize {
         self.table.lock().windows.len()
+    }
+}
+
+impl RateLimiter<IpAddr> {
+    /// Check one request from `ip` at `now`, charged to its source
+    /// bucket ([`rate_key`]).
+    #[cfg(test)]
+    fn check(&self, ip: IpAddr, now: Instant) -> RateVerdict {
+        self.check_key(rate_key(ip), now)
+    }
+
+    /// [`Self::check`], counting refusals. `true` when it may proceed.
+    fn admit(&self, ip: IpAddr, now: Instant, node: &MeshNode) -> bool {
+        self.admit_key(rate_key(ip), ip, now, node)
     }
 }
 
@@ -1028,6 +1091,7 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
         allowed_origins: Arc::new(config.allowed_origins.clone()),
         any_origin: config.any_origin,
         rate: Arc::new(RateLimiter::new(config.offers_per_ip_per_minute)),
+        credential_rate: Arc::new(RateLimiter::new(config.offers_per_credential_per_minute)),
         acme: config.acme.clone(),
         dialogs: Arc::new(AtomicU64::new(1)),
         attempts: Arc::new(Attempts::default()),
@@ -1917,6 +1981,20 @@ async fn post_offer(
         Ok(credential) => credential,
         Err(response) => return *response,
     };
+    // One visitor's budget, charged only now that the issuer signature
+    // verified: by (source bucket, invite nonce), so visitors sharing an
+    // address each have their own, and a credential shared by many
+    // visitors is still bounded per address.
+    let visitor = (rate_key(remote.ip()), credential.invite.nonce);
+    if !state
+        .credential_rate
+        .admit_key(visitor, remote.ip(), Instant::now(), &state.node)
+    {
+        return refuse(
+            BootstrapRefusal::RateLimited,
+            "too many bootstrap offers for this credential from this address",
+        );
+    }
     let Some(node_id) = parse_node_id(&request.node_id) else {
         return refuse(
             BootstrapRefusal::MalformedCredential,

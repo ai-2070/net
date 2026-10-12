@@ -427,9 +427,10 @@ const anchor = spawn(netMesh, [
   '--insecure-permissions',
   '--game', GAME,
   '--game-stats-secs', '5',
-  // A lab run puts many players behind ONE address (a machine of player
-  // tabs), which real players are not; the per-address limits that stop a
-  // flood would stop the test. Raised here, and reported in the results.
+  // A lab run puts every player tab of a machine behind ONE address. The
+  // anchor charges offers per visitor and caps an address at 120 a minute,
+  // which a machine of 64 tabs re-dialling during joins can exceed; raised
+  // here for the test, and reported in the results.
   '--offers-per-minute', String(perAddressLimit),
   '--credentials-per-minute', String(perAddressLimit),
   '--output', 'ndjson',

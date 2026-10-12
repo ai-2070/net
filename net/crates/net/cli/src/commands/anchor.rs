@@ -979,7 +979,7 @@ pub struct ServeArgs {
     )]
     pub open_game_max_players: Option<usize>,
 
-    /// Per-source-IP `POST /credential` ceiling per minute (default 30).
+    /// Per-source-IP `POST /credential` ceiling per minute (default 120).
     #[arg(long = "credentials-per-minute")]
     pub credentials_per_minute: Option<u32>,
 
@@ -1000,9 +1000,16 @@ pub struct ServeArgs {
     )]
     pub allow_origin: Vec<String>,
 
-    /// Per-source-IP `POST /rtc/offer` ceiling per minute.
+    /// Per-source-IP `POST /rtc/offer` ceiling per minute, across every
+    /// credential from that address (default 120).
     #[arg(long = "offers-per-minute")]
     pub offers_per_minute: Option<u32>,
+
+    /// Per-(source IP, credential) `POST /rtc/offer` ceiling per minute:
+    /// one visitor's budget (default 10). Visitors behind one shared
+    /// address each get their own; `--offers-per-minute` caps them all.
+    #[arg(long = "offers-per-credential-per-minute")]
+    pub offers_per_credential_per_minute: Option<u32>,
 }
 
 /// What `serve` reports once it is up.
@@ -1514,6 +1521,9 @@ async fn run_serve(
     listener_config.additional_acme_challenge_addrs = resolved.challenge[1..].to_vec();
     if let Some(limit) = args.offers_per_minute {
         listener_config.offers_per_ip_per_minute = limit;
+    }
+    if let Some(limit) = args.offers_per_credential_per_minute {
+        listener_config.offers_per_credential_per_minute = limit;
     }
 
     // R6: operator tooling reads the anchors THIS node has ingested.
