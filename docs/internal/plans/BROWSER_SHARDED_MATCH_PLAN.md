@@ -556,6 +556,33 @@ every 30 s instead of every 2 s left the overhead unchanged (1.87× vs
 runs the host and all 64 players. Assume nothing about a browser host's
 capacity above 32 players until the multi-machine run measures it.
 
+**Credit leak on lossy streams, found and fixed (2026-10-12).** The
+staggered 1 × 64 run (players joining 500 ms apart) left its last two
+relayed players with `backpressure: … needs 192 bytes of send credit and
+has 34`. Cause: a stream's credit is
+`window − (sent − receiver's consumed)`, and on a FIRE-AND-FORGET stream a
+lost packet is never consumed. Its bytes stayed outstanding forever, the
+64 KiB window drained (~402 frames), and the stream could never send
+again; a reopen keeps the label's stream id and the drained state.
+
+**Fix**, in `net-mesh-wire` `StreamState`: a fire-and-forget stream whose
+credit made no progress for `FIRE_AND_FORGET_RECLAIM_AFTER` (2 s) with
+bytes outstanding writes them off as lost. Later grants are offset by the
+written-off total, since the receiver never counts those bytes. Reliable
+streams, and promoted ones, are never written off. A late arrival is
+clamped to the sent watermark.
+
+**Evidence:**
+- five witnesses in `wire/src/session.rs`, each checked by a mutation;
+- wire 288 / native credit units 138 / stream integration 6 /
+  `rtc_backpressure` 7 / leaf native 485, all green;
+- **rerun: all 64 players joined**, including 14 whose direct attempt
+  failed and who rode the relay (first snapshot p50 598 ms, max 27 s).
+
+The host page's reports stopped 65 s before that run's verdict. It's a
+harness gap: one `getStats()` that never resolves stalls every later
+report. Fixed with a per-connection timeout.
+
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It
 needs ≥ 3 machines.

@@ -37,6 +37,13 @@ the README on why it is a sibling package rather than a sub-path.
   load, never delivered a snapshot. The stream now rides the relayed
   session, and direct is retried at most every `directRetryMs` (default
   30 s). Send failures now show in `stats().lastError`.
+- **A lossy stream no longer wedges after loss.** On a fire-and-forget
+  stream a lost packet's bytes were never credited back, so every loss
+  shrank the 64 KiB send window for good; after a window's worth the
+  stream refused every send (`backpressure … the peer has not granted
+  more yet`), and a reopen kept the drained state. Credit stalled for
+  2 s with bytes outstanding is now written off as lost (`net-mesh-wire`,
+  `FIRE_AND_FORGET_RECLAIM_AFTER`); reliable streams are unchanged.
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers
