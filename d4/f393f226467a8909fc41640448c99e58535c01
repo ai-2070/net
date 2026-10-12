@@ -1,0 +1,44 @@
+web/src/content/docs/sdk/browser/store.md
+  s_d71d2b607c2060::t_580948b96428a8 400-401
+web/src/content/docs/sdk/browser/world.md
+  s_d71d2b607c2060::t_580948b96428a8 24
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_d71d2b607c2060::t_4042048debed15 382-384
+net/crates/net/examples/shard-topology/page/match.mjs
+  s_d71d2b607c2060::t_4c7be5ecd5544d 386-397,408,449
+  s_d71d2b607c2060::t_d2fa29192790ae 99-128,413-414,416-417
+  s_d71d2b607c2060::t_3b6cd28e8511b2 450
+net/crates/net/browser-ts/src/world/regions.ts
+  s_d71d2b607c2060::t_273ac450544436 66-72
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_580948b96428a8 637-667
+net/crates/net/browser-ts/src/lobby.ts
+  s_d71d2b607c2060::t_4042048debed15 554-555,613
+  s_d71d2b607c2060::t_273ac450544436 115-128
+net/crates/net/examples/shard-topology/run.mjs
+  s_d71d2b607c2060::t_580948b96428a8 217
+  s_d71d2b607c2060::t_4c7be5ecd5544d 158,175,179-183
+  s_d71d2b607c2060::t_dfe889b661b2bb 184-185
+.claude/skills/net-browser/store.md
+  s_d71d2b607c2060::t_580948b96428a8 360,382-385
+.claude/skills/net-browser/world.md
+  s_d71d2b607c2060::t_580948b96428a8 19-21,32
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d71d2b607c2060::t_580948b96428a8 54-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d4f393f226467a8909fc41640448c99e58535c01",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
