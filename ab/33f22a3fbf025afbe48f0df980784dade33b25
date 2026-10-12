@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/src/org_serve.rs
+  s_ae82cd919caae2::t_b40cd790eb03e4 412-417
+  s_ae82cd919caae2::t_3d33dcccdc8e4c 406-411,418
+net/crates/net/bindings/python/tests/test_stub_drift.py
+  s_ae82cd919caae2::t_f5db997d2c22f8 225-227
+  s_ae82cd919caae2::t_ebd75639fb9595 196,206-208,210,261-297
+  s_ae82cd919caae2::t_20aa0857795e0b 298-299
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_ae82cd919caae2::t_f5db997d2c22f8 3994-4009,4041-4052
+  s_ae82cd919caae2::t_b9ee042f1abc9b 4856-4860,5284-5291
+net/crates/net/bindings/python/src/identity.rs
+  s_ae82cd919caae2::t_b9ee042f1abc9b 231-232,352-353
+net/crates/net/sdk/src/revocation.rs
+  s_ae82cd919caae2::t_23e11fa5989f5c 256
+net/crates/net/bindings/python/src/blob.rs
+  s_ae82cd919caae2::t_b9ee042f1abc9b 185-186,912-913
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ab33f22a3fbf025afbe48f0df980784dade33b25",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

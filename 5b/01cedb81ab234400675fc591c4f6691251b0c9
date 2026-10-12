@@ -1,0 +1,35 @@
+net/crates/net/sdk/src/stream.rs
+  s_ae82cd919caae2::t_87e873e521f0d4 172-182
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_ae82cd919caae2::t_47b8b335a6f305 382-383,594
+  s_ae82cd919caae2::t_e9d9e9add7d9a6 455
+net/crates/net/sdk/src/transport.rs
+  s_ae82cd919caae2::t_bcb5c29f41a831 427-435
+  s_ae82cd919caae2::t_a45363557ee8a5 278,291-300,329
+net/crates/net/sdk/src/mesh_rpc_resilience.rs
+  s_ae82cd919caae2::t_47b8b335a6f305 371-373,376-377
+  s_ae82cd919caae2::t_23ab59de1e6c8b 909-913,915-917,936
+net/crates/net/sdk/src/identity.rs
+  s_ae82cd919caae2::t_87e873e521f0d4 280-285
+net/crates/net/sdk/src/error.rs
+  s_ae82cd919caae2::t_e9d9e9add7d9a6 60-70
+net/crates/net/sdk/tests/mesh_rpc_breaker.rs
+  s_ae82cd919caae2::t_582193170c56ff 412-433,435-441,445-473
+  s_ae82cd919caae2::t_7cc9a8b8795818 434,442-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5b01cedb81ab234400675fc591c4f6691251b0c9",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

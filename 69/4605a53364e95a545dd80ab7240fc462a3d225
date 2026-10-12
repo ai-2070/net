@@ -1,0 +1,24 @@
+net/crates/net/browser-ts/test/classification.test.ts
+  s_d8b00bedd146e9::t_12abae100d93fe 294-295,298,305-320
+  s_d8b00bedd146e9::t_767afe282ee21e 522-523
+  s_d8b00bedd146e9::t_9243796673312d 321-322
+net/crates/net/browser-ts/src/udp-probe.ts
+  s_d8b00bedd146e9::t_4b5c71e71f590d 291-298,300-305
+  s_d8b00bedd146e9::t_b977a25b55bf11 306,309,332
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "694605a53364e95a545dd80ab7240fc462a3d225",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

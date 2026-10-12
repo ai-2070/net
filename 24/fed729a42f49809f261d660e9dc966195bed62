@@ -1,0 +1,20 @@
+net/crates/net/sdk/src/org/tests_live.rs
+  s_16bd53708deb14::t_8b060705fc1c2a 65,67-68,95-102,104-117,127,133-134
+  s_16bd53708deb14::t_a4b2be1880fa3e 103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "24fed729a42f49809f261d660e9dc966195bed62",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

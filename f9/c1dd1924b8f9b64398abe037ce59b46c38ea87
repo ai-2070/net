@@ -1,0 +1,35 @@
+net/crates/net/sdk-ts/src/_internal.ts
+  s_ae82cd919caae2::t_bfb5fd2816c77c 153-164
+  s_ae82cd919caae2::t_6147d68890a400 122-152
+net/crates/net/sdk-ts/test/daemon_factory_binding.test.ts
+  s_ae82cd919caae2::t_9083bb03665463 1-80
+net/crates/net/sdk-ts/src/mesh.ts
+  s_ae82cd919caae2::t_ae40671fdf9b4b 707-712,714-719,721-734
+  s_ae82cd919caae2::t_a49c379a6c89bd 87
+net/crates/net/sdk-ts/src/compute.ts
+  s_ae82cd919caae2::t_6147d68890a400 37,394-403,751-759,761-781,784
+net/crates/net/sdk-ts/test/stream_handler_isolation.test.ts
+  s_ae82cd919caae2::t_991b256367be20 1-47
+net/crates/net/sdk-ts/src/meshos.ts
+  s_ae82cd919caae2::t_bdd5ad9ca10480 59
+  s_ae82cd919caae2::t_6147d68890a400 259-271,366-369,371
+net/crates/net/sdk-ts/src/store-transport.ts
+  s_ae82cd919caae2::t_a49c379a6c89bd 40
+  s_ae82cd919caae2::t_ae40671fdf9b4b 127-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f9c1dd1924b8f9b64398abe037ce59b46c38ea87",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

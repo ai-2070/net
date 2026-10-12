@@ -1,0 +1,43 @@
+net/crates/net/sdk/tests/mesh_zero_timings.rs
+  s_ae82cd919caae2::t_344c2e2e7bdcf2 1-44
+net/crates/net/bindings/python/tests/test_sync_stream_close.py
+  s_ae82cd919caae2::t_0c694d0a1d65d7 1-52
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_ae82cd919caae2::t_e0f08001974a86 1027-1039,1043,1049-1061,1067,1084-1085,1088-1090,1093,1096,1099-1120,1124-1132,1160-1161,1163-1165,1170,1174-1175,1177-1179,2660,2698
+  s_ae82cd919caae2::t_63f534f6b2543b 349-354
+  s_ae82cd919caae2::t_fef4c59c9d5145 1192-1235,1249,1268,1287,1298,1307,1324,1358-1359,1392,1408,1423,1434,1441,1458,1467,1486,1494-1502,1505,1545,1552,1573-1574,1599,1612,1623,1630,1647,1670-1671,1694-1695,1708,1717-1725,1728,1752-1753,2740,2783
+  s_ae82cd919caae2::t_c22a5701866f05 1044-1048
+  s_ae82cd919caae2::t_ade974fcf7a3b5 1332-1335,1655-1658
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_ae82cd919caae2::t_f4b20b1cd21b94 2277-2319
+net/crates/net/bindings/python/src/lib.rs
+  s_ae82cd919caae2::t_2816b169ab79a9 3703-3709,3726
+  s_ae82cd919caae2::t_8b5821729bae35 907,912
+  s_ae82cd919caae2::t_4386c2b6d16f3e 767,804-806,867,876,881-886,2143,2160,2182-2187,2189,2209,2227,2570,2583-2585,2590-2591,2593-2597,2604-2609,2614-2618,3448,3452-3454,3478,3483
+  s_ae82cd919caae2::t_cc2497472781be 2190-2193,2228-2231,2677-2683
+net/crates/net/bindings/python/src/payment_provider.rs
+  s_ae82cd919caae2::t_cc2497472781be 561-566,581-586
+go/mesh.go
+  s_ae82cd919caae2::t_2c5ff752c3b100 235-240
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_ae82cd919caae2::t_baeae7041b5556 213
+  s_ae82cd919caae2::t_63f534f6b2543b 275-278
+net/crates/net/src/adapter/net/mesh.rs
+  s_ae82cd919caae2::t_598e0e6b25e6fb 13876-13892
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b4379985c52d3675d7dd414939c406424280e661",
+  "prompts": {},
+  "sessions": {
+    "s_ae82cd919caae2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700d2786-663a-44a8-930f-58e09f26c10d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

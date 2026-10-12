@@ -1,0 +1,40 @@
+net/crates/net/cli/src/commands/identity.rs
+  s_16bd53708deb14::t_10a9be1fce4244 114-122,395-398,403,531-532
+net/crates/net/sdk/src/mesh_enroll.rs
+  s_16bd53708deb14::t_599680cbbaab67 264-265,304-305
+net/crates/net/sdk/tests/compute_migration.rs
+  s_16bd53708deb14::t_53376f54d45363 1605-1607,1618-1623,1627-1629
+  s_16bd53708deb14::t_bbe7775bf57108 1565-1604,1608-1617,1624-1626,1630-1633
+net/crates/net/sdk/src/revocation.rs
+  s_16bd53708deb14::t_6508516dbc4bcd 151-157
+  s_16bd53708deb14::t_517f216cf1809b 404-438
+  s_16bd53708deb14::t_a049b9a318893d 439-440
+net/crates/net/src/adapter/net/identity/token.rs
+  s_16bd53708deb14::t_89f675b79b479e 1129-1134,1138-1141,1177-1185,1188-1191,1195,2541
+  s_16bd53708deb14::t_45ff37bfb8960a 2507-2540
+  s_16bd53708deb14::t_53376f54d45363 1186-1187
+  s_16bd53708deb14::t_6d48e324116a4b 2542
+net/crates/net/adapters/mcp/src/wrap/delegation.rs
+  s_16bd53708deb14::t_6508516dbc4bcd 283-285,697
+net/crates/net/sdk/src/compute.rs
+  s_16bd53708deb14::t_345898322d4d84 1067-1074
+  s_16bd53708deb14::t_c44e803d7e1c49 2287-2314
+  s_16bd53708deb14::t_f38ad01ab80aaa 2173-2175
+  s_16bd53708deb14::t_8a94038cfc3315 209-215,348,1244-1245,1297,1892-1893
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b3669584863a9b087aeaea067e2629ae7692f4e6",
+  "prompts": {},
+  "sessions": {
+    "s_16bd53708deb14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed443c35-d1f8-4f55-8bd6-290211bb463e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
