@@ -161,6 +161,17 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
       const diag = await entry.page.evaluate(() => globalThis.__diag?.() ?? null).catch(error => String(error));
       log(`[${entry.role}] not ready: ${JSON.stringify(status)}
     diag: ${JSON.stringify(diag)}`);
+      // Both ends of each pair that never delivered: this page's view of
+      // the host, and every host page's view of this player.
+      if (entry.role === 'player' && status?.node) {
+        for (const other of pages) {
+          if (other.role !== 'host') continue;
+          const hostView = await other.page.evaluate(id => globalThis.__peer?.(id) ?? null, status.node).catch(error => String(error));
+          const hostId = await other.page.evaluate(() => globalThis.__match?.node ?? null).catch(() => null);
+          const playerView = hostId ? await entry.page.evaluate(id => globalThis.__peer?.(id) ?? null, hostId).catch(error => String(error)) : null;
+          log(`    pair ${status.node} ↔ host ${hostId}: player sees ${JSON.stringify(playerView)}; host sees ${JSON.stringify(hostView)}`);
+        }
+      }
     }
   }
   await browser.close();

@@ -98,10 +98,16 @@ async function wire() {
   let directUp = 0;
   const now = new Map();
   for (const [i, { pc }] of connections.entries()) {
+    if (i > 0 && pc.connectionState === 'closed') continue;
     let sent = 0;
     let received = 0;
     try {
-      const report = await pc.getStats();
+      // Bounded: one connection whose getStats() never settles must not
+      // stall this report and every later one (seen at 1 × 64).
+      const report = await Promise.race([
+        pc.getStats(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('getStats timed out')), 500)),
+      ]);
       report.forEach(entry => {
         if (entry.type === 'transport') {
           sent += entry.bytesSent ?? 0;
@@ -306,6 +312,7 @@ async function runHost(hosts) {
   requestAnimationFrame(render);
   status.phase = 'ready';
   extra.players = () => host.players().length;
+  extra.heldPeers = () => host.players();
   extra.lastSendError = () => host.lastSendError;
   extra.clients = () => Object.fromEntries([...clients].map(([h, c]) => [h, c.stats()]));
   extra.dropped = () => host.dropped;
@@ -354,6 +361,18 @@ async function runPlayer(hosts) {
     return out;
   };
 }
+
+// This node's view of one peer pair: the live attempt (direct or not),
+// and whether netcode holds the peer. For a pair that never delivered.
+globalThis.__peer = async id => {
+  let attempt;
+  try {
+    attempt = await node.peerAttempt(id);
+  } catch (error) {
+    attempt = { error: String(error?.message ?? error) };
+  }
+  return { attempt, heldByHost: typeof extra.heldPeers === 'function' ? extra.heldPeers().includes(id) : null };
+};
 
 globalThis.__diag = () => ({
   outcomes,
