@@ -1,0 +1,39 @@
+net/crates/net/examples/shard-topology/page/match.mjs
+  s_d71d2b607c2060::t_9b4772dce66a1a 39,195,215,218,379
+  s_d71d2b607c2060::t_7390964e075c21 214,306-307,354-365
+  s_d71d2b607c2060::t_31c8a65694618e 1-38,40-161,169-172,182-194,196-213,216-217,219-305,308-353,366-378,380-409
+  s_d71d2b607c2060::t_9142875a165940 162-168,173-181
+net/crates/net/examples/shard-topology/.gitignore
+  s_d71d2b607c2060::t_7e952fd1d77b8f 1-2
+net/crates/net/examples/shard-topology/page/index.html
+  s_d71d2b607c2060::t_3ed3f07948842f 1-3,5-7
+  s_d71d2b607c2060::t_e22d3ca3ed5711 4
+net/crates/net/examples/shard-topology/package.json
+  s_d71d2b607c2060::t_3ed3f07948842f 1-14
+net/crates/net/examples/shard-topology/run.mjs
+  s_d71d2b607c2060::t_7390964e075c21 157-161
+  s_d71d2b607c2060::t_c4a081411013e6 204,430-434,496
+  s_d71d2b607c2060::t_adf63649c249d3 488-494
+  s_d71d2b607c2060::t_2c1f16e61a9490 1-70,75,77-154,163-203,205-429,435-487,495,497-507
+  s_d71d2b607c2060::t_2ac21733c2a187 71-74,76
+  s_d71d2b607c2060::t_9b4772dce66a1a 155-156,162
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_043d7ff3fc0cde 4-14,467-526
+  s_d71d2b607c2060::t_b3fc53521696c6 527-529
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4ae16bfc4c3945951c6af8c4872191e6afa0cc79",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
