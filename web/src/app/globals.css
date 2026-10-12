@@ -839,16 +839,7 @@
 }
 @utility animate-demo-sweep {
   animation: demo-sweep 5s linear infinite;
-}
-@keyframes blink-soft {
-  0%,
-  100% {
-    opacity: 1;
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
   }
-  50% {
-    opacity: 0.35;
-  }
-}
-@utility animate-blink-soft {
-  animation: blink-soft 1.6s ease-in-out infinite;
 }

@@ -20,7 +20,7 @@ export const metadata: Metadata = {
   title:
     "NET for games — multiplayer for any engine, plug and play for Three.js",
   description:
-    "NET is an open multiplayer protocol for any game engine, and plug and play for Three.js: add co-op, multiplayer or MMO-scale play with @net-mesh/browser. Players connect directly, one player hosts, zero input delay. Open source and free to ship.",
+    "NET is an open multiplayer protocol for any game engine, and plug and play for Three.js: add co-op, multiplayer or MMO-scale play with @net-mesh/browser. Players connect directly when the network allows, one player hosts, and your own moves show instantly. Open source and free to ship.",
 };
 
 export default function GamesPage(): JSX.Element {

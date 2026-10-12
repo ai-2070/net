@@ -28,8 +28,11 @@ const MODES: ReadonlyArray<{ tag: string; title: string; body: string }> = [
 ];
 
 const NET_FACTS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: "60/s", label: "updates between players" },
-  { value: "p2p", label: "every page linked to every other" },
+  { value: "120/s", label: "updates between players, 60 above 8" },
+  {
+    value: "p2p",
+    label: "every page linked to every other, direct when possible",
+  },
   { value: "0", label: "servers you run (public anchor)" },
   { value: "host", label: "can leave, the fight goes on" },
 ];
@@ -59,8 +62,9 @@ export function GamesDemoSection() {
       {playing && DEMO_URL ? (
         <div
           ref={frameWrap}
-          // Exactly the viewport under the fixed nav, and scrolled to sit there.
-          className="relative flex flex-col bg-black h-[calc(100svh-80px)] scroll-mt-20"
+          // Exactly the viewport under the fixed nav, and scrolled to sit there;
+          // the whole screen once it is the fullscreen element.
+          className="relative flex flex-col bg-black h-[calc(100svh-80px)] [&:fullscreen]:h-[100svh] scroll-mt-20"
         >
           <div className="flex items-center justify-between gap-4 px-4 h-11 border-b border-line bg-bg text-[10px] tracking-[0.14em] uppercase">
             <span className="text-ink-dim truncate">
@@ -96,8 +100,10 @@ export function GamesDemoSection() {
             src={DEMO_URL}
             title="Rose & Blade, a multiplayer Three.js game running over NET"
             className="flex-1 min-h-0 w-full border-0 block"
-            // The game needs fullscreen (and holds the keyboard there), pointer
-            // lock for the mouse, and sound once the player clicks.
+            // The game needs fullscreen (and holds the keyboard there) and sound
+            // once the player clicks. Pointer lock needs no entry: it is gated
+            // only for sandboxed frames (`allow-pointer-lock`), and this one
+            // is not sandboxed.
             allow="fullscreen; autoplay; gamepad; keyboard-map"
             allowFullScreen
           />

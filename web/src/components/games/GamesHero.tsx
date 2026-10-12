@@ -1,12 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-// Drop a looping reel of multiplayer gameplay here and the hero plays it.
-// Until the file exists, a rendered stand-in (below) cuts between camera
-// angles over a small networked battle, so the hero never sits empty.
-export const HERO_REEL_SRC = "/games/hero-reel.mp4";
+// Drop a looping reel of multiplayer gameplay into `public/games/` and point
+// this at it (e.g. "/games/hero-reel.mp4") and the hero plays it. While it is
+// null no <video> is rendered, so the page makes no request for a missing
+// file; a rendered stand-in (below) cuts between camera angles over a small
+// networked battle instead, so the hero never sits empty.
+export const HERO_REEL_SRC: string | null = null;
 
 // ── rendered stand-in reel ──────────────────────────────────────────────────
 
@@ -98,7 +100,6 @@ function ReelCanvas() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     resize();
-    window.addEventListener("resize", resize);
 
     const project = (
       x: number,
@@ -295,6 +296,14 @@ function ReelCanvas() {
       raf = requestAnimationFrame(loop);
     };
 
+    // Resizing clears the bitmap. The loop repaints on its next frame; the
+    // reduced-motion still frame has no loop, so it is repainted here.
+    const onResize = (): void => {
+      resize();
+      if (reduce) draw();
+    };
+    window.addEventListener("resize", onResize);
+
     if (reduce) {
       for (let i = 0; i < 60; i++) step(1 / 30, 0);
       draw();
@@ -305,7 +314,7 @@ function ReelCanvas() {
 
     return () => {
       cancelAnimationFrame(raf);
-      window.removeEventListener("resize", resize);
+      window.removeEventListener("resize", onResize);
     };
   }, []);
 
@@ -316,16 +325,28 @@ function ReelCanvas() {
 
 // ── hero ────────────────────────────────────────────────────────────────────
 
-const HUD_STATS: ReadonlyArray<{ value: string; unit: string; label: string }> =
-  [
-    { value: "0", unit: "ms", label: "input delay" },
-    { value: "16", unit: "players", label: "per host, tested" },
-    { value: "8,000", unit: "npcs", label: "per host, tested" },
-    { value: "$0", unit: "", label: "license or per-player fees" },
-  ];
+const REDUCED_MOTION = "(prefers-reduced-motion: reduce)";
+
+function subscribeReducedMotion(onChange: () => void): () => void {
+  const mq = window.matchMedia(REDUCED_MOTION);
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+}
 
 export function GamesHero() {
+  // The server snapshot says "reduce", so the reel is never in the server
+  // render and only mounts once the client has seen the visitor's setting.
+  const reduceMotion = useSyncExternalStore(
+    subscribeReducedMotion,
+    () => window.matchMedia(REDUCED_MOTION).matches,
+    () => true,
+  );
+  const reelOn = HERO_REEL_SRC !== null && !reduceMotion;
   const [reelReady, setReelReady] = useState(false);
+  // Set once the reel has fully faded in. The canvas underneath is hidden for
+  // good from then on, so it is unmounted and its frame loop stops.
+  const [reelShown, setReelShown] = useState(false);
+  const showReel = reelOn && reelReady;
 
   return (
     <section
@@ -334,20 +355,26 @@ export function GamesHero() {
     >
       {/* background reel */}
       <div className="absolute inset-0" aria-hidden>
-        <ReelCanvas />
-        <video
-          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ${
-            reelReady ? "opacity-100" : "opacity-0"
-          }`}
-          src={HERO_REEL_SRC}
-          autoPlay
-          muted
-          loop
-          playsInline
-          preload="metadata"
-          onLoadedData={() => setReelReady(true)}
-          onError={() => setReelReady(false)}
-        />
+        {reelOn && reelShown ? null : <ReelCanvas />}
+        {reelOn ? (
+          <video
+            className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ${
+              showReel ? "opacity-100" : "opacity-0"
+            }`}
+            src={HERO_REEL_SRC ?? undefined}
+            autoPlay
+            muted
+            loop
+            playsInline
+            preload="metadata"
+            onLoadedData={() => setReelReady(true)}
+            onTransitionEnd={() => setReelShown(reelReady)}
+            onError={() => {
+              setReelReady(false);
+              setReelShown(false);
+            }}
+          />
+        ) : null}
         {/* legibility: darken left + bottom, keep the action visible on the right */}
         <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(10,12,10,0.94)_0%,rgba(10,12,10,0.78)_38%,rgba(10,12,10,0.25)_75%,rgba(10,12,10,0.4)_100%)]" />
         <div className="absolute inset-x-0 bottom-0 h-40 bg-[linear-gradient(0deg,#0a0c0a,transparent)]" />
@@ -377,14 +404,13 @@ export function GamesHero() {
         </h1>
 
         <p className="font-sans text-[20px] md:text-[22px] text-ink max-w-[620px] leading-[1.45]">
-          Plug and play support for Three.js: turn any
-          Three.js game into a multiplayer, co-op, or an MMO.
+          Plug and play support for Three.js: turn any Three.js game into a
+          multiplayer game, a co-op game, or an MMO.
         </p>
 
         <p className="font-sans text-[15px] text-ink-dim mt-4 max-w-[580px] leading-[1.6]">
-          Players connect straight to
-          each other, there is no game server in the middle.
-          Free and open source.
+          Players connect straight to each other whenever the network allows.
+          There is no game server running the match. Free and open source.
         </p>
 
         <div className="mt-8 flex gap-3 flex-wrap items-center">
@@ -403,33 +429,9 @@ export function GamesHero() {
         </div>
       </div>
 
-      {/* HUD stat bar */}
-      {/*<div className="relative border-t border-line bg-bg/70 backdrop-blur-md">
-        <div className="grid grid-cols-2 md:grid-cols-4 max-w-[1440px] mx-auto">
-          {HUD_STATS.map((s) => (
-            <div
-              key={s.unit + s.label}
-              className="px-6 py-5 border-r border-line last:border-r-0 [&:nth-child(2)]:max-md:border-r-0 max-md:[&:nth-child(-n+2)]:border-b"
-            >
-              <div className="font-sans text-accent text-[28px] md:text-[34px] font-semibold leading-none tabular-nums">
-                {s.value}
-                {s.unit ? (
-                  <span className="text-ink-dim text-[12px] font-mono font-normal ml-1.5 uppercase tracking-[0.1em]">
-                    {s.unit}
-                  </span>
-                ) : null}
-              </div>
-              <div className="text-[10px] tracking-[0.14em] uppercase text-ink-dim mt-2">
-                {s.label}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>*/}
-
       <div className="absolute top-5 right-6 hidden md:flex items-center gap-2 text-[10px] tracking-[0.14em] uppercase text-ink-dim">
         <span className="w-1.5 h-1.5 rounded-full bg-warn inline-block animate-pulse-dot" />
-        {reelReady ? "gameplay reel" : "preview render"}
+        {showReel ? "gameplay reel" : "preview render"}
       </div>
     </section>
   );

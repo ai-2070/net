@@ -21,37 +21,19 @@ const SPEED: ReadonlyArray<SpeedStat> = [
     value: "0",
     unit: "ms",
     title: "input delay",
-    body: "Your character moves on the same frame you press the key. The host confirms it in the background.",
+    body: "Your own moves are predicted on the same frame you press the key. The host confirms them in the background.",
   },
-  // {
-  //   value: "1",
-  //   unit: "hop",
-  //   title: "player to player",
-  //   body: "Players connect directly over WebRTC. There is no game server in the middle adding its own ping.",
-  // },
-  // {
-  //   value: "30",
-  //   unit: "/ sec",
-  //   title: "world updates",
-  //   body: "The default tick rate. Raise it for a twitch shooter, lower it for a strategy game.",
-  // },
   {
-    value: "~2",
+    value: "~5",
     unit: "ms",
-    title: "to update 8,000 npcs",
-    body: "Only the entities that changed are checked and sent.",
+    title: "host tick, 8,000 npcs",
+    body: "Measured on one machine, with 16 players and 5% of the world moving each tick. Only the entities that changed are checked, and each player is sent only what is near them.",
   },
-  // {
-  //   value: "16",
-  //   unit: "players",
-  //   title: "on one host",
-  //   body: "Tested with 16 players and 8,000 entities. Host splitting for bigger worlds is supported.",
-  // },
   {
-    value: "240",
+    value: "~550",
     unit: "kB",
     title: "total download",
-    body: "The whole networking engine, gzipped. Smaller than most of your textures.",
+    body: "The whole networking engine, WebAssembly and JavaScript, gzipped. Smaller than most of your textures.",
   },
 ];
 
@@ -66,9 +48,10 @@ export function GamesSpeedSection() {
       </DisplayHeading>
 
       <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
-        Most online game sends every move to a server somewhere and waits
-        for the answer. With NET, you see your own moves right away, players
-        talk directly to each other. There's no server round-trip.
+        Most online games send every move to a server somewhere and wait for the
+        answer. With NET, you see your own moves right away, and players link
+        directly to each other whenever the network allows. No game server runs
+        the match.
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -112,14 +95,14 @@ const MODES: ReadonlyArray<Mode> = [
     tag: "01",
     title: "Co-op",
     players: "2–4 players",
-    body: "One friend hosts in their browser and plays too. The others join. Nobody gets an unfair edge just for hosting.",
+    body: "One friend hosts in their browser and plays too. The others join. The host plays through the same view as everyone else.",
     apis: ["hostStore", "joinStore", "hostPlayer"],
     href: "/docs/sdk/browser/store",
   },
   {
     tag: "02",
     title: "Multiplayer",
-    players: "8–16 per room",
+    players: "up to 16 per room",
     body: "Create a lobby, share a room code, and play. Lobbies are found over the network itself, so there is no matchmaking server. Movement stays smooth even when packets drop.",
     apis: ["createLobby", "joinLobby", "joinNetcode"],
     href: "/docs/sdk/browser/netcode",
@@ -251,7 +234,8 @@ const world = await joinLobby({
 
 const definition = defineStore({
   id: 'arena', version: 1, state, empty,
-  actions: { fire },
+  actions: { fire: { input: parseFire, output: parseHull } },
+  inputs: {},
   visibility: { 'players.*.hand': 'owner' }, // secrets stay secret
 });
 
@@ -563,7 +547,7 @@ const PROPS: ReadonlyArray<{ k: string; title: string; body: string }> = [
   {
     k: "02",
     title: "No wallhacks",
-    body: "Hidden data is never sent to players who shouldn't see it, so there is nothing to dig out.",
+    body: "Hidden data is never sent to players who shouldn't see it, so there is nothing to dig out. (The host's own page holds everything; for real stakes, run a dedicated host.)",
   },
   {
     k: "03",
@@ -583,7 +567,7 @@ const PROPS: ReadonlyArray<{ k: string; title: string; body: string }> = [
   {
     k: "06",
     title: "Encrypted end to end",
-    body: "Every connection runs over an encrypted Noise session, from the first packet.",
+    body: "Every NET packet travels inside an encrypted Noise session, even when the anchor has to relay it.",
   },
 ];
 
