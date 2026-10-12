@@ -1,0 +1,27 @@
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d71d2b607c2060::t_375fbb880a9935 40-46
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_375fbb880a9935 559-585
+net/crates/net/wire/src/session.rs
+  s_d71d2b607c2060::t_e1e237d8a0d02f 3253,4172-4177,4179-4181,4278-4279
+  s_d71d2b607c2060::t_7cf40b3c1ee6e4 32-42,2160-2178,2499-2500,2861-2862,2872-2878,3108-3117,3217-3252
+  s_d71d2b607c2060::t_f448d34e66e119 2868,4150-4171,4178,4182-4185,4195-4272,4277
+  s_d71d2b607c2060::t_e9688f62a4ffbc 2863-2867,3146-3147,4186-4194,4273-4276
+  s_d71d2b607c2060::t_60da9ce0a3cc1f 3254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "95bae8001f049df367e39e3e9a1fa94745bc9274",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
