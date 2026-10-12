@@ -21,7 +21,7 @@ around it.
 
 A region host serves one store per region, named by region (several may share a
 node), and keeps announcing them. An announcement is a lease, so
-`announceRegions` re-announces every 2 seconds:
+`announceRegions` re-announces every 30 seconds:
 
 ```typescript
 import { hostStore } from '@net-mesh/browser';

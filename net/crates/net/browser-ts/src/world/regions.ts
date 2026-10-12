@@ -63,8 +63,13 @@ export function regionTag(world: string, region: string): string {
   return `net-world:${world}:region:${region}`;
 }
 
-/** How often region hosts re-announce: an announcement is a lease. */
-export const REGION_ANNOUNCE_MS = 2_000;
+/**
+ * How often region hosts re-announce: an announcement is a lease, held
+ * for the leaf's 300 s TTL. 30 s, not 2 s, for the reason
+ * `LOBBY_ANNOUNCE_MS` gives: re-announcements flood through the anchor to
+ * every peer, and at 2 s they saturated a host's anchor link at 64 nodes.
+ */
+export const REGION_ANNOUNCE_MS = 30_000;
 
 /**
  * Announce that this node hosts `regions` of `world`, and keep announcing

@@ -16,8 +16,9 @@ world must use the same `size`.
   (`radius` default 1).
 - `regionTag(world, region)` is the directory tag a host announces,
   `net-world:<world>:region:<region>`.
-- `REGION_ANNOUNCE_MS` (2000) is how often `announceRegions` re-announces: an
-  announcement is a lease.
+- `REGION_ANNOUNCE_MS` (30000) is how often `announceRegions` re-announces: an
+  announcement is a lease (300 s TTL). Not faster: refreshes flood through the
+  anchor to every peer.
 
 ## Region hosts
 
@@ -28,7 +29,7 @@ import { announceRegions, handoffLink, parseHandoffLedger, regionDirectory,
 
 // One store per region, named by region; several may share a node.
 const host = hostStore({ definition: region, store: 'r:4:7', transport, … });
-announceRegions(node, 'my-world', ['r:4:7']);            // re-announces every 2 s
+announceRegions(node, 'my-world', ['r:4:7']);            // re-announces every 30 s
 
 // Moving an entity to the neighbour: at-most-once.
 const directory = regionDirectory({ node, world: 'my-world', trustedHosts: HOST_NODE_IDS });

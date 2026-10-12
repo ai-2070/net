@@ -96,27 +96,36 @@ async function wire() {
   let directSent = 0;
   let directReceived = 0;
   let directUp = 0;
-  const now = new Map();
-  for (const [i, { pc }] of connections.entries()) {
-    if (i > 0 && pc.connectionState === 'closed') continue;
-    let sent = 0;
-    let received = 0;
-    try {
-      // Bounded: one connection whose getStats() never settles must not
-      // stall this report and every later one (seen at 1 × 64).
-      const report = await Promise.race([
-        pc.getStats(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('getStats timed out')), 500)),
-      ]);
-      report.forEach(entry => {
-        if (entry.type === 'transport') {
-          sent += entry.bytesSent ?? 0;
-          received += entry.bytesReceived ?? 0;
-        }
-      });
-    } catch {
-      continue;
-    }
+  // All reads at once, each bounded: sequential reads over 65 connections
+  // under load took longer than the report interval, so reports piled up
+  // and none landed (seen at 1 × 64). A connection that does not answer
+  // keeps its last reading, so the next one is not a delta from zero.
+  const readings = await Promise.all(
+    connections.map(async ({ pc }, i) => {
+      if (i > 0 && pc.connectionState === 'closed') return null;
+      try {
+        const report = await Promise.race([
+          pc.getStats(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('getStats timed out')), 500)),
+        ]);
+        let sent = 0;
+        let received = 0;
+        report.forEach(entry => {
+          if (entry.type === 'transport') {
+            sent += entry.bytesSent ?? 0;
+            received += entry.bytesReceived ?? 0;
+          }
+        });
+        return { pc, i, sent, received };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const now = new Map(previousWire);
+  for (const reading of readings) {
+    if (reading === null) continue;
+    const { pc, i, sent, received } = reading;
     const before = previousWire.get(pc) ?? { sent: 0, received: 0 };
     now.set(pc, { sent, received });
     if (i === 0) {
@@ -374,6 +383,18 @@ globalThis.__peer = async id => {
   return { attempt, heldByHost: typeof extra.heldPeers === 'function' ? extra.heldPeers().includes(id) : null };
 };
 
+// Every non-zero leaf counter, drop reasons included: where a peer's
+// packets die (`no_session`, `routing_expired`, …) when a pair never
+// delivers.
+const nonZeroCounters = () => {
+  try {
+    return Object.fromEntries(Object.entries(node.counters()).filter(([, v]) => v !== '0'));
+  } catch (error) {
+    return { error: String(error?.message ?? error) };
+  }
+};
+globalThis.__counters = nonZeroCounters;
+
 globalThis.__diag = () => ({
   outcomes,
   connect: Object.fromEntries(Object.entries(extra).filter(([key]) => key.startsWith('connect:'))),
@@ -384,12 +405,16 @@ globalThis.__diag = () => ({
   clients: typeof extra.clients === 'function' ? extra.clients() : null,
   counters: node?.rtcStats().counters ?? null,
   connections: connections.map(({ pc }) => pc.connectionState),
+  leafCounters: node ? nonZeroCounters() : null,
 });
 
 // ── report ──────────────────────────────────────────────────────────────
 
+// One report at a time: a slow one is skipped over, never stacked.
+let reporting = false;
 setInterval(async () => {
-  if (index === undefined) return;
+  if (index === undefined || reporting) return;
+  reporting = true;
   try {
     const counters = node.rtcStats().counters;
     const ticks = tickMs.splice(0);
@@ -421,6 +446,8 @@ setInterval(async () => {
     });
   } catch (error) {
     status.reportError = String(error?.message ?? error);
+  } finally {
+    reporting = false;
   }
 }, 1000);
 

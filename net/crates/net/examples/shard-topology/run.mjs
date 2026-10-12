@@ -155,6 +155,7 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
     if (state.phase === 'done') break;
   }
   clearInterval(sampler);
+  let anyFailedPlayer = false;
   for (const entry of pages) {
     const status = await entry.page.evaluate(() => globalThis.__match ?? null).catch(() => null);
     if (status?.phase !== 'ready') {
@@ -171,7 +172,15 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
           const playerView = hostId ? await entry.page.evaluate(id => globalThis.__peer?.(id) ?? null, hostId).catch(error => String(error)) : null;
           log(`    pair ${status.node} ↔ host ${hostId}: player sees ${JSON.stringify(playerView)}; host sees ${JSON.stringify(hostView)}`);
         }
+        anyFailedPlayer = true;
       }
+    }
+  }
+  if (anyFailedPlayer) {
+    for (const entry of pages) {
+      if (entry.role !== 'host') continue;
+      const counters = await entry.page.evaluate(() => globalThis.__counters?.() ?? null).catch(error => String(error));
+      log(`[host] leaf counters: ${JSON.stringify(counters)}`);
     }
   }
   await browser.close();
@@ -205,7 +214,7 @@ const config = {
   tickRate: num('tick-rate', 20),
   visible: num('visible', 30),
   burnMs: num('burn-ms', 4),
-  announceMs: num('announce-ms', 2000),
+  announceMs: num('announce-ms', 30_000), // the library's LOBBY_ANNOUNCE_MS
   relayed: flag('relayed'),
 };
 const measureSecs = num('measure-secs', 30);

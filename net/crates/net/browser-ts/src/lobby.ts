@@ -112,8 +112,20 @@ export const MAX_LOBBY_CAPACITY = 256;
 /** Characters a code is made of: no 0/O, 1/I/L, so a code survives being read aloud. */
 export const LOBBY_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 export const LOBBY_CODE_LENGTH = 6;
-/** How often a lobby re-announces itself. */
-export const LOBBY_ANNOUNCE_MS = 2_000;
+/**
+ * How often a lobby (and a joiner's seek tag) refreshes its announcement.
+ * A change of players is announced at once; this is only the lease
+ * refresh, well inside the leaf's 300 s announcement TTL.
+ *
+ * It was 2 s. Every node's re-announcement is flooded through the anchor
+ * to every peer, each of which answers every packet with a credit grant,
+ * so the load grows with the square of the players: at 64 players on one
+ * anchor (sharded-match plan, S0b) a 2 s refresh pinned the host's anchor
+ * link at its SCTP advisory (84,667 refused sends), starving every
+ * relayed pair and timing out handshakes. At 30 s the same run joined all
+ * 64, every pair direct, with no refusals.
+ */
+export const LOBBY_ANNOUNCE_MS = 30_000;
 
 /** The frame bound the package's own tests and demo use. */
 const DEFAULT_MAX_EVENT_BYTES = 8104;
@@ -539,6 +551,8 @@ export interface JoinLobbyOptions<S extends object, A extends ActionSpec, I exte
    * announces goes here. The same option as `createLobby`'s.
    */
   readonly tags?: readonly string[];
+  /** How often the seek tag is refreshed while joined. Default {@link LOBBY_ANNOUNCE_MS}. */
+  readonly announceEveryMs?: number;
 }
 
 /**
@@ -596,7 +610,7 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
     void sent.finally(() => seekingInFlight.delete(sent));
   };
   announce();
-  const timer = setInterval(announce, LOBBY_ANNOUNCE_MS);
+  const timer = setInterval(announce, options.announceEveryMs ?? LOBBY_ANNOUNCE_MS);
   // Withdraws the seek tag, after any seeking announcement still in
   // flight. Settles once the withdrawal has been attempted (a failure is
   // swallowed, as every announcement here is), so a `close()` that awaits

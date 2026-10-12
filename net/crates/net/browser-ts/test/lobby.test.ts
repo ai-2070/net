@@ -379,7 +379,9 @@ describe('joining reaches a host that only accepts discovered peers', () => {
         return joiner.announce(tags);
       },
     };
-    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code });
+    // A short refresh, so the next seeking announcement comes in test time
+    // (the default is LOBBY_ANNOUNCE_MS, 30 s).
+    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code, announceEveryMs: 200 });
     await world.ready();
     holding = Promise.withResolvers<void>();
     // The re-announce timer's next seeking announcement, held in flight:

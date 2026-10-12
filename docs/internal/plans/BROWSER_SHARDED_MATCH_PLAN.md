@@ -634,6 +634,37 @@ remains**. The 7 left:
 Both sit on a machine running 65 tabs; the multi-machine run separates
 them from load.
 
+**Bug 2, relayed pairs the host never heard: announcement flooding
+(2026-10-13).** Leaf drop counters and the host's console showed the
+host's ANCHOR link pinned at its 96 KiB SCTP advisory, with 84,667 refused
+sends starting in the first seconds of the join. Everything the host sent
+through the anchor was refused, and every relayed player starved.
+
+Isolating it:
+
+| Run | Players joined | Advisory refusals |
+|---|---|---|
+| 1 × 16, all relayed | all joined | 0 |
+| 1 × 64, announcements every 2 s | 60/64 | 84,667 |
+| 1 × 64, announcements every 30 s | **64/64, every pair direct**, first snapshot ≤ 5 s | **0** |
+
+Cause: every node re-announced every 2 s (`LOBBY_ANNOUNCE_MS`,
+`REGION_ANNOUNCE_MS`, the harness). Each refresh is flooded through the
+anchor to every peer, and each peer answers every packet with a credit
+grant, so the load grows with the square of the players.
+
+The lobbies plan had left the 2 s cadence as a guess "correct under
+either behaviour", pending a measurement, and an announcement carries a
+300 s TTL anyway. **Fix:** both constants are now 30 s. A change of
+players is still announced at once. `joinLobby` gains `announceEveryMs`.
+
+**Measured, and not separable from this machine.** With announcements
+every 30 s, 1 × 64 is clean on joins: all direct, all held, 7.3 Mbit/s
+wire upload. But the host tab's main thread is 99% busy (tick p95
+30.6 ms, 10 fps). The wire/payload ratio (7.4×) disagrees with what the
+players report receiving, so treat it as unreliable under saturation.
+Both need the multi-machine run.
+
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It
 needs ≥ 3 machines.

@@ -51,6 +51,13 @@ the README on why it is a sibling package rather than a sub-path.
   with `direct: true` on the other, for good. An answerer is now direct
   only once the establishment is proven, and an establishment its offerer
   abandons returns the pair to its relay (`net-mesh-leaf`).
+- **Lobbies, joiners and region hosts refresh their announcements every
+  30 s, not 2 s** (`LOBBY_ANNOUNCE_MS`, `REGION_ANNOUNCE_MS`). Every refresh
+  floods through the anchor to every peer, so the load grows with the square
+  of the players: at 64 players on one anchor a 2 s refresh pinned the
+  host's anchor link at its SCTP advisory, starving every relayed pair. A
+  change of players is still announced at once, and an announcement lives
+  300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has.
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers
