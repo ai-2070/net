@@ -1,0 +1,31 @@
+net/crates/net/browser-ts/src/netcode/client.ts
+  s_d71d2b607c2060::t_74e59843d2efad 105-109,111-116,513-518,521-523
+  s_d71d2b607c2060::t_4e8e8bb2a812a4 38-63,132-133,159-166,181-187,269-273,277-284,291,293-295,347-375,385-388,561-574,585-586,592
+net/crates/net/browser-ts/test/netcode/join.test.ts
+  s_d71d2b607c2060::t_d5bf5d5889e467 1-164
+  s_d71d2b607c2060::t_026237433283b5 165-214
+net/crates/net/browser-ts/src/netcode/index.ts
+  s_d71d2b607c2060::t_4e8e8bb2a812a4 14-15
+.claude/skills/net-browser/netcode.md
+  s_d71d2b607c2060::t_007d9b5e4377fb 175-181
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d71d2b607c2060::t_23fee24ce03a50 26-36
+web/src/content/docs/sdk/browser/netcode.md
+  s_d71d2b607c2060::t_102cd767c4d70c 171-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5b245739740b98b636b8f7f87f8da410199f4914",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
