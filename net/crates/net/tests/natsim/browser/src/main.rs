@@ -1360,6 +1360,9 @@ async fn run_row(m: &Matrix, verdict: &mut Verdict) -> Result<(), String> {
     // Both namespaces serve their page on `localhost:<page_port>`, so
     // ONE origin covers both browsers.
     boot.offers_per_ip_per_minute = 200;
+    // Its pages reuse a few minted credentials from one address, so
+    // the per-(address, credential) offer budget must not bind either.
+    boot.offers_per_credential_per_minute = 200;
     // The dual-stack anchor's second listener: same port, the other
     // family, the SAME router state (so an attempt minted over one
     // family is valid on the other).

@@ -1311,6 +1311,9 @@ async fn run(
         origin.clone(),
     );
     cfg.offers_per_ip_per_minute = 200;
+    // Its pages reuse a few minted credentials from one address, so
+    // the per-(address, credential) offer budget must not bind either.
+    cfg.offers_per_credential_per_minute = 200;
     let listener = serve_bootstrap(Arc::clone(&anchor), cfg)
         .await
         .map_err(|e| format!("bootstrap listener: {e}"))?;
