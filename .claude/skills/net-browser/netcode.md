@@ -138,6 +138,38 @@ with physics ragdolls and 2–16 players, works this way:
   `ClockEstimator` per peer (median RTT, jitter); `(await
   node.peerAttempt(peer)).direct` says whether each pair is direct. Show both in a debug overlay.
 
+## Compact snapshots
+
+Give host and players the same entity codec, and snapshots go binary: about
+7x smaller than JSON for typical transforms (measured:
+`browser-ts/scripts/bench-netcode.mjs --codec compact`).
+
+```ts
+import { angle, entityCodec, quantized, uint } from '@net-mesh/browser/netcode';
+
+const shipCodec = entityCodec<Ship>({
+  x: quantized(0, 512),   // 16 bits over the range: ~8 mm
+  z: quantized(0, 512),
+  yaw: angle(),           // 8 bits: ~1.4 degrees
+  hp: uint(8),
+});
+hostNetcode({ /* ... */, codec: shipCodec });
+joinNetcode({ /* ... */, codec: shipCodec });
+```
+
+- **Fields:** `quantized(min, max, bits = 16)` (clamped to the range),
+  `angle(bits = 8)`, `uint(bits)`, `int(bits)`, `float32()`, `bool()`. An
+  entity must be a flat object of exactly the schema's fields.
+- **JSON is the fallback, never an error.** A player sends its codec's
+  fingerprint; the host sends binary only on a match, JSON otherwise. An
+  entity the codec refuses (an extra field, a value out of range) sends that
+  player JSON for that tick and counts `dropped['codec-write-failed']`.
+- **Values arrive quantized.** Reconciliation compares within the codec's
+  quanta (`codec.near`), so quantization is not a correction.
+- **Ids travel as indexes** the host never reuses; a lost name is asked for
+  again, and the entity is left out until it arrives
+  (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
+
 ## Rules that bite
 
 - **Lossy streams are `connect()`-only.** `openSession()` refuses
@@ -154,7 +186,7 @@ with physics ragdolls and 2–16 players, works this way:
 - **Past the newest snapshot remote entities hold**, unless you set
   `extrapolateMs` (then they carry on along their last motion for at most
   that long; a custom `interpolate` then sees `alpha > 1`).
-- **Not built yet:** binary encoding (frames are JSON).
+- **Snapshots are JSON unless both ends have a codec** (Compact snapshots, above).
 - **Building blocks are exported too**, for a custom loop: `ClockEstimator`
   (NTP-style offset from the lowest-RTT samples), `SnapshotBuffer`
   (time-ordered snapshots with interpolated reads) and `lerpNumbers` (the
@@ -163,5 +195,5 @@ with physics ragdolls and 2–16 players, works this way:
   treats the lossy channel as its only one.
 - Source: `net/crates/net/browser-ts/src/netcode/`, tests
   `net/crates/net/browser-ts/test/netcode/netcode.test.ts` (a simulated
-  lossy, laggy network) and `net/crates/net/sdk-ts/test/store_transport.test.ts`
+  lossy, laggy network), `test/netcode/codec.test.ts` (compact snapshots) and `net/crates/net/sdk-ts/test/store_transport.test.ts`
   (a native dedicated host).

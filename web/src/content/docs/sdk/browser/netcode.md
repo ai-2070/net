@@ -127,12 +127,44 @@ function frame() {
 
 `stats()` reports `clock` (`offsetMs`, `rttMs`, `jitterMs`, `samples`),
 `snapshots`, `lateSnapshots` (reordered by the carrier), `pendingInputs`,
-`corrections` and `partialSnapshots` (chunked snapshots completed with carried-over
-entities). `hostNow()` is the host clock as estimated, and `close()` stops the
+`corrections`, `partialSnapshots` (chunked snapshots completed with carried-over
+entities), `binaryFrames` and `unnamedEntities` (compact snapshots, below). `hostNow()` is the host clock as estimated, and `close()` stops the
 player.
 
 The building blocks are exported too: `ClockEstimator` (NTP-style, trusting the
 lowest-RTT samples), `SnapshotBuffer` and `lerpNumbers`.
+
+## Compact snapshots
+
+Give host and players the same entity codec, and snapshots go binary: about
+7x smaller than JSON for typical transforms (measured:
+the package's `bench:netcode` script with `--codec compact`).
+
+```ts
+import { angle, entityCodec, quantized, uint } from '@net-mesh/browser/netcode';
+
+const shipCodec = entityCodec<Ship>({
+  x: quantized(0, 512),   // 16 bits over the range: ~8 mm
+  z: quantized(0, 512),
+  yaw: angle(),           // 8 bits: ~1.4 degrees
+  hp: uint(8),
+});
+hostNetcode({ /* ... */, codec: shipCodec });
+joinNetcode({ /* ... */, codec: shipCodec });
+```
+
+- **Fields:** `quantized(min, max, bits = 16)` (clamped to the range),
+  `angle(bits = 8)`, `uint(bits)`, `int(bits)`, `float32()`, `bool()`. An
+  entity must be a flat object of exactly the schema's fields.
+- **JSON is the fallback, never an error.** A player sends its codec's
+  fingerprint; the host sends binary only on a match, JSON otherwise. An
+  entity the codec refuses (an extra field, a value out of range) sends that
+  player JSON for that tick and counts `dropped['codec-write-failed']`.
+- **Values arrive quantized.** Reconciliation compares within the codec's
+  quanta (`codec.near`), so quantization is not a correction.
+- **Ids travel as indexes** the host never reuses; a lost name is asked for
+  again, and the entity is left out until it arrives
+  (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
 
 ## Rules that bite
 
@@ -143,7 +175,7 @@ lowest-RTT samples), `SnapshotBuffer` and `lerpNumbers`.
   `interest` rather than sending the world.
 - **The anchor must be the same release as the package.** An older anchor does
   not know the lossy channel and treats it as the page's only one.
-- **Frames are JSON.** Binary encoding is not built yet.
+- **Snapshots are JSON unless both ends have a codec.** See Compact snapshots, above.
 - **`interpolationDelayMs` is fixed.** On bursty links, such as a relayed pair
   or busy Wi-Fi, a fixed delay either stutters or adds lag everyone feels. If
   remote entities stop and jump, raise it, or adapt it in a custom loop (below).

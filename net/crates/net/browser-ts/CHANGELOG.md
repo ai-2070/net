@@ -14,6 +14,16 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## Unreleased
+
+- **Compact netcode snapshots.** `hostNetcode` and `joinNetcode` take an
+  optional `codec` built with `entityCodec({ x: quantized(0, 512), yaw:
+  angle(), hp: uint(8), ... })`. When both ends have the same codec,
+  snapshots are binary and about 7x smaller; otherwise they stay JSON, so a
+  page without a codec keeps working unchanged. Two new frames ride the
+  JSON wire: the codec fingerprint on join and ping (`f`), and a request
+  for entity names (`u`). New stats: `binaryFrames`, `unnamedEntities`.
+
 ## 0.43.0 — one identity per origin, bounded streams
 
 - **`connect()` locks its identity.** With a custodial identity it takes

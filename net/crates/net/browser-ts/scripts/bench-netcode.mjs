@@ -25,8 +25,8 @@
 //   - snapshot bytes: netcode frame payloads (the JSON frame, its envelope
 //     included), split into player-facing and host-facing. Not the
 //     transport's own overhead (Noise, SCTP/DTLS, IP/UDP).
-//   - compact: the same snapshot frames in a prototype binary codec
-//     (`compactCodec`, measurement only), to size the encoding lever.
+//   - `--codec compact`: hosts and players use the netcode entity codec
+//     (`entityCodec`, binary snapshots) instead of JSON frames.
 //   - control: clock pongs are timer-driven in real time (4/s per client),
 //     and this harness ticks faster than real time, so their rate is
 //     computed — measured pong size × 4/s × receivers — not counted.
@@ -40,7 +40,16 @@
 import { performance } from 'node:perf_hooks';
 
 import * as pkg from '../dist/index.js';
-import { hostNetcode, joinNetcode } from '../dist/netcode/index.js';
+import {
+  angle,
+  decodeBinarySnapshot,
+  entityCodec,
+  hostNetcode,
+  isBinaryFrame,
+  joinNetcode,
+  quantized,
+  uint,
+} from '../dist/netcode/index.js';
 import { createLocalMesh } from '../dist/local.js';
 
 const args = process.argv.slice(2);
@@ -108,77 +117,20 @@ const turn = () => new Promise(resolve => setImmediate(resolve));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * A PROTOTYPE compact snapshot codec — measurement only, not the wire. It
- * answers one question for the plan: how many bytes the same snapshot
- * costs when the game supplies a schema, against today's JSON frames.
- *
- * Frame: kind u8 · tick u32 · host time u32 (ms) · ack u32 · chunk u8 ·
- * of u8 · interest version u16 · count u16 = 19 B. Entity: index u16 (a
- * match-local id from the assignment, instead of the 16-hex key) · x, z
- * u16 quantized over the arena · yaw u8, then a player's hp, ammo, team
- * (u8 each) or an NPC's hp/2 and kind (u8 each). Each JSON frame is
- * encoded as its own compact frame, so chunking is counted as JSON chose
- * it — conservative: compact frames would need fewer chunks.
+ * The entity schema for `--codec compact`. Players and NPCs share one
+ * shape (an NPC has no ammo or team, a player no kind), since one codec
+ * serves one netcode instance.
  */
-function compactCodec(ids, side) {
-  const index = new Map(ids.map((id, i) => [id, i]));
-  // Clamped: a position rounded after it was clamped can sit a hair past
-  // the edge, and 65536 would wrap to 0 in a u16.
-  const q16 = v => Math.min(65535, Math.max(0, Math.round((v / side) * 65535)));
-  const q8yaw = v => Math.round(((((v % 6.2832) + 6.2832) % 6.2832) / 6.2832) * 255) & 255;
-  const isNpc = id => id.startsWith('npc');
-  const encode = frame => {
-    const entries = Object.entries(frame.e);
-    let size = 19;
-    for (const [id] of entries) size += isNpc(id) ? 9 : 10;
-    const view = new DataView(new ArrayBuffer(size));
-    view.setUint8(0, 1);
-    view.setUint32(1, frame.tick);
-    view.setUint32(5, Math.round(frame.t) >>> 0);
-    view.setUint32(9, frame.ack);
-    view.setUint8(13, frame.c ?? 0);
-    view.setUint8(14, frame.of ?? 1);
-    view.setUint16(15, frame.iv ?? 0);
-    view.setUint16(17, entries.length);
-    let at = 19;
-    for (const [id, e] of entries) {
-      view.setUint16(at, index.get(id));
-      view.setUint16(at + 2, q16(e.x));
-      view.setUint16(at + 4, q16(e.z));
-      view.setUint8(at + 6, q8yaw(e.yaw));
-      if (isNpc(id)) {
-        view.setUint8(at + 7, Math.round(e.hp / 2));
-        view.setUint8(at + 8, e.kind);
-        at += 9;
-      } else {
-        view.setUint8(at + 7, e.hp);
-        view.setUint8(at + 8, e.ammo);
-        view.setUint8(at + 9, e.team);
-        at += 10;
-      }
-    }
-    return new Uint8Array(view.buffer);
-  };
-  // Decode and compare: a codec that lost an entity or a field would make
-  // every number below a lie.
-  const check = (frame, bytes) => {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const count = view.getUint16(17);
-    if (count !== Object.keys(frame.e).length || view.getUint32(1) !== frame.tick) throw new Error('compact codec: header mismatch');
-    let at = 19;
-    for (let k = 0; k < count; k += 1) {
-      const id = ids[view.getUint16(at)];
-      const e = frame.e[id];
-      if (e === undefined) throw new Error(`compact codec: entity ${id} not in the frame`);
-      const x = (view.getUint16(at + 2) / 65535) * side;
-      const z = (view.getUint16(at + 4) / 65535) * side;
-      if (Math.abs(x - e.x) > side / 65535 + 0.01 || Math.abs(z - e.z) > side / 65535 + 0.01) {
-        throw new Error(`compact codec: position of ${id} off by more than a quantum`);
-      }
-      at += isNpc(id) ? 9 : 10;
-    }
-  };
-  return { encode, check };
+function codecFor(side) {
+  return entityCodec({
+    x: quantized(0, side),
+    z: quantized(0, side),
+    yaw: angle(),
+    hp: uint(8),
+    ammo: uint(8),
+    team: uint(8),
+    kind: uint(8),
+  });
 }
 
 /** Wrap a node so every frame it sends is recorded, to be tallied OUTSIDE the timed tick. */
@@ -200,10 +152,12 @@ function recording(node, hostIds, outbox) {
   };
 }
 
-async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmupMs }) {
+async function run({ hosts: H, players: N, npcs: M, mode, codec: codecName, ticks, visible, warmupMs }) {
   const random = rng(H * 1_000_003 + N * 1009 + M * 7 + (mode === 'full' ? 1 : 2));
   // The arena: a 3×3 block of cells holds ~`visible` of the N players.
   const side = Math.sqrt(N / Math.min(visible, N)) * 3 * CELL;
+  const codec = codecName === 'compact' ? codecFor(side) : undefined;
+  const withCodec = codec === undefined ? {} : { codec };
   const mesh = createLocalMesh();
   const hostNodes = Array.from({ length: H }, () => mesh.node());
   const hostIds = new Set(hostNodes.map(node => node.nodeIdHex()));
@@ -218,13 +172,13 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
   const positions = new Map(); // player id → bench-side position, for interest
   playerNodes.forEach((node, i) => {
     const id = node.nodeIdHex();
-    const state = { x: round(random() * side), z: round(random() * side), yaw: 0, hp: 100, ammo: 30, team: i % 2 };
+    const state = { x: round(random() * side), z: round(random() * side), yaw: 0, hp: 100, ammo: 30, team: i % 2, kind: 0 };
     worlds[ownerOfPlayer(i)].set(id, state);
     positions.set(id, state);
   });
   for (let k = 0; k < M; k += 1) {
     const id = `npc${k}`;
-    worlds[ownerOfNpc(id)].set(id, { x: round(random() * side), z: round(random() * side), yaw: 0, hp: 200, kind: k % 4 });
+    worlds[ownerOfNpc(id)].set(id, { x: round(random() * side), z: round(random() * side), yaw: 0, hp: 200, ammo: 0, team: 0, kind: 1 + (k % 4) });
   }
 
   // Hosts.
@@ -258,6 +212,7 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
         }
       },
       snapshot: () => Object.fromEntries(worlds[h]),
+      ...withCodec,
       ...(mode === 'interest' ? { interest: (_id, e) => pkg.cellKey(e.x, e.z, CELL) } : {}),
     }),
   );
@@ -267,7 +222,7 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
   for (let a = 0; a < H; a += 1) {
     for (let b = 0; b < H; b += 1) {
       if (a === b) continue;
-      spectators.push(joinNetcode({ transport: hostNodes[a], host: hostNodes[b].nodeIdHex(), label: LABEL }));
+      spectators.push(joinNetcode({ transport: hostNodes[a], host: hostNodes[b].nodeIdHex(), label: LABEL, ...withCodec }));
     }
   }
 
@@ -279,6 +234,13 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
     received.set(id, tally);
     node.onEvent(event => {
       if (event.payload === undefined) return;
+      if (isBinaryFrame(event.payload)) {
+        const decoded = codec === undefined ? null : decodeBinarySnapshot(event.payload, LABEL, codec);
+        if (decoded === null) return;
+        tally.bytes += event.payload.length;
+        tally.entities += decoded.entities.size;
+        return;
+      }
       let frame;
       try {
         frame = JSON.parse(decoder.decode(event.payload));
@@ -296,6 +258,7 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
         host: hostNode.nodeIdHex(),
         label: LABEL,
         ...(h === ownerOfPlayer(i) ? { local: { id, predict: move } } : {}),
+        ...withCodec,
         ...(mode === 'interest' ? { interest: pkg.cellsAround(at.x, at.z, { size: CELL }) } : {}),
       }),
     );
@@ -347,7 +310,7 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
   const collectPongs = () => {
     for (const outbox of outboxes) {
       for (const { payload } of outbox) {
-        if (JSON.parse(decoder.decode(payload)).k !== 'q') continue;
+        if (isBinaryFrame(payload) || JSON.parse(decoder.decode(payload)).k !== 'q') continue;
         pong.bytes += payload.length;
         pong.count += 1;
       }
@@ -371,30 +334,16 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
     tally.entities = 0;
   }
   const hostMs = hostNodes.map(() => []);
-  const sent = hostNodes.map(() => ({ toPlayers: 0, toHosts: 0, frames: 0, compactToPlayers: 0, compactToHosts: 0 }));
-  const codec = compactCodec(
-    [...playerNodes.map(node => node.nodeIdHex()), ...Array.from({ length: M }, (_, k) => `npc${k}`)],
-    side,
-  );
-  let checked = 0;
+  const sent = hostNodes.map(() => ({ toPlayers: 0, toHosts: 0, frames: 0, binaryFrames: 0 }));
   const tally = () => {
     outboxes.forEach((outbox, h) => {
       for (const { toHost, payload } of outbox) {
-        const frame = JSON.parse(decoder.decode(payload));
-        if (frame.k !== 's') continue;
-        const compact = codec.encode(frame);
-        if (checked < 200) {
-          codec.check(frame, compact);
-          checked += 1;
-        }
+        const binary = isBinaryFrame(payload);
+        if (!binary && JSON.parse(decoder.decode(payload)).k !== 's') continue;
         sent[h].frames += 1;
-        if (toHost) {
-          sent[h].toHosts += payload.length;
-          sent[h].compactToHosts += compact.length;
-        } else {
-          sent[h].toPlayers += payload.length;
-          sent[h].compactToPlayers += compact.length;
-        }
+        if (binary) sent[h].binaryFrames += 1;
+        if (toHost) sent[h].toHosts += payload.length;
+        else sent[h].toPlayers += payload.length;
       }
       outbox.length = 0;
     });
@@ -414,7 +363,7 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
     toPlayers: s.toPlayers / ticks,
     toHosts: s.toHosts / ticks,
     frames: s.frames / ticks,
-    compact: (s.compactToPlayers + s.compactToHosts) / ticks,
+    binaryShare: s.frames === 0 ? 0 : s.binaryFrames / s.frames,
   }));
   const pongSize = pong.count === 0 ? 0 : pong.bytes / pong.count;
   const controlMbit = pongSize * PING_HZ * mean(receivers) * 8 / 1e6;
@@ -435,6 +384,7 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
     players: N,
     npcs: M,
     mode,
+    codec: codecName,
     ticks,
     arenaSide: Math.round(side),
     joinedAll,
@@ -455,14 +405,9 @@ async function run({ hosts: H, players: N, npcs: M, mode, ticks, visible, warmup
     // The busiest host's upload: snapshots at each rate, plus control.
     mbitPerHostMax: Object.fromEntries(RATES.map(rate => [`${rate}Hz`, mbit(rate)(Math.max(...totals)) + controlMbit])),
     mbitPerHostMean: Object.fromEntries(RATES.map(rate => [`${rate}Hz`, mbit(rate)(mean(totals)) + controlMbit])),
-    // The same snapshots in the prototype compact codec (control unchanged).
-    compactMbitPerHostMax: Object.fromEntries(
-      RATES.map(rate => [`${rate}Hz`, mbit(rate)(Math.max(...perHost.map(p => p.compact))) + controlMbit]),
-    ),
-    compactRatio: (() => {
-      const json = totals.reduce((a, b) => a + b, 0);
-      return json === 0 ? 0 : perHost.reduce((a, p) => a + p.compact, 0) / json;
-    })(),
+    // With --codec compact: the share of snapshot frames that went binary
+    // (1.0 once every client negotiated; JSON before that, and on fallback).
+    binaryShare: mean(perHost.map(p => p.binaryShare)),
     wallMsPerTick: wallMs / ticks,
     notReady,
     dropped,
@@ -476,6 +421,8 @@ const hostsList = pick('hosts', [1, 4, 8]);
 const playersList = pick('players', [16, 64, 128]);
 const npcsList = pick('npcs', [0, 100, 300]);
 const modes = has('mode') ? [text('mode', 'interest')] : ['full', 'interest'];
+const codecs = has('codec') ? [text('codec', 'json')] : ['json', 'compact'];
+for (const codec of codecs) if (codec !== 'json' && codec !== 'compact') throw new Error(`--codec is 'json' or 'compact', got '${codec}'`);
 for (const mode of modes) if (mode !== 'full' && mode !== 'interest') throw new Error(`--mode is 'full' or 'interest', got '${mode}'`);
 const base = { ticks: flag('ticks', 40), visible: flag('visible', 30), warmupMs: flag('warmup-ms', 10_000) };
 
@@ -485,21 +432,21 @@ if (!json) {
     `ticks=${base.ticks} visible≈${base.visible} cell=${CELL} squad=${SQUAD} (local mesh, dist build; payload only, no transport overhead)\n`,
   );
   console.log(
-    'mode      H    N  npc | host ms/tick med  p95 worst | recv/host | B/host/tick →players →hosts | Mbit/s/host max @20  @30 | compact @20  @30 ratio | ctl Mbit | ent/player/tick B/ent | notReady',
+    'codec   mode      H    N  npc | host ms/tick med  p95 worst | recv/host | B/host/tick →players →hosts | Mbit/s/host max @20  @30 | binary | ctl Mbit | ent/player/tick B/ent | notReady',
   );
 }
 
 // A point that never finishes is a finding, not a hang: bounded and named.
 const LIMIT_MS = flag('limit-ms', 300_000);
 const results = [];
-for (const mode of modes) {
+for (const codec of codecs) for (const mode of modes) {
   for (const hosts of hostsList) {
     for (const players of playersList) {
       for (const npcs of npcsList) {
-        const label = `${mode} H=${hosts} N=${players} npc=${npcs}`;
+        const label = `${codec} ${mode} H=${hosts} N=${players} npc=${npcs}`;
         let timer;
         const r = await Promise.race([
-          run({ ...base, hosts, players, npcs, mode }),
+          run({ ...base, hosts, players, npcs, mode, codec }),
           new Promise((_, reject) => {
             timer = setTimeout(() => reject(new Error(`${label} did not finish within ${String(LIMIT_MS)} ms`)), LIMIT_MS);
           }),
@@ -508,6 +455,7 @@ for (const mode of modes) {
         if (json) continue;
         console.log(
           [
+            r.codec.padEnd(7),
             r.mode.padEnd(9),
             String(r.hosts).padStart(1),
             String(r.players).padStart(4),
@@ -525,9 +473,7 @@ for (const mode of modes) {
             fmt(r.mbitPerHostMax['20Hz'], 2).padStart(21),
             fmt(r.mbitPerHostMax['30Hz'], 2).padStart(5),
             '|',
-            fmt(r.compactMbitPerHostMax['20Hz'], 2).padStart(11),
-            fmt(r.compactMbitPerHostMax['30Hz'], 2).padStart(5),
-            fmt(r.compactRatio, 2).padStart(5),
+            fmt(r.binaryShare, 2).padStart(6),
             '|',
             fmt(r.controlMbitPerHost, 2).padStart(8),
             '|',

@@ -29,6 +29,7 @@ import {
   encodeFrame,
   eventPeer,
 } from './wire.js';
+import { type EntityCodec, encodeBinarySnapshot, nameBytes } from './codec.js';
 
 /** One input as `step` receives it. */
 export interface TickInput<I> {
@@ -101,6 +102,13 @@ export interface HostNetcodeOptions<E, I> {
   readonly playerTimeoutMs?: number;
   /** `false` to drive ticks yourself with {@link HostNetcode.tick}. Default `true`. */
   readonly autoTick?: boolean;
+  /**
+   * Compact snapshots (`codec.ts`): players whose `joinNetcode` has a codec
+   * with the same fingerprint receive binary snapshots; everyone else JSON.
+   * An entity the codec refuses sends that player JSON for that tick
+   * (`dropped['codec-write-failed']`).
+   */
+  readonly codec?: EntityCodec<E>;
   readonly now?: Now;
 }
 
@@ -134,6 +142,12 @@ interface Player<I> {
   /** The interest keys it stated (`null`: none, so everything) and their version. */
   interest: ReadonlySet<string> | null;
   interestVersion: number;
+  /** Its codec fingerprint matches the host's: it gets binary snapshots. */
+  binary: boolean;
+  /** Binary indexes whose name it has been sent at least once. */
+  named: Set<number>;
+  /** Indexes it asked to have named again (`u` frames). */
+  requested: Set<number>;
 }
 
 /** History kept: enough ticks to cover the rewind cap with room. */
@@ -198,7 +212,8 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
   let lastTickAt = now();
   let closed = false;
 
-  const send = (peer: string, player: Player<I>, frame: Frame<E, I>) => {
+  const send = (peer: string, player: Player<I>, frame: Frame<E, I>) => sendBytes(peer, player, encodeFrame(frame));
+  const sendBytes = (peer: string, player: Player<I>, payload: Uint8Array) => {
     if (player.stream === null) {
       if (!player.opening) {
         player.opening = true;
@@ -241,7 +256,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       }
     };
     try {
-      void Promise.resolve(stream.send(encodeFrame(frame))).catch(retire);
+      void Promise.resolve(stream.send(payload)).catch(retire);
     } catch (error) {
       retire(error);
     }
@@ -262,9 +277,71 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       lastHeard: now(),
       interest: null,
       interestVersion: 0,
+      binary: false,
+      named: new Set(),
+      requested: new Set(),
     };
     players.set(peer, player);
     return player;
+  };
+
+  // Binary ids: an index per entity id, in order of first appearance, never
+  // reused while this host runs — so a stale snapshot cannot name the wrong
+  // entity.
+  const codec = options.codec;
+  const indexOf = new Map<string, number>();
+  const nameOf: Uint8Array[] = [];
+  const indexFor = (id: string): number => {
+    let index = indexOf.get(id);
+    if (index === undefined) {
+      index = nameOf.length;
+      indexOf.set(id, index);
+      nameOf.push(nameBytes(id));
+    }
+    return index;
+  };
+  const noteFingerprint = (player: Player<I>, fingerprint: string | undefined) => {
+    if (codec !== undefined) player.binary = fingerprint === codec.fingerprint;
+  };
+
+  /** One player's view as binary frames, chunked to fit; names it needs included. */
+  const binaryFrames = (
+    player: Player<I>,
+    tick: number,
+    time: number,
+    view: Readonly<Record<string, E>>,
+  ): Uint8Array[] => {
+    const header = { tick, t: time, ack: player.lastApplied, ...(player.interestVersion > 0 ? { iv: player.interestVersion } : {}) };
+    const ids = Object.keys(view);
+    const named = (index: number) => player.named.has(index) && !player.requested.has(index);
+    const build = (of: number): Uint8Array[] => {
+      const parts = Array.from({ length: of }, () => ({ names: new Map<number, Uint8Array>(), entities: new Map<number, E>() }));
+      for (const id of ids) {
+        const index = indexFor(id);
+        const part = parts[of === 1 ? 0 : chunkOf(id, of)]!;
+        part.entities.set(index, view[id]!);
+        if (!named(index)) part.names.set(index, nameOf[index]!);
+      }
+      return parts.map((part, c) =>
+        encodeBinarySnapshot(options.label, of === 1 ? header : { ...header, c, of }, part.names, part.entities, codec!),
+      );
+    };
+    let frames = build(1);
+    if (frames[0]!.length > maxFrameBytes) {
+      let of = Math.min(MAX_SNAPSHOT_CHUNKS, Math.max(2, Math.ceil(frames[0]!.length / (maxFrameBytes * 0.75))));
+      for (;;) {
+        frames = build(of);
+        if (of >= MAX_SNAPSHOT_CHUNKS || frames.every(frame => frame.length <= maxFrameBytes)) break;
+        of = Math.min(MAX_SNAPSHOT_CHUNKS, of * 2);
+      }
+    }
+    // Built: their names count as sent. A lost one is asked for again.
+    for (const id of ids) {
+      const index = indexOf.get(id)!;
+      player.named.add(index);
+      player.requested.delete(index);
+    }
+    return frames;
   };
 
   const stopEvents = options.transport.onEvent(event => {
@@ -282,9 +359,15 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     player.lastHeard = t1;
     switch (frame.k) {
       case 'h':
+        noteFingerprint(player, frame.f);
         return;
       case 'p':
+        noteFingerprint(player, frame.f);
         send(peer, player, { n: options.label, k: 'q', t0: frame.t0, t1, t2: now() });
+        return;
+      case 'u':
+        // Only indexes this host has assigned; anything else is noise.
+        for (const index of frame.u) if (index < nameOf.length) player.requested.add(index);
         return;
       case 'w':
         // The lossy carrier reorders and repeats: only a newer version counts.
@@ -350,6 +433,21 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
           filtered[id] = entity;
         }
         view = filtered;
+      }
+      if (codec !== undefined && player.binary) {
+        let binary: Uint8Array[] | null = null;
+        try {
+          binary = binaryFrames(player, tick, time, view);
+        } catch (error) {
+          // The codec refused an entity: this player gets JSON this tick,
+          // not a snapshot missing a field.
+          lastError = String((error as Error)?.message ?? error);
+          drop('codec-write-failed');
+        }
+        if (binary !== null) {
+          for (const payload of binary) sendBytes(peer, player, payload);
+          continue;
+        }
       }
       const frames = snapshotFrames(
         options.label,

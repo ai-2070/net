@@ -1,12 +1,12 @@
 # Sharded matches across player hosts — plan
 
 **Status:** in progress, as an **experiment**. Revised after review on
-2026-10-12 (§8). No release targeted. **S0 done (2026-10-12).** With JSON,
-only 8 hosts at 20 Hz fit the budget. With a prototype compact codec,
-which is ~7× smaller, **one host fits 128 players at 20 Hz**, and 2–4
-hosts cover NPCs (§3 S0 results). **Next: S0c** (the compact codec in
-netcode), then **S0b** (real-browser topology) measuring it. Whether
-sharding is needed at all is decided after S0b.
+2026-10-12 (§8). No release targeted. **S0 and S0c done (2026-10-12).**
+With the netcode codec, snapshots are ~7–8× smaller than JSON. **One host
+fits 128 players at 20 Hz (5.7 Mbit/s)**, and 4 hosts fit 300 NPCs
+(5.9 Mbit/s). A single host with 300 NPCs is CPU-bound (~17 ms/tick)
+(§3 S0 and S0c results). **Next: S0b** (real-browser topology, with the
+codec on). Whether sharding is needed at all is decided after S0b.
 **Scope:** `@net-mesh/browser`: the netcode module (`src/netcode/`), reuse of
 the world module's forwarded actions (`src/world/`), and the lobby store
 (`src/lobby.ts`). There is **no change to the leaf, the anchor or the core
@@ -389,6 +389,58 @@ Added 2026-10-12 after the S0 encoding experiment.
   - `bench-netcode.mjs` measures the real codec, replacing the prototype,
     within 10% of the prototype's bytes;
   - host ms/tick no worse than JSON.
+
+**Result — S0c built (2026-10-12).** `browser-ts/src/netcode/codec.ts`:
+`entityCodec` over `quantized`/`angle`/`uint`/`int`/`float32`/`bool`
+fields, a binary snapshot frame (magic `0xb1`, label hash, varint header,
+names, entities), and negotiation by codec fingerprint on `h`/`p` frames
+with a `u` frame to request lost names. The design differs from the sketch
+above in three places:
+
+- **Names travel with snapshots, not in a separate table:** an entity's
+  name rides the first snapshot that shows it to a player, and the player
+  asks again for any index it can't name. No acknowledgements are needed.
+- **Indexes are varints, not u16**, so there's no cap of 65,536 entities
+  per match, and they're 1 B up to 127.
+- **Reconciliation compares within the codec's quanta** (`codec.near`).
+  Otherwise every quantized snapshot would read as a correction.
+
+Evidence:
+
+- **Tests:** `test/netcode/codec.test.ts`, 19 tests, covering:
+  - field property tests, with the S0 edge-wrap bug as a named case;
+  - frame round-trip, every truncation refused, trailing byte and duplicate
+    index refused;
+  - JSON fallback for a mismatched codec and for no codec on either side;
+  - lost-name recovery;
+  - JSON fallback when the codec refuses an entity;
+  - index never reused;
+  - chunking by binary size.
+- **Mutations:** five mutations each make a test fail: removing the clamp,
+  exact correction compare, ignoring `u` requests, reusing an index, and no
+  fallback.
+- **Full suite:** `npm test`, 1,030 tests passed.
+- **Benchmark:** `npm run bench:netcode` now takes `--codec json|compact`.
+  Full sweep, 108 points, all joined, every compact snapshot binary. Players
+  and NPCs share a 9 B schema (x, z, yaw, hp, ammo, team, kind). Interest,
+  128 players, busiest host, pongs included:
+
+| H | NPCs | JSON Mbit/s @20 / @30 | compact Mbit/s @20 / @30 | prototype @20 | host ms/tick med, JSON → compact |
+|---|---|---|---|---|---|
+| 1 | 0 | 46.2 / 69.1 | **5.7** / 8.5 | 5.65 | 6.50 → 4.97 |
+| 1 | 100 | 73.0 / 109 | 9.5 / 14.1 | 8.75 | 10.80 → 8.80 |
+| 1 | 300 | 137 / 206 | 18.6 / 27.7 | 16.1 | 24.93 → **16.73** |
+| 4 | 0 | 15.8 / 23.6 | 2.3 / 3.3 | 2.24 | 1.10 → 1.51 |
+| 4 | 300 | 43.3 / 64.8 | **5.9** / 8.6 | 5.41 | 3.23 → 3.93 |
+| 8 | 0 | 9.7 / 14.4 | 1.7 / 2.3 | 1.58 | 1.26 → 0.98 |
+| 8 | 300 | 24.8 / 37.0 | 3.6 / 5.2 | — | 3.01 → 2.26 |
+
+The real codec is within 2–8% of the prototype's bytes; its frames carry
+an exact f64 time and one more field. Host CPU is in the same band as JSON:
+lower at most points, higher at a few within the run-to-run noise noted in
+S0. **New finding:** a single host with 300 NPCs costs ~17 ms/tick, over
+the 10 ms budget. With many NPCs, CPU becomes the reason to shard before
+bandwidth does.
 
 #### S0b — Topology, in real browsers (the gate for D9)
 

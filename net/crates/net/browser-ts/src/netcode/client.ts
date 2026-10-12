@@ -25,6 +25,7 @@ import {
   type WireInput,
   MAX_NETCODE_INTEREST_KEYS,
   MAX_NETCODE_INTEREST_KEY_LENGTH,
+  MAX_NAME_REQUESTS,
   chunkOf,
   defaultNow,
   decodeFrame,
@@ -32,6 +33,7 @@ import {
   eventPeer,
   peerHex,
 } from './wire.js';
+import { type EntityCodec, decodeBinarySnapshot, isBinaryFrame } from './codec.js';
 
 /** A chunked snapshot being assembled. */
 interface Assembly<E> {
@@ -91,6 +93,12 @@ export interface JoinNetcodeOptions<E, I> {
    * controls; it only closes the gap.
    */
   readonly correctionSmoothingMs?: number;
+  /**
+   * Compact snapshots (`codec.ts`): the same codec the host uses. With a
+   * matching fingerprint the host sends binary snapshots; otherwise JSON,
+   * which this client still reads.
+   */
+  readonly codec?: EntityCodec<E>;
   readonly now?: Now;
 }
 
@@ -106,6 +114,10 @@ export interface NetcodeStats {
   readonly corrections: number;
   /** Chunked snapshots finished with chunks missing (their entities carried over). */
   readonly partialSnapshots: number;
+  /** Snapshot frames that arrived binary (a codec negotiated). */
+  readonly binaryFrames: number;
+  /** Entities left out of a binary snapshot because their index had no name yet (asked for again). */
+  readonly unnamedEntities: number;
 }
 
 /** The running client. */
@@ -157,6 +169,11 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     return blend(correcting.from, predicted, Math.max(0, alpha));
   };
   let snapshotsSeen = 0;
+  // With a codec the host's state arrives quantized, and a prediction is
+  // never exactly a quantized value: compare within the codec's quanta, or
+  // every snapshot would read as a correction.
+  const sameState = (a: E, b: E): boolean =>
+    options.codec !== undefined ? options.codec.near(a, b) : JSON.stringify(a) === JSON.stringify(b);
   // The interest set: what was asked, its version, and the newest version a
   // snapshot has echoed (the `w` frame repeats until they meet).
   let interest: readonly string[] | null = null;
@@ -244,6 +261,10 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   const stopEvents = options.transport.onEvent(event => {
     if (closed || event.type !== 'stream_data') return;
     if (eventPeer(event.peerNode) !== host) return;
+    if (isBinaryFrame(event.payload)) {
+      onBinary(event.payload);
+      return;
+    }
     const frame = decodeFrame<E, I>(event.payload, label);
     if (frame === null) return;
     if (frame.k === 'q') {
@@ -251,6 +272,19 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       return;
     }
     if (frame.k !== 's') return;
+    onSnapshot(frame);
+  });
+
+  /** One snapshot frame, JSON or decoded binary: whole, or a chunk. */
+  function onSnapshot(frame: {
+    readonly tick: number;
+    readonly t: number;
+    readonly ack: number;
+    readonly e: Readonly<Record<string, E>>;
+    readonly c?: number;
+    readonly of?: number;
+    readonly iv?: number;
+  }): void {
     joined = true;
     if (frame.iv !== undefined && frame.iv > interestAcked) interestAcked = frame.iv;
     if (frame.of === undefined || frame.c === undefined) {
@@ -272,7 +306,48 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     assembly.parts.set(frame.c, frame.e);
     assembly.ack = Math.max(assembly.ack, frame.ack);
     if (assembly.parts.size === assembly.of) finish(frame.tick, assembly);
-  });
+  }
+
+  // Binary snapshots: index → id, learnt from the frames that name them.
+  // The host never reuses an index, so a name, once known, stays right.
+  const idOf = new Map<number, string>();
+  let binaryFrames = 0;
+  let unnamedEntities = 0;
+  function onBinary(payload: Uint8Array): void {
+    const codec = options.codec;
+    if (codec === undefined) return;
+    const decoded = decodeBinarySnapshot(payload, label, codec);
+    if (decoded === null) return;
+    for (const [index, id] of decoded.names) {
+      const known = idOf.get(index);
+      // A different name for a known index is not this host's protocol.
+      if (known !== undefined && known !== id) return;
+    }
+    for (const [index, id] of decoded.names) idOf.set(index, id);
+    binaryFrames += 1;
+    const entities: Record<string, E> = {};
+    const unknown: number[] = [];
+    for (const [index, entity] of decoded.entities) {
+      const id = idOf.get(index);
+      if (id === undefined) {
+        unknown.push(index);
+        continue;
+      }
+      Object.defineProperty(entities, id, { value: entity, enumerable: true, writable: true, configurable: true });
+    }
+    if (unknown.length > 0) {
+      unnamedEntities += unknown.length;
+      send({ n: label, k: 'u', u: unknown.slice(0, MAX_NAME_REQUESTS) });
+    }
+    onSnapshot({
+      tick: decoded.tick,
+      t: decoded.t,
+      ack: decoded.ack,
+      e: entities,
+      ...(decoded.iv === undefined ? {} : { iv: decoded.iv }),
+      ...(decoded.of === undefined ? {} : { c: decoded.c!, of: decoded.of }),
+    });
+  }
 
   /**
    * A chunked snapshot, done: every chunk, or the chunks that came, with
@@ -322,7 +397,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       if (authoritative !== undefined) {
         let replayed: E = authoritative;
         for (const input of pending) replayed = options.local.predict(replayed, input.data);
-        if (predicted !== null && JSON.stringify(replayed) !== JSON.stringify(predicted)) {
+        if (predicted !== null && !sameState(replayed, predicted)) {
           corrections += 1;
           // Blend from what is on screen now, so a correction that lands
           // mid-blend continues from there rather than jumping back.
@@ -333,19 +408,20 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     }
   }
 
-  // Join, and keep the clock honest.
+  // Join, and keep the clock honest. The codec fingerprint rides both.
+  const fingerprint = options.codec === undefined ? {} : { f: options.codec.fingerprint };
   const pingEvery = 1000 / Math.max(0.5, options.pingRate ?? 4);
   const timer = setInterval(() => {
-    if (!joined) send({ n: label, k: 'h' });
-    send({ n: label, k: 'p', t0: now() });
+    if (!joined) send({ n: label, k: 'h', ...fingerprint });
+    send({ n: label, k: 'p', t0: now(), ...fingerprint });
     sendInterest();
     // Unacknowledged inputs are repeated even with nothing new to send, so
     // a lost input frame is repaired without waiting for the next input.
     if (pending.length > 0) send({ n: label, k: 'i', i: pending.slice(-redundancy) });
   }, pingEvery);
   void open().then(() => {
-    send({ n: label, k: 'h' });
-    send({ n: label, k: 'p', t0: now() });
+    send({ n: label, k: 'h', ...fingerprint });
+    send({ n: label, k: 'p', t0: now(), ...fingerprint });
     sendInterest();
   });
 
@@ -383,6 +459,8 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       pendingInputs: pending.length,
       corrections,
       partialSnapshots,
+      binaryFrames,
+      unnamedEntities,
     }),
     close() {
       if (closed) return;

@@ -46,12 +46,18 @@ export interface WireInput<I> {
 }
 
 export type Frame<E, I> =
-  /** Player → host: join (repeated until the first snapshot). */
-  | { readonly n: string; readonly k: 'h' }
+  /**
+   * Player → host: join (repeated until the first snapshot). `f` is the
+   * player's entity-codec fingerprint, if it has one: the host sends binary
+   * snapshots only when it matches its own (`codec.ts`).
+   */
+  | { readonly n: string; readonly k: 'h'; readonly f?: string }
   /** Player → host: the newest inputs, the unacknowledged ones repeated. */
   | { readonly n: string; readonly k: 'i'; readonly i: readonly WireInput<I>[] }
-  /** Player → host: clock ping. */
-  | { readonly n: string; readonly k: 'p'; readonly t0: number }
+  /** Player → host: clock ping, repeating the codec fingerprint (a lost join must not pin a player to JSON). */
+  | { readonly n: string; readonly k: 'p'; readonly t0: number; readonly f?: string }
+  /** Player → host: binary-snapshot indexes it has no name for; the host names them again. */
+  | { readonly n: string; readonly k: 'u'; readonly u: readonly number[] }
   /**
    * Player → host: the interest keys it wants, version `v` (repeated until a
    * snapshot echoes `v` back as `iv`; the host keeps the highest version).
@@ -82,6 +88,9 @@ export type Frame<E, I> =
 /** Interest keys a player may name, and the longest key, in UTF-16 units. */
 export const MAX_NETCODE_INTEREST_KEYS = 256;
 export const MAX_NETCODE_INTEREST_KEY_LENGTH = 64;
+
+/** Indexes one `u` frame may ask to have named. */
+export const MAX_NAME_REQUESTS = 256;
 
 /** Chunks a snapshot may be split into, at most. */
 export const MAX_SNAPSHOT_CHUNKS = 256;
@@ -119,9 +128,17 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
   if (typeof value !== 'object' || value === null) return null;
   const frame = value as { n?: unknown; k?: unknown };
   if (frame.n !== label || typeof frame.k !== 'string') return null;
+  const fingerprint = (frame as { f?: unknown }).f;
+  if (fingerprint !== undefined && (typeof fingerprint !== 'string' || fingerprint.length > 64)) return null;
   switch (frame.k) {
     case 'h':
       return frame as Frame<E, I>;
+    case 'u': {
+      const u = (frame as { u?: unknown }).u;
+      return Array.isArray(u) && u.length <= MAX_NAME_REQUESTS && u.every(index => Number.isSafeInteger(index) && index >= 0)
+        ? (frame as Frame<E, I>)
+        : null;
+    }
     case 'i':
       return Array.isArray((frame as { i?: unknown }).i) ? (frame as Frame<E, I>) : null;
     case 'p':
