@@ -1,0 +1,31 @@
+.github/scripts/check-c-abi.py
+  s_d8b00bedd146e9::t_098437e2be456d 66
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_e9837360b3b6d8 5351,5358
+net/crates/net/tests/c_abi/breaks.toml
+  s_d8b00bedd146e9::t_ceafa2dd9064b7 5
+web/src/content/docs/start/install/_shared.md
+  s_d8b00bedd146e9::t_96b227d65d4116 29
+web/src/content/docs/start/install/python.md
+  s_d8b00bedd146e9::t_f50304d0a34c3a 8
+web/src/content/docs/start/install/rust.md
+  s_d8b00bedd146e9::t_0dd65dcf2ef34d 11,15-16,56
+web/src/content/docs/start/install/typescript.md
+  s_d8b00bedd146e9::t_82463d22253050 8,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e16644fb220c5670f7cdb09d5d0ad4c50ddc6de4",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
