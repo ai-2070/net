@@ -288,20 +288,25 @@ export async function probeStunBinding(
     timeoutMs,
   );
 
-  // Completion settles `unanswered` only on the engine's own "no
-  // response" report. Without one it is inconclusive: libwebrtc drops a
-  // reflexive candidate equal to a public host address, so the anchor
-  // can have answered with nothing visible (`stunProbeVerdict`, the same
-  // rule).
+  // Completion with no reflexive candidate is inconclusive only when no
+  // "no response" report came AND a host candidate carried a literal
+  // public address: libwebrtc drops a reflexive candidate equal to it, so
+  // the anchor can have answered with nothing visible. Behind NAT, or
+  // with only `.local` hosts (Firefox, which also makes no "no response"
+  // report), the srflx is never suppressed and its absence is silence
+  // (`stunProbeVerdict`, the same rule).
+  let publicHost = false;
   const gatheringDone = (): void => {
-    if (noResponse !== null) {
-      settle({ type: 'unanswered', detail: noResponse });
+    if (noResponse === null && publicHost) {
+      settle({
+        type: 'notRun',
+        reason:
+          'gathering completed beside a public host with no reflexive candidate and no "no response" report: ' +
+          'inconclusive',
+      });
       return;
     }
-    settle({
-      type: 'notRun',
-      reason: 'gathering completed with no reflexive candidate and no "no response" report: inconclusive',
-    });
+    settle({ type: 'unanswered', detail: noResponse ?? 'gathering completed with no reflexive candidate' });
   };
 
   // Did the engine gather anything at all? A connection it fails
@@ -324,6 +329,7 @@ export async function probeStunBinding(
       return;
     }
     gathered = true;
+    if (hostCandidateIsPublic(candidate.candidate)) publicHost = true;
     // Host candidates are gathered regardless of what the network does
     // to UDP — Chromium even hides them behind an mDNS `.local` name —
     // so only a reflexive one is evidence.
