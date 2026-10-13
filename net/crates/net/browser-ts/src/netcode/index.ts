@@ -14,7 +14,18 @@ export type { HostNetcode, HostNetcodeOptions, Rewound, TickContext, TickInput }
 export { NetcodeError, createInputSequencer, joinNetcode } from './client.js';
 export type { InputSequencer, JoinNetcodeOptions, LocalEntity, NetcodeClient, NetcodeErrorKind, NetcodeStats } from './client.js';
 export { joinShards } from './shards.js';
-export { assignAction, assignmentProblems, authorizeTeams, leaseWatch, mayReassign, renewLeases, shardAssignment, teamOf } from './assignment.js';
+export {
+  assignAction,
+  assignmentProblems,
+  authorizeTeams,
+  leaseWatch,
+  mayReassign,
+  npcShard,
+  renewLeases,
+  shardAssignment,
+  teamOf,
+  withNpcs,
+} from './assignment.js';
 export type { LeaseWatch, LeaseWatchOptions, MatchAssignment, ShardRecord, Squad } from './assignment.js';
 export type { JoinShardsOptions, ShardAssignment, ShardStats, ShardedMatch, ShardedMatchStats } from './shards.js';
 export { ClockEstimator, CLOCK_WINDOW } from './clock.js';

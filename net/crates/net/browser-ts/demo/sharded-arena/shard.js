@@ -105,6 +105,14 @@ export function shardHost(lib, options) {
       }),
     );
   }
+  /** Every other shard's entities, as spectated (their owners' only). */
+  const knownElsewhere = () => {
+    const all = {};
+    for (const [name, spectator] of spectators) {
+      for (const [id, entity] of Object.entries(spectator.view())) if (owner(id) === name) all[id] = entity;
+    }
+    return all;
+  };
   /** Where `id` is, from this shard's world or the host that owns it. */
   const whereIs = id => {
     if (owns(id)) return region.entities[id];
@@ -152,6 +160,26 @@ export function shardHost(lib, options) {
       error => count(record.forwarded, error?.code === 'refused' ? `refused:${error.message}` : 'unresolved'),
     );
     return entities;
+  };
+
+  /**
+   * An NPC's shot (N1), on the same path as a player's. The pose is from
+   * two ticks back, not this one: the target's host checks it against its
+   * history of this host, and the snapshot carrying the current tick is
+   * still in flight when the claim lands. `seenB` is when this host's view
+   * of the target was taken — its spectator clock, less the delay.
+   */
+  const npcFire = (entities, npc, target) => {
+    if (combat === undefined || entities[npc] === undefined) return entities;
+    const seenA = now() - 2000 / tickRate;
+    const targetShard = owner(target);
+    const seenB =
+      targetShard === shard ? seenA : (spectators.get(targetShard)?.hostNow() ?? Number.NaN) - (combat.viewDelayMs ?? 100);
+    if (!Number.isFinite(seenB)) {
+      count(record.forwarded, 'refused-here:no-clock');
+      return entities;
+    }
+    return fire(entities, npc, seenA, { target, seenB });
   };
 
   /**
@@ -221,7 +249,16 @@ export function shardHost(lib, options) {
           if (data?.fire !== undefined) entities = fire(entities, peer, seen, data.fire);
         }
       }
-      if (options.advance !== undefined) entities = options.advance(entities);
+      if (options.advance !== undefined) {
+        // NPC AI (N1): it sees the whole match as this host knows it —
+        // other hosts' entities ~100–150 ms late — and may queue shots.
+        const shots = [];
+        entities = options.advance(entities, {
+          known: () => ({ ...knownElsewhere(), ...entities }),
+          fire: (npc, target) => shots.push({ npc, target }),
+        });
+        for (const { npc, target } of shots) entities = npcFire(entities, npc, target);
+      }
       if (entities !== region.entities) region = { ...region, entities };
     },
     // A player moving away is still this shard's to SHOW until the
@@ -342,13 +379,7 @@ export function shardHost(lib, options) {
     /** What this host last observed of `name`'s shard, as that host sent it. */
     observed: name => spectators.get(name)?.latest()?.entities ?? null,
     /** The whole match as this host knows it: its own entities, plus every other host's as spectated. */
-    known: () => {
-      const all = {};
-      for (const [name, spectator] of spectators) {
-        for (const [id, entity] of Object.entries(spectator.view())) if (owner(id) === name) all[id] = entity;
-      }
-      return { ...all, ...region.entities };
-    },
+    known: () => ({ ...knownElsewhere(), ...region.entities }),
     close() {
       handoffs.close();
       link.close();

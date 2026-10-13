@@ -1162,6 +1162,43 @@ Fixed objectives belong to the lobby node.
 duplication and reordering; an NPC→player hit with an out-of-tolerance
 `pose` is refused; one NPC on two shards fails validation.
 
+**Result: N1 built (2026-10-13), ahead of S7 by decision.**
+
+- **The assignment:** `ShardRecord.npcs` lists each shard's NPCs.
+  - `npcShard(id, shards)` is D7: FNV-1a over the sorted shard names, the
+    same on every node.
+  - `withNpcs` spawns NPCs onto shards.
+  - `assignmentProblems` refuses an NPC on two shards, and an NPC with a
+    player's id.
+  - `shardAssignment` includes NPCs in `owner`.
+- **The recipe:** `advance(entities, ai)` runs the owner's AI with
+  `ai.known()`, the whole match as this host sees it (other hosts'
+  entities ~100–150 ms late), and `ai.fire(npc, target)`. An NPC shot
+  takes S3's path.
+  - **Its pose is from two ticks back**, not the current tick. The target's
+    host checks it against its history of this host, and the snapshot
+    carrying the current tick is still in flight when the claim lands.
+  - `seenB` is this host's spectator clock, less `viewDelayMs`.
+
+`test/netcode/npc.test.ts` (4 tests), under 10% loss, 30% duplication and
+20 ms jitter:
+- 5 hits each way between an NPC on A and a player on B are each applied
+  exactly once (health 100 → 50 on both sides);
+- a forged NPC → player pose is refused (`pose-mismatch`);
+- D7 placement is deterministic and spreads NPCs over both shards;
+- one NPC on two shards fails validation.
+
+Mutation checks each fail a test:
+- **the NPC's pose taken from the current tick:** only 1 of 5 shots
+  landed, the rest `no-history`, so this mutation is the evidence for the
+  two-tick rule;
+- NPC double ownership allowed;
+- no pose check;
+- no ledger dedupe.
+
+Fixed objectives stay with the lobby node, as the plan says; there is
+nothing to build for them here.
+
 #### N2 — NPCs driven by paths in the store (a feature, not free savings)
 
 - Path records in the lobby store (D8), carrying an interest key.

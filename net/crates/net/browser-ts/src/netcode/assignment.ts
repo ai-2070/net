@@ -34,6 +34,8 @@ export interface ShardRecord {
   /** The host's node id, 16 hex. The host is itself a player in some squad. */
   readonly host: string;
   readonly squads: readonly string[];
+  /** NPC ids this shard owns and runs the AI of (D7: fixed at spawn, see {@link npcShard}). */
+  readonly npcs?: readonly string[];
 }
 
 /** The record the lobby node writes. */
@@ -103,14 +105,24 @@ export function assignmentProblems(assignment: MatchAssignment): string[] {
   for (const squad of Object.keys(assignment.squads)) {
     if (!ownerOfSquad.has(squad)) problems.push(`squad ${squad} is owned by no shard`);
   }
+  const ownerOfNpc = new Map<string, string>();
+  for (const [shard, { npcs }] of Object.entries(assignment.shards)) {
+    for (const npc of npcs ?? []) {
+      const other = ownerOfNpc.get(npc);
+      if (other !== undefined) problems.push(`npc ${npc} is owned by two shards: ${other} and ${shard}`);
+      else ownerOfNpc.set(npc, shard);
+      if (squadOf.has(npc)) problems.push(`npc ${npc} has a player's id`);
+    }
+  }
   return problems;
 }
 
 /** The view `joinShards` and the shard hosts read: hosts, and owner by player. */
 export function shardAssignment(assignment: MatchAssignment): ShardAssignment {
   const owner: Record<string, string> = {};
-  for (const [shard, { squads }] of Object.entries(assignment.shards)) {
+  for (const [shard, { squads, npcs }] of Object.entries(assignment.shards)) {
     for (const squad of squads) for (const member of assignment.squads[squad]?.members ?? []) owner[member] = shard;
+    for (const npc of npcs ?? []) owner[npc] = shard;
   }
   const hosts: Record<string, string> = {};
   for (const [shard, { host }] of Object.entries(assignment.shards)) hosts[shard] = host;
@@ -246,4 +258,28 @@ export function authorizeTeams(
     }
     return otherwise(request);
   };
+}
+
+/**
+ * D7: the shard an NPC belongs to, fixed at spawn — FNV-1a of its id over
+ * the shard names in sorted order. Every node computes the same answer, so
+ * a lobby can spawn NPCs without asking anyone.
+ */
+export function npcShard(npc: string, shards: readonly string[]): string {
+  if (shards.length === 0) throw new RangeError('no shards to place an NPC on');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < npc.length; i += 1) hash = Math.imul(hash ^ npc.charCodeAt(i), 0x01000193);
+  return [...shards].sort()[(hash >>> 0) % shards.length]!;
+}
+
+/** `assignment` with `npcs` spawned onto shards by {@link npcShard} (added to any each shard already owns). */
+export function withNpcs(assignment: MatchAssignment, npcs: readonly string[]): MatchAssignment {
+  const names = Object.keys(assignment.shards);
+  const shards: Record<string, ShardRecord> = { ...assignment.shards };
+  for (const npc of npcs) {
+    const shard = npcShard(npc, names);
+    const record = shards[shard]!;
+    shards[shard] = { ...record, npcs: [...(record.npcs ?? []), npc] };
+  }
+  return { ...assignment, shards };
 }

@@ -26,6 +26,10 @@ the README on why it is a sibling package rather than a sub-path.
   epoch. When ownership changes, the old owner's copy lingers for
   `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
   what the fencing dropped.
+- **NPCs in sharded matches.** A `ShardRecord` lists the NPCs its shard
+  owns (`npcs`). `npcShard(id, shards)` places one deterministically
+  (D7), and `withNpcs` spawns a batch. The validator refuses an NPC owned
+  twice.
 - **Recovering a lost host's players.** `NetcodeClient.latest()` returns
   the newest snapshot as the host sent it: the state a surviving host
   restores a lost host's entities from. `adoptPlayer(peer, { resume: true

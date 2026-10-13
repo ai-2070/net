@@ -45,8 +45,12 @@ export interface ShardHostOptions<E extends Placed, I> {
   readonly initial?: Readonly<Record<string, E>>;
   /** Apply one player input to its entity. */
   apply(state: E, input: I): E;
-  /** Advance the shard's own entities one tick (NPCs, physics). */
-  advance?(entities: Readonly<Record<string, E>>): Readonly<Record<string, E>>;
+  /**
+   * Advance the shard's own entities one tick: physics, and NPC AI (N1).
+   * `ai.known()` is the whole match as this host knows it; `ai.fire(npc,
+   * target)` queues an NPC's shot on the cross-host hit path.
+   */
+  advance?(entities: Readonly<Record<string, E>>, ai: NpcContext<E>): Readonly<Record<string, E>>;
   /** Players see entities within this distance of their own. Default: no fog. */
   readonly fogRadius?: number;
   interest?(id: string, entity: E): string | null;
@@ -64,6 +68,14 @@ export interface ShardHostOptions<E extends Placed, I> {
   readonly now?: () => number;
 }
 
+/** What NPC AI gets each tick. */
+export interface NpcContext<E> {
+  /** Every entity this host knows: its own now, other hosts' as spectated (~100–150 ms late). */
+  known(): Readonly<Record<string, E>>;
+  /** Queue a shot by `npc` (one this shard owns) at `target`, decided like a player's. */
+  fire(npc: string, target: string): void;
+}
+
 /** Hitscan combat rules, as both the shooter's and the target's host apply them. */
 export interface ShardCombat<E> {
   /** Check a shot at the shooter's host (ammo, cooldown, alive): the shooter after firing, or a refusal reason. */
@@ -78,6 +90,8 @@ export interface ShardCombat<E> {
   readonly epsilon?: number;
   /** The widest history gap a pose is judged across, ms. Default three snapshot intervals. */
   readonly maxGapMs?: number;
+  /** How far behind its host's clock this host renders other hosts (an NPC's `seenB`), ms. Default 100. */
+  readonly viewDelayMs?: number;
   /** How far back `seenA`/`seenB` may reach, ms (D5). Default 300. */
   readonly maxRewindMs?: number;
 }
