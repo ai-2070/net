@@ -92,7 +92,7 @@ export interface ShardCombat<E> {
   readonly maxGapMs?: number;
   /** How far behind its host's clock this host renders other hosts (an NPC's `seenB`), ms. Default 100. */
   readonly viewDelayMs?: number;
-  /** How far back `seenA`/`seenB` may reach, ms (D5). Default 300. */
+  /** How far back `seenA`/`seenB` may reach, ms (D5). Default 500: covers ~140 ms one-way. */
   readonly maxRewindMs?: number;
 }
 

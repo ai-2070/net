@@ -238,10 +238,13 @@ Mutual kills across hosts trade.
 
 - **The rewind cap is the latency budget.** A claim reaches the target's
   host aged interpolation delay + player→host + up to a tick + host→host.
-  At a 300 ms cap, players beyond ~40 ms one-way start losing cross-host
-  hits (measured: 93% land at 40–80 ms, 11% at 80–140 ms). Size
-  `combat.maxRewindMs` for your players, knowing a longer rewind lets
-  laggy players hit around corners.
+  The recipe's default `combat.maxRewindMs` is 500 ms. Measured:
+  - 300 ms lost most cross-host hits beyond ~40 ms one-way, with only 11%
+    landing at 80–140 ms;
+  - 500 ms lands 97% at 80–140 ms.
+
+  A longer rewind lets laggy players hit around corners; size it for your
+  players.
 - **The assignment lives in the lobby's store** as a `MatchAssignment`
   (`{ epoch, shards: { [name]: { host, squads } }, squads, leases, renewals }`):
   - `assignmentProblems` validates it: each player owned once, and no host

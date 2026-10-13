@@ -242,7 +242,7 @@ S7.
 | D2 | How hosts are found | **The lobby store's assignment** (above). Not `announceRegions`: the lobby already owns its node's announcement, and an assignment can't be ambiguous. |
 | D3 | Where the code lives | **`joinShards` in `@net-mesh/browser/netcode`.** Host-side wiring is a demo under `browser-ts/demo/` plus a skill section, until a second game needs it as an API. |
 | D4 | Number of hosts, tick rate | **Changed 2026-10-12 (S0 encoding experiment): with compact snapshots (S0c), 1 host for player-only matches at 20 Hz, and 2–4 hosts with NPCs or at 30 Hz.** The earlier "8 hosts at 20 Hz" was sized for JSON, at ~8.9 Mbit/s with no margin. S0b sets the final number from measured overhead. |
-| D5 | Rewind cap for cross-host hits | **300 ms** (default 200), to be fixed by S3's measured age of `seenB` at B. |
+| D5 | Rewind cap for cross-host hits | **Decided 2026-10-13: 500 ms** (single-host default stays 200). S3 measured the age of `seenB` at B; 300 ms covered only players under ~40 ms one-way. |
 | D6 | Durability | **None, and crash recovery is a rollback** (S6). The match lives only in memory. Spectators' copies of a crashed host's entities survive it, so recovery from them is a policy, not a continuation. |
 | D7 | Who owns an NPC | **Fixed at spawn, `hash(npcId) mod hosts`.** Objectives belong to the lobby node. |
 | D8 | Where NPC paths live (N2) | **The lobby store, written only by the NPC's owner** (checked against the assignment). |
@@ -941,8 +941,19 @@ players up to about 40 ms one-way**, and at 80–140 ms nearly every
 cross-host hit is refused. Covering a p95 of 465 ms needs a cap near
 500 ms. That's the fairness trade single-host lag compensation already
 makes: a longer rewind lets a high-latency player hit around corners.
-**D5 is left at 300 ms pending a decision.** `combat.maxRewindMs` sets
-it. `no-history` stayed at or below 1% with 10% loss.
+`no-history` stayed at or below 1% with 10% loss.
+
+**D5 decided: 500 ms** (the recipe's default, set by `combat.maxRewindMs`).
+The same runs at 500 ms:
+
+| One-way latency | Loss | hit | `beyond-cap` | `no-history` |
+|---|---|---|---|---|
+| 20–30 ms | 2% | 100 | 0 | 0 |
+| 40–80 ms | 10% | 99 | 0 | 1 |
+| 80–140 ms | 10% | 97 | 3 | 0 |
+
+The cost, accepted: a player up to ~140 ms one-way can be hit around a
+corner they had already rounded, up to half a second earlier.
 
 #### S7 — The 128-player gate (players only)
 

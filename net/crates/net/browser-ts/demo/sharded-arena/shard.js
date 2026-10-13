@@ -73,7 +73,7 @@ export function shardHost(lib, options) {
   const tickRate = options.tickRate ?? 20;
   const combat = options.combat;
   const now = options.now ?? (() => Date.now());
-  const maxRewindMs = combat?.maxRewindMs ?? 300;
+  const maxRewindMs = combat?.maxRewindMs ?? 500;
   const distance = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
   // What combat did, for the game and for S3's records.
   const record = { fired: 0, local: { hit: 0, miss: 0 }, forwarded: {}, served: {}, seenBAgeMs: [] };
