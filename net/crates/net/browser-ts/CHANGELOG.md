@@ -26,6 +26,19 @@ the README on why it is a sibling package rather than a sub-path.
   epoch. When ownership changes, the old owner's copy lingers for
   `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
   what the fencing dropped.
+- **Planned moves between hosts.**
+  - `hostNetcode`'s `releasePlayer(peer)` returns `{ lastApplied }` and
+    stops taking that player's inputs, unapplied and unacknowledged;
+    `adoptPlayer(peer, { lastApplied })` resumes above it.
+  - `joinNetcode({ sequencer })` with `createInputSequencer()` shares one
+    input sequence across clients, which `joinShards` does for every shard.
+
+  A moved player's inputs carry on, and an input the old host applied is
+  never applied again.
+- **A backlog of unacknowledged inputs is no longer cut to the newest 8.**
+  When more than `inputRedundancy` inputs are waiting (a high-latency
+  link, or a change of host), the next input frame carries all of them,
+  up to 64. Before, the older ones were lost for good.
 - **Sharded matches get an assignment record and leases**
   (`@net-mesh/browser/netcode`). `MatchAssignment` lives in the lobby's
   store and gives shard hosts, the squads each shard owns, and a lease

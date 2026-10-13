@@ -1038,6 +1038,52 @@ together, and the client's input sequence continues across the move.
   applied again**. Also: the entity is never authoritative on two shards,
   and `stats().corrections` stays within a stated bound during the move.
 
+**Result: S5 built (2026-10-13).**
+
+- `hostNetcode`: `releasePlayer(peer)` → `{ lastApplied }` stops taking
+  that player's inputs without applying or acknowledging them.
+  `adoptPlayer(peer, { lastApplied })` takes them again above the
+  boundary.
+- `joinNetcode({ sequencer })` / `createInputSequencer` is one sequence,
+  and one list of unacknowledged inputs, that `joinShards` shares across
+  every shard.
+- The recipe's `movePlayer(peer, toShard)`, in one synchronous turn,
+  releases the player and freezes `{ state, lastApplied }` into the
+  handoff. The receiving host unwraps it on commit and adopts the
+  boundary, and a refused move re-adopts it at the source. Inputs apply
+  wherever the entity is live, and the handoff keeps that to one host at
+  a time.
+
+`test/netcode/planned-move.test.ts` (3 tests):
+- **The review's counterexample, named:** input 41 is applied by the old
+  host and its acknowledgement is lost to a blocked link. The player
+  re-sends 41 to the new host, and x stays 41. 42 is then applied once.
+- **A player moving through the move, with the new epoch arriving 200 ms
+  and 800 ms after it:**
+  - x ends equal to the number of inputs sent (exactly once);
+  - the entity is never live on two hosts;
+  - at most one correction;
+  - another player never loses sight of it.
+
+Mutation checks each fail a test:
+- adopt ignoring the boundary;
+- no shared sequencer;
+- release still taking inputs (this one needs the delayed epoch; an
+  instant one hides it);
+- the backlog capped at `inputRedundancy`;
+- no frozen copy shown (the watcher then lost sight of the player for
+  225 ms and 885 ms).
+
+Two fixes the tests forced, beyond the list above:
+- **The input backlog.** A player re-sent only its newest
+  `inputRedundancy` (8) unacknowledged inputs, so a new epoch slower than
+  8 inputs' worth (400 ms at 20 Hz) lost the older ones. A longer backlog
+  now goes out whole, up to 64, in **one** frame. Split across frames,
+  two could land in different ticks, and the host would skip the gap.
+- **The departing copy.** From the freeze until the epoch moves the
+  owner, no shard drew the entity. The old host now keeps showing its
+  frozen state while the assignment still names it the owner.
+
 #### S6 — A host crashes: recovery is a rollback
 
 Handoff can't help when the source host is dead. After the lease wait

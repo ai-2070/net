@@ -61,6 +61,14 @@ export class NetcodeError extends Error {
   }
 }
 
+/**
+ * Unacknowledged inputs one frame may carry when there is a backlog — the
+ * inputs held across a change of owner while the new epoch propagated. One
+ * frame, so they arrive together: inputs split over frames can land in two
+ * ticks, and a host skips the gap the earlier frame would have filled.
+ */
+const MAX_INPUT_BACKLOG = 64;
+
 /** A chunked snapshot being assembled. */
 interface Assembly<E> {
   readonly t: number;
@@ -150,7 +158,25 @@ export interface JoinNetcodeOptions<E, I> {
    * epoch drops them. `joinShards` supplies it.
    */
   epoch?(): number;
+  /**
+   * The input sequence and the unacknowledged inputs, when they must
+   * outlive this client: `joinShards` shares one across every shard, so a
+   * player moved to another host carries on at the next `seq` and re-sends
+   * what the old host never acknowledged. Default: this client's own.
+   */
+  readonly sequencer?: InputSequencer<I>;
   readonly now?: Now;
+}
+
+/** The input sequence and the inputs not yet acknowledged, shareable between clients. */
+export interface InputSequencer<I> {
+  seq: number;
+  pending: WireInput<I>[];
+}
+
+/** A fresh {@link InputSequencer}: `seq` 0, nothing pending. */
+export function createInputSequencer<I>(): InputSequencer<I> {
+  return { seq: 0, pending: [] };
 }
 
 /** What {@link NetcodeClient.stats} reports. */
@@ -236,8 +262,9 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   const snapshots = new SnapshotBuffer<E>();
   let stream: NetcodeStream | null = null;
   let closed = false;
-  let seq = 0;
-  let pending: WireInput<I>[] = [];
+  // Shared with the other shards' clients when `sequencer` is given, so the
+  // sequence and the unacknowledged inputs survive a change of owner.
+  const inputs: InputSequencer<I> = options.sequencer ?? createInputSequencer<I>();
   let predicted: E | null = null;
   // A correction being blended in: the stale prediction (still advanced
   // by every input, so it keeps pace with the controls) and when it began.
@@ -296,6 +323,12 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   let epochTick = -1;
   let lastSnapshotAt: number | null = null;
   const inputEpoch = () => (options.epoch === undefined ? {} : { ep: options.epoch() });
+  // The newest `redundancy` inputs — or, past that, the whole backlog up to
+  // MAX_INPUT_BACKLOG, in one frame.
+  const sendInputs = () => {
+    const count = inputs.pending.length > redundancy ? MAX_INPUT_BACKLOG : redundancy;
+    send({ n: label, k: 'i', i: inputs.pending.slice(-count), ...inputEpoch() });
+  };
 
   const offset = () => clock.estimate()?.offsetMs ?? null;
   const hostNow = () => {
@@ -552,13 +585,13 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     // Reconcile only on a snapshot newer than any seen: an older one
     // (reordered by the carrier) must not roll the local entity back.
     if (options.local && (newest === null || tick > newest.tick)) {
-      pending = pending.filter(input => input.seq > ack);
+      inputs.pending = inputs.pending.filter(input => input.seq > ack);
       const authoritative = Object.prototype.hasOwnProperty.call(sent, options.local.id)
         ? sent[options.local.id]
         : undefined;
       if (authoritative !== undefined) {
         let replayed: E = authoritative;
-        for (const input of pending) replayed = options.local.predict(replayed, input.data);
+        for (const input of inputs.pending) replayed = options.local.predict(replayed, input.data);
         if (predicted !== null && !sameState(replayed, predicted)) {
           corrections += 1;
           // Blend from what is on screen now, so a correction that lands
@@ -586,7 +619,13 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     sendInterest();
     // Unacknowledged inputs are repeated even with nothing new to send, so
     // a lost input frame is repaired without waiting for the next input.
-    if (pending.length > 0) send({ n: label, k: 'i', i: pending.slice(-redundancy), ...inputEpoch() });
+    // With a shared sequencer, only the client predicting the local entity
+    // speaks for the inputs: under `joinShards` the other shards' clients
+    // hold the same pending list and must not send it to their hosts.
+    const speaks = options.sequencer === undefined || options.local !== undefined;
+    if (speaks && inputs.pending.length > 0) {
+      sendInputs();
+    }
   }, pingEvery);
   void open().then(() => {
     send({ n: label, k: 'h', ...fingerprint });
@@ -597,14 +636,15 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   return {
     input(data: I) {
       if (closed) return;
-      seq += 1;
+      inputs.seq += 1;
+      const seq = inputs.seq;
       const seen = (hostNow() ?? now()) - delay;
-      pending.push({ seq, seen, data });
+      inputs.pending.push({ seq, seen, data });
       if (options.local && predicted !== null) {
         predicted = options.local.predict(predicted, data);
         if (correcting !== null) correcting = { ...correcting, from: options.local.predict(correcting.from, data) };
       }
-      send({ n: label, k: 'i', i: pending.slice(-redundancy), ...inputEpoch() });
+      sendInputs();
     },
     view() {
       const at = hostNow();
@@ -640,7 +680,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       clock: clock.estimate(),
       snapshots: snapshotsSeen,
       lateSnapshots: snapshots.late,
-      pendingInputs: pending.length,
+      pendingInputs: inputs.pending.length,
       corrections,
       partialSnapshots,
       binaryFrames,

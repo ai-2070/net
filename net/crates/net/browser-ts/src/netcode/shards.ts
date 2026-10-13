@@ -42,7 +42,14 @@
  * assignment comes from is the lobby's (S4).
  */
 
-import { type JoinNetcodeOptions, type LocalEntity, type NetcodeClient, type NetcodeStats, joinNetcode } from './client.js';
+import {
+  type JoinNetcodeOptions,
+  type LocalEntity,
+  type NetcodeClient,
+  type NetcodeStats,
+  createInputSequencer,
+  joinNetcode,
+} from './client.js';
 import { type NetcodeTransport, type Now, defaultNow, peerHex } from './wire.js';
 
 /** Who hosts which shard and who owns which entity, at one epoch. */
@@ -57,7 +64,7 @@ export interface ShardAssignment {
 
 /** {@link joinShards}'s argument. */
 export interface JoinShardsOptions<E, I>
-  extends Omit<JoinNetcodeOptions<E, I>, 'host' | 'local' | 'epoch' | 'transport' | 'label' | 'interest'> {
+  extends Omit<JoinNetcodeOptions<E, I>, 'host' | 'local' | 'epoch' | 'transport' | 'label' | 'interest' | 'sequencer'> {
   readonly transport: NetcodeTransport;
   /** The netcode label every shard host serves. */
   readonly label: string;
@@ -163,6 +170,9 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
   let inputsFrozen = 0;
   let frozenView: Readonly<Record<string, E>> = {};
   const live = () => options.live?.() ?? true;
+  // One sequence for this player across every shard: a move to another
+  // owner continues it, and re-sends what the old owner never acknowledged.
+  const sequencer = createInputSequencer<I>();
   // Everything a shard's `joinNetcode` takes as given; the rest is per shard.
   const {
     assignment: _assignment,
@@ -184,6 +194,7 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
       ...(owns && options.local !== undefined ? { local: options.local } : {}),
       ...(interest === undefined ? {} : { interest }),
       epoch: () => installed.epoch,
+      sequencer,
       now,
     });
     return { host, client, owns, drawn: {}, seen: 0, joinedAt: now() };

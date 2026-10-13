@@ -7,7 +7,15 @@ import type {
   hostNetcode,
   joinNetcode,
 } from '../../src/netcode/index.js';
-import type { BorderAction, RegionHandoffs, handoffLink, regionHandoffs, regionState } from '../../src/world/index.js';
+import type {
+  BorderAction,
+  HandoffEvent,
+  HandoffId,
+  RegionHandoffs,
+  handoffLink,
+  regionHandoffs,
+  regionState,
+} from '../../src/world/index.js';
 
 /** The library pieces the recipe wires; the page passes `dist`, the test `src`. */
 export interface ShardLib {
@@ -47,6 +55,8 @@ export interface ShardHostOptions<E extends Placed, I> {
   readonly autoTick?: boolean;
   /** More cross-host actions this shard serves, beside combat's `hit`. */
   readonly actions?: Readonly<Record<string, BorderAction<E>>>;
+  /** Handoff outcomes: `moved` at the source is when the lobby raises the epoch (S5). */
+  onHandoffEvent?(event: HandoffEvent): void;
   /** Whether this host still holds its lease (S4: `leaseWatch` over its lease in the lobby store). */
   live?(): boolean;
   /** Cross-host hits (S3). A fire input carries `{ fire: { target, seenB } }`. */
@@ -90,6 +100,10 @@ export interface ShardHost<E> {
   readonly netcode: HostNetcode<E>;
   readonly handoffs: RegionHandoffs<E>;
   world(): Readonly<Record<string, E>>;
+  /** Move `peer`'s entity to `toShard`, with its input boundary (S5). */
+  movePlayer(peer: string, toShard: string): Promise<HandoffId>;
+  /** Install a newer assignment with the same hosts; `false` for an older or equal epoch. */
+  setAssignment(next: ShardAssignment): boolean;
   known(): Readonly<Record<string, E>>;
   close(): void;
 }

@@ -143,6 +143,21 @@ export interface HostNetcode<E> {
    * never further back than `maxRewindMs` before now.
    */
   rewind(seen: number): Rewound<E>;
+  /**
+   * Stop taking `peer`'s inputs, and say how far they were applied: the
+   * half of a planned move (sharded matches, S5) that pairs with the
+   * entity's frozen state. Call it between ticks — the state you freeze in
+   * the same synchronous turn then contains exactly inputs `1..lastApplied`.
+   * Later inputs from `peer` are dropped unapplied and unacknowledged
+   * (`dropped['released']`), so the player keeps them for the new owner.
+   */
+  releasePlayer(peer: string): { readonly lastApplied: number };
+  /**
+   * Take `peer`'s inputs from `lastApplied + 1` on: the other half of a
+   * planned move. Inputs at or below it — already in the state the entity
+   * arrived with — are never applied here.
+   */
+  adoptPlayer(peer: string, from: { readonly lastApplied: number }): void;
   /** Frames dropped and why. */
   readonly dropped: Readonly<Record<string, number>>;
   /** The last error a send or stream open raised, for diagnosis; `null` if none. */
@@ -165,6 +180,8 @@ interface Player<I> {
   named: Set<number>;
   /** Indexes it asked to have named again (`u` frames). */
   requested: Set<number>;
+  /** Released by a planned move: inputs are not taken until adopted again. */
+  released: boolean;
 }
 
 /** History kept: enough ticks to cover the rewind cap with room. */
@@ -301,6 +318,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       binary: false,
       named: new Set(),
       requested: new Set(),
+      released: false,
     };
     players.set(peer, player);
     return player;
@@ -409,6 +427,10 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
           drop('stale-epoch');
           return;
         }
+        if (player.released) {
+          drop('released');
+          return;
+        }
         for (const input of frame.i) {
           if (!Number.isInteger(input.seq) || input.seq <= player.lastApplied) continue;
           if (!player.pending.has(input.seq)) {
@@ -512,6 +534,22 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
 
   return {
     players: () => [...players.keys()],
+    releasePlayer(peer: string) {
+      const player = players.get(peer);
+      if (player === undefined) return { lastApplied: 0 };
+      // Received but not yet applied: not in the frozen state, so not
+      // acknowledged — the player still holds them, for the new owner.
+      player.pending.clear();
+      player.released = true;
+      return { lastApplied: player.lastApplied };
+    },
+    adoptPlayer(peer: string, from: { readonly lastApplied: number }) {
+      const player = playerFor(peer);
+      if (player === null) return;
+      player.released = false;
+      player.lastApplied = Math.max(player.lastApplied, from.lastApplied);
+      for (const seq of [...player.pending.keys()]) if (seq <= player.lastApplied) player.pending.delete(seq);
+    },
     get currentTick() {
       return tick;
     },

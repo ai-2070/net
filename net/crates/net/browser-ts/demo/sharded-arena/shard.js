@@ -25,6 +25,13 @@
  * - **The assignment**, static here; with `options.live` (a `leaseWatch`
  *   over this shard's lease in the lobby store, S4) the host stops
  *   simulating, sending and serving hits the moment its lease runs out.
+ * - **Planned moves** (S5): `movePlayer(peer, toShard)` releases the
+ *   player's inputs and freezes its entity with the last input applied, in
+ *   one synchronous turn, and hands the pair over. The new owner adopts
+ *   the boundary, so an input the old owner applied is never applied again
+ *   — even when its acknowledgement was lost and the player re-sends it.
+ *   Inputs apply to whichever host holds the entity live, and the handoff
+ *   keeps that to one host at a time; the lobby then raises the epoch.
  * - **Cross-host hits** (S3, `options.combat`), hitscan. A fire input
  *   `{ fire: { target, seenB } }` is checked here (the shooter's host, A)
  *   and, for a target another shard owns, forwarded to its host (B) as a
@@ -37,6 +44,13 @@
  * read and write the same entities.
  */
 
+/**
+ * A player entity in flight between shards: its state and the last input
+ * applied to it, frozen together (S5). Only ever inside a handoff — the
+ * receiving host unwraps it the moment it is admitted.
+ */
+const MOVED = '__moved';
+
 /** The handoff region name of shard `name`. */
 export const regionOf = name => `shard:${name}`;
 
@@ -47,7 +61,8 @@ export const regionOf = name => `shard:${name}`;
  * @param options see `shard.d.ts`
  */
 export function shardHost(lib, options) {
-  const { transport, label, assignment, shard } = options;
+  const { transport, label, shard } = options;
+  let assignment = options.assignment;
   const self = transport.nodeIdHex();
   if (assignment.hosts[shard] !== self) throw new Error(`shard ${shard} is not hosted by this node (${self})`);
   const owner = id => assignment.owner?.[id];
@@ -65,6 +80,10 @@ export function shardHost(lib, options) {
   const count = (bucket, key) => {
     bucket[key] = (bucket[key] ?? 0) + 1;
   };
+
+  // Players frozen for a move away: shown (never simulated) until the
+  // assignment moves them.
+  const departing = new Map();
 
   // The world: this shard's own entities, as a handoff region.
   let region = lib.regionState(regionOf(shard), options.initial ?? {});
@@ -192,7 +211,9 @@ export function shardHost(lib, options) {
         // Only a player this shard owns moves here: its inputs reach no
         // other host (`joinShards` sends to the owner), and one that did
         // is not this host's to apply.
-        if (!owns(peer) || entities[peer] === undefined) continue;
+        // Live here is what makes it ours to move: the handoff hands the
+        // entity from one region to the next, never to two at once.
+        if (entities[peer] === undefined) continue;
         for (const { data, seen } of list) {
           entities = { ...entities, [peer]: options.apply(entities[peer], data) };
           if (data?.fire !== undefined) entities = fire(entities, peer, seen, data.fire);
@@ -201,7 +222,18 @@ export function shardHost(lib, options) {
       if (options.advance !== undefined) entities = options.advance(entities);
       if (entities !== region.entities) region = { ...region, entities };
     },
-    snapshot: () => region.entities,
+    // A player moving away is still this shard's to SHOW until the
+    // assignment says otherwise: its frozen state, so other players do not
+    // see it vanish while the handoff and the new epoch are in flight.
+    snapshot: () => {
+      if (departing.size === 0) return region.entities;
+      const shown = { ...region.entities };
+      for (const [id, state] of departing) {
+        if (owner(id) === shard && shown[id] === undefined) shown[id] = state;
+        else departing.delete(id);
+      }
+      return shown;
+    },
     visible: (peer, _id, entity) => {
       if (hosts.has(peer) || fog === Infinity) return true;
       const viewer = whereIs(peer);
@@ -226,9 +258,19 @@ export function shardHost(lib, options) {
     region: regionOf(shard),
     load: () => region,
     commit: next => {
-      region = next;
+      // A moved player arriving (or a refused move returning): adopt its
+      // input boundary, and keep the bare state.
+      let entities = next.entities;
+      for (const [id, value] of Object.entries(next.entities)) {
+        const moved = value?.[MOVED];
+        if (moved === undefined) continue;
+        netcode.adoptPlayer(id, { lastApplied: moved.lastApplied });
+        entities = { ...entities, [id]: moved.state };
+      }
+      region = entities === next.entities ? next : { ...next, entities };
     },
     actions: { ...(combat === undefined ? {} : { hit: hitAction }), ...(options.actions ?? {}) },
+    ...(options.onHandoffEvent === undefined ? {} : { onEvent: options.onHandoffEvent }),
     // A hit confirmed later than ~500 ms is worse than a miss (plan, S3).
     ...(combat === undefined ? {} : { timing: { retryMs: 50, giveUpMs: 500, handledRetentionMs: 10_000 }, tickMs: 25 }),
     ...(options.now === undefined ? {} : { now: options.now }),
@@ -242,6 +284,27 @@ export function shardHost(lib, options) {
     combat: () => record,
     /** This shard's authoritative entities. */
     world: () => region.entities,
+    /**
+     * Move `peer`'s entity to `toShard`. Resolves with the handoff id once
+     * it is offered; `onHandoffEvent` reports `moved` (then the lobby raises
+     * the epoch) or `refused` (the entity is back here, and so are its inputs).
+     */
+    movePlayer(peer, toShard) {
+      const state = region.entities[peer];
+      if (state === undefined) return Promise.reject(new Error(`${peer} is not live on shard ${shard}`));
+      // One synchronous turn: no tick can run between the release and the
+      // freeze, so the frozen state holds exactly inputs 1..lastApplied.
+      const { lastApplied } = netcode.releasePlayer(peer);
+      departing.set(peer, state);
+      region = { ...region, entities: { ...region.entities, [peer]: { [MOVED]: { state, lastApplied } } } };
+      return handoffs.handoff(peer, regionOf(toShard));
+    },
+    /** Install a newer assignment (same hosts; S5 moves owners, not hosts). */
+    setAssignment(next) {
+      if (next.epoch <= assignment.epoch) return false;
+      assignment = next;
+      return true;
+    },
     /** The whole match as this host knows it: its own entities, plus every other host's as spectated. */
     known: () => {
       const all = {};
