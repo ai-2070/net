@@ -1167,7 +1167,7 @@ impl Inner {
             // it installed. The identity is the half that matters
             // across a re-attempt — a predecessor channel's late ICE
             // `disconnected` → `failed` transition (or its late
-            // remote close, below) still queued after a successor's install names
+            // refusal, below) still queued after a successor's install names
             // the predecessor's channel and must not remove the
             // successor's entry. A report that matches no entry is no
             // loss this table knows; the entry it failed to match is
@@ -1177,7 +1177,7 @@ impl Inner {
             // a dying link is a fact about the pair, and whether this
             // leaf OWNS the repair is the policy's question
             // ([`crate::retry`]), not this fence's. Once per channel,
-            // though: a channel whose far-end close already filed
+            // though: a channel whose far-end refusal already filed
             // its loss (below, on an earlier drain) is not a second
             // loss when ICE gives up on it too.
             if self.loss_reports.first(peer, channel) {
@@ -1186,25 +1186,30 @@ impl Inner {
                     .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
             }
         }
-        // **The far end closed the channel a session rides.** The
-        // second detector, and the fast one: ICE takes its consent
-        // timeout to walk to `failed` after the far end goes away,
-        // and a close arrives in a round trip. It is also the only
-        // one that fires when the far end closed the channel while
-        // the path itself stayed healthy — which is exactly what a
-        // peer does with a channel it holds no session for
+        // **The far end refused the channel a session rides.** The
+        // second detector, and the only one that fires while the
+        // path itself stays healthy: a peer that holds no session
+        // for what arrives on a direct channel says so
+        // ([`crate::rtc::NO_SESSION_NOTICE`]) and closes it
         // ([`Inner::close_orphaned_link`]). Without it an initiator
         // whose session the responder never installed sent into the
         // void for as long as ICE stayed up: S0b's 1 × 96 run lost 3
         // players that way for its whole 240 s.
         //
-        // Narrower than the ICE source on purpose: a close is a loss
-        // only for the channel a session was installed over. A
-        // channel that closes before anything installed is an
-        // attempt's business, and its deadline settles it.
+        // The notice and not the close: a bare far-end close is a
+        // re-offer replacing the link, or a tab going away, and
+        // treating it as a loss dropped the session a re-offer
+        // signals over and turned §4.5's deadline terminal into a
+        // fast `sessionLost`.
         //
-        // Filed as what it is — a close, not an ICE failure — and
-        // only once per channel ([`Inner::loss_reports`]).
+        // Narrower than the ICE source on purpose: a refusal is a
+        // loss only for the channel a session was installed over. A
+        // channel refused before anything installed is an attempt's
+        // business, and its deadline settles it.
+        //
+        // Filed as `ChannelClosed` — the far end closes the channel
+        // right after — not as an ICE failure, and only once per
+        // channel ([`Inner::loss_reports`]).
         for (peer, channel) in self.transport.take_channel_closes() {
             if self.drop_installed_over(peer, channel) && self.loss_reports.first(peer, channel) {
                 self.retry_triggers
@@ -1234,7 +1239,7 @@ impl Inner {
             .drop_session_if_incarnation(peer, installed.incarnation, "the DataChannel closed")
     }
 
-    /// Close the direct link to `peer`: it delivered a sealed packet
+    /// Refuse the direct link to `peer`: it delivered a sealed packet
     /// and this leaf holds nothing that could ever open one from it.
     ///
     /// No session, no establishment parked or pending promotion, and
@@ -1244,26 +1249,48 @@ impl Inner {
     /// That is the S0b ghost: an initiator that installed on message
     /// 2 while this end never promoted (an expired proof, or a
     /// superseded admission), sending at 20 Hz into a link this end
-    /// would have kept open indefinitely. Closing it is the one
-    /// signal both ends already understand: the far end's channel
-    /// `close` drops the session it installed over it
-    /// ([`Inner::harvest_ice_failures`]) and files its re-attempt.
+    /// would have kept open indefinitely.
     ///
-    /// A live attempt is settled `Failed` (which closes the channel
-    /// with everything else it owns); a link with no live attempt is
-    /// closed directly.
+    /// **The signal is the notice, not the close**
+    /// ([`crate::rtc::NO_SESSION_NOTICE`]). A bare far-end close is
+    /// also what a re-offer replacing a link and a tab going away
+    /// look like, and neither may cost the far end its session — so
+    /// the far end acts only on the notice, which names the channel
+    /// it arrived on: it drops the session it installed over THAT
+    /// channel ([`Inner::harvest_ice_failures`]) and files its
+    /// re-attempt.
+    ///
+    /// **A live attempt is left to itself.** Its channel is this
+    /// leaf's fresh re-attempt, waiting for the initiator's message
+    /// 1 — and a sealed packet under the far end's OLDER session
+    /// (installed over a predecessor channel) is orphaned here too
+    /// while that handshake has not started. Settling the attempt
+    /// `Failed` killed the very repair that would have fixed the
+    /// pair (stage 6 drives the four §9 methods one call at a time,
+    /// so that window is wide). The notice still goes — it is fenced
+    /// at the far end on the channel it names, so it ends a ghost
+    /// installed over this channel and nothing else — and the
+    /// attempt's own handshake or deadline settles the link.
+    ///
+    /// With no live attempt the link is closed after the notice.
     fn close_orphaned_link(&mut self, peer: NodeId) {
+        if !self.transport.refuse(peer) {
+            // Already refused (one notice per link), or nothing to
+            // refuse it on.
+            return;
+        }
         let live = self
             .peers
             .get(&peer)
-            .filter(|dialog| dialog.terminal.is_none())
-            .map(|dialog| Attempt {
-                peer,
-                dialog: dialog.dialog,
-            });
-        if !live.is_some_and(|attempt| self.settle(attempt, IceTerm::Failed, "failed")) {
-            self.transport.close(peer);
+            .is_some_and(|dialog| dialog.terminal.is_none());
+        if live {
+            console_error(&format!(
+                "net-mesh-leaf: refused the direct link to {peer:016x} during a live attempt: \
+                 it carries traffic for a session this leaf does not hold"
+            ));
+            return;
         }
+        self.transport.close(peer);
         self.channel_installations.remove(&peer);
         console_error(&format!(
             "net-mesh-leaf: closed the direct link to {peer:016x}: it carries traffic \

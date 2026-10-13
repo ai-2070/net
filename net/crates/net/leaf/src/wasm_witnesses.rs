@@ -2650,14 +2650,17 @@ async fn a_ghost_session_is_closed_by_its_responder_and_reported_at_its_initiato
     p.leaf.close();
 }
 
-/// A far end that closes the channel a session was installed over
-/// drops exactly that session and files the re-attempt — and a close
-/// that names another channel drops nothing.
+/// A far end that REFUSES and closes the channel a session was
+/// installed over drops exactly that session and files the
+/// re-attempt — and a refusal that names another channel drops
+/// nothing.
 ///
-/// The initiator half of the ghost repair: before, a channel close
-/// was not a loss at all, so only ICE's consent timeout could end a
-/// session whose far end had gone, and it never did while the path
-/// stayed healthy.
+/// The initiator half of the ghost repair: before, nothing told a
+/// leaf its far end held no session, so only ICE's consent timeout
+/// could end it, and it never did while the path stayed healthy. The
+/// far end refuses exactly as `Inner::close_orphaned_link` does —
+/// the notice, then the close; a bare close is not a loss
+/// ([`a_far_end_replacing_its_link_costs_neither_end_its_session`]).
 #[wasm_bindgen_test]
 async fn the_far_end_closing_an_installed_channel_drops_exactly_its_session() {
     let p = pair();
@@ -2678,7 +2681,12 @@ async fn the_far_end_closing_an_installed_channel_drops_exactly_its_session() {
     );
     assert_eq!(triggers(), before, "and files nothing");
 
-    // The far end really closes; this leaf's channel really reports it.
+    // The far end really refuses and closes; this leaf's channel
+    // really reports it.
+    assert!(
+        p.peer_transport.refuse(p.us),
+        "the far end's notice is sent"
+    );
     p.peer_transport.close(p.us);
     for _ in 0..80 {
         with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
@@ -2692,6 +2700,147 @@ async fn the_far_end_closing_an_installed_channel_drops_exactly_its_session() {
         "the session goes with the channel the far end closed"
     );
     assert_eq!(triggers(), before + 1, "and the re-attempt is filed");
+    p.leaf.close();
+}
+
+/// A far end whose re-offer REPLACES the channel a session rides
+/// costs neither end that session — the bare close it makes is not a
+/// loss.
+///
+/// The stage 6 regression (`stage6_the_four_wasm_methods_drive_one_
+/// attempt_end_to_end` and the four checks behind it, both engines):
+/// the offerer re-offers on a pair that is already direct, and its
+/// link replacement closes the channel under the answerer. Treating
+/// that close as a loss dropped the answerer's session — the session
+/// the re-offer's envelopes are sealed under — so the answer was
+/// refused "no verified offer", the offerer's attempt ran out as
+/// `iceTimeout`, and the next check found a "healthy" pair that was
+/// not. Same shape as §4.5's tab teardown, whose contract is the
+/// call's own deadline, not a fast `sessionLost`.
+///
+/// This leaf is the answerer here, exactly as stage 6's: the peer
+/// initiates, then re-offers. The close is OBSERVED before the claim
+/// (this leaf's channel leaves `open`), so the assertion is about a
+/// close that arrived, not one still in flight.
+///
+/// Inverse: file a bare far-end close into `channel_closes` (the
+/// 0f4d38242 `close` handler) — the session goes and a trigger files.
+#[wasm_bindgen_test]
+async fn a_far_end_replacing_its_link_costs_neither_end_its_session() {
+    let p = pair();
+    direct_session(&p).await;
+    let installed = p
+        .leaf
+        .inner
+        .borrow()
+        .node
+        .session_incarnation(p.peer_id)
+        .expect("the direct session is installed");
+    let triggers = || p.leaf.inner.borrow().retry_triggers.borrow().len();
+    let before = triggers();
+
+    // The peer re-offers: `create_offer` replaces its link, and the
+    // replacement closes the channel this leaf's session rides.
+    let _reoffer = p
+        .peer_transport
+        .create_offer(p.us, &[])
+        .await
+        .expect("the peer's re-offer");
+    let mut closed = false;
+    for _ in 0..80 {
+        with_node(&p.leaf.inner, |guard| {
+            guard.harvest_ice_failures();
+            guard.pump();
+        });
+        if !p.transport().is_open(p.peer_id) {
+            closed = true;
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert!(closed, "the replacement really closed this leaf's channel");
+    // A few more turns, so a close event queued behind the state
+    // change has every chance to be drained.
+    for _ in 0..5 {
+        gloo_timer_sleep(TICK_MS).await.ok();
+        with_node(&p.leaf.inner, |guard| {
+            guard.harvest_ice_failures();
+            guard.pump();
+        });
+    }
+
+    assert_eq!(
+        p.leaf.inner.borrow().node.session_incarnation(p.peer_id),
+        Some(installed),
+        "a far end replacing its link is not a loss: the session it signals over stays"
+    );
+    assert_eq!(triggers(), before, "and nothing is filed for it");
+    p.leaf.close();
+}
+
+/// An orphaned packet on a LIVE attempt's channel refuses the link
+/// but does not kill the attempt.
+///
+/// LEAF-2's shape: this leaf answered a fresh re-offer and its
+/// channel is open, waiting for the initiator's message 1, while it
+/// holds no session for the peer — and the peer, still holding an
+/// OLDER session, sends under it over the new channel. Settling the
+/// attempt `Failed` there (0f4d38242) killed the repair before its
+/// handshake started. The notice still goes (the far end fences it
+/// on the channel it names), and the attempt stays live for its own
+/// handshake or deadline to settle.
+///
+/// Inverse: settle the live attempt `Failed` in
+/// `Inner::close_orphaned_link` — the terminal reads `failed`.
+#[wasm_bindgen_test]
+async fn an_orphaned_packet_on_a_live_attempts_channel_does_not_kill_the_attempt() {
+    let p = pair();
+    // The peer holds a direct session over a FIRST channel, then
+    // re-offers: the second dialog is the live attempt.
+    direct_session(&p).await;
+    let dialog = p.answer_a_real_offer().await;
+    p.open_answer(dialog).await;
+    assert_eq!(
+        p.terminal(),
+        None,
+        "the re-attempt is live, before its handshake"
+    );
+    let peer_channel = p
+        .peer_transport
+        .channel_id(p.us)
+        .expect("the peer's link exists");
+    with_node(&p.leaf.inner, |guard| {
+        guard
+            .node
+            .drop_session(p.peer_id, "witness: this end lost it");
+    });
+
+    p.peer
+        .borrow_mut()
+        .publish(p.us, "chat", b"under the older session")
+        .expect("the peer holds its session");
+    p.pump_peer();
+    p.await_arrival().await;
+    assert_eq!(p.counter("no_session"), 1, "the packet itself was refused");
+
+    assert_eq!(p.terminal(), None, "the live attempt is not settled by it");
+    assert!(
+        p.transport().is_open(p.peer_id),
+        "and its channel stays open for the handshake it is waiting for"
+    );
+    let mut reported = Vec::new();
+    for _ in 0..80 {
+        reported.extend(p.peer_transport.take_channel_closes());
+        if !reported.is_empty() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        reported,
+        vec![(p.us, peer_channel)],
+        "the far end is still told, on the channel it sent on"
+    );
     p.leaf.close();
 }
 

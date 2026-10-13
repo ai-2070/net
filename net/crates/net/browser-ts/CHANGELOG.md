@@ -129,10 +129,9 @@ the README on why it is a sibling package rather than a sub-path.
   of the players: at 64 players on one anchor a 2 s refresh pinned the
   host's anchor link at its SCTP advisory, starving every relayed pair. A
   change of players is still announced at once, and an announcement lives
-  300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has. A lobby
-  with a free seat still refreshes every 2 s (`OPEN_LOBBY_ANNOUNCE_MS`): a
-  node that just connected sees a lobby only at its next refresh, and one
-  host refreshing is linear in the peers, not square.
+  300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has. A node that
+  connects later does not wait for a refresh: the anchor replays the
+  announcements it holds to each session that enrolls, within its game.
 - **Stream data is routed to its stream, not filtered by every stream.**
   Each `LeafStream`'s listener used to receive every node event and read
   it to find its own, so a host with one stream per player paid players ×
@@ -145,12 +144,14 @@ the README on why it is a sibling package rather than a sub-path.
   an open direct channel, every packet was dropped and nothing noticed:
   the player's sends never fail and the connection stayed healthy. A
   1 × 96 run lost 3 players that way for its whole 240 s. The side
-  without a session now closes that channel (and logs `closed the direct
-  link`). The other side treats a channel closed by its peer as a lost
-  session, exactly as it already treated an ICE failure, and connects
-  again. Before, only ICE could report a loss, which takes its 30 s
-  consent timeout after a peer leaves and never fires while the path is
-  healthy.
+  without a session now tells its peer so on that channel and closes it
+  (and logs `closed the direct link`). The other side treats that notice
+  as a lost session, exactly as it already treated an ICE failure, and
+  connects again. Before, only ICE could report a loss, which takes its
+  30 s consent timeout after a peer leaves and never fires while the
+  path is healthy. A channel the peer merely closes — its re-offer
+  replacing the link, or its tab going away — is still not a loss: the
+  session stays, and an open call still ends on its own deadline.
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers
