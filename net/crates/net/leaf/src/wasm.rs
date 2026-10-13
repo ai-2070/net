@@ -390,19 +390,26 @@ struct Subscription {
     id: u64,
     /// The callback itself.
     callback: js_sys::Function,
-    /// The Rust closure behind `callback`, when there is one —
-    /// [`LeafStream::on_message`] registers a Rust filter closure and
-    /// hands out the `Function` built over it.
+    /// The stream this registration is for, when it is a stream's
+    /// ([`LeafStream::on_message`]): it is handed that stream's
+    /// `stream_data` and nothing else. `None` is a node-wide listener
+    /// ([`LeafNode::on_event`]), handed every event.
     ///
-    /// Kept here so the registration OWNS it. `forget()` retained the
-    /// closure and its captured consumer for the node's whole life
-    /// while `close`/`remove_listener` dropped only this `Function`:
-    /// one leaked closure plus one retained consumer per stream
-    /// generation, with `listener_count` reporting flat. Dropped when
-    /// the registration is retired and no dispatch snapshot can still
-    /// reach it ([`Inner::retired`]).
-    retained: Option<Closure<dyn FnMut(JsValue)>>,
+    /// **Routed here, by key, not by a filter on the event text.** A
+    /// stream used to register a Rust closure that copied every
+    /// event's JSON back into wasm and substring-matched its peer and
+    /// stream id — so every event crossed the boundary once per open
+    /// stream. A host with one stream per player pays that as
+    /// players × events: the sharded-match S0b run measured the copy
+    /// (`passStringToWasm0`) at 1.2% of a 32-player host's main
+    /// thread and 13.3% of a 64-player one's.
+    stream: Option<StreamKey>,
 }
+
+/// What a `stream_data` event is routed by: the peer whose session
+/// delivered it and the stream id. Both halves, because the id alone
+/// is one label's id on every peer (R4-10).
+type StreamKey = (NodeId, u64);
 
 /// The transport-loss path's fence record: the session one open
 /// DataChannel's handshake installed, and the identity of that
@@ -496,6 +503,44 @@ pub(crate) struct Inner {
     /// by [`Inner::on_handshake`] and consumed by [`Inner::pump`]
     /// when `take_verified_admissions` reports the proof verified.
     admissions: HashMap<NodeId, Attempt>,
+    /// The relay each pending admission's message 1 displaced, keyed by
+    /// peer: what the pair goes back to if the establishment is never
+    /// proven.
+    ///
+    /// Found by the sharded-match S0b run: the offerer's handshake ran
+    /// out its attempt deadline before the (slow) answerer's message 2
+    /// came back, so it settled `failed` and kept its routed session;
+    /// this answerer had already dropped the relay at message 1 and,
+    /// with nothing to undo it, reported `open`/`direct:true` and sent
+    /// on a channel the offerer had closed. Restored when the admission
+    /// expires unproven ([`Inner::pump`]) — §9 step 6, "the routed
+    /// session is simply never replaced".
+    displaced_relays: HashMap<NodeId, NodeId>,
+    /// Sessions an unproven admission's retirement handed back to the
+    /// relay, keyed by peer, each with the incarnation it restored.
+    ///
+    /// **The one session a relayed message 1 may re-establish over.**
+    /// The answerer cannot tell whether the offerer received message
+    /// 2: if it did not, the offerer still holds the routed session
+    /// this side restored and nothing more is needed; if it did, the
+    /// offerer installed the direct keys over its routed ones and
+    /// holds a session this side never promoted. The retirement closes
+    /// the channel, so the offerer's close handler drops that session
+    /// and files its repair — and §9 step 5's repair is a ROUTED
+    /// reconnection, whose relayed message 1 the ordinary rule refuses
+    /// while this side holds any session. Where UDP is blocked that
+    /// refusal left the pair with mismatched keys and no way back.
+    /// So a relayed message 1 is admitted over exactly this session
+    /// ([`Inner::reestablishable`]), and only while it is still the
+    /// incarnation restored. Admission parks a provisional
+    /// establishment and nothing more: the session is replaced only
+    /// by a verified establishment proof, so a replayed message 1
+    /// still displaces nothing.
+    restored_routed: HashMap<NodeId, u64>,
+    /// Which channel's loss has already been filed as a re-attempt
+    /// trigger, so a channel close and the same channel's later ICE
+    /// `failed` file one trigger, not two.
+    loss_reports: crate::retry::LossReports,
     /// The session each open DataChannel's handshake installed, and
     /// the identity of the channel it installed it over, keyed by
     /// peer.
@@ -550,7 +595,11 @@ pub(crate) struct Inner {
     /// `borrow_mut` and trapped, and so did closing the node from a
     /// callback. Collected here, handed out by
     /// [`dispatch_events`] with no borrow held.
-    outbox: Vec<String>,
+    ///
+    /// Each event carries its [`StreamKey`] when it is `stream_data`,
+    /// so [`dispatch_events`] can hand it to its stream's
+    /// registrations without reading the text.
+    outbox: Vec<(String, Option<StreamKey>)>,
     /// Whether a dispatch is already walking the outbox.
     ///
     /// A callback that sends re-enters [`dispatch_events`] through
@@ -565,25 +614,14 @@ pub(crate) struct Inner {
     /// its registrar can cancel it with.
     ///
     /// **A registration is owned, not forgotten.** `LeafStream`'s
-    /// `on_message` appends a filter closure here and the closure
-    /// captures the consumer's wrapper, so before the token existed
+    /// `on_message` appends the consumer's callback here (keyed to
+    /// its stream, [`Subscription::stream`]), so before the token existed
     /// a page that opened and closed streams for the life of the
     /// node accumulated one permanently-retained closure per open —
     /// each still invoked for every event the node produced, each
     /// still holding its wrapper alive. Closing the stream removed
     /// nothing, because nothing named the registration.
     listeners: Vec<Subscription>,
-    /// Registration closures retired while a dispatch snapshot can
-    /// still reach their `Function`, kept until none can.
-    ///
-    /// Dropping a `Closure` invalidates the `js_sys::Function` built
-    /// from it — a queued call into one throws "closure invoked
-    /// recursively or after being dropped" — and [`dispatch_events`]
-    /// walks a snapshot of those `Function`s. So a removal taken
-    /// mid-dispatch parks the closure here, and the dispatch drops it
-    /// once its snapshot is dead. Outside a dispatch nothing can
-    /// reach one and it goes at once.
-    retired: Vec<Closure<dyn FnMut(JsValue)>>,
     /// The next token. Process-monotonic within the node, never
     /// reused: a token is the right to remove exactly one
     /// registration, and a reused one would let a closed stream's
@@ -679,8 +717,18 @@ impl Inner {
             };
             match self.node.classify_datagram(transport_peer, bytes) {
                 Inbound::Refused => {}
-                Inbound::Session { from, packet, .. } => {
+                Inbound::Session {
+                    from,
+                    packet,
+                    relayed,
+                } => {
+                    let orphaned = self.orphaned(from, transport_peer, relayed);
                     self.node.on_datagram(from, packet, now);
+                    // Re-read after: the packet itself may have been
+                    // what installed a session (a promoted proof).
+                    if orphaned && !self.node.has_session(from) {
+                        self.close_orphaned_link(from);
+                    }
                 }
                 Inbound::Handshake {
                     from,
@@ -714,7 +762,10 @@ impl Inner {
     /// *relayed* message 1 may only ESTABLISH — it is refused when a
     /// session already exists — so nothing a relay replays can
     /// displace a live session, let alone downgrade a direct one to
-    /// a relayed one. A *direct* message 1 may replace, because it
+    /// a relayed one. (One exception, and it is not a displacement: a
+    /// routed session an unproven admission's retirement restored may
+    /// be re-established over, because the peer may no longer hold its
+    /// keys — [`Inner::restored_routed`].) A *direct* message 1 may replace, because it
     /// arrived on a DataChannel this leaf negotiated with that peer
     /// inside an attempt it is driving; that is §9 step 4.
     ///
@@ -879,8 +930,11 @@ impl Inner {
                 // Establish only, and only for a peer whose signed
                 // announcement this leaf verified — which
                 // `classify_datagram` already required to resolve
-                // `from` at all.
-                !self.node.has_session(from)
+                // `from` at all. The one session it may re-establish
+                // over is a routed one an unproven admission's
+                // retirement restored, whose keys the peer may no
+                // longer hold ([`Inner::restored_routed`]).
+                !self.node.has_session(from) || self.reestablishable(from)
             } else {
                 // Replace, but only inside an attempt this leaf is
                 // driving AND that has not already ended. A direct
@@ -943,6 +997,13 @@ impl Inner {
             // recorded instead is the OWNER of the admission: the
             // attempt whose channel this message 1 arrived on, which
             // `pump` settles if and when the proof verifies.
+            // The relay this displaces is kept until the proof
+            // verifies: if it never does, the pair goes back to it.
+            // The FIRST displaced relay is the one the routed session
+            // uses; a repeated message 1 has nothing new to record.
+            if let Some(relay) = self.node.peer_relay(from) {
+                self.displaced_relays.entry(from).or_insert(relay);
+            }
             self.node.clear_peer_relay(from);
             if let Some(attempt) = self.attempt_of(from) {
                 self.admissions.insert(from, attempt);
@@ -975,6 +1036,7 @@ impl Inner {
     fn direct_installed(&mut self, attempt: Attempt) {
         let peer = attempt.peer;
         self.node.clear_peer_relay(peer);
+        self.displaced_relays.remove(&peer);
         // What this channel's handshake just installed — the one
         // establishment the channel CARRIED — recorded WITH this
         // channel's own identity. When a channel dies, the
@@ -1103,41 +1165,151 @@ impl Inner {
             // installed ([`Inner::channel_installations`]): the
             // reporting channel's own identity, and the incarnation
             // it installed. The identity is the half that matters
-            // across a re-attempt — the trigger that exists is not
-            // "a predecessor channel's late close" (`closed` is not a
-            // loss and files nothing) but the predecessor channel's
-            // late ICE `disconnected` → `failed` transition, and such
-            // a report still queued after a successor's install names
+            // across a re-attempt — a predecessor channel's late ICE
+            // `disconnected` → `failed` transition (or its late
+            // refusal, below) still queued after a successor's install names
             // the predecessor's channel and must not remove the
             // successor's entry. A report that matches no entry is no
             // loss this table knows; the entry it failed to match is
             // left in place for the channel it actually belongs to.
-            //
-            // This drain is the module's only transport-loss
-            // detector: the DataChannel installs no `onclose`
-            // handler, and the ICE `disconnected` → `failed` watcher
-            // is what reports a link that is gone.
-            let matched = self
-                .channel_installations
-                .get(&peer)
-                .filter(|installed| installed.channel == channel)
-                .copied();
-            if let Some(installed) = matched {
-                self.channel_installations.remove(&peer);
-                self.node.drop_session_if_incarnation(
-                    peer,
-                    installed.incarnation,
-                    "the DataChannel closed",
-                );
-            }
+            self.drop_installed_over(peer, channel);
             // The re-attempt trigger files regardless of the fence:
             // a dying link is a fact about the pair, and whether this
             // leaf OWNS the repair is the policy's question
-            // ([`crate::retry`]), not this fence's.
-            self.retry_triggers
-                .borrow_mut()
-                .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+            // ([`crate::retry`]), not this fence's. Once per channel,
+            // though: a channel whose far-end refusal already filed
+            // its loss (below, on an earlier drain) is not a second
+            // loss when ICE gives up on it too.
+            if self.loss_reports.first(peer, channel) {
+                self.retry_triggers
+                    .borrow_mut()
+                    .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+            }
         }
+        // **The far end refused the channel a session rides.** The
+        // second detector, and the only one that fires while the
+        // path itself stays healthy: a peer that holds no session
+        // for what arrives on a direct channel says so
+        // ([`crate::rtc::NO_SESSION_NOTICE`]) and closes it
+        // ([`Inner::close_orphaned_link`]). Without it an initiator
+        // whose session the responder never installed sent into the
+        // void for as long as ICE stayed up: S0b's 1 × 96 run lost 3
+        // players that way for its whole 240 s.
+        //
+        // The notice and not the close: a bare far-end close is a
+        // re-offer replacing the link, or a tab going away, and
+        // treating it as a loss dropped the session a re-offer
+        // signals over and turned §4.5's deadline terminal into a
+        // fast `sessionLost`.
+        //
+        // Narrower than the ICE source on purpose: a refusal is a
+        // loss only for the channel a session was installed over. A
+        // channel refused before anything installed is an attempt's
+        // business, and its deadline settles it.
+        //
+        // Filed as `ChannelClosed` — the far end closes the channel
+        // right after — not as an ICE failure, and only once per
+        // channel ([`Inner::loss_reports`]).
+        for (peer, channel) in self.transport.take_channel_closes() {
+            if self.drop_installed_over(peer, channel) && self.loss_reports.first(peer, channel) {
+                self.retry_triggers
+                    .borrow_mut()
+                    .push_back((crate::retry::TriggerSource::ChannelClosed, Some(peer)));
+            }
+        }
+    }
+
+    /// Drop the session `channel` installed for `peer`, when that is
+    /// still the session the channel carries; `true` if it dropped.
+    ///
+    /// The fence both loss detectors share: the reporting channel's
+    /// own identity and the incarnation it installed
+    /// ([`Inner::channel_installations`]).
+    fn drop_installed_over(&mut self, peer: NodeId, channel: u64) -> bool {
+        let matched = self
+            .channel_installations
+            .get(&peer)
+            .filter(|installed| installed.channel == channel)
+            .copied();
+        let Some(installed) = matched else {
+            return false;
+        };
+        self.channel_installations.remove(&peer);
+        self.node
+            .drop_session_if_incarnation(peer, installed.incarnation, "the DataChannel closed")
+    }
+
+    /// Refuse the direct link to `peer`: it delivered a sealed packet
+    /// and this leaf holds nothing that could ever open one from it.
+    ///
+    /// No session, no establishment parked or pending promotion, and
+    /// no handshake in flight — so every packet on this link is
+    /// refused `no_session` for as long as the link lives, and the
+    /// far end, which believes it holds a session, never learns.
+    /// That is the S0b ghost: an initiator that installed on message
+    /// 2 while this end never promoted (an expired proof, or a
+    /// superseded admission), sending at 20 Hz into a link this end
+    /// would have kept open indefinitely.
+    ///
+    /// **The signal is the notice, not the close**
+    /// ([`crate::rtc::NO_SESSION_NOTICE`]). A bare far-end close is
+    /// also what a re-offer replacing a link and a tab going away
+    /// look like, and neither may cost the far end its session — so
+    /// the far end acts only on the notice, which names the channel
+    /// it arrived on: it drops the session it installed over THAT
+    /// channel ([`Inner::harvest_ice_failures`]) and files its
+    /// re-attempt.
+    ///
+    /// **A live attempt is left to itself.** Its channel is this
+    /// leaf's fresh re-attempt, waiting for the initiator's message
+    /// 1 — and a sealed packet under the far end's OLDER session
+    /// (installed over a predecessor channel) is orphaned here too
+    /// while that handshake has not started. Settling the attempt
+    /// `Failed` killed the very repair that would have fixed the
+    /// pair (stage 6 drives the four §9 methods one call at a time,
+    /// so that window is wide). The notice still goes — it is fenced
+    /// at the far end on the channel it names, so it ends a ghost
+    /// installed over this channel and nothing else — and the
+    /// attempt's own handshake or deadline settles the link.
+    ///
+    /// With no live attempt the link is closed after the notice.
+    fn close_orphaned_link(&mut self, peer: NodeId) {
+        if !self.transport.refuse(peer) {
+            // Already refused (one notice per link), or nothing to
+            // refuse it on.
+            return;
+        }
+        let live = self
+            .peers
+            .get(&peer)
+            .is_some_and(|dialog| dialog.terminal.is_none());
+        if live {
+            console_error(&format!(
+                "net-mesh-leaf: refused the direct link to {peer:016x} during a live attempt: \
+                 it carries traffic for a session this leaf does not hold"
+            ));
+            return;
+        }
+        self.transport.close(peer);
+        self.channel_installations.remove(&peer);
+        console_error(&format!(
+            "net-mesh-leaf: closed the direct link to {peer:016x}: it carries traffic \
+             for a session this leaf does not hold"
+        ));
+    }
+
+    /// Whether a sealed packet `from` arriving directly could only
+    /// be refused `no_session`, now and later: nothing installed,
+    /// parked, promoted or in flight could open it.
+    fn orphaned(&self, from: NodeId, transport_peer: NodeId, relayed: bool) -> bool {
+        !relayed
+            && from == transport_peer
+            && from != self.anchor
+            && !self.node.has_session(from)
+            && self.node.provisional_attempt(from).is_none()
+            && !self.node.verified_admission_pending(from)
+            && !self.node.is_handshaking(from)
+            && self.transport.is_open(from)
     }
 
     /// Deliver, then run the node's time-driven work: retransmit
@@ -1169,7 +1341,80 @@ impl Inner {
             }
         }
         self.node.tick(clock::now());
+        self.retire_unproven_admissions();
         self.flush();
+    }
+
+    /// Admissions whose establishment expired unproven: the offerer
+    /// never completed it (typically it ran out its own deadline and
+    /// gave up). The pair goes back to the relay message 1 displaced,
+    /// keeping the routed session it never stopped using on the
+    /// offerer's side, and the attempt ends `Relayed` — §9 step 6's
+    /// supported disposition — never `direct`.
+    ///
+    /// Non-destructive on purpose, unlike a supersession or a close
+    /// ([`Inner::settle`] drops the routed session there): an expiry
+    /// leaves both ends holding that routed session, and dropping it
+    /// here would leave the offerer sending relayed packets this side
+    /// can no longer open. The retired establishment still installs
+    /// nothing — [`LeafNode::tick`] already destroyed its keys.
+    fn retire_unproven_admissions(&mut self) {
+        let expired: Vec<(NodeId, Attempt)> = self
+            .admissions
+            .iter()
+            .filter(|(peer, _)| {
+                self.node.provisional_attempt(**peer).is_none()
+                    && !self.node.verified_admission_pending(**peer)
+            })
+            .map(|(peer, attempt)| (*peer, *attempt))
+            .collect();
+        for (peer, attempt) in expired {
+            self.retire_unproven(peer, attempt);
+        }
+    }
+
+    /// Retire `peer`'s admission, owned by `attempt`, as unproven: the
+    /// pair goes back to its routed session over the relay, and the
+    /// attempt ends `Relayed`. `true` if the term applied.
+    ///
+    /// The one non-destructive retirement, shared by the proof
+    /// deadline ([`Inner::retire_unproven_admissions`]) and the
+    /// attempt deadline when the channel closed under a pending proof
+    /// (`service_peer`) — which used to fall through to the STUN probe
+    /// and `settle`'s destructive branch, dropping the routed session
+    /// the offerer kept and labelling an ICE path that connected
+    /// `iceTimeout` / `udpBlocked`.
+    ///
+    /// **The session is never left without a route.** The relay
+    /// message 1 displaced goes back; when none was recorded (the
+    /// pair held a session with no relay entry when message 1
+    /// arrived), the anchor — the only relay a leaf uses — stands in:
+    /// the attempt's channel is closed below, so a session left with
+    /// neither would reach nobody while reading as live. And the
+    /// restored session is recorded as one the peer may re-establish
+    /// over ([`Inner::restored_routed`]).
+    fn retire_unproven(&mut self, peer: NodeId, attempt: Attempt) -> bool {
+        // Removed BEFORE the settle, so the settle's destructive
+        // branch (which keys on a live admission) is not taken.
+        self.admissions.remove(&peer);
+        let displaced = self.displaced_relays.remove(&peer);
+        if let Some(incarnation) = self.node.session_incarnation(peer) {
+            if self.node.peer_relay(peer).is_none() {
+                self.node
+                    .set_peer_relay(peer, displaced.unwrap_or(self.anchor));
+            }
+            self.restored_routed.insert(peer, incarnation);
+        }
+        self.settle(attempt, IceTerm::Relayed, "failed")
+    }
+
+    /// Whether `peer`'s session is still the one an unproven
+    /// admission's retirement restored, so a relayed message 1 may
+    /// re-establish over it ([`Inner::restored_routed`]).
+    fn reestablishable(&self, peer: NodeId) -> bool {
+        self.restored_routed
+            .get(&peer)
+            .is_some_and(|restored| self.node.session_incarnation(peer) == Some(*restored))
     }
 
     /// Put everything the node queued on the wire and collect
@@ -1203,27 +1448,30 @@ impl Inner {
                 self.file_signal(envelope);
             }
         }
-        self.outbox
-            .extend(events.iter().map(crate::node::LeafEvent::to_json));
+        self.outbox.extend(events.iter().map(|event| {
+            let key = match event {
+                LeafEvent::StreamData {
+                    peer_node,
+                    stream_id,
+                    ..
+                } => Some((*peer_node, *stream_id)),
+                _ => None,
+            };
+            (event.to_json(), key)
+        }));
     }
 
     /// Register `callback`, returning the token that removes it.
     ///
-    /// `retained` is the Rust closure behind `callback`, when there
-    /// is one — [`LeafStream::on_message`] registers a filter and
-    /// hands out the `Function` built over it. The registration owns
-    /// it and gives it up at removal ([`Inner::retire_listener`]).
-    fn add_listener(
-        &mut self,
-        callback: js_sys::Function,
-        retained: Option<Closure<dyn FnMut(JsValue)>>,
-    ) -> u64 {
+    /// `stream` scopes it to one stream's `stream_data`
+    /// ([`Subscription::stream`]); `None` hands it every event.
+    fn add_listener(&mut self, callback: js_sys::Function, stream: Option<StreamKey>) -> u64 {
         let id = self.next_listener_id;
         self.next_listener_id = self.next_listener_id.wrapping_add(1);
         self.listeners.push(Subscription {
             id,
             callback,
-            retained,
+            stream,
         });
         id
     }
@@ -1231,33 +1479,16 @@ impl Inner {
     /// Remove the registration `id` names. `false` when it is
     /// already gone — which is the outcome a second cancellation
     /// wanted, so it is not an error.
+    ///
+    /// Safe from inside a listener: [`dispatch_events`] walks a
+    /// snapshot of the callbacks, so this turn still delivers to the
+    /// removed one and the next does not.
     fn remove_listener(&mut self, id: u64) -> bool {
         let Some(index) = self.listeners.iter().position(|s| s.id == id) else {
             return false;
         };
-        let subscription = self.listeners.remove(index);
-        self.retire_listener(subscription.retained);
+        self.listeners.remove(index);
         true
-    }
-
-    /// Give up a removed registration's closure — now if nothing can
-    /// still reach it, later if a dispatch snapshot can.
-    ///
-    /// `dispatching` is exactly "a snapshot of the listeners'
-    /// `Function`s is live", so a removal taken from inside a
-    /// listener parks the closure in [`Inner::retired`] and the
-    /// dispatch drops it once the snapshot is dead: dropping a
-    /// `Closure` invalidates the `Function` a queued call would still
-    /// reach. Outside a dispatch it goes at once — which is what
-    /// makes the documented open/`on_message`/`close` lifecycle leave
-    /// `listener_count` flat in CLOSURES too, not just in tokens.
-    fn retire_listener(&mut self, retained: Option<Closure<dyn FnMut(JsValue)>>) {
-        let Some(closure) = retained else {
-            return;
-        };
-        if self.dispatching {
-            self.retired.push(closure);
-        }
     }
 
     /// File one verified envelope where the §9 drive loop will find
@@ -1603,6 +1834,7 @@ impl Inner {
         // settles `Direct`, so this branch never sees a promotion.
         if self.admissions.get(&attempt.peer) == Some(&attempt) {
             self.admissions.remove(&attempt.peer);
+            self.displaced_relays.remove(&attempt.peer);
             self.node
                 .drop_session(attempt.peer, "the establishment's attempt was retired");
         }
@@ -1681,6 +1913,9 @@ impl Inner {
         self.offers.clear();
         self.handshakes.clear();
         self.admissions.clear();
+        self.displaced_relays.clear();
+        self.restored_routed.clear();
+        self.loss_reports.clear();
         self.channel_installations.clear();
         self.retry.forget_all();
         self.unregister_retry_listeners();
@@ -1724,10 +1959,6 @@ fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
             if guard.dispatching {
                 return;
             }
-            // No snapshot is live at this point — the previous
-            // iteration's went out of scope at its end — so whatever
-            // a removal parked during one can go now.
-            guard.retired.clear();
             if guard.outbox.is_empty() {
                 return;
             }
@@ -1742,14 +1973,20 @@ fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
                 guard
                     .listeners
                     .iter()
-                    .map(|s| s.callback.clone())
+                    .map(|s| (s.callback.clone(), s.stream))
                     .collect::<Vec<_>>(),
             )
         };
-        for json in events {
-            let value = JsValue::from_str(&json);
-            for listener in &listeners {
-                let _ = listener.call1(&JsValue::NULL, &value);
+        for (json, key) in events {
+            // Built once, and only when some registration takes it:
+            // a stream's data no other stream wants never crosses.
+            let mut value: Option<JsValue> = None;
+            for (listener, stream) in &listeners {
+                if stream.is_some() && *stream != key {
+                    continue;
+                }
+                let value = value.get_or_insert_with(|| JsValue::from_str(&json));
+                let _ = listener.call1(&JsValue::NULL, value);
             }
         }
         // Cleared after delivery, so a callback's re-entrant dispatch
@@ -1911,6 +2148,9 @@ impl LeafNode {
             peers: HashMap::new(),
             handshakes: HashMap::new(),
             admissions: HashMap::new(),
+            displaced_relays: HashMap::new(),
+            restored_routed: HashMap::new(),
+            loss_reports: crate::retry::LossReports::default(),
             channel_installations: HashMap::new(),
             next_routed: 0,
             anchor_candidates: VecDeque::new(),
@@ -1919,7 +2159,6 @@ impl LeafNode {
             outbox: Vec::new(),
             dispatching: false,
             listeners: Vec::new(),
-            retired: Vec::new(),
             next_listener_id: 1,
             closed: false,
             // One window for the episode and for the re-attempt it
@@ -2202,7 +2441,7 @@ impl LeafNode {
     /// The re-attempt owner's ledger, as JSON.
     ///
     /// `{"armed":<bool>,"online":"<n>","iceFailed":"<n>",
-    /// "triggers":"<n>","started":"<n>","coalesced":"<n>",
+    /// "channelClosed":"<n>","triggers":"<n>","started":"<n>","coalesced":"<n>",
     /// "notEligible":"<n>","openEpisodes":<n>,"owned":<n>,
     /// "last":"<disposition>"|null}`.
     ///
@@ -2224,12 +2463,13 @@ impl LeafNode {
             .retry_last
             .map_or_else(|| "null".to_string(), json_string);
         format!(
-            "{{\"armed\":{},\"online\":\"{}\",\"iceFailed\":\"{}\",\"triggers\":\"{}\",\
-             \"started\":\"{}\",\"coalesced\":\"{}\",\"notEligible\":\"{}\",\
+            "{{\"armed\":{},\"online\":\"{}\",\"iceFailed\":\"{}\",\"channelClosed\":\"{}\",\
+             \"triggers\":\"{}\",\"started\":\"{}\",\"coalesced\":\"{}\",\"notEligible\":\"{}\",\
              \"discardedUnarmed\":\"{}\",\"openEpisodes\":{},\"owned\":{},\"last\":{last}}}",
             guard.retry.is_armed(),
             ledger.online,
             ledger.ice_failed,
+            ledger.channel_closed,
             ledger.triggers(),
             ledger.started,
             ledger.coalesced,
@@ -3476,6 +3716,38 @@ impl LeafNode {
             } else {
                 "gathering"
             }
+        } else if with_node(&self.inner, |guard| {
+            guard.admissions.get(&peer) == Some(&attempt)
+        }) {
+            // The offerer's message 1 arrived and its proof has not.
+            // Never `settle_peer_deadline`: its settle would take the
+            // destructive branch and drop the routed session the
+            // offerer may still be using, and its STUN probe would
+            // label an ICE path that CONNECTED a timeout.
+            if open {
+                // The proof can still arrive. Its window is bounded
+                // ([`crate::establish::PROOF_DEADLINE_MS`]); it ends
+                // in a promotion or in
+                // [`Inner::retire_unproven_admissions`].
+                "open"
+            } else {
+                // The channel the proof would ride is gone — the
+                // offerer gave up and closed it — so nothing can
+                // promote this admission: retire it now, the same
+                // non-destructive way the proof deadline would.
+                with_node(&self.inner, |guard| {
+                    if guard.retire_unproven(peer, attempt) {
+                        "failed"
+                    } else {
+                        guard
+                            .peers
+                            .get(&peer)
+                            .filter(|dialog| dialog.dialog == attempt.dialog)
+                            .and_then(|dialog| dialog.terminal)
+                            .map_or("failed", |(_, state)| state)
+                    }
+                })
+            }
         } else if open {
             // ICE connected and the session did not install inside
             // the attempt's bound. `udp_blocked` is unclaimable — a
@@ -4070,9 +4342,17 @@ impl LeafNode {
 
     /// Is a direct session with `peer` installed — which is a
     /// different fact from an open channel?
+    ///
+    /// **Not while an establishment proof is pending.** An answerer
+    /// drops the relay at message 1, while the routed session is still
+    /// in the table; reading "session, no relay" as installed reported
+    /// `direct` before anything was proven — and, when the offerer gave
+    /// up, kept reporting it (S0b). Direct means PROVEN.
     fn installed(&self, peer: NodeId) -> bool {
         let guard = self.inner.borrow();
-        guard.node.has_session(peer) && guard.node.peer_relay(peer).is_none()
+        guard.node.has_session(peer)
+            && guard.node.peer_relay(peer).is_none()
+            && !guard.admissions.contains_key(&peer)
     }
 
     /// Settle `attempt` because its deadline passed with no session
@@ -4300,7 +4580,7 @@ impl LeafStream {
     /// comes from a label or from a publish contract and neither
     /// involves the peer, so one label opened to two peers is one id
     /// on two sessions — a supported composition. Filtering the
-    /// node-wide event stream by the id alone made both wrappers
+    /// node's events by the id alone made both wrappers
     /// accept whichever peer's payload arrived, delivering one
     /// peer's bytes into the other peer's inbox; a page that echoes
     /// then amplifies it. The incarnation rides the event as
@@ -4314,36 +4594,19 @@ impl LeafStream {
     /// self` — so the advertised echo trapped instead of sending.
     ///
     /// **Returns the token that cancels the registration**, decimal.
-    /// The closure is registered on the node and captures the
-    /// consumer's callback, so a registration nothing names is
-    /// retained for the node's whole life and keeps being invoked
-    /// for every event it produces — which is what repeated
+    /// The callback is registered on the node, so a registration
+    /// nothing names is retained for the node's whole life and keeps
+    /// being invoked for its stream's data — which is what repeated
     /// open/close accumulated before the token existed.
     /// [`Self::close`] gives back every token this stream took, so
     /// an ordinary consumer never has to; [`Self::remove_listener`]
     /// is for one that wants to stop listening without closing.
     pub fn on_message(&self, callback: js_sys::Function) -> String {
-        // Both halves of the key, and the event's own spelling of
-        // each: decimal, exactly as `to_json` writes them.
-        let peer = format!("\"peer_node\":\"{}\"", self.handle.peer);
-        let stream = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
-        let filter = Closure::wrap(Box::new(move |json: JsValue| {
-            if json.as_string().is_some_and(|text| {
-                text.contains("\"stream_data\"") && text.contains(&peer) && text.contains(&stream)
-            }) {
-                let _ = callback.call1(&JsValue::NULL, &json);
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-        let function: js_sys::Function =
-            filter.as_ref().unchecked_ref::<js_sys::Function>().clone();
-        // The registration OWNS the closure, not `forget()` — which
-        // retained it and its captured consumer for the node's whole
-        // life while `close`/`remove_listener` dropped only this
-        // `Function`: one leaked closure plus one retained consumer
-        // per stream generation, with `listener_count` reporting
-        // flat. [`Inner::retire_listener`] drops it when the
-        // registration goes and no dispatch snapshot can reach it.
-        let id = self.inner.borrow_mut().add_listener(function, Some(filter));
+        // Both halves of the key ([`StreamKey`]): routed by
+        // [`dispatch_events`], so the callback is handed exactly
+        // this stream's `stream_data` and never reads anything else.
+        let key = (self.handle.peer, self.handle.stream_id);
+        let id = self.inner.borrow_mut().add_listener(callback, Some(key));
         self.subscriptions.borrow_mut().push(id);
         id.to_string()
     }
@@ -4385,11 +4648,10 @@ impl LeafStream {
     /// **Every registration this stream took is given back**, so
     /// repeated open/close leaves [`LeafNode::listener_count`] flat.
     /// A callback registered through [`Self::on_message`] lives on
-    /// the node, not on this object, and it captures the consumer's
-    /// own callback — so a close that removed only the node's stream
-    /// state left the closure attached, still invoked for every
-    /// event the node produced and still holding its consumer
-    /// alive, for as long as the node lived.
+    /// the node, not on this object — so a close that removed only
+    /// the node's stream state left it attached, still invoked and
+    /// still holding its consumer alive, for as long as the node
+    /// lived.
     ///
     /// A refusal here is reported rather than returned: the handle is
     /// being discarded either way, and `close` is the one operation

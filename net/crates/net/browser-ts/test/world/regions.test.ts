@@ -5,8 +5,9 @@
  * guess when a region's directory entry is contested.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { ANNOUNCE_RETRY_MS } from '../../src/lobby.js';
 import { createLocalMesh } from '../../src/local.js';
 import { defineStore } from '../../src/store/definition.js';
 import { hostStore, type HostedStoreHandle } from '../../src/store/host.js';
@@ -213,5 +214,37 @@ describe('joinWorld', () => {
     await until(() => view.regions()[0]?.phase === 'ready', 'all-digit region ready');
     expect(view.regions()[0]?.host).toBe(DIGITS);
     expect(await view.act('poke', {})).toEqual({ region: 'r:0:0' });
+  });
+});
+
+// NET-3 (sharded-match review): a failed announcement used to wait for the
+// next 30 s lease refresh, leaving the region unfindable that long.
+describe('announceRegions after a failed announcement', () => {
+  it('retries on a short doubling backoff, not the lease refresh, and stops once one lands', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      let failures = 3;
+      const node = {
+        announce: async () => {
+          calls += 1;
+          if (failures-- > 0) throw new Error('anchor link down');
+        },
+      };
+      const stop = announceRegions(node, WORLD, ['r:0:0']);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(ANNOUNCE_RETRY_MS);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(2 * ANNOUNCE_RETRY_MS);
+      expect(calls).toBe(3);
+      await vi.advanceTimersByTimeAsync(4 * ANNOUNCE_RETRY_MS);
+      expect(calls).toBe(4); // this one landed
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(calls).toBe(4); // nothing more until the lease refresh
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

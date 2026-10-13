@@ -332,6 +332,11 @@ struct IceStatsRow {
     /// sources and this one was new. Absent from an older anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_rate_table_full: Option<u64>,
+    /// Bootstrap offers admitted on the per-source backstop alone
+    /// because no per-visitor budget was available. Absent from an
+    /// older anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_visitor_budget_degraded: Option<u64>,
 }
 
 /// The one-line prose form of the denominator, printed with every
@@ -599,6 +604,7 @@ async fn run_stats(
         caveat: ICE_CAVEAT,
         bootstrap_rate_limited: stats.bootstrap_rate_limited,
         bootstrap_rate_table_full: stats.bootstrap_rate_table_full,
+        bootstrap_visitor_budget_degraded: stats.bootstrap_visitor_budget_degraded,
     };
     emit_value(OutputFormat::resolve_oneshot(output), &row)
         .map_err(|e| generic(format!("write anchor stats: {e}")))?;
@@ -979,7 +985,7 @@ pub struct ServeArgs {
     )]
     pub open_game_max_players: Option<usize>,
 
-    /// Per-source-IP `POST /credential` ceiling per minute (default 30).
+    /// Per-source-IP `POST /credential` ceiling per minute (default 120).
     #[arg(long = "credentials-per-minute")]
     pub credentials_per_minute: Option<u32>,
 
@@ -1000,9 +1006,16 @@ pub struct ServeArgs {
     )]
     pub allow_origin: Vec<String>,
 
-    /// Per-source-IP `POST /rtc/offer` ceiling per minute.
+    /// Per-source-IP `POST /rtc/offer` ceiling per minute, across every
+    /// credential from that address (default 120).
     #[arg(long = "offers-per-minute")]
     pub offers_per_minute: Option<u32>,
+
+    /// Per-(source IP, credential) `POST /rtc/offer` ceiling per minute:
+    /// one visitor's budget (default 10). Visitors behind one shared
+    /// address each get their own; `--offers-per-minute` caps them all.
+    #[arg(long = "offers-per-credential-per-minute")]
+    pub offers_per_credential_per_minute: Option<u32>,
 }
 
 /// What `serve` reports once it is up.
@@ -1514,6 +1527,9 @@ async fn run_serve(
     listener_config.additional_acme_challenge_addrs = resolved.challenge[1..].to_vec();
     if let Some(limit) = args.offers_per_minute {
         listener_config.offers_per_ip_per_minute = limit;
+    }
+    if let Some(limit) = args.offers_per_credential_per_minute {
+        listener_config.offers_per_credential_per_minute = limit;
     }
 
     // R6: operator tooling reads the anchors THIS node has ingested.

@@ -92,7 +92,14 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
   64 characters. The set crosses the lossy carrier as a versioned frame
   repeated until a snapshot acknowledges it, so it survives loss.
 - The default `interpolate` lerps numeric fields (nested too) and takes the
-  rest from the newer state; supply your own for angles that wrap.
+  rest from the newer state. With a `codec`, the default is
+  `codec.interpolate`, which turns `angle()` fields the short way (in the
+  correction blend too); without one, supply your own for angles that wrap
+  (`lerpAngle(from, to, alpha)` is exported for it).
+- **Acks trim every client's pending inputs**, predicting (`local`) or not,
+  so a backlog frame (up to 64 inputs, after a change of owner) goes back to
+  `inputRedundancy` once acknowledged. Under `joinShards` only the client
+  that owns the player trims the shared sequencer.
 - **`interpolationDelayMs` is fixed.** Over bursty links (a relayed pair, a
   busy Wi-Fi) a fixed delay either stutters or adds lag everyone feels. If it
   stutters, raise it; a custom loop can adapt it (see below).
@@ -138,7 +145,208 @@ with physics ragdolls and 2–16 players, works this way:
   `ClockEstimator` per peer (median RTT, jitter); `(await
   node.peerAttempt(peer)).direct` says whether each pair is direct. Show both in a debug overlay.
 
+## Compact snapshots
+
+Give host and players the same entity codec, and snapshots go binary: about
+7x smaller than JSON for typical transforms (measured:
+`browser-ts/scripts/bench-netcode.mjs --codec compact`).
+
+```ts
+import { angle, entityCodec, quantized, uint } from '@net-mesh/browser/netcode';
+
+const shipCodec = entityCodec<Ship>({
+  x: quantized(0, 512),   // 16 bits over the range: ~8 mm
+  z: quantized(0, 512),
+  yaw: angle(),           // 8 bits: ~1.4 degrees
+  hp: uint(8),
+});
+hostNetcode({ /* ... */, codec: shipCodec });
+joinNetcode({ /* ... */, codec: shipCodec });
+```
+
+- **Fields:** `quantized(min, max, bits = 16)` (clamped to the range),
+  `angle(bits = 8)`, `uint(bits)`, `int(bits)`, `float32()`, `bool()`. An
+  entity must be a flat object of exactly the schema's fields.
+- **JSON is the fallback, never an error.** A player sends its codec's
+  fingerprint; the host sends binary only on a match, JSON otherwise. An
+  entity the codec refuses (an extra field, a value out of range) sends that
+  player JSON for that tick and counts `dropped['codec-write-failed']`.
+- **Values arrive quantized.** Reconciliation compares within the codec's
+  quanta (`codec.near`), so quantization is not a correction. A NaN or
+  infinite `float32()` off the wire refuses the frame.
+- **Ids travel as indexes** the host never reuses; a lost name is asked for
+  again, and the entity is left out until it arrives
+  (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
+  The host honours a `u` request for an index at most once per 100 ms
+  (`dropped['name-request-throttled']`). Ids unseen for `NAME_FORGET_MS`
+  (10 s) are forgotten and named afresh on return (the player keeps names
+  30 s), so projectiles do not grow the tables all match.
+- **Binary snapshots carry the host's instance** (wire version 2, part of
+  the fingerprint). A host re-created under the same label resets the
+  player's names and snapshots instead of being read through the old
+  names; a pre-instance package has another fingerprint, so a mixed pair
+  runs on JSON.
+
+## Sharded matches: several hosts, one arena
+
+When one host's upload can't carry the match, split the entities across
+hosts. Each player joins **every** host and merges them with `joinShards`.
+Each host owns some entities and is authoritative for those only.
+Ownership is an explicit record, the `ShardAssignment`:
+`{ epoch, hosts: { [shard]: nodeHex }, owner: { [entityId]: shard } }`.
+
+```ts
+import { joinShards } from '@net-mesh/browser/netcode';
+
+const match = joinShards<Ship, Move>({
+  transport: node,
+  label: 'arena.move',
+  assignment,                         // or `ownerOf: (id, assignment) => shard`
+  local: { id: myId, predict: move }, // predicted on the shard that owns you
+  interest: cellsAround(x, z),        // sent to every shard
+});
+draw(match.view());                   // merged: remote interpolated, yours predicted
+match.input(data);                    // to the owning shard only, stamped with the epoch
+match.hostNow('s1');                  // that shard's clock (for hit claims)
+match.setAssignment(next);            // a higher epoch only; returns false otherwise
+match.stats();                        // per shard (silentMs), and what the fencing dropped
+```
+
+- **An entity is drawn only from its owner at the installed epoch.**
+  Another shard's copy is dropped (`droppedNotOwner`).
+- **A shard sending snapshots from another epoch is frozen** at its last
+  drawn state, minus what it no longer owns, until it catches up
+  (`droppedStaleEpoch`) or you install its newer epoch (`heldNewerEpoch`).
+  So a player that installs an assignment before its hosts doesn't see the
+  world blink.
+- **An owner change lingers** at the old owner's last state for `lingerMs`
+  (default 1000), or until the new owner first shows it.
+- **The epoch rides the wire:** `hostNetcode({ epoch })` stamps snapshots
+  and drops input frames from another epoch (`dropped['stale-epoch']`).
+  `joinNetcode({ epoch })` stamps inputs, and `stats().epoch` is the newest
+  snapshot's.
+
+**The host side is a recipe, not an API:**
+`net/crates/net/browser-ts/demo/sharded-arena/shard.js` (`shardHost(lib,
+options)`, typed in `shard.d.ts`). Copy it. It wires:
+- `hostNetcode` sending and applying only what the shard owns;
+- `authorize` limited to the roster plus the other hosts;
+- fog by the player's position on whichever host owns it;
+- a spectator `joinNetcode` to every other host;
+- `regionHandoffs` over a `handoffLink` whose peers come from the
+  assignment.
+
+The page beside it runs 4 hosts × 32 bots on the local mesh.
+
+**Cross-host hits** (`options.combat`, hitscan). A fire input
+`{ fire: { target, seenB } }` (with `seenB = match.hostNow(targetShard) -
+interpolationDelayMs`) is checked at the shooter's host. A shot at another
+shard's target is forwarded as a `hit` action, which the target's host
+applies at most once. That host refuses for:
+- another epoch (`stale-epoch`);
+- a `seenB` older than its rewind cap (`beyond-cap`);
+- no history of the shooter at `seenA` (`no-history`);
+- a claimed shooter pose that doesn't match that history (`pose-mismatch`).
+
+It checks the pose against **`NetcodeClient.sampleAt(hostTime)`**, its own
+past snapshots of the shooter's host, never the current view, so a fast
+shooter isn't falsely refused. An unanswered hit is a miss after 500 ms.
+Mutual kills across hosts trade.
+
+- **The rewind cap is the latency budget.** A claim reaches the target's
+  host aged interpolation delay + player→host + up to a tick + host→host.
+  The recipe's default `combat.maxRewindMs` is 500 ms. Measured:
+  - 300 ms lost most cross-host hits beyond ~40 ms one-way, with only 11%
+    landing at 80–140 ms;
+  - 500 ms lands 97% at 80–140 ms.
+
+  A longer rewind lets laggy players hit around corners; size it for your
+  players.
+- **The assignment lives in the lobby's store** as a `MatchAssignment`
+  (`{ epoch, shards: { [name]: { host, squads } }, squads, leases, renewals }`):
+  - `assignmentProblems` validates it: each player owned once, and no host
+    owning its own squad.
+  - `assignAction({ lobby })` is the store action only the lobby node may
+    call.
+  - `shardAssignment(record)` is what `joinShards` takes.
+  - `authorizeTeams` admits `team:<name>` audiences.
+- **Leases fence what can't hear the lobby.** The lobby bumps counters with
+  `renewLeases` every `leaseMs / 3`. `leaseWatch({ read, leaseMs })` judges
+  one on this node's own clock, from when a renewal arrives:
+  - a host passes it as `hostNetcode({ live })` and stops simulating and
+    sending without it;
+  - a player passes one over `renewals` as `joinShards({ live })` and
+    freezes (`stats().frozen`: show "reconnecting").
+  - The first value it reads is a baseline, not a lease (a replica can
+    hold a counter written long ago). It is live once a renewal is seen
+    to arrive, about `leaseMs / 3` after it starts. Poll it every tick or
+    frame: it notices a move only when asked.
+
+  Reassign a lost host's entities only once `mayReassign(lastRenewedAt,
+  now, leaseMs, driftMarginMs, maxDeliveryMs)` says so. `maxDeliveryMs`
+  bounds how late a renewal can reach a host: one delivered later keeps
+  that host live past the reassignment. Size it from the store's measured
+  replication delay; the default 0 assumes instant delivery.
+- **Planned moves carry the input boundary.** The recipe's
+  `movePlayer(peer, toShard)` freezes the entity together with
+  `hostNetcode.releasePlayer(peer)`'s `{ lastApplied }` in one
+  synchronous turn. The new owner adopts it (`adoptPlayer`), so an input
+  the old host applied is never applied again, even when its
+  acknowledgement was lost. The boundary waits for the player however late
+  it arrives: a record that times out first, or a peer `authorize` refuses
+  for now (`dropped['adopt-unauthorized']`), keeps it for when the player is
+  admitted. `joinShards` shares one input sequence across
+  shards (`createInputSequencer`). Raise the epoch when the handoff
+  reports `moved`.
+- **A lost host is a rollback.** After the lease wait, reassign its
+  entities. The new owner restores each one from the last snapshot it
+  observed (`NetcodeClient.latest()`), and the player resumes from its
+  next input (`adoptPlayer(peer, { resume: true })` drops what was
+  pending). A hit in flight to the lost host is a miss, and is never
+  re-sent.
+- **NPCs** belong to a shard per `npcShard(id, shards)`, deterministic on
+  every node (`withNpcs` spawns a batch). The owner runs their AI in the
+  recipe's `advance(entities, ai)` and fires with `ai.fire(npc, target)`.
+- **NPCs on paths:** publish a route once (`NpcPath` in the lobby store,
+  written through `pathAction`, owner-only) instead of every tick. Draw
+  with `npcModes().resolve(view, records, ownerNow)`, which picks the
+  source with the higher mode version `mv`. Never put a fogged NPC on a
+  path: the record goes to every reader. Measured with 50 NPCs: 47 KB/s
+  live, 1.6 KB/s on paths, per viewer.
+  - The saving is for players only. The recipe keeps sending a path NPC
+    to the other hosts and into its own rewind history, so it can still
+    be hit, shoot, and be restored when its host is lost (it comes back
+    live under a new `mv`).
+  - A refused path write switches the NPC back to live under a further
+    `mv`. A path NPC that dies, or can't be restored, gets its record
+    retired (`mode: 'live'`, no points). `npcModes` holds a live NPC no
+    snapshot shows for `carryMs`, then stops drawing it.
+- **One clock per host.** The recipe's `now` defaults to the netcode's
+  (`performance.now()`), the clock `hostNow()` estimates. Hits, NPC shots
+  and path points are all on it; `host.now()` reads it for path points.
+  Don't pass `Date.now` to one piece and leave the rest on the default:
+  every forwarded hit is then refused `beyond-cap`.
+- Tests:
+  `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/sharded-arena.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/cross-host-hits.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/assignment.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/planned-move.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/host-crash.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/npc.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/npc-paths.test.ts`.
+
 ## Rules that bite
+
+- **A join that never connects says why.** `await net.ready()` rejects
+  with a `NetcodeError` after `joinTimeoutMs` (default 15 s):
+  `no-announcement` means this node never heard the host announce, so it
+  cannot reach it. A lobby announces for you; a page that joins a host
+  directly must make sure the host announces and query its tag first.
+  `stats().connectOutcome` shows the last `connectPeer` outcome. After a
+  direct attempt ends relayed, or `connectPeer` rejects, the next offer
+  waits `directRetryMs` (default 30 s); reopened streams ride the session
+  there is meanwhile.
 
 - **Lossy streams are `connect()`-only.** `openSession()` refuses
   `lossy: true`; games run on `connect()` anyway (stores need it too).
@@ -154,14 +362,16 @@ with physics ragdolls and 2–16 players, works this way:
 - **Past the newest snapshot remote entities hold**, unless you set
   `extrapolateMs` (then they carry on along their last motion for at most
   that long; a custom `interpolate` then sees `alpha > 1`).
-- **Not built yet:** binary encoding (frames are JSON).
+- **Snapshots are JSON unless both ends have a codec** (Compact snapshots, above).
 - **Building blocks are exported too**, for a custom loop: `ClockEstimator`
   (NTP-style offset from the lowest-RTT samples), `SnapshotBuffer`
-  (time-ordered snapshots with interpolated reads) and `lerpNumbers` (the
-  default interpolator).
+  (time-ordered snapshots with interpolated reads; `sample` at a snapshot's
+  exact time returns that snapshot whole), `lerpNumbers` (the default
+  interpolator) and `lerpAngle`.
 - The **anchor must be the same release** as the package: an older anchor
   treats the lossy channel as its only one.
 - Source: `net/crates/net/browser-ts/src/netcode/`, tests
   `net/crates/net/browser-ts/test/netcode/netcode.test.ts` (a simulated
-  lossy, laggy network) and `net/crates/net/sdk-ts/test/store_transport.test.ts`
+  lossy, laggy network), `net/crates/net/browser-ts/test/netcode/codec.test.ts` (compact
+  snapshots) and `net/crates/net/sdk-ts/test/store_transport.test.ts`
   (a native dedicated host).

@@ -118,7 +118,7 @@ function frame() {
 | Option | Default | |
 |---|---|---|
 | `interpolationDelayMs` | 100 | how far behind the host clock others render |
-| `interpolate` | `lerpNumbers` | blend two states; numeric fields, nested too |
+| `interpolate` | `lerpNumbers` (the codec's blend with a `codec`) | blend two states; numeric fields, nested too |
 | `correctionSmoothingMs` | 100 | how long a correction takes to show |
 | `extrapolateMs` | 0 | carry others on through a late snapshot |
 | `inputRedundancy` | 8 | unacknowledged inputs repeated per input frame |
@@ -126,15 +126,117 @@ function frame() {
 | `interest` | none | interest keys to receive |
 
 `stats()` reports `clock` (`offsetMs`, `rttMs`, `jitterMs`, `samples`),
-`snapshots`, `lateSnapshots` (reordered by the carrier), `pendingInputs`,
-`corrections` and `partialSnapshots` (chunked snapshots completed with carried-over
-entities). `hostNow()` is the host clock as estimated, and `close()` stops the
+`snapshots`, `lateSnapshots` (reordered by the carrier), `pendingInputs`
+(dropped once the host acknowledges them, whether or not the client predicts),
+`corrections`, `partialSnapshots` (chunked snapshots completed with carried-over
+entities), `binaryFrames` and `unnamedEntities` (compact snapshots, below). `hostNow()` is the host clock as estimated, and `close()` stops the
 player.
 
 The building blocks are exported too: `ClockEstimator` (NTP-style, trusting the
-lowest-RTT samples), `SnapshotBuffer` and `lerpNumbers`.
+lowest-RTT samples), `SnapshotBuffer`, `lerpNumbers`, and `lerpAngle` (an
+angle the short way round, for a custom `interpolate`).
+
+## Compact snapshots
+
+Give host and players the same entity codec, and snapshots go binary: about
+7x smaller than JSON for typical transforms (measured:
+the package's `bench:netcode` script with `--codec compact`).
+
+```ts
+import { angle, entityCodec, quantized, uint } from '@net-mesh/browser/netcode';
+
+const shipCodec = entityCodec<Ship>({
+  x: quantized(0, 512),   // 16 bits over the range: ~8 mm
+  z: quantized(0, 512),
+  yaw: angle(),           // 8 bits: ~1.4 degrees
+  hp: uint(8),
+});
+hostNetcode({ /* ... */, codec: shipCodec });
+joinNetcode({ /* ... */, codec: shipCodec });
+```
+
+- **Fields:** `quantized(min, max, bits = 16)` (clamped to the range),
+  `angle(bits = 8)`, `uint(bits)`, `int(bits)`, `float32()`, `bool()`. An
+  entity must be a flat object of exactly the schema's fields.
+- **JSON is the fallback, never an error.** A player sends its codec's
+  fingerprint; the host sends binary only on a match, JSON otherwise. An
+  entity the codec refuses (an extra field, a value out of range) sends that
+  player JSON for that tick and counts `dropped['codec-write-failed']`.
+- **Values arrive quantized.** Reconciliation compares within the codec's
+  quanta (`codec.near`), so quantization is not a correction. A `float32()`
+  that arrives as NaN or an infinity refuses the frame.
+- **Angles turn the short way.** With a codec and no `interpolate` of its
+  own, a player blends with `codec.interpolate`: an `angle()` field goes from
+  350° to 10° through 0°, in interpolation and in a correction alike.
+- **Ids travel as indexes** the host never reuses; a lost name is asked for
+  again, and the entity is left out until it arrives
+  (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
+  An id no player has been shown for 10 s is forgotten and named afresh if
+  it returns, so short-lived ids do not grow the tables all match. Every
+  binary snapshot carries the host's instance: a host re-created under the
+  same label is never read through the old one's names.
+- **The fingerprint covers the wire version too.** A package from before
+  instance-stamped snapshots has another fingerprint for the same schema,
+  so a mixed pair runs on JSON.
+
+## Several hosts: a sharded match
+
+One host's upload carries roughly 128 players at 20 Hz with compact
+snapshots. Past that, or with many NPCs, split the match. Each host owns
+some of the entities and is authoritative for those alone. Each player
+joins every host, and `joinShards` merges them into one view:
+
+```ts
+import { joinShards } from '@net-mesh/browser/netcode';
+
+const match = joinShards<Ship, Move>({
+  transport: node,
+  label: 'arena.move',
+  // Who hosts which shard, and who owns which entity, at one epoch.
+  assignment: {
+    epoch: 1,
+    hosts: { s0: hostA, s1: hostB },
+    owner: { [myId]: 's0', [rivalId]: 's1' },
+  },
+  local: { id: myId, predict: move },
+});
+
+renderLoop(() => draw(match.view())); // every shard's own entities; yours predicted
+onKey(input => match.input(input));   // sent only to the shard that owns you
+```
+
+- **An entity is drawn only from the shard that owns it.** A copy from any
+  other host is ignored, so a host can't show you what it doesn't own.
+- **The assignment changes by epoch.** `setAssignment(next)` installs a
+  higher epoch and ignores anything else. Hosts stamp each snapshot with
+  their epoch (`hostNetcode({ epoch })`). A host still sending from
+  another epoch is frozen at what you last saw from it, so the world
+  doesn't blink while everyone catches up. An entity that changes owner
+  lingers briefly at its last position. A shard that has to be rejoined
+  (its host changed, or you moved to or from it) keeps showing what it
+  last drew until the new connection's first snapshot, and `ready()`
+  waits on the new connection, not the closed one.
+- **`stats()`** reports each shard, including how long it has been silent,
+  and counts what the ownership and epoch rules dropped.
+
+Each host runs `hostNetcode` for the entities it owns, plus a spectator
+`joinNetcode` to every other host so it knows the whole world. A
+cross-host hit is checked by the shooter's host and decided by the
+target's host, against its own history of the shooter
+(`NetcodeClient.sampleAt`). The browser package's `demo/sharded-arena/`
+is the recipe to copy.
 
 ## Rules that bite
+
+- **A join that never connects says why.** `await net.ready()` rejects
+  with a `NetcodeError` after `joinTimeoutMs` (default 15 s):
+  `no-announcement` means this node never heard the host announce, so it
+  cannot reach it. A lobby announces for you; a page that joins a host
+  directly must make sure the host announces and query its tag first.
+  `stats().connectOutcome` shows the last `connectPeer` outcome. After a
+  direct attempt ends relayed, or `connectPeer` rejects, the client waits
+  `directRetryMs` (default 30 s) before offering again, and reopens its
+  stream on the session there is meanwhile.
 
 - **The lossy carrier is `connect()`-only.** A follower tab's `openSession()`
   refuses `lossy: true`. Games run on `connect()` anyway, as stores do.
@@ -143,7 +245,7 @@ lowest-RTT samples), `SnapshotBuffer` and `lerpNumbers`.
   `interest` rather than sending the world.
 - **The anchor must be the same release as the package.** An older anchor does
   not know the lossy channel and treats it as the page's only one.
-- **Frames are JSON.** Binary encoding is not built yet.
+- **Snapshots are JSON unless both ends have a codec.** See Compact snapshots, above.
 - **`interpolationDelayMs` is fixed.** On bursty links, such as a relayed pair
   or busy Wi-Fi, a fixed delay either stutters or adds lag everyone feels. If
   remote entities stop and jump, raise it, or adapt it in a custom loop (below).

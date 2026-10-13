@@ -28,6 +28,7 @@
  * otherwise a node that announces a region could also send offers as it.
  */
 
+import { ANNOUNCE_RETRY_MAX_MS, ANNOUNCE_RETRY_MS } from '../lobby.js';
 import { nodeHexOf } from '../store/host.js';
 import type { NodeDescriptor } from '../node.js';
 import { joinStore, type JoinedStoreHandle } from '../store/join.js';
@@ -63,8 +64,15 @@ export function regionTag(world: string, region: string): string {
   return `net-world:${world}:region:${region}`;
 }
 
-/** How often region hosts re-announce: an announcement is a lease. */
-export const REGION_ANNOUNCE_MS = 2_000;
+/**
+ * How often region hosts re-announce: an announcement is a lease, held
+ * for the leaf's 300 s TTL. 30 s, not 2 s, for the reason
+ * `LOBBY_ANNOUNCE_MS` gives: re-announcements flood through the anchor to
+ * every peer, and at 2 s they saturated a host's anchor link at 64 nodes.
+ * A failed announcement is retried sooner, as a lobby's is
+ * (`ANNOUNCE_RETRY_MS`, doubling up to `ANNOUNCE_RETRY_MAX_MS`).
+ */
+export const REGION_ANNOUNCE_MS = 30_000;
 
 /**
  * Announce that this node hosts `regions` of `world`, and keep announcing
@@ -79,8 +87,30 @@ export function announceRegions(
 ): Cancel {
   const tags = [...(options.tags ?? []), ...regions.map(region => regionTag(world, region))];
   let stopped = false;
+  // A failed announcement is retried on a short backoff of its own: a
+  // region nobody can find for a whole lease refresh is a hole in the map.
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let retryMs = ANNOUNCE_RETRY_MS;
   const once = () => {
-    if (!stopped) void node.announce(tags).catch(() => undefined);
+    if (stopped) return;
+    if (retry !== null) {
+      clearTimeout(retry);
+      retry = null;
+    }
+    void node.announce(tags).then(
+      () => {
+        retryMs = ANNOUNCE_RETRY_MS;
+      },
+      () => {
+        if (stopped || retry !== null) return;
+        retry = setTimeout(() => {
+          retry = null;
+          once();
+        }, retryMs);
+        (retry as { unref?: () => void }).unref?.();
+        retryMs = Math.min(retryMs * 2, ANNOUNCE_RETRY_MAX_MS);
+      },
+    );
   };
   once();
   const timer = setInterval(once, options.everyMs ?? REGION_ANNOUNCE_MS);
@@ -88,6 +118,7 @@ export function announceRegions(
   return () => {
     stopped = true;
     clearInterval(timer);
+    if (retry !== null) clearTimeout(retry);
   };
 }
 

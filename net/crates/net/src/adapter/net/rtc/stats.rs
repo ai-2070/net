@@ -155,6 +155,7 @@ pub struct RtcStats {
     stun_binding_requests: AtomicU64,
     bootstrap_rate_limited: AtomicU64,
     bootstrap_rate_table_full: AtomicU64,
+    bootstrap_visitor_budget_degraded: AtomicU64,
     ice_attempted: AtomicU64,
     ice_direct: AtomicU64,
     ice_relayed: AtomicU64,
@@ -368,6 +369,11 @@ impl RtcStats {
         bootstrap_rate_table_full,
         note_bootstrap_rate_table_full,
         "Bootstrap listener requests refused because the rate limiter already holds its bound of live sources and this source is new. Separate from `bootstrap_rate_limited`: this is many sources at once, not one eager one, and no existing restriction was evicted to admit it."
+    );
+    counter!(
+        bootstrap_visitor_budget_degraded,
+        note_bootstrap_visitor_budget_degraded,
+        "Bootstrap offers admitted WITHOUT a per-visitor (source, credential) budget, on the per-source backstop alone, because the per-visitor table was full or the source already held its bound of visitor budgets. Admitted, not refused: a full per-visitor table must not refuse every new visitor anchor-wide."
     );
     // ---------------------------------------------------------------
     // The ICE attempt ledger (plan §10). Read the type-level

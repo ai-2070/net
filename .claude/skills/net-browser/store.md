@@ -341,7 +341,10 @@ writes.
   Trading is not built — do not fake it with two independent actions.
 - **Prefer a lobby over hand-rolled discovery.** `createLobby({ node, game,
   name, capacity, info?, visibility?, …hostStore options })` hosts the store,
-  gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own;
+  gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own
+  (every `LOBBY_ANNOUNCE_MS`, 30 s; a FAILED announcement, the lobby's or a
+  joiner's seek tag, is retried after `ANNOUNCE_RETRY_MS`, 1 s, doubling to
+  `ANNOUNCE_RETRY_MAX_MS`, 8 s);
   `listLobbies({ node, game })` returns `{ code, name, players, capacity, info,
   host, store }`; `joinLobby({ node, definition, game, code | lobby })` finds
   the host and returns a `joinStore` handle (await `ready()`). Capacity counts
@@ -357,7 +360,7 @@ writes.
     Announcements take a moment to reach a node that just connected. Poll
     every 500 ms for about 4 s before showing "no games".
   - **A closed tab's lobby stays listed until its announcement lapses.** The
-    host re-announces every `LOBBY_ANNOUNCE_MS` (2 s); a tab killed outright
+    host refreshes its announcement every `LOBBY_ANNOUNCE_MS` (30 s); a tab killed outright
     withdraws nothing. Expect a stale entry for a short while, and a
     `joinLobby` that answers `not-found`.
   - **Close a joined lobby before creating one on the same node.** Closing
@@ -379,8 +382,10 @@ writes.
     boundary); `createLobby({ game })` / `listLobbies({ game })` scope the
     listings inside it. They may differ.
 - **Discovery before join** (without a lobby). Share the host's `node.nodeIdHex()` out of band (the
-  demo uses a `?host=<hex>` link). The host announces a tag and **re-announces
-  every ~2 s** — announcements are leases that expire. The joiner polls
+  demo uses a `?host=<hex>` link). The host announces a tag and **refreshes it
+  every ~30 s** — announcements are leases that expire (300 s TTL). Not
+  faster: every refresh floods through the anchor to every peer, and at 2 s
+  that saturated a host's anchor link at 64 players. The joiner polls
   `node.query(tag)` until the host is present — compare with
   `peerIdHex(descriptor.nodeId)`, since a descriptor's `nodeId` is decimal — and
   only then calls `joinStore`; joining a host it has never seen fails with

@@ -286,6 +286,26 @@ impl LeafEvent {
             ),
         }
     }
+
+    /// The `(peer_node, stream_id)` a `stream_data` event is for,
+    /// read back from [`Self::to_json`]'s own spelling; `None` for
+    /// every other event.
+    ///
+    /// For a consumer that holds only the text — a session's
+    /// listeners, which are handed events relayed between tabs as
+    /// JSON — so it can route an event to its stream once, instead
+    /// of handing every event to every stream's filter to read.
+    pub fn stream_data_key(json: &str) -> Option<(NodeId, u64)> {
+        let rest = json.strip_prefix("{\"type\":\"stream_data\",")?;
+        // The first occurrence is the field: the fields before the
+        // payload are decimal strings, and base64 has no quote.
+        let field = |name: &str| -> Option<u64> {
+            let start = rest.find(&format!("\"{name}\":\""))? + name.len() + 4;
+            let len = rest[start..].find('"')?;
+            rest[start..start + len].parse().ok()
+        };
+        Some((field("peer_node")?, field("stream_id")?))
+    }
 }
 
 /// One outbound packet and who it is for.
@@ -1275,6 +1295,14 @@ impl LeafNode {
     /// an authenticated peer.
     pub fn take_verified_admissions(&mut self) -> Vec<NodeId> {
         core::mem::take(&mut self.verified_admissions)
+    }
+
+    /// Whether `peer`'s establishment proof verified and is waiting to
+    /// be taken by [`Self::take_verified_admissions`] — so its
+    /// provisional entry is gone because it was PROMOTED, not because
+    /// it expired.
+    pub fn verified_admission_pending(&self, peer: NodeId) -> bool {
+        self.verified_admissions.contains(&peer)
     }
 
     /// Retire every provisional establishment whose deadline has
@@ -5681,6 +5709,35 @@ mod tests {
             crate::stream::stream_id_from_label("app/telemetry")
         );
         assert!(parsed.header.flags.is_reliable());
+    }
+
+    /// The key a session routes `stream_data` by is read back from
+    /// the serializer's own output — both halves, at the extremes —
+    /// and no other event has one, not even `stream_failed`, which
+    /// carries the same two fields.
+    #[test]
+    fn a_stream_data_key_reads_back_from_the_event_json() {
+        let event = LeafEvent::StreamData {
+            peer_node: u64::MAX - 1,
+            incarnation: 7,
+            stream_id: u64::MAX,
+            seq: 3,
+            payload: Bytes::from_static(b"\"stream_id\":\"1\""),
+        };
+        assert_eq!(
+            LeafEvent::stream_data_key(&event.to_json()),
+            Some((u64::MAX - 1, u64::MAX))
+        );
+        let failed = LeafEvent::StreamFailed {
+            peer_node: 5,
+            stream_id: 6,
+            reason: StreamFailure::PeerReset,
+        };
+        assert_eq!(LeafEvent::stream_data_key(&failed.to_json()), None);
+        assert_eq!(
+            LeafEvent::stream_data_key("{\"type\":\"stream_data\"}"),
+            None
+        );
     }
 
     #[test]

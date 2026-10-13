@@ -15,6 +15,12 @@ export interface SimOptions {
   readonly lossRate?: number;
   /** Extra per-frame delay spread, ms (uniform 0..jitterMs) — reorders. */
   readonly jitterMs?: number;
+  /**
+   * Fraction of frames, reliable or lossy, delivered twice (the copy after
+   * its own independent delay): what a retransmit whose original was only
+   * late looks like from above.
+   */
+  readonly duplicateRate?: number;
   readonly seed?: number;
   /**
    * How events spell the sender: `'decimal'` (the default — what the
@@ -44,6 +50,8 @@ export function simNetwork(options: SimOptions) {
   // it was opened under, like the leaf's stale-handle refusal.
   const incarnation = new Map<string, number>();
   const stats: SimStats = { sent: 0, dropped: 0, delivered: 0 };
+  // Links cut until a time: `from>to` → the Date.now() it heals at.
+  const blocked = new Map<string, number>();
 
   function node(id: string): NetcodeTransport {
     handlers.set(id, handlers.get(id) ?? new Set());
@@ -63,15 +71,24 @@ export function simNetwork(options: SimOptions) {
               stats.dropped += 1;
               return;
             }
-            const delay = options.latencyMs + random() * (options.jitterMs ?? 0);
-            const copy = payload.slice();
-            setTimeout(() => {
-              stats.delivered += 1;
-              for (const handler of [...(handlers.get(peer) ?? [])]) {
-                const peerNode = options.peerSpelling === 'hex' ? id : BigInt(`0x${id}`).toString(10);
-                handler({ type: 'stream_data', streamId: label, peerNode, payload: copy });
-              }
-            }, delay);
+            if ((blocked.get(`${id}>${peer}`) ?? 0) > Date.now()) {
+              stats.dropped += 1;
+              return;
+            }
+            // Drawn only when asked for, so a seeded run without duplicates
+            // keeps the exact loss pattern it always had.
+            const copies = (options.duplicateRate ?? 0) > 0 && random() < options.duplicateRate! ? 2 : 1;
+            for (let n = 0; n < copies; n += 1) {
+              const delay = options.latencyMs + random() * (options.jitterMs ?? 0);
+              const copy = payload.slice();
+              setTimeout(() => {
+                stats.delivered += 1;
+                for (const handler of [...(handlers.get(peer) ?? [])]) {
+                  const peerNode = options.peerSpelling === 'hex' ? id : BigInt(`0x${id}`).toString(10);
+                  handler({ type: 'stream_data', streamId: label, peerNode, payload: copy });
+                }
+              }, delay);
+            }
           },
           close: () => {
             open = false;
@@ -90,5 +107,9 @@ export function simNetwork(options: SimOptions) {
   const replaceSession = (id: string) => {
     incarnation.set(id, (incarnation.get(id) ?? 0) + 1);
   };
-  return { node, stats, replaceSession };
+  /** Drop every frame `from` sends `to` for the next `ms` (Date.now() clock). */
+  const block = (from: string, to: string, ms: number) => {
+    blocked.set(`${from}>${to}`, Date.now() + ms);
+  };
+  return { node, stats, replaceSession, block };
 }

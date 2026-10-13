@@ -27,7 +27,7 @@ use net_sdk::enrollment::InviteToken;
 use net_sdk::identity::Identity;
 use net_sdk::rtc_bootstrap::{
     bootstrap_router, serve_bootstrap, AnchorInfo, BootstrapConfig, BootstrapTls, ErrorBody,
-    OfferResponse,
+    OfferResponse, VISITOR_BUDGETS_PER_SOURCE,
 };
 use tower::ServiceExt as _;
 
@@ -119,6 +119,17 @@ async fn post_offer(
     node_id: u64,
     sdp: &str,
 ) -> (StatusCode, Vec<u8>) {
+    post_offer_from(router, credential, node_id, sdp, "203.0.113.9:5000").await
+}
+
+/// [`post_offer`] from a chosen source address.
+async fn post_offer_from(
+    router: &axum::Router,
+    credential: &BrowserBootstrapCredential,
+    node_id: u64,
+    sdp: &str,
+    from: &str,
+) -> (StatusCode, Vec<u8>) {
     let request = Request::builder()
         .method("POST")
         .uri("/rtc/offer")
@@ -129,7 +140,7 @@ async fn post_offer(
     let response = router
         .clone()
         .into_make_service_with_connect_info::<std::net::SocketAddr>()
-        .oneshot("203.0.113.9:5000".parse::<std::net::SocketAddr>().unwrap())
+        .oneshot(from.parse::<std::net::SocketAddr>().unwrap())
         .await
         .expect("make service")
         .oneshot(request)
@@ -290,6 +301,170 @@ async fn the_per_source_ip_rate_limit_refuses_typed_and_early() {
     assert_eq!(refusals[1].1, "wrong_trust_domain");
     assert_eq!(refusals[2].0, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(refusals[2].1, "rate_limited");
+}
+
+/// Visitors behind ONE address (a carrier NAT, a campus, a LAN party)
+/// each get their own offer budget: it is charged per (address,
+/// credential), and only the backstop is per address. Found by the
+/// sharded-match S0b run, where the eleventh player behind one address
+/// was refused inside a minute.
+///
+/// Inverse: charge the visitor budget by address alone (drop the nonce
+/// from the key) — the second credential's first offer is
+/// `rate_limited` and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn visitors_behind_one_address_each_get_their_own_offer_budget() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.offers_per_credential_per_minute = 2;
+    cfg.offers_per_ip_per_minute = 100;
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let alice = credential_for(PSK, Duration::from_secs(600));
+    let bob = credential_for(PSK, Duration::from_secs(600));
+
+    let mut alice_refusals = Vec::new();
+    for node in 0..3u64 {
+        let (status, body) = post_offer(&router, &alice, 0x100 + node, "v=0").await;
+        alice_refusals.push((status, body));
+    }
+    for (status, body) in &alice_refusals[..2] {
+        assert!(
+            *status == StatusCode::OK || refusal_of(body) != "rate_limited",
+            "within the visitor budget: {status}"
+        );
+    }
+    assert_eq!(alice_refusals[2].0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refusal_of(&alice_refusals[2].1), "rate_limited");
+    assert!(message_of(&alice_refusals[2].1).contains("for this credential"));
+
+    // Same address, another visitor: a budget of its own.
+    let (status, body) = post_offer(&router, &bob, 0x200, "v=0").await;
+    assert!(
+        status == StatusCode::OK || refusal_of(&body) != "rate_limited",
+        "a second visitor behind the same address was refused: {status}"
+    );
+}
+
+/// The per-address backstop still bounds what one address spends
+/// across every credential it presents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_per_address_backstop_caps_every_credential_together() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.offers_per_credential_per_minute = 10;
+    cfg.offers_per_ip_per_minute = 3;
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let mut answers = Vec::new();
+    for node in 0..4u64 {
+        let visitor = credential_for(PSK, Duration::from_secs(600));
+        answers.push(post_offer(&router, &visitor, 0x300 + node, "v=0").await);
+    }
+    for (status, body) in &answers[..3] {
+        assert!(*status == StatusCode::OK || refusal_of(body) != "rate_limited");
+    }
+    assert_eq!(answers[3].0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refusal_of(&answers[3].1), "rate_limited");
+    assert!(
+        message_of(&answers[3].1).contains("from this address")
+            && !message_of(&answers[3].1).contains("for this credential"),
+        "the backstop, not a visitor budget: {}",
+        message_of(&answers[3].1)
+    );
+}
+
+/// One credential shipped to many visitors (`anchor credential mint`)
+/// is charged per ADDRESS, never globally: visitors elsewhere are not
+/// spending each other's budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_credential_is_charged_per_address_not_globally() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.offers_per_credential_per_minute = 2;
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let shared = credential_for(PSK, Duration::from_secs(600));
+    let mut here = Vec::new();
+    for node in 0..3u64 {
+        here.push(
+            post_offer_from(&router, &shared, 0x400 + node, "v=0", "198.51.100.1:5000").await,
+        );
+    }
+    assert_eq!(refusal_of(&here[2].1), "rate_limited");
+    let (status, body) = post_offer_from(&router, &shared, 0x500, "v=0", "198.51.100.2:5000").await;
+    assert!(
+        status == StatusCode::OK || refusal_of(&body) != "rate_limited",
+        "a visitor at another address shares nothing with the first: {status}"
+    );
+}
+
+/// The visitor budget is charged only AFTER the issuer signature
+/// verifies: a forged copy of a visitor's invite, refused as malformed,
+/// cannot spend that visitor's offers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_credential_cannot_spend_a_visitors_budget() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.offers_per_credential_per_minute = 1;
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let genuine = credential_for(PSK, Duration::from_secs(600));
+    let forged = BrowserBootstrapCredential::mint(
+        &Identity::from_seed([0xEEu8; 32]),
+        genuine.invite.clone(),
+        [3u8; 32],
+        Psk::new(PSK),
+        "https://anchor.example",
+        Duration::from_secs(86_400),
+    );
+    for node in 0..3u64 {
+        let (status, body) = post_offer(&router, &forged, 0x600 + node, "v=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(refusal_of(&body), "rate_limited");
+    }
+    let (status, body) = post_offer(&router, &genuine, 0x700, "v=0").await;
+    assert!(
+        status == StatusCode::OK || refusal_of(&body) != "rate_limited",
+        "the forgeries spent the genuine visitor's budget: {status}"
+    );
+}
+
+/// Review ANCHOR-1: one address presenting more credentials than it may
+/// hold per-visitor budgets for is not refused for want of room. The
+/// visitors past [`VISITOR_BUDGETS_PER_SOURCE`] are admitted on the
+/// per-address backstop and counted, and the visitors that DO hold a
+/// budget are still held to it. Before, the per-visitor table had no
+/// per-source cap, and once full it refused every new visitor
+/// anchor-wide.
+///
+/// Inverse: refuse in `admit_visitor` when there is no room — the
+/// visitors past the cap come back `rate_limited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visitor_with_no_room_for_a_budget_is_admitted_on_the_backstop() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.offers_per_credential_per_minute = 1;
+    cfg.offers_per_ip_per_minute = 1_000;
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let extra = 4;
+    let visitors: Vec<_> = (0..VISITOR_BUDGETS_PER_SOURCE + extra)
+        .map(|_| credential_for(PSK, Duration::from_secs(600)))
+        .collect();
+    for (i, visitor) in visitors.iter().enumerate() {
+        let (status, body) = post_offer(&router, visitor, 0x800 + i as u64, "v=0").await;
+        assert!(
+            status == StatusCode::OK || refusal_of(&body) != "rate_limited",
+            "visitor {i} was refused for want of a budget: {status}"
+        );
+    }
+    assert_eq!(
+        anchor.rtc_stats().bootstrap_visitor_budget_degraded(),
+        extra as u64,
+        "the visitors past the cap were admitted on the backstop"
+    );
+    let (status, body) = post_offer(&router, &visitors[0], 0x900, "v=0").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        message_of(&body).contains("for this credential"),
+        "a visitor holding a budget is still held to it"
+    );
 }
 
 /// CORS is an explicit allow-list: the configured origin is echoed,

@@ -14,6 +14,182 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## Unreleased
+
+- **`joinShards` merges a match split across several hosts** (topology A:
+  every player joins every host). It runs one `joinNetcode` per shard host
+  and draws each entity only from the shard that owns it in the installed
+  `ShardAssignment` (`{ epoch, hosts, owner }`, or an `ownerOf` resolver).
+  Inputs go only to the shard that owns you. A shard sending snapshots
+  from another epoch is frozen at its last drawn state, minus anything it
+  no longer owns, until it catches up or `setAssignment` installs its
+  epoch. When ownership changes, the old owner's copy lingers for
+  `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
+  what the fencing dropped.
+- **NPCs on paths.** An NPC on a known route can be published once, as an
+  `NpcPath` record in the lobby store, instead of in every snapshot.
+  - `pathAction({ assignment })` is the store action: only the NPC's
+    owning host may write a record.
+  - `npcModes().resolve(view, records, ownerNow)` is what a client draws
+    from. It picks whichever source, snapshot or record, carries the
+    higher mode version `mv`. While a due record is late it carries the
+    NPC forward for up to 500 ms, and it blends every switch.
+  - `pathAt` evaluates a path.
+
+  Measured with 50 NPCs: 47 KB/s live, 1.6 KB/s on paths, per viewer.
+- **NPCs in sharded matches.** A `ShardRecord` lists the NPCs its shard
+  owns (`npcs`). `npcShard(id, shards)` places one deterministically
+  (D7), and `withNpcs` spawns a batch. The validator refuses an NPC owned
+  twice.
+- **Recovering a lost host's players.** `NetcodeClient.latest()` returns
+  the newest snapshot as the host sent it: the state a surviving host
+  restores a lost host's entities from. `adoptPlayer(peer, { resume: true
+  })` takes such a player's inputs from its next frame on, dropping what
+  it had pending (`dropped['resumed']`).
+- **Planned moves between hosts.**
+  - `hostNetcode`'s `releasePlayer(peer)` returns `{ lastApplied }` and
+    stops taking that player's inputs, unapplied and unacknowledged;
+    `adoptPlayer(peer, { lastApplied })` resumes above it.
+  - `joinNetcode({ sequencer })` with `createInputSequencer()` shares one
+    input sequence across clients, which `joinShards` does for every shard.
+
+  A moved player's inputs carry on, and an input the old host applied is
+  never applied again.
+- **A backlog of unacknowledged inputs is no longer cut to the newest 8.**
+  When more than `inputRedundancy` inputs are waiting (a high-latency
+  link, or a change of host), the next input frame carries all of them,
+  up to 64. Before, the older ones were lost for good.
+- **Sharded matches get an assignment record and leases**
+  (`@net-mesh/browser/netcode`). `MatchAssignment` lives in the lobby's
+  store and gives shard hosts, the squads each shard owns, and a lease
+  per host:
+  - `assignmentProblems` validates it: each player is owned exactly once,
+    and no host owns its own squad.
+  - `assignAction({ lobby })` is the store action only the lobby node may
+    call.
+  - `renewLeases` bumps the counters.
+  - `leaseWatch` judges a counter on this node's own clock.
+  - `shardAssignment` gives the `joinShards` view.
+  - `authorizeTeams` admits `team:<name>` audiences.
+
+  `hostNetcode({ live })` stops simulating and sending once its lease is
+  lost. `joinShards({ live })` freezes the view (`stats().frozen`).
+- **`NetcodeClient.sampleAt(hostTime)`** returns the host's entities as
+  of a host time, from the snapshots the client holds, plus the gap
+  between the two snapshots around that time. It returns `null` when no
+  two snapshots bracket the time. This is history, never extrapolated: a
+  shard host uses it to check a cross-host hit claim against where the
+  shooter really was. `SnapshotBuffer.sample` is the same read.
+- **An optional epoch on the netcode wire.** `hostNetcode({ epoch })`
+  stamps `ep` on every snapshot and drops input frames stamped with
+  another epoch (`dropped['stale-epoch']`). `joinNetcode({ epoch })` stamps
+  inputs, and `stats()` gains `epoch` (from the newest snapshot) and
+  `lastSnapshotAt`. Binary snapshots with an epoch use a new kind byte, so
+  an older decoder refuses them rather than misreading them. Frames
+  without `ep` are unchanged.
+
+- **Compact netcode snapshots.** `hostNetcode` and `joinNetcode` take an
+  optional `codec` built with `entityCodec({ x: quantized(0, 512), yaw:
+  angle(), hp: uint(8), ... })`. When both ends have the same codec,
+  snapshots are binary and about 7x smaller; otherwise they stay JSON, so a
+  page without a codec keeps working unchanged. Two new frames ride the
+  JSON wire: the codec fingerprint on join and ping (`f`), and a request
+  for entity names (`u`). New stats: `binaryFrames`, `unnamedEntities`.
+- **`joinNetcode` says why it has not joined.** `await net.ready()`
+  resolves at the first snapshot and rejects with a typed `NetcodeError`
+  after `joinTimeoutMs` (default 15 s): `no-announcement` (this node never
+  heard the host announce, so it cannot reach it — the failure that used
+  to wait silently forever), `unreachable`, `timeout`, or `closed`. The
+  client keeps retrying regardless. `stats()` gains `connectOutcome` and
+  `lastError`.
+- **A pair left on the relay is no longer re-offered on every reopen.**
+  When `joinNetcode`'s direct attempt ended relayed (`iceTimeout`, …),
+  every stream reopen started a fresh ICE attempt, and one finishing late
+  replaced the session under the stream. That was a loop that, under
+  load, never delivered a snapshot. The stream now rides the relayed
+  session, and direct is retried at most every `directRetryMs` (default
+  30 s). Send failures now show in `stats().lastError`.
+- **A lossy stream no longer wedges after loss.** On a fire-and-forget
+  stream a lost packet's bytes were never credited back, so every loss
+  shrank the 64 KiB send window for good; after a window's worth the
+  stream refused every send (`backpressure … the peer has not granted
+  more yet`), and a reopen kept the drained state. Credit stalled for
+  2 s with bytes outstanding is now written off as lost (`net-mesh-wire`,
+  `FIRE_AND_FORGET_RECLAIM_AFTER`); reliable streams are unchanged.
+- **A peer pair can no longer end half-direct.** When a slow answerer's
+  handshake reply crossed the offerer's deadline, the offerer fell back to
+  the relay while the answerer reported `direct` and sent on a channel the
+  offerer had closed: `peerAttempt` read `failed` on one end and `open`
+  with `direct: true` on the other, for good. An answerer is now direct
+  only once the establishment is proven, and an establishment its offerer
+  abandons returns the pair to its relay (`net-mesh-leaf`).
+- **Lobbies, joiners and region hosts refresh their announcements every
+  30 s, not 2 s** (`LOBBY_ANNOUNCE_MS`, `REGION_ANNOUNCE_MS`). Every refresh
+  floods through the anchor to every peer, so the load grows with the square
+  of the players: at 64 players on one anchor a 2 s refresh pinned the
+  host's anchor link at its SCTP advisory, starving every relayed pair. A
+  change of players is still announced at once, and an announcement lives
+  300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has. A node that
+  connects later does not wait for a refresh: the anchor replays the
+  announcements it holds to each session that enrolls, within its game.
+- **Stream data is routed to its stream, not filtered by every stream.**
+  Each `LeafStream`'s listener used to receive every node event and read
+  it to find its own, so a host with one stream per player paid players ×
+  events: at 64 players that was 13% of the host's main thread. Events are
+  now routed by peer and stream id inside the wasm, on both the
+  `connect()` and the `openSession()` paths (`net-mesh-leaf`). What a
+  listener receives is unchanged.
+- **A direct connection one side no longer recognises now recovers.** If
+  a host held no session for a player that was still sending to it over
+  an open direct channel, every packet was dropped and nothing noticed:
+  the player's sends never fail and the connection stayed healthy. A
+  1 × 96 run lost 3 players that way for its whole 240 s. The side
+  without a session now tells its peer so on that channel and closes it
+  (and logs `closed the direct link`). The other side treats that notice
+  as a lost session, exactly as it already treated an ICE failure, and
+  connects again. Before, only ICE could report a loss, which takes its
+  30 s consent timeout after a peer leaves and never fires while the
+  path is healthy. A channel the peer merely closes — its re-offer
+  replacing the link, or its tab going away — is still not a loss: the
+  session stays, and an open call still ends on its own deadline.
+- **Fewer clock pings once the clock has settled:** `pingRate` (default
+  4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
+  pays a packet's fixed transport overhead; measured in real browsers
+  (1 host × 32 players) host upload fell from 2.19 to 1.82 Mbit/s.
+- **Review fixes to this release's netcode** (sharded-match review):
+  - A client drops acknowledged inputs with or without `local`, so it no
+    longer sends 64-input frames for good after a backlog.
+  - Binary snapshots carry the host's instance: a host re-created under the
+    same label is no longer drawn under the old ids. The codec fingerprint
+    gains a wire version, so peers from before this change use JSON.
+  - `angle()` fields interpolate the short way (`lerpAngle`,
+    `EntityCodec.interpolate`, the default with a codec).
+  - `adoptPlayer`'s input boundary survives a slow first frame or an
+    `authorize` refusal (`dropped['adopt-unauthorized']`).
+  - A rejected `connectPeer` also waits `directRetryMs` before re-offering.
+  - Name tables forget ids unseen for 10 s (`NAME_FORGET_MS`); a `u` request
+    is honoured once per 100 ms per index, only for indexes that player was
+    shown (`dropped['name-request-throttled']`).
+  - Input seqs must be positive safe integers; `float32()` refuses NaN and
+    infinities; `sampleAt` at a snapshot's exact time includes entities that
+    first appear in it.
+  - A failed announcement (lobby, seek tag, region host) is retried after
+    1 s, doubling to 8 s (`ANNOUNCE_RETRY_MS`, `ANNOUNCE_RETRY_MAX_MS`).
+  - `joinShards`: a rejoined shard keeps its last state until its first
+    snapshot; `ready()` follows rejoins.
+  - `leaseWatch` takes its first reading as a baseline, not a lease;
+    `mayReassign` takes a `maxDeliveryMs` margin.
+  - `assignmentProblems` validates shapes, own keys and `renewals`;
+    `pathAction` matches NPC ids exactly. `npcModes` prunes its tracks,
+    builds path poses on the freshest entry, stops drawing a live NPC no
+    snapshot shows, and `stats()` reports `tracks`.
+  - `regionHandoffs` gains `actionTiming` for forwarded actions.
+  - The shard host recipe uses the netcode clock throughout (cross-host hits
+    were refused `beyond-cap` with the old `Date.now` default), keeps path
+    NPCs hittable and recoverable, and validates `setAssignment`.
+  - `retryReport()` gains `channelClosed`: a far-end channel close is its
+    own re-attempt trigger, and one channel's loss counts once.
+
 ## 0.43.0 — one identity per origin, bounded streams
 
 - **`connect()` locks its identity.** With a custodial identity it takes

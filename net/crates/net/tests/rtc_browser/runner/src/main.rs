@@ -2138,6 +2138,9 @@ async fn run(
     // reach. Nothing here tests the limiter; the witnesses that care
     // about admission test §12, which is a different gate.
     cfg.offers_per_ip_per_minute = 2_000;
+    // Its pages reuse a few minted credentials from one address, so
+    // the per-(address, credential) offer budget must not bind either.
+    cfg.offers_per_credential_per_minute = 2_000;
     let anchor_listener = serve_bootstrap(Arc::clone(&anchor), cfg.clone())
         .await
         .map_err(|e| format!("anchor listener: {e}"))?;

@@ -212,7 +212,9 @@ refreshed — so discovery code runs offline unchanged. It is evidence about gam
 logic, not about whether two browsers can reach each other.
 
 An announcement is a lease, so both sides re-announce on a timer; a joiner that
-looks a few seconds late otherwise reports that the host never announced.
+looks a few seconds late otherwise reports that the host never announced. A
+failed announcement is retried within a second or so (doubling to 8 s), not at
+the next 30 s refresh.
 
 ### A dedicated host in Node
 
@@ -397,8 +399,8 @@ subscription at once. `lobby.self` is the host's own player (below).
 - **An empty list right after connecting is not real yet.** Announcements take
   a moment to reach a node that just connected. Poll `listLobbies` every half
   second for a few seconds before showing "no games".
-- **A closed tab's lobby stays listed for a moment.** The host re-announces
-  every 2 seconds and a tab killed outright withdraws nothing, so its listing
+- **A closed tab's lobby stays listed for a moment.** The host refreshes its
+  announcement every 30 seconds and a tab killed outright withdraws nothing, so its listing
   lasts until the announcement lapses, and joining it answers `not-found`.
 - **Close a joined lobby before creating one on the same node.** Leaving a
   lobby announces the node's own `tags` again, which replaces the whole tag set

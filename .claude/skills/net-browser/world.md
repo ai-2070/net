@@ -16,8 +16,10 @@ world must use the same `size`.
   (`radius` default 1).
 - `regionTag(world, region)` is the directory tag a host announces,
   `net-world:<world>:region:<region>`.
-- `REGION_ANNOUNCE_MS` (2000) is how often `announceRegions` re-announces: an
-  announcement is a lease.
+- `REGION_ANNOUNCE_MS` (30000) is how often `announceRegions` re-announces: an
+  announcement is a lease (300 s TTL). Not faster: refreshes flood through the
+  anchor to every peer. A failed announcement is retried sooner, after 1 s
+  doubling to 8 s (the lobby's `ANNOUNCE_RETRY_MS` / `ANNOUNCE_RETRY_MAX_MS`).
 
 ## Region hosts
 
@@ -28,7 +30,7 @@ import { announceRegions, handoffLink, parseHandoffLedger, regionDirectory,
 
 // One store per region, named by region; several may share a node.
 const host = hostStore({ definition: region, store: 'r:4:7', transport, … });
-announceRegions(node, 'my-world', ['r:4:7']);            // re-announces every 2 s
+announceRegions(node, 'my-world', ['r:4:7']);            // re-announces every 30 s
 
 // Moving an entity to the neighbour: at-most-once.
 const directory = regionDirectory({ node, world: 'my-world', trustedHosts: HOST_NODE_IDS });
@@ -72,6 +74,11 @@ await handoffs.handoff('ship-7', 'r:4:8');               // frozen here now, liv
     remembers a decision, default 600 000). **`handledRetentionMs` must exceed
     `giveUpMs`**, or a late re-offer could be admitted twice; the steps throw
     `RangeError` for a timing that breaks it.
+  - `actionTiming`: the same three, for forwarded actions only (default:
+    `timing`). Give a short-lived action (a hit worth nothing after 500 ms)
+    its own here, and leave entity handoffs on `timing`: a 500 ms
+    `giveUpMs` on a handoff leaves the entity live nowhere, and a short
+    retention can admit it twice.
   - `tickMs` (the retry/prune loop, default 100), `ghosting.everyMs` (default
     100), `newId` (the handoff and action id source; default the region plus 64
     random bits), `now`.

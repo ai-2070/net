@@ -94,6 +94,31 @@ describe('lobbies', () => {
     expect(await listLobbies({ node: mesh.node(), game: 'other-game' })).toEqual([]);
   });
 
+  // NET-3 (sharded-match review): a failed first announcement used to leave
+  // the lobby unfindable until the 30 s lease refresh.
+  it('retries a failed announcement soon, not at the lease refresh', async () => {
+    const mesh = createLocalMesh();
+    const inner = mesh.node();
+    let failures = 1;
+    const node = {
+      ...inner,
+      announce: async (tags: readonly string[]) => {
+        if (failures-- > 0) throw new Error('anchor link down');
+        return inner.announce(tags);
+      },
+    };
+    const lobby = await lobbyOn(mesh, { node });
+    await settle();
+    expect(await listLobbies({ node: mesh.node(), game: 'lobby-test' })).toEqual([]);
+    const deadline = Date.now() + 3_000;
+    let listed: Awaited<ReturnType<typeof listLobbies>> = [];
+    while (listed.length === 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      listed = await listLobbies({ node: mesh.node(), game: 'lobby-test' });
+    }
+    expect(listed.map(entry => entry.code)).toEqual([lobby.code]);
+  });
+
   it('joins by code — typed loosely — and plays; the host sees the player arrive', async () => {
     const mesh = createLocalMesh();
     const lobby = await lobbyOn(mesh);
@@ -379,7 +404,9 @@ describe('joining reaches a host that only accepts discovered peers', () => {
         return joiner.announce(tags);
       },
     };
-    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code });
+    // A short refresh, so the next seeking announcement comes in test time
+    // (the default is LOBBY_ANNOUNCE_MS, 30 s).
+    const world = await joinLobby({ node: slow, definition: room, game: 'lobby-test', code: lobby.code, announceEveryMs: 200 });
     await world.ready();
     holding = Promise.withResolvers<void>();
     // The re-announce timer's next seeking announcement, held in flight:
@@ -392,6 +419,27 @@ describe('joining reaches a host that only accepts discovered peers', () => {
     holding.resolve();
     await closing;
     expect(order).toEqual(['seek', 'withdraw']);
+  });
+
+  // NET-3 (sharded-match review): a failed seek announcement used to wait
+  // for the 30 s refresh, and the reach below gave up at its 20 s deadline.
+  it('retries a failed seek announcement soon, so the join still lands before the deadline', async () => {
+    const mesh = createLocalMesh();
+    const hostNode = mesh.node();
+    const lobby = await lobbyOn(mesh, { node: hostNode });
+    const { joiner } = strictJoiner(mesh, hostNode);
+    let failures = 1;
+    const flaky = {
+      ...joiner,
+      announce: async (tags: readonly string[]) => {
+        if (tags.length > 0 && failures-- > 0) throw new Error('anchor link down');
+        return joiner.announce(tags);
+      },
+    };
+    const world = await joinLobby({ node: flaky, definition: room, game: 'lobby-test', code: lobby.code, timeoutMs: 4_000 });
+    await world.ready();
+    await expect(world.act('sit', {})).resolves.toEqual({ seat: 1 });
+    await world.close();
   });
 
   it('names an unreachable host, typed, at the deadline', async () => {

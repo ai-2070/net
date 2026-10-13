@@ -76,6 +76,23 @@ describe('SnapshotBuffer', () => {
     expect(buffer.at(999, lerpNumbers).s).toEqual({ x: 20, y: 0 });
   });
 
+  it('samples history between the snapshots that bracket a time, with their gap, and never outside them', () => {
+    const buffer = new SnapshotBuffer<Ship>();
+    buffer.add(snap(0, 0, 0));
+    buffer.add(snap(1, 100, 10));
+    // Tick 2 lost: 100 → 300 is one wide gap.
+    buffer.add(snap(3, 300, 30));
+    expect(buffer.sample(50, lerpNumbers)).toEqual({ entities: { s: { x: 5, y: 0 } }, gapMs: 100 });
+    expect(buffer.sample(200, lerpNumbers)).toEqual({ entities: { s: { x: 20, y: 0 } }, gapMs: 200 });
+    expect(buffer.sample(300, lerpNumbers)?.entities.s).toEqual({ x: 30, y: 0 });
+    // Outside what is held: no history, not the nearest end.
+    expect(buffer.sample(-1, lerpNumbers)).toBeNull();
+    expect(buffer.sample(301, lerpNumbers)).toBeNull();
+    // An entity at only one end of the gap is not known across it.
+    buffer.add({ tick: 4, time: 400, entities: {} });
+    expect(buffer.sample(350, lerpNumbers)?.entities).toEqual({});
+  });
+
   it('extrapolates past the newest only when asked, and only as far as the cap', () => {
     const buffer = new SnapshotBuffer<Ship>();
     buffer.add(snap(0, 0, 0));

@@ -1434,6 +1434,11 @@ export interface RetryReport {
   readonly online: string;
   /** Triggers filed by the ICE `disconnected` → `failed` watcher. */
   readonly iceFailed: string;
+  /**
+   * Triggers filed because the far end closed a DataChannel a session
+   * rode. One channel's loss counts once, here or under `iceFailed`.
+   */
+  readonly channelClosed: string;
   /** Every trigger seen, whatever the owner decided. */
   readonly triggers: string;
   /** Re-attempts STARTED. One per network change, per peer. */
@@ -1501,6 +1506,7 @@ export function parseRetryReport(json: string): RetryReport {
     armed: raw.armed === true,
     online: String(raw.online ?? '0'),
     iceFailed: String(raw.iceFailed ?? '0'),
+    channelClosed: String(raw.channelClosed ?? '0'),
     triggers: String(raw.triggers ?? '0'),
     started: String(raw.started ?? '0'),
     coalesced: String(raw.coalesced ?? '0'),

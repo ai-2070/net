@@ -292,7 +292,16 @@ export interface RegionHandoffsOptions<E> {
   };
   /** Outcomes: `moved`, `refused`, `unresolved` (source), `admitted` (target). */
   onEvent?(event: HandoffEvent): void;
+  /** Entity handoffs: re-offer, give up, and how long a decision is remembered. */
   readonly timing?: HandoffTiming;
+  /**
+   * Forwarded actions ({@link RegionHandoffs.forward}), when they need other
+   * timing than entity handoffs: a hit is worthless after half a second,
+   * while a moving entity must not be given up that soon (it would be live
+   * nowhere) nor forgotten while its offer may still be re-sent (it could
+   * be admitted twice). Default: `timing`.
+   */
+  readonly actionTiming?: HandoffTiming;
   /** How often to re-offer and prune, ms. Default 100. */
   readonly tickMs?: number;
   readonly now?: () => number;
@@ -423,9 +432,10 @@ export function regionHandoffs<E>(options: RegionHandoffsOptions<E>): RegionHand
       options.link.send({ to, body: frame });
     }
   };
-  const retryMs = options.timing?.retryMs ?? 250;
-  const giveUpMs = options.timing?.giveUpMs ?? 60_000;
-  const retentionMs = options.timing?.handledRetentionMs ?? 600_000;
+  const actionTiming = options.actionTiming ?? options.timing;
+  const retryMs = actionTiming?.retryMs ?? 250;
+  const giveUpMs = actionTiming?.giveUpMs ?? 60_000;
+  const retentionMs = actionTiming?.handledRetentionMs ?? 600_000;
 
   const stop = options.link.onMessage(body => {
     if (closed) return;

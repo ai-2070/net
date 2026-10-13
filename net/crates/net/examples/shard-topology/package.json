@@ -1,0 +1,14 @@
+{
+  "name": "net-shard-topology",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sharded-match plan S0b: real browsers as shard hosts and players against a real `net-mesh anchor serve --game`, measuring connections per host, wire upload, transport overhead and frame time. `playwright-core` drives the browsers.",
+  "scripts": {
+    "coordinator": "node run.mjs coordinator",
+    "browsers": "node run.mjs browsers"
+  },
+  "dependencies": {
+    "playwright-core": "1.56.0"
+  }
+}

@@ -112,8 +112,34 @@ export const MAX_LOBBY_CAPACITY = 256;
 /** Characters a code is made of: no 0/O, 1/I/L, so a code survives being read aloud. */
 export const LOBBY_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 export const LOBBY_CODE_LENGTH = 6;
-/** How often a lobby re-announces itself. */
-export const LOBBY_ANNOUNCE_MS = 2_000;
+/**
+ * How often a lobby (and a joiner's seek tag) refreshes its announcement.
+ * A change of players is announced at once; this is only the lease
+ * refresh, well inside the leaf's 300 s announcement TTL.
+ *
+ * It was 2 s. Every node's re-announcement is flooded through the anchor
+ * to every peer, each of which answers every packet with a credit grant,
+ * so the load grows with the square of the players: at 64 players on one
+ * anchor (sharded-match plan, S0b) a 2 s refresh pinned the host's anchor
+ * link at its SCTP advisory (84,667 refused sends), starving every
+ * relayed pair and timing out handshakes. At 30 s the same run joined all
+ * 64, every pair direct, with no refusals.
+ *
+ * A node that connects later does not wait for this refresh: the anchor
+ * replays the announcements it holds to each session that enrolls, within
+ * its game, so an existing lobby is listed at once.
+ *
+ * A FAILED announcement is not left to this cadence: it is retried after
+ * {@link ANNOUNCE_RETRY_MS}, doubling up to {@link ANNOUNCE_RETRY_MAX_MS},
+ * until one succeeds. A joiner gives up after 20 s, and a lobby whose
+ * first announcement failed must not stay unfindable for 30.
+ */
+export const LOBBY_ANNOUNCE_MS = 30_000;
+
+/** The first retry after a failed announcement, ms (lobbies, seek tags, region hosts). */
+export const ANNOUNCE_RETRY_MS = 1_000;
+/** The longest wait between retries of a failing announcement, ms. */
+export const ANNOUNCE_RETRY_MAX_MS = 8_000;
 
 /** The frame bound the package's own tests and demo use. */
 const DEFAULT_MAX_EVENT_BYTES = 8104;
@@ -405,6 +431,10 @@ export async function createLobby<S extends object, A extends ActionSpec, I exte
   let closed = false;
   let announcing: Promise<void> | null = null;
   let again = false;
+  // A failed announcement is retried on its own short backoff, not at the
+  // next lease refresh.
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let retryMs = ANNOUNCE_RETRY_MS;
 
   function currentTags(): string[] {
     const list = [...(tags ?? []), lookup];
@@ -421,11 +451,24 @@ export async function createLobby<S extends object, A extends ActionSpec, I exte
       again = true;
       return;
     }
+    if (retry !== null) {
+      clearTimeout(retry);
+      retry = null;
+    }
     announcing = node
       .announce(currentTags())
+      .then(() => {
+        retryMs = ANNOUNCE_RETRY_MS;
+      })
       .catch(() => {
-        // The next tick tries again; a lobby that cannot announce is
-        // simply not found, which the joiner reports as `not-found`.
+        // Retried shortly; until one lands the lobby is simply not found,
+        // which a joiner reports as `not-found`.
+        if (closed || retry !== null) return;
+        retry = setTimeout(() => {
+          retry = null;
+          announce();
+        }, retryMs);
+        retryMs = Math.min(retryMs * 2, ANNOUNCE_RETRY_MAX_MS);
       })
       .finally(() => {
         announcing = null;
@@ -487,6 +530,7 @@ export async function createLobby<S extends object, A extends ActionSpec, I exte
       if (closed) return;
       closed = true;
       clearInterval(timer);
+      if (retry !== null) clearTimeout(retry);
       stopMembership();
       listeners.clear();
       await me.close();
@@ -539,6 +583,8 @@ export interface JoinLobbyOptions<S extends object, A extends ActionSpec, I exte
    * announces goes here. The same option as `createLobby`'s.
    */
   readonly tags?: readonly string[];
+  /** How often the seek tag is refreshed while joined. Default {@link LOBBY_ANNOUNCE_MS}. */
+  readonly announceEveryMs?: number;
 }
 
 /**
@@ -589,14 +635,35 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
   // them, or one landing after it would put the seek tag back — over a
   // lobby this node created meanwhile.
   const seekingInFlight = new Set<Promise<void>>();
+  // A failed seek announcement is retried on a short backoff: the host
+  // cannot let this player in until it holds one, and the reach below
+  // gives up at `timeoutMs` — long before the next lease refresh.
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let retryMs = ANNOUNCE_RETRY_MS;
   const announce = () => {
     if (stopped !== null) return;
-    const sent = node.announce(seeking).catch(() => {});
+    if (retry !== null) {
+      clearTimeout(retry);
+      retry = null;
+    }
+    const sent = node.announce(seeking).then(
+      () => {
+        retryMs = ANNOUNCE_RETRY_MS;
+      },
+      () => {
+        if (stopped !== null || retry !== null) return;
+        retry = setTimeout(() => {
+          retry = null;
+          announce();
+        }, retryMs);
+        retryMs = Math.min(retryMs * 2, ANNOUNCE_RETRY_MAX_MS);
+      },
+    );
     seekingInFlight.add(sent);
     void sent.finally(() => seekingInFlight.delete(sent));
   };
   announce();
-  const timer = setInterval(announce, LOBBY_ANNOUNCE_MS);
+  const timer = setInterval(announce, options.announceEveryMs ?? LOBBY_ANNOUNCE_MS);
   // Withdraws the seek tag, after any seeking announcement still in
   // flight. Settles once the withdrawal has been attempted (a failure is
   // swallowed, as every announcement here is), so a `close()` that awaits
@@ -606,6 +673,7 @@ export async function joinLobby<S extends object, A extends ActionSpec, I extend
   const stop = (): Promise<void> => {
     if (stopped !== null) return stopped;
     clearInterval(timer);
+    if (retry !== null) clearTimeout(retry);
     stopped = Promise.all(seekingInFlight).then(() => node.announce(keep)).catch(() => {});
     return stopped;
   };

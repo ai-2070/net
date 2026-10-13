@@ -222,6 +222,27 @@ pub const CHANNEL_LABEL: &str = net_wire::carrier::RELIABLE_CHANNEL_LABEL;
 /// The unordered, zero-retransmit channel's label ([`net_wire::carrier`]).
 pub const LOSSY_CHANNEL_LABEL: &str = net_wire::carrier::LOSSY_CHANNEL_LABEL;
 
+/// The frame a responder sends on a direct Net channel before it
+/// closes it for carrying sealed packets it holds no session for
+/// (`crate::wasm::Inner::close_orphaned_link`).
+///
+/// **Why a frame and not the close alone.** The close by itself is
+/// ambiguous: a far end also closes a channel when its re-offer
+/// replaces the link or its tab goes away, and neither of those is a
+/// session loss. The notice is what tells the ghost apart.
+///
+/// Never a Net packet: its first two bytes (`b"ne"`, `0x656E`
+/// little-endian) are neither the packet magic (`0x4E45`) nor the
+/// routing magic (`0x5452`), so it can never be mistaken for one —
+/// and the message handler matches it by exact equality before
+/// anything is delivered. It needs no seal: only the peer this
+/// channel's DTLS association was negotiated with (its fingerprint
+/// rode a signed signalling envelope) can write on the channel, and
+/// what it can do with it is no more than closing the channel could:
+/// end the session installed over THAT channel. A leaf that predates
+/// it refuses it as unparsable and carries on.
+pub const NO_SESSION_NOTICE: &[u8] = b"net-leaf/no-session/1";
+
 /// Past this many bytes buffered on the lossy channel a lossy packet is
 /// dropped instead of sent: newer state is already on its way.
 pub const LOSSY_BUFFERED_LIMIT: u32 = 64 * 1024;
@@ -254,6 +275,9 @@ struct PeerLink {
     channel_id: u64,
     connection: RtcPeerConnection,
     channel: Option<RtcDataChannel>,
+    /// Whether [`RtcLeafTransport::refuse`] already sent this link's
+    /// notice: one per link, however many orphaned packets arrive.
+    refused: bool,
     /// The unordered, zero-retransmit channel ([`LOSSY_CHANNEL_LABEL`]).
     /// `None` until it opens — and for a peer that never offers one, in
     /// which case lossy packets ride [`Self::channel`] like any other.
@@ -387,6 +411,22 @@ pub struct RtcLeafTransport {
     /// ([`crate::retry::RetryPolicy`]) rather than deciding for
     /// themselves.
     ice_failures: Rc<RefCell<VecDeque<IceLoss>>>,
+    /// Peers whose far end REFUSED a Net channel — sent
+    /// [`NO_SESSION_NOTICE`] on it, then closed it — each with the
+    /// identity of the channel that carried the notice ([`IceLoss`]'s
+    /// shape).
+    ///
+    /// Queued for the reason [`Self::ice_failures`] is. **A bare
+    /// close does not land here.** A far end closes a channel for
+    /// reasons that are not a loss of the session riding it: its own
+    /// re-offer replacing the link (§9 step 4 — the session keeps
+    /// riding the relay, and the replacement handshake supersedes
+    /// it), its tab going away (§4.5: the call's own deadline is the
+    /// terminal, not a fast `sessionLost`), a page closing channels.
+    /// Treating every remote close as a loss dropped the very session
+    /// a re-offer signals over. Only the notice says "I hold no
+    /// session for what you send me".
+    channel_closes: Rc<RefCell<VecDeque<IceLoss>>>,
 }
 
 impl RtcLeafTransport {
@@ -400,7 +440,60 @@ impl RtcLeafTransport {
             next_channel: Rc::new(core::cell::Cell::new(0)),
             stats: Rc::new(RtcLinkCounters::default()),
             ice_failures: Rc::new(RefCell::new(VecDeque::new())),
+            channel_closes: Rc::new(RefCell::new(VecDeque::new())),
         }
+    }
+
+    /// Take the far-end refusals filed since the last call, each
+    /// naming the channel that carried the notice.
+    ///
+    /// Not a loss on its own: a refusal is acted on only when it
+    /// names the channel a live session was installed over
+    /// (`crate::wasm::Inner::harvest_ice_failures`). It is how an
+    /// initiator whose session the responder never installed learns
+    /// so while ICE stays healthy — which ICE's own detector never
+    /// reports.
+    pub fn take_channel_closes(&self) -> Vec<IceLoss> {
+        self.channel_closes.borrow_mut().drain(..).collect()
+    }
+
+    /// Refuse `peer`'s Net channel: send [`NO_SESSION_NOTICE`] on it,
+    /// once per link; `true` if this call sent it.
+    ///
+    /// Written straight to the channel, past the §2 retention queue:
+    /// it is one tiny frame, and a frame queued behind a backlog
+    /// would be discarded by the close that follows it. The engine
+    /// sends what is pending before a `close()` takes effect, so a
+    /// caller that closes the link right after still delivers it.
+    pub fn refuse(&self, peer: NodeId) -> bool {
+        let mut peers = self.peers.borrow_mut();
+        let Some(link) = peers.get_mut(&peer) else {
+            return false;
+        };
+        if link.refused {
+            return false;
+        }
+        let Some(channel) = link.channel.as_ref() else {
+            return false;
+        };
+        if channel.ready_state() != RtcDataChannelState::Open {
+            return false;
+        }
+        if channel.send_with_u8_array(NO_SESSION_NOTICE).is_err() {
+            return false;
+        }
+        link.refused = true;
+        true
+    }
+
+    /// File one far-end refusal, as the channel's message handler
+    /// does on [`NO_SESSION_NOTICE`]. Test seam only, for the reason
+    /// [`Self::report_ice_loss`] is one.
+    #[cfg(test)]
+    pub(crate) fn report_channel_close(&self, peer: NodeId, channel_id: u64) {
+        self.channel_closes
+            .borrow_mut()
+            .push_back((peer, channel_id));
     }
 
     /// The transport's ledger, in the native `RtcStats` field names.
@@ -536,14 +629,18 @@ impl RtcLeafTransport {
             &lossy,
         );
 
+        let channel_id = self.next_channel_id();
         let message = message_handler(
             Rc::clone(&self.inbound),
             Rc::clone(&self.stats),
+            Refusals {
+                queue: Rc::downgrade(&self.channel_closes),
+                channel_id,
+            },
             peer,
             &channel,
         );
         let ice = self.install_ice_handler(peer, &connection);
-        let channel_id = self.next_channel_id();
         let ice_state = self.install_ice_state_handler(peer, channel_id, &connection);
         let low = low_water_handler(
             Rc::downgrade(&self.peers),
@@ -564,6 +661,7 @@ impl RtcLeafTransport {
                 channel_id,
                 connection: connection.clone(),
                 channel: Some(channel),
+                refused: false,
                 lossy: Some(lossy),
                 _lossy_message: Some(lossy_message),
                 retained: VecDeque::new(),
@@ -629,6 +727,7 @@ impl RtcLeafTransport {
         let peers = Rc::downgrade(&self.peers);
         let inbound = Rc::clone(&self.inbound);
         let stats = Rc::clone(&self.stats);
+        let closes = Rc::downgrade(&self.channel_closes);
         let on_data_channel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
             channel.set_binary_type(RtcDataChannelType::Arraybuffer);
@@ -649,7 +748,20 @@ impl RtcLeafTransport {
                 }
                 return;
             }
-            let message = message_handler(Rc::clone(&inbound), Rc::clone(&stats), peer, &channel);
+            // This connection's link identity, captured when the
+            // link was minted — not whichever link holds the peer
+            // when a refusal is drained ([`IceLoss`]).
+            let refusals = Refusals {
+                queue: closes.clone(),
+                channel_id,
+            };
+            let message = message_handler(
+                Rc::clone(&inbound),
+                Rc::clone(&stats),
+                refusals,
+                peer,
+                &channel,
+            );
             // The low-water handler is what retries a retained
             // packet; an accepted channel without it would retain
             // for ever after the first refusal.
@@ -679,6 +791,7 @@ impl RtcLeafTransport {
                 channel_id,
                 connection: connection.clone(),
                 channel: None,
+                refused: false,
                 lossy: None,
                 _lossy_message: None,
                 retained: VecDeque::new(),
@@ -1080,10 +1193,25 @@ pub fn new_connection(ice_servers: &[IceServer]) -> Result<RtcPeerConnection> {
         .map_err(|e| unsupported("RTCPeerConnection", &e))
 }
 
+/// Where a Net channel's message handler files a far-end refusal
+/// ([`NO_SESSION_NOTICE`]), and the identity of the link it names.
+///
+/// `Weak` for the reason [`low_water_handler`]'s is: the handler
+/// lives in the link the transport holds.
+struct Refusals {
+    queue: Weak<RefCell<VecDeque<IceLoss>>>,
+    channel_id: u64,
+}
+
 /// The inbound handler for one peer's channel.
+///
+/// A [`NO_SESSION_NOTICE`] is filed into `refusals`, naming this
+/// link, and is not delivered: it is the transport's frame, not a
+/// datagram.
 fn message_handler(
     inbound: InboundSink,
     stats: Rc<RtcLinkCounters>,
+    refusals: Refusals,
     peer: NodeId,
     channel: &RtcDataChannel,
 ) -> Closure<dyn FnMut(MessageEvent)> {
@@ -1097,6 +1225,12 @@ fn message_handler(
             // A text frame on the Net channel is not ours.
             return;
         };
+        if bytes == NO_SESSION_NOTICE {
+            if let Some(queue) = refusals.queue.upgrade() {
+                queue.borrow_mut().push_back((peer, refusals.channel_id));
+            }
+            return;
+        }
         stats.note_ingress_delivered();
         inbound(peer, Bytes::from(bytes));
     }) as Box<dyn FnMut(MessageEvent)>);

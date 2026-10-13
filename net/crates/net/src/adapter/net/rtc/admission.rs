@@ -91,6 +91,23 @@ pub fn tenants_may_meet(a: Option<TenantId>, b: Option<TenantId>) -> bool {
     }
 }
 
+/// May an announcement whose origin was enrolled for `origin` reach a
+/// session whose admission is `recipient` — flooded live or replayed?
+///
+/// [`tenants_may_meet`] for an admitted recipient. A **provisional**
+/// recipient has no tenant YET, and "no tenant" must not read as the
+/// native "meets everyone": an unenrolled browser session would
+/// otherwise be shown every game's announcements (and the keys in them)
+/// for as long as it stays unenrolled, and could harvest them without
+/// ever enrolling. It sees only untenanted announcements; its own
+/// tenant's are replayed to it when enrollment promotes it.
+pub fn announcement_may_reach(origin: Option<TenantId>, recipient: &PeerAdmission) -> bool {
+    if recipient.is_provisional() {
+        return origin.is_none();
+    }
+    tenants_may_meet(origin, recipient.tenant())
+}
+
 /// What a session may exercise (§12), kept beside — never inside —
 /// `PeerTransport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

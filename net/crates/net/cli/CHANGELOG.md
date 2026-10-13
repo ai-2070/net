@@ -20,6 +20,25 @@ and output shape.
 - Games on one anchor are kept apart: a session is promoted for the game
   its grant names, and the anchor neither floods, replays nor relays
   between sessions of different games.
+  - A visitor that has not enrolled yet sees no game's announcements, and
+    an announcement keeps its game after its host disconnects. Before this,
+    an unenrolled session counted as "no game", which meets everyone.
+  - A visitor is caught up on its game's announcements when enrollment
+    promotes it. Before this, a lobby announced before the visitor arrived
+    stayed invisible to it until the host announced again.
+- **Visitors behind one shared address can all join.** Offers are now
+  charged per visitor: per (source IP, credential), default 10 a minute,
+  new `--offers-per-credential-per-minute`. `--offers-per-minute` becomes
+  the per-address backstop across all of them, and its default rises from
+  10 to 120. `--credentials-per-minute` rises from 30 to 120; the per-game
+  issuance ceiling is unchanged. Before this, the eleventh player behind
+  one carrier NAT, campus or LAN party was refused `rate_limited` inside a
+  minute. A credential shared by every visitor (`anchor credential mint`)
+  is still charged per address, exactly as before. One address holds at
+  most 32 per-visitor budgets; a visitor with no room for one (that limit,
+  or the anchor-wide table full) is admitted on the per-address backstop
+  instead of refused, counted as `bootstrap_visitor_budget_degraded` in
+  `anchor stats`.
 - `--credential-issuer` is now optional when `--issuer-identity` is given.
 - `--inspect-target` omits `credential_issuer_fingerprint` when only
   `--issuer-identity` names the issuer (inspection reads no key files).
