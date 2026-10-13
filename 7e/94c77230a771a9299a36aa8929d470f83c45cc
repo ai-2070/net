@@ -1,0 +1,19 @@
+net/crates/net/sdk/tests/mesh_rpc_hedge.rs
+  s_b1acdb693663bb::t_6a0d4a05bb8a1a 243-254,258-266,296-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7e94c77230a771a9299a36aa8929d470f83c45cc",
+  "prompts": {},
+  "sessions": {
+    "s_b1acdb693663bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "17df3b8f-0ce0-4d2f-8b07-ecbf9099f1cd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
