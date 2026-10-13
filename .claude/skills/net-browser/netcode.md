@@ -277,10 +277,20 @@ Mutual kills across hosts trade.
   next input (`adoptPlayer(peer, { resume: true })` drops what was
   pending). A hit in flight to the lost host is a miss, and is never
   re-sent.
+- **NPCs** belong to a shard per `npcShard(id, shards)`, deterministic on
+  every node (`withNpcs` spawns a batch). The owner runs their AI in the
+  recipe's `advance(entities, ai)` and fires with `ai.fire(npc, target)`.
+- **NPCs on paths:** publish a route once (`NpcPath` in the lobby store,
+  written through `pathAction`, owner-only) instead of every tick. Draw
+  with `npcModes().resolve(view, records, ownerNow)`, which picks the
+  source with the higher mode version `mv`. Never put a fogged NPC on a
+  path: the record goes to every reader. Measured with 50 NPCs: 47 KB/s
+  live, 1.6 KB/s on paths, per viewer.
 - Tests: `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
   `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`,
   `test/netcode/assignment.test.ts`, `test/netcode/planned-move.test.ts`,
-  `test/netcode/host-crash.test.ts`.
+  `test/netcode/host-crash.test.ts`, `test/netcode/npc.test.ts`,
+  `test/netcode/npc-paths.test.ts`.
 
 ## Rules that bite
 

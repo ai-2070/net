@@ -1,6 +1,9 @@
 // Types for `shard.js`, the shard host recipe (sharded-match plan, S2).
 
 import type {
+  NpcPath,
+  PathPoint,
+  pathAt,
   EntityCodec,
   HostNetcode,
   ShardAssignment,
@@ -19,6 +22,8 @@ import type {
 
 /** The library pieces the recipe wires; the page passes `dist`, the test `src`. */
 export interface ShardLib {
+  /** Needed only with `options.paths`. */
+  readonly pathAt?: typeof pathAt;
   readonly hostNetcode: typeof hostNetcode;
   readonly joinNetcode: typeof joinNetcode;
   readonly handoffLink: typeof handoffLink;
@@ -59,6 +64,12 @@ export interface ShardHostOptions<E extends Placed, I> {
   readonly autoTick?: boolean;
   /** More cross-host actions this shard serves, beside combat's `hit`. */
   readonly actions?: Readonly<Record<string, BorderAction<E>>>;
+  /** NPC paths (N2): where records are published (the lobby store's `setPath`), and how long a switch is announced. */
+  readonly paths?: {
+    write(npc: string, path: NpcPath): unknown;
+    /** Snapshots keep sending a path NPC this long after the switch, ms. Default 1000. */
+    readonly announceMs?: number;
+  };
   /** Handoff outcomes: `moved` at the source is when the lobby raises the epoch (S5). */
   onHandoffEvent?(event: HandoffEvent): void;
   /** Whether this host still holds its lease (S4: `leaseWatch` over its lease in the lobby store). */
@@ -123,6 +134,8 @@ export interface ShardHost<E> {
    */
   setAssignment(next: ShardAssignment): boolean;
   recovered(): readonly string[];
+  setNpcPath(npc: string, points: readonly PathPoint[], key?: string | null): unknown;
+  setNpcLive(npc: string, key?: string | null): unknown;
   observed(shard: string): Readonly<Record<string, E>> | null;
   known(): Readonly<Record<string, E>>;
   close(): void;

@@ -40,6 +40,13 @@
  *   applied at most once at B (the handoff ledger), retried every 50 ms,
  *   and abandoned after 500 ms: an unresolved hit is a miss, never re-sent.
  *
+ * - **NPC paths** (N2, `options.paths`): `setNpcPath(npc, points)` puts an
+ *   NPC on a route published once to the lobby store; the host drives it
+ *   along the route, announces the switch in snapshots for `announceMs`,
+ *   then stops sending it. `setNpcLive(npc)` switches back. Every switch
+ *   bumps the NPC's mode version `mv` (see `npcModes` in the package for
+ *   the client's half). Refused under fog: a path goes to every reader.
+ *
  * The world is a handoff `RegionState`, so a handoff and the tick loop
  * read and write the same entities.
  */
@@ -86,6 +93,9 @@ export function shardHost(lib, options) {
   const departing = new Map();
   // Restored from observation after a host was lost.
   const recovered = [];
+  // NPCs on a path: their points, and since when (for the announce window).
+  const routes = new Map();
+  const announceMs = options.paths?.announceMs ?? 1000;
 
   // The world: this shard's own entities, as a handoff region.
   let region = lib.regionState(regionOf(shard), options.initial ?? {});
@@ -259,14 +269,26 @@ export function shardHost(lib, options) {
         });
         for (const { npc, target } of shots) entities = npcFire(entities, npc, target);
       }
+      // NPCs on a path go where the path says, on this host's clock.
+      if (routes.size > 0) {
+        const at = now();
+        for (const [npc, { points }] of routes) {
+          const state = entities[npc];
+          const point = state === undefined ? null : lib.pathAt(points, at);
+          if (point !== null) entities = { ...entities, [npc]: { ...state, x: point.x, z: point.z } };
+        }
+      }
       if (entities !== region.entities) region = { ...region, entities };
     },
     // A player moving away is still this shard's to SHOW until the
     // assignment says otherwise: its frozen state, so other players do not
     // see it vanish while the handoff and the new epoch are in flight.
     snapshot: () => {
-      if (departing.size === 0) return region.entities;
+      if (departing.size === 0 && routes.size === 0) return region.entities;
       const shown = { ...region.entities };
+      // A path NPC is announced for `announceMs`, then left to the record.
+      const at = now();
+      for (const [npc, { since }] of routes) if (at - since >= announceMs) delete shown[npc];
       for (const [id, state] of departing) {
         if (owner(id) === shard && shown[id] === undefined) shown[id] = state;
         else departing.delete(id);
@@ -373,6 +395,30 @@ export function shardHost(lib, options) {
       }
       if (entities !== region.entities) region = { ...region, entities };
       return true;
+    },
+    /**
+     * Put `npc` (one this shard owns) on a path (N2): `points` are by this
+     * host's clock. Bumps its `mv`, writes the record through
+     * `options.paths.write`, and from `announceMs` later stops sending it.
+     */
+    setNpcPath(npc, points, key = null) {
+      if (options.paths === undefined) throw new Error('no options.paths: nowhere to publish a path');
+      if (fog !== Infinity) throw new Error('an NPC under fog never uses a path: the record would reveal it');
+      const state = region.entities[npc];
+      if (state === undefined) throw new Error(`${npc} is not live on shard ${shard}`);
+      const mv = (state.mv ?? 0) + 1;
+      region = { ...region, entities: { ...region.entities, [npc]: { ...state, mv, mode: 'path' } } };
+      routes.set(npc, { points, since: now() });
+      return options.paths.write(npc, { mv, mode: 'path', key, points });
+    },
+    /** Take `npc` off its path: live again, in every snapshot. */
+    setNpcLive(npc, key = null) {
+      const state = region.entities[npc];
+      if (state === undefined || options.paths === undefined) return undefined;
+      const mv = (state.mv ?? 0) + 1;
+      routes.delete(npc);
+      region = { ...region, entities: { ...region.entities, [npc]: { ...state, mv, mode: 'live' } } };
+      return options.paths.write(npc, { mv, mode: 'live', key, points: [] });
     },
     /** Entities this host restored from observation after a host was lost (S6). */
     recovered: () => [...recovered],

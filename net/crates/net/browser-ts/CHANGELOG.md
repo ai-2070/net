@@ -26,6 +26,17 @@ the README on why it is a sibling package rather than a sub-path.
   epoch. When ownership changes, the old owner's copy lingers for
   `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
   what the fencing dropped.
+- **NPCs on paths.** An NPC on a known route can be published once, as an
+  `NpcPath` record in the lobby store, instead of in every snapshot.
+  - `pathAction({ assignment })` is the store action: only the NPC's
+    owning host may write a record.
+  - `npcModes().resolve(view, records, ownerNow)` is what a client draws
+    from. It picks whichever source, snapshot or record, carries the
+    higher mode version `mv`. While a due record is late it carries the
+    NPC forward for up to 500 ms, and it blends every switch.
+  - `pathAt` evaluates a path.
+
+  Measured with 50 NPCs: 47 KB/s live, 1.6 KB/s on paths, per viewer.
 - **NPCs in sharded matches.** A `ShardRecord` lists the NPCs its shard
   owns (`npcs`). `npcShard(id, shards)` places one deterministically
   (D7), and `withNpcs` spawns a batch. The validator refuses an NPC owned

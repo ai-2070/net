@@ -14,6 +14,8 @@ export type { HostNetcode, HostNetcodeOptions, Rewound, TickContext, TickInput }
 export { NetcodeError, createInputSequencer, joinNetcode } from './client.js';
 export type { InputSequencer, JoinNetcodeOptions, LocalEntity, NetcodeClient, NetcodeErrorKind, NetcodeStats } from './client.js';
 export { joinShards } from './shards.js';
+export { MAX_PATH_POINTS, npcModes, pathAction, pathAt, pathProblems } from './paths.js';
+export type { ModedEntity, NpcModes, NpcModesOptions, NpcPath, PathPoint } from './paths.js';
 export {
   assignAction,
   assignmentProblems,

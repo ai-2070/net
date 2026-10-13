@@ -1228,6 +1228,60 @@ nothing to build for them here.
   An NPC hidden by `visible` never appears through a path record
   (`assertHidden`). The S0 benchmark records the upload saved.
 
+**Result: N2 built (2026-10-13), ahead of S7 by decision.**
+`src/netcode/paths.ts`:
+- **The record.** `NpcPath { mv, mode, key, points }` lives in the lobby
+  store. `pathAction({ assignment })` is its store action (D8): only the
+  host whose shard owns the NPC writes one, with a rising `mv` and a valid
+  path (at most 64 points, never back in time). `pathAt` evaluates one.
+- **The client's half: `npcModes().resolve(view, records, ownerNow)`.**
+  - It draws each NPC from whichever source shows the highest `mv`. It
+    *remembers* the highest a snapshot showed after the entry leaves the
+    view.
+  - A path that's due, with its record late, uses the still-announcing
+    snapshot entry. Failing that, it carries the last live motion forward
+    for ≤ 500 ms, then holds.
+  - A switch of source blends over 100 ms.
+- **The host side: the recipe's `setNpcPath(npc, points)` /
+  `setNpcLive(npc)`.**
+  - Each bumps `mv` and writes the record.
+  - On a path, the host drives the NPC along it.
+  - It announces a switch in snapshots for `announceMs` (1 s), then stops
+    sending that NPC.
+  - It refuses a path under fog, because a record goes to every reader of
+    the store.
+
+`test/netcode/npc-paths.test.ts` (9 tests):
+- **Path → live → path under random reordering, 5 seeds.** The store is
+  simulated as an ordered replica arriving 0–400 ms late against
+  snapshots, over 30 ms ± 20 ms with 5% loss. The path turns 90° from the
+  live motion, so a wrong source shows as distance.
+  - Every 10 ms the drawn NPC is within 2.4 units (one tick plus jitter
+    plus a frame at 20 units/s) of the host's true position at render
+    time; the worst seen was 0.86.
+  - No frame moves it more than 1.2 units, which is what interpolation
+    alone does. A late snapshot already jumps it up to ~1.0 while plainly
+    live.
+- A late record is carried, then held, then taken over.
+- A fogged NPC gets no record (`assertHidden` on the store state).
+- D8's write rules.
+- **Upload saved,** measured with 50 NPCs and one viewer: **47,286 B/s live
+  → 1,582 B/s on paths** after the announce window. The test requires less
+  than a fifth.
+
+Mutation checks each fail a test:
+- the record winning regardless of `mv`;
+- no announce window;
+- no carry;
+- forgetting a snapshot's `mv` once the entry leaves (a real defect the
+  carry test found and the fix closed);
+- no blend;
+- a path allowed under fog;
+- anyone writing a path.
+
+Not done: the S0 benchmark (`bench-netcode.mjs`) has no path mode, so the
+saving is measured by that test, not by S0.
+
 ## 4. Order
 
 S0 (done) → **S0c** (compact codec) → S0b (gates; D4, D9 and whether to
