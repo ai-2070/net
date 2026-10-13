@@ -665,6 +665,38 @@ wire upload. But the host tab's main thread is 99% busy (tick p95
 players report receiving, so treat it as unreliable under saturation.
 Both need the multi-machine run.
 
+**Host CPU at 1 × 64: a streams × events cost in the leaf
+(2026-10-13).** The harness gained `--profile-ms`: a CDP CPU profile of
+host 0 during the measuring window, summarised by self time and saved
+as `work/host0.cpuprofile`. A rerun of 1 × 64 on a quieter machine
+passed every gate (all direct, 60 fps, tick p95 11.9 ms, 3.80 Mbit/s
+wire upload against 1.98 payload, 1.92×), so the earlier 99%-busy, 10 fps
+reading was mostly the shared machine. But the profile named one cost
+that grows faster than the player count: `passStringToWasm0`, at 1.2% of
+the host's main thread with 32 players and 13.3% with 64.
+
+Cause: every stream's `on_message` registered a filter that copied every
+node event's JSON back into wasm to substring-match its peer and stream
+id. A host with one stream per player therefore paid players × events.
+At 64 players and 20 Hz that is about 82,000 copies a second. The
+session API's streams (`leader_session.rs`) had the same filter.
+
+**Fix:** both dispatchers route `stream_data` to the stream's
+registration by key (peer, stream id) and never read the text
+(`net-mesh-leaf`). The R4-10 witnesses (two peers under one label) are
+the guard: removing the key check fails them on both paths.
+
+| 1 × 64 host | Before | After |
+|---|---|---|
+| `passStringToWasm0` share of main thread | 13.3% | below 0.3% |
+| Main thread not idle (profile) | 70% | 55% |
+| CDP busy | 0.82 | 0.58 |
+| Gate | pass | pass (60 fps, tick p95 14.7 ms, 4.41 Mbit/s, 1.83×) |
+
+About 24% of what remains is the harness's deliberate 4 ms per-frame
+burn, so the host's real netcode work at 64 players is about 30% of one
+core.
+
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It
 needs ≥ 3 machines.

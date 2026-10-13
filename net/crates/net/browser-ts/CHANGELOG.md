@@ -58,6 +58,13 @@ the README on why it is a sibling package rather than a sub-path.
   host's anchor link at its SCTP advisory, starving every relayed pair. A
   change of players is still announced at once, and an announcement lives
   300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has.
+- **Stream data is routed to its stream, not filtered by every stream.**
+  Each `LeafStream`'s listener used to receive every node event and read
+  it to find its own, so a host with one stream per player paid players ×
+  events: at 64 players that was 13% of the host's main thread. Events are
+  now routed by peer and stream id inside the wasm, on both the
+  `connect()` and the `openSession()` paths (`net-mesh-leaf`). What a
+  listener receives is unchanged.
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers

@@ -335,7 +335,15 @@ struct SessionState {
     subscribed: BTreeSet<String>,
     /// Channels the leader told us it re-established.
     restored: Vec<String>,
-    listeners: Vec<Function>,
+    /// Each with the stream it is for, when it is a stream's
+    /// ([`ProxyStream::on_message`]): handed that stream's
+    /// `stream_data` and nothing else. `None` is handed every event.
+    ///
+    /// Routed by key in [`flush_events`], once per event, for the
+    /// reason `wasm::Subscription::stream` gives: a filter per stream
+    /// that reads every event costs streams × events, and a host with
+    /// one stream per player pays it on every input.
+    listeners: Vec<(Function, Option<(crate::control_plane::NodeId, u64)>)>,
     lock: Option<WebLock>,
     /// Set while this session's generation is superseded: the fence
     /// [`stand_down`] raised, naming what this tab presented and what
@@ -894,7 +902,21 @@ impl Lifecycle {
 
     /// Register a listener for this session's event JSON.
     pub fn on_event(&self, callback: Function) {
-        self.shared.state.borrow_mut().listeners.push(callback);
+        self.shared
+            .state
+            .borrow_mut()
+            .listeners
+            .push((callback, None));
+    }
+
+    /// Register a listener for one stream's `stream_data` only: the
+    /// peer and the stream id, both halves of the key.
+    fn on_stream_data(&self, key: (crate::control_plane::NodeId, u64), callback: Function) {
+        self.shared
+            .state
+            .borrow_mut()
+            .listeners
+            .push((callback, Some(key)));
     }
 
     /// Stand down: cancel a bootstrap that is still running, fence the
@@ -1881,9 +1903,15 @@ fn flush_events(shared: &Rc<Shared>) {
     }
     let listeners = shared.state.borrow().listeners.clone();
     for json in queued {
-        let value = JsValue::from_str(&json);
-        for listener in &listeners {
-            let _ = listener.call1(&JsValue::NULL, &value);
+        let key = crate::node::LeafEvent::stream_data_key(&json);
+        // Built once, and only when some listener takes it.
+        let mut value: Option<JsValue> = None;
+        for (listener, stream) in &listeners {
+            if stream.is_some() && *stream != key {
+                continue;
+            }
+            let value = value.get_or_insert_with(|| JsValue::from_str(&json));
+            let _ = listener.call1(&JsValue::NULL, value);
         }
     }
 }
@@ -3351,27 +3379,20 @@ impl ProxyStream {
     /// proxied consumer received whichever peer's payload arrived.
     /// That is R4-10, on the proxied path.
     pub fn on_message(&self, callback: Function) {
-        // The event's own spelling of each half: decimal, exactly as
-        // `to_json` writes them.
-        let wanted_peer = format!("\"peer_node\":\"{}\"", self.peer);
-        let wanted_stream = format!("\"stream_id\":\"{}\"", self.stream_id);
+        // Both halves of the key are routed by [`flush_events`]; the
+        // generation is this handle's own, so it is checked here.
         let lifecycle = self.lifecycle.clone();
         let generation = self.generation;
         let filter = Closure::wrap(Box::new(move |json: JsValue| {
             if lifecycle.generation() != generation {
                 return;
             }
-            if json.as_string().is_some_and(|text| {
-                text.contains("\"stream_data\"")
-                    && text.contains(&wanted_peer)
-                    && text.contains(&wanted_stream)
-            }) {
-                let _ = callback.call1(&JsValue::NULL, &json);
-            }
+            let _ = callback.call1(&JsValue::NULL, &json);
         }) as Box<dyn FnMut(JsValue)>);
         let function = filter.as_ref().unchecked_ref::<Function>().clone();
         filter.forget();
-        self.lifecycle.on_event(function);
+        self.lifecycle
+            .on_stream_data((self.peer, self.stream_id), function);
     }
 
     /// Stop using the stream.

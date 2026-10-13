@@ -390,19 +390,26 @@ struct Subscription {
     id: u64,
     /// The callback itself.
     callback: js_sys::Function,
-    /// The Rust closure behind `callback`, when there is one —
-    /// [`LeafStream::on_message`] registers a Rust filter closure and
-    /// hands out the `Function` built over it.
+    /// The stream this registration is for, when it is a stream's
+    /// ([`LeafStream::on_message`]): it is handed that stream's
+    /// `stream_data` and nothing else. `None` is a node-wide listener
+    /// ([`LeafNode::on_event`]), handed every event.
     ///
-    /// Kept here so the registration OWNS it. `forget()` retained the
-    /// closure and its captured consumer for the node's whole life
-    /// while `close`/`remove_listener` dropped only this `Function`:
-    /// one leaked closure plus one retained consumer per stream
-    /// generation, with `listener_count` reporting flat. Dropped when
-    /// the registration is retired and no dispatch snapshot can still
-    /// reach it ([`Inner::retired`]).
-    retained: Option<Closure<dyn FnMut(JsValue)>>,
+    /// **Routed here, by key, not by a filter on the event text.** A
+    /// stream used to register a Rust closure that copied every
+    /// event's JSON back into wasm and substring-matched its peer and
+    /// stream id — so every event crossed the boundary once per open
+    /// stream. A host with one stream per player pays that as
+    /// players × events: the sharded-match S0b run measured the copy
+    /// (`passStringToWasm0`) at 1.2% of a 32-player host's main
+    /// thread and 13.3% of a 64-player one's.
+    stream: Option<StreamKey>,
 }
+
+/// What a `stream_data` event is routed by: the peer whose session
+/// delivered it and the stream id. Both halves, because the id alone
+/// is one label's id on every peer (R4-10).
+type StreamKey = (NodeId, u64);
 
 /// The transport-loss path's fence record: the session one open
 /// DataChannel's handshake installed, and the identity of that
@@ -563,7 +570,11 @@ pub(crate) struct Inner {
     /// `borrow_mut` and trapped, and so did closing the node from a
     /// callback. Collected here, handed out by
     /// [`dispatch_events`] with no borrow held.
-    outbox: Vec<String>,
+    ///
+    /// Each event carries its [`StreamKey`] when it is `stream_data`,
+    /// so [`dispatch_events`] can hand it to its stream's
+    /// registrations without reading the text.
+    outbox: Vec<(String, Option<StreamKey>)>,
     /// Whether a dispatch is already walking the outbox.
     ///
     /// A callback that sends re-enters [`dispatch_events`] through
@@ -578,25 +589,14 @@ pub(crate) struct Inner {
     /// its registrar can cancel it with.
     ///
     /// **A registration is owned, not forgotten.** `LeafStream`'s
-    /// `on_message` appends a filter closure here and the closure
-    /// captures the consumer's wrapper, so before the token existed
+    /// `on_message` appends the consumer's callback here (keyed to
+    /// its stream, [`Subscription::stream`]), so before the token existed
     /// a page that opened and closed streams for the life of the
     /// node accumulated one permanently-retained closure per open —
     /// each still invoked for every event the node produced, each
     /// still holding its wrapper alive. Closing the stream removed
     /// nothing, because nothing named the registration.
     listeners: Vec<Subscription>,
-    /// Registration closures retired while a dispatch snapshot can
-    /// still reach their `Function`, kept until none can.
-    ///
-    /// Dropping a `Closure` invalidates the `js_sys::Function` built
-    /// from it — a queued call into one throws "closure invoked
-    /// recursively or after being dropped" — and [`dispatch_events`]
-    /// walks a snapshot of those `Function`s. So a removal taken
-    /// mid-dispatch parks the closure here, and the dispatch drops it
-    /// once its snapshot is dead. Outside a dispatch nothing can
-    /// reach one and it goes at once.
-    retired: Vec<Closure<dyn FnMut(JsValue)>>,
     /// The next token. Process-monotonic within the node, never
     /// reused: a token is the right to remove exactly one
     /// registration, and a reused one would let a closed stream's
@@ -1261,27 +1261,30 @@ impl Inner {
                 self.file_signal(envelope);
             }
         }
-        self.outbox
-            .extend(events.iter().map(crate::node::LeafEvent::to_json));
+        self.outbox.extend(events.iter().map(|event| {
+            let key = match event {
+                LeafEvent::StreamData {
+                    peer_node,
+                    stream_id,
+                    ..
+                } => Some((*peer_node, *stream_id)),
+                _ => None,
+            };
+            (event.to_json(), key)
+        }));
     }
 
     /// Register `callback`, returning the token that removes it.
     ///
-    /// `retained` is the Rust closure behind `callback`, when there
-    /// is one — [`LeafStream::on_message`] registers a filter and
-    /// hands out the `Function` built over it. The registration owns
-    /// it and gives it up at removal ([`Inner::retire_listener`]).
-    fn add_listener(
-        &mut self,
-        callback: js_sys::Function,
-        retained: Option<Closure<dyn FnMut(JsValue)>>,
-    ) -> u64 {
+    /// `stream` scopes it to one stream's `stream_data`
+    /// ([`Subscription::stream`]); `None` hands it every event.
+    fn add_listener(&mut self, callback: js_sys::Function, stream: Option<StreamKey>) -> u64 {
         let id = self.next_listener_id;
         self.next_listener_id = self.next_listener_id.wrapping_add(1);
         self.listeners.push(Subscription {
             id,
             callback,
-            retained,
+            stream,
         });
         id
     }
@@ -1289,33 +1292,16 @@ impl Inner {
     /// Remove the registration `id` names. `false` when it is
     /// already gone — which is the outcome a second cancellation
     /// wanted, so it is not an error.
+    ///
+    /// Safe from inside a listener: [`dispatch_events`] walks a
+    /// snapshot of the callbacks, so this turn still delivers to the
+    /// removed one and the next does not.
     fn remove_listener(&mut self, id: u64) -> bool {
         let Some(index) = self.listeners.iter().position(|s| s.id == id) else {
             return false;
         };
-        let subscription = self.listeners.remove(index);
-        self.retire_listener(subscription.retained);
+        self.listeners.remove(index);
         true
-    }
-
-    /// Give up a removed registration's closure — now if nothing can
-    /// still reach it, later if a dispatch snapshot can.
-    ///
-    /// `dispatching` is exactly "a snapshot of the listeners'
-    /// `Function`s is live", so a removal taken from inside a
-    /// listener parks the closure in [`Inner::retired`] and the
-    /// dispatch drops it once the snapshot is dead: dropping a
-    /// `Closure` invalidates the `Function` a queued call would still
-    /// reach. Outside a dispatch it goes at once — which is what
-    /// makes the documented open/`on_message`/`close` lifecycle leave
-    /// `listener_count` flat in CLOSURES too, not just in tokens.
-    fn retire_listener(&mut self, retained: Option<Closure<dyn FnMut(JsValue)>>) {
-        let Some(closure) = retained else {
-            return;
-        };
-        if self.dispatching {
-            self.retired.push(closure);
-        }
     }
 
     /// File one verified envelope where the §9 drive loop will find
@@ -1784,10 +1770,6 @@ fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
             if guard.dispatching {
                 return;
             }
-            // No snapshot is live at this point — the previous
-            // iteration's went out of scope at its end — so whatever
-            // a removal parked during one can go now.
-            guard.retired.clear();
             if guard.outbox.is_empty() {
                 return;
             }
@@ -1802,14 +1784,20 @@ fn dispatch_events(inner: &Rc<RefCell<Inner>>) {
                 guard
                     .listeners
                     .iter()
-                    .map(|s| s.callback.clone())
+                    .map(|s| (s.callback.clone(), s.stream))
                     .collect::<Vec<_>>(),
             )
         };
-        for json in events {
-            let value = JsValue::from_str(&json);
-            for listener in &listeners {
-                let _ = listener.call1(&JsValue::NULL, &value);
+        for (json, key) in events {
+            // Built once, and only when some registration takes it:
+            // a stream's data no other stream wants never crosses.
+            let mut value: Option<JsValue> = None;
+            for (listener, stream) in &listeners {
+                if stream.is_some() && *stream != key {
+                    continue;
+                }
+                let value = value.get_or_insert_with(|| JsValue::from_str(&json));
+                let _ = listener.call1(&JsValue::NULL, value);
             }
         }
         // Cleared after delivery, so a callback's re-entrant dispatch
@@ -1980,7 +1968,6 @@ impl LeafNode {
             outbox: Vec::new(),
             dispatching: false,
             listeners: Vec::new(),
-            retired: Vec::new(),
             next_listener_id: 1,
             closed: false,
             // One window for the episode and for the re-attempt it
@@ -4381,7 +4368,7 @@ impl LeafStream {
     /// comes from a label or from a publish contract and neither
     /// involves the peer, so one label opened to two peers is one id
     /// on two sessions — a supported composition. Filtering the
-    /// node-wide event stream by the id alone made both wrappers
+    /// node's events by the id alone made both wrappers
     /// accept whichever peer's payload arrived, delivering one
     /// peer's bytes into the other peer's inbox; a page that echoes
     /// then amplifies it. The incarnation rides the event as
@@ -4395,36 +4382,19 @@ impl LeafStream {
     /// self` — so the advertised echo trapped instead of sending.
     ///
     /// **Returns the token that cancels the registration**, decimal.
-    /// The closure is registered on the node and captures the
-    /// consumer's callback, so a registration nothing names is
-    /// retained for the node's whole life and keeps being invoked
-    /// for every event it produces — which is what repeated
+    /// The callback is registered on the node, so a registration
+    /// nothing names is retained for the node's whole life and keeps
+    /// being invoked for its stream's data — which is what repeated
     /// open/close accumulated before the token existed.
     /// [`Self::close`] gives back every token this stream took, so
     /// an ordinary consumer never has to; [`Self::remove_listener`]
     /// is for one that wants to stop listening without closing.
     pub fn on_message(&self, callback: js_sys::Function) -> String {
-        // Both halves of the key, and the event's own spelling of
-        // each: decimal, exactly as `to_json` writes them.
-        let peer = format!("\"peer_node\":\"{}\"", self.handle.peer);
-        let stream = format!("\"stream_id\":\"{}\"", self.handle.stream_id);
-        let filter = Closure::wrap(Box::new(move |json: JsValue| {
-            if json.as_string().is_some_and(|text| {
-                text.contains("\"stream_data\"") && text.contains(&peer) && text.contains(&stream)
-            }) {
-                let _ = callback.call1(&JsValue::NULL, &json);
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-        let function: js_sys::Function =
-            filter.as_ref().unchecked_ref::<js_sys::Function>().clone();
-        // The registration OWNS the closure, not `forget()` — which
-        // retained it and its captured consumer for the node's whole
-        // life while `close`/`remove_listener` dropped only this
-        // `Function`: one leaked closure plus one retained consumer
-        // per stream generation, with `listener_count` reporting
-        // flat. [`Inner::retire_listener`] drops it when the
-        // registration goes and no dispatch snapshot can reach it.
-        let id = self.inner.borrow_mut().add_listener(function, Some(filter));
+        // Both halves of the key ([`StreamKey`]): routed by
+        // [`dispatch_events`], so the callback is handed exactly
+        // this stream's `stream_data` and never reads anything else.
+        let key = (self.handle.peer, self.handle.stream_id);
+        let id = self.inner.borrow_mut().add_listener(callback, Some(key));
         self.subscriptions.borrow_mut().push(id);
         id.to_string()
     }
@@ -4466,11 +4436,10 @@ impl LeafStream {
     /// **Every registration this stream took is given back**, so
     /// repeated open/close leaves [`LeafNode::listener_count`] flat.
     /// A callback registered through [`Self::on_message`] lives on
-    /// the node, not on this object, and it captures the consumer's
-    /// own callback — so a close that removed only the node's stream
-    /// state left the closure attached, still invoked for every
-    /// event the node produced and still holding its consumer
-    /// alive, for as long as the node lived.
+    /// the node, not on this object — so a close that removed only
+    /// the node's stream state left it attached, still invoked and
+    /// still holding its consumer alive, for as long as the node
+    /// lived.
     ///
     /// A refusal here is reported rather than returned: the handle is
     /// being discarded either way, and `close` is the one operation

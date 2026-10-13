@@ -228,7 +228,6 @@ fn pair() -> Pair {
         outbox: Vec::new(),
         dispatching: false,
         listeners: Vec::new(),
-        retired: Vec::new(),
         channel_installations: HashMap::new(),
         next_listener_id: 1,
         closed: false,
