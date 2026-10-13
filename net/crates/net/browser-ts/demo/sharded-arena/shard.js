@@ -23,6 +23,13 @@
  *   D6) and no `ghosting` (every host already spectates every other). It
  *   carries forwarded actions now and planned moves later (S5).
  * - **A static assignment**: no lobby, no leases yet (S4).
+ * - **Cross-host hits** (S3, `options.combat`), hitscan. A fire input
+ *   `{ fire: { target, seenB } }` is checked here (the shooter's host, A)
+ *   and, for a target another shard owns, forwarded to its host (B) as a
+ *   `hit` action: `{ shooter, target, poseA, seenA, seenB, ep }`. B decides
+ *   the death — see `hitAction` for its three checks. The forward is
+ *   applied at most once at B (the handoff ledger), retried every 50 ms,
+ *   and abandoned after 500 ms: an unresolved hit is a miss, never re-sent.
  *
  * The world is a handoff `RegionState`, so a handoff and the tick loop
  * read and write the same entities.
@@ -46,6 +53,16 @@ export function shardHost(lib, options) {
   const hosts = new Set(Object.values(assignment.hosts));
   const roster = new Set(options.roster);
   const fog = options.fogRadius ?? Infinity;
+  const tickRate = options.tickRate ?? 20;
+  const combat = options.combat;
+  const now = options.now ?? (() => Date.now());
+  const maxRewindMs = combat?.maxRewindMs ?? 300;
+  const distance = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+  // What combat did, for the game and for S3's records.
+  const record = { fired: 0, local: { hit: 0, miss: 0 }, forwarded: {}, served: {}, seenBAgeMs: [] };
+  const count = (bucket, key) => {
+    bucket[key] = (bucket[key] ?? 0) + 1;
+  };
 
   // The world: this shard's own entities, as a handoff region.
   let region = lib.regionState(regionOf(shard), options.initial ?? {});
@@ -72,10 +89,96 @@ export function shardHost(lib, options) {
     return name === undefined ? undefined : spectators.get(name)?.view()[id];
   };
 
+  // A fire input from `peer`, whose state is `shooter`: checked, then hit
+  // locally or forwarded. Returns the world with the shot's local effects.
+  const fire = (entities, peer, seenA, shot) => {
+    if (combat === undefined || typeof shot?.target !== 'string' || !Number.isFinite(shot.seenB) || !Number.isFinite(seenA)) {
+      return entities;
+    }
+    const fired = combat.fire(entities[peer]);
+    if (typeof fired === 'string') {
+      count(record.forwarded, `refused-here:${fired}`);
+      return entities;
+    }
+    record.fired += 1;
+    entities = { ...entities, [peer]: fired };
+    const then = netcode.rewind(seenA).entities;
+    const poseA = then[peer];
+    if (poseA === undefined) {
+      count(record.forwarded, 'refused-here:no-history');
+      return entities;
+    }
+    const targetShard = owner(shot.target);
+    if (targetShard === shard) {
+      // Both here: single-host lag compensation, the shooter's clock.
+      const target = then[shot.target];
+      if (target !== undefined && entities[shot.target] !== undefined && combat.hits(poseA, target)) {
+        record.local.hit += 1;
+        return { ...entities, [shot.target]: combat.damage(entities[shot.target]) };
+      }
+      record.local.miss += 1;
+      return entities;
+    }
+    if (targetShard === undefined || assignment.hosts[targetShard] === undefined) {
+      count(record.forwarded, 'refused-here:no-owner');
+      return entities;
+    }
+    const claim = { shooter: peer, target: shot.target, poseA, seenA, seenB: shot.seenB, ep: assignment.epoch };
+    handoffs.forward(regionOf(targetShard), 'hit', claim).then(
+      output => count(record.forwarded, output?.hit === true ? 'hit' : 'miss'),
+      error => count(record.forwarded, error?.code === 'refused' ? `refused:${error.message}` : 'unresolved'),
+    );
+    return entities;
+  };
+
+  /**
+   * B's half: a claim from shard `from` that its shooter hit our target.
+   *
+   * 1. `seenB` must be within this host's rewind cap (`beyond-cap`).
+   * 2. `poseA` is checked against THIS host's spectator history of A at
+   *    A's time `seenA` — not against the current view, which a fast
+   *    shooter has long left — within `maxSpeed × (gap + jitter) + ε`
+   *    (`pose-mismatch`). The gap is the bracketing snapshots' own spacing.
+   * 3. No history covering `seenA` (lost snapshots, or too old) is
+   *    `no-history`: refused and counted, never accepted unchecked.
+   *
+   * Then the target as it was at `seenB` decides the hit, and the damage
+   * lands on its state now — so a mutual kill across hosts is a trade.
+   */
+  const hitAction = (entities, claim, from) => {
+    const fromShard = /^shard:(.+)$/.exec(from)?.[1];
+    const verdict = (reason, output) => {
+      count(record.served, reason);
+      return output ?? reason;
+    };
+    if (typeof claim !== 'object' || claim === null || claim.ep !== assignment.epoch) return verdict('stale-epoch');
+    if (fromShard === undefined || owner(claim.shooter) !== fromShard) return verdict('not-owner');
+    if (owner(claim.target) !== shard || entities[claim.target] === undefined) return verdict('not-owner');
+    const at = now();
+    if (record.seenBAgeMs.length < 10_000) record.seenBAgeMs.push(at - claim.seenB);
+    if (!(claim.seenB <= at) || at - claim.seenB > maxRewindMs) return verdict('beyond-cap');
+    const spectator = spectators.get(fromShard);
+    const history = spectator?.sampleAt(claim.seenA) ?? null;
+    const maxGapMs = combat.maxGapMs ?? 3000 / tickRate;
+    const shooterThen = history?.entities[claim.shooter];
+    if (history === null || history.gapMs > maxGapMs || shooterThen === undefined) return verdict('no-history');
+    const jitter = spectator.stats().clock?.jitterMs ?? 0;
+    const tolerance = (combat.maxSpeed * (history.gapMs + jitter)) / 1000 + (combat.epsilon ?? 0.5);
+    if (distance(claim.poseA, shooterThen) > tolerance) return verdict('pose-mismatch');
+    const targetThen = netcode.rewind(claim.seenB).entities[claim.target];
+    if (targetThen === undefined) return verdict('no-history');
+    if (!combat.hits(claim.poseA, targetThen)) return verdict('miss', { entities, output: { hit: false } });
+    return verdict('hit', {
+      entities: { ...entities, [claim.target]: combat.damage(entities[claim.target]) },
+      output: { hit: true },
+    });
+  };
+
   const netcode = lib.hostNetcode({
     transport,
     label,
-    tickRate: options.tickRate ?? 20,
+    tickRate,
+    maxRewindMs,
     autoTick: options.autoTick,
     epoch: () => assignment.epoch,
     authorize: peer => roster.has(peer) || hosts.has(peer),
@@ -86,9 +189,10 @@ export function shardHost(lib, options) {
         // other host (`joinShards` sends to the owner), and one that did
         // is not this host's to apply.
         if (!owns(peer) || entities[peer] === undefined) continue;
-        let state = entities[peer];
-        for (const { data } of list) state = options.apply(state, data);
-        entities = { ...entities, [peer]: state };
+        for (const { data, seen } of list) {
+          entities = { ...entities, [peer]: options.apply(entities[peer], data) };
+          if (data?.fire !== undefined) entities = fire(entities, peer, seen, data.fire);
+        }
       }
       if (options.advance !== undefined) entities = options.advance(entities);
       if (entities !== region.entities) region = { ...region, entities };
@@ -120,7 +224,9 @@ export function shardHost(lib, options) {
     commit: next => {
       region = next;
     },
-    ...(options.actions === undefined ? {} : { actions: options.actions }),
+    actions: { ...(combat === undefined ? {} : { hit: hitAction }), ...(options.actions ?? {}) },
+    // A hit confirmed later than ~500 ms is worse than a miss (plan, S3).
+    ...(combat === undefined ? {} : { timing: { retryMs: 50, giveUpMs: 500, handledRetentionMs: 10_000 }, tickMs: 25 }),
     ...(options.now === undefined ? {} : { now: options.now }),
   });
 
@@ -128,6 +234,8 @@ export function shardHost(lib, options) {
     shard,
     netcode,
     handoffs,
+    /** What combat did: shots, local hits, forwarded outcomes, served verdicts, `seenB` ages at this host. */
+    combat: () => record,
     /** This shard's authoritative entities. */
     world: () => region.entities,
     /** The whole match as this host knows it: its own entities, plus every other host's as spectated. */

@@ -74,6 +74,35 @@ export class SnapshotBuffer<E> {
   }
 
   /**
+   * History, not rendering: the entities as of host time `time`, from the
+   * two snapshots that bracket it, and how far apart those two were. `null`
+   * when no two held snapshots bracket `time` — before the oldest, after
+   * the newest — so a caller checking a claim against history can tell "no
+   * history" from "this is where it was". Never extrapolates.
+   *
+   * `gapMs` is the evidence's resolution: one snapshot interval normally,
+   * more where snapshots were lost. A caller sets its tolerance from it, or
+   * refuses a gap too wide to judge.
+   */
+  sample(time: number, blend: Interpolator<E>): { readonly entities: Readonly<Record<string, E>>; readonly gapMs: number } | null {
+    const list = this.#snapshots;
+    if (list.length === 0 || time < list[0]!.time || time > list.at(-1)!.time) return null;
+    if (list.length === 1) return { entities: list[0]!.entities, gapMs: 0 };
+    let i = 1;
+    while (i < list.length - 1 && list[i]!.time < time) i += 1;
+    const a = list[i - 1]!;
+    const b = list[i]!;
+    const alpha = b.time === a.time ? 1 : (time - a.time) / (b.time - a.time);
+    const out: Record<string, E> = {};
+    for (const [id, to] of Object.entries(b.entities)) {
+      const from = a.entities[id];
+      // In only one of the two: known at one end of the gap, not across it.
+      if (from !== undefined) out[id] = blend(from, to, alpha);
+    }
+    return { entities: out, gapMs: b.time - a.time };
+  }
+
+  /**
    * The entities as of host time `at`: interpolated between the two
    * snapshots around it. Before the oldest held, the oldest. Past the
    * newest: held there, or — with `extrapolateMs` — carried on along the

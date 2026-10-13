@@ -45,12 +45,45 @@ export interface ShardHostOptions<E extends Placed, I> {
   readonly codec?: EntityCodec<E>;
   readonly tickRate?: number;
   readonly autoTick?: boolean;
-  /** Cross-host actions this shard serves (S3's hit claims). */
+  /** More cross-host actions this shard serves, beside combat's `hit`. */
   readonly actions?: Readonly<Record<string, BorderAction<E>>>;
+  /** Cross-host hits (S3). A fire input carries `{ fire: { target, seenB } }`. */
+  readonly combat?: ShardCombat<E>;
   readonly now?: () => number;
 }
 
+/** Hitscan combat rules, as both the shooter's and the target's host apply them. */
+export interface ShardCombat<E> {
+  /** Check a shot at the shooter's host (ammo, cooldown, alive): the shooter after firing, or a refusal reason. */
+  fire(shooter: E): E | string;
+  /** Does a shot from `shooter` hit `target`? Both as they were when the shooter saw them. */
+  hits(shooter: E, target: E): boolean;
+  /** The target after one hit. */
+  damage(target: E): E;
+  /** The fastest an entity moves, units/s: sizes the pose tolerance. */
+  readonly maxSpeed: number;
+  /** Added to the pose tolerance. Default 0.5. */
+  readonly epsilon?: number;
+  /** The widest history gap a pose is judged across, ms. Default three snapshot intervals. */
+  readonly maxGapMs?: number;
+  /** How far back `seenA`/`seenB` may reach, ms (D5). Default 300. */
+  readonly maxRewindMs?: number;
+}
+
+/** What combat did on one host. */
+export interface ShardCombatRecord {
+  fired: number;
+  readonly local: { hit: number; miss: number };
+  /** Outcomes of shots this host forwarded: `hit`, `miss`, `unresolved`, `refused:<reason>`, `refused-here:<reason>`. */
+  readonly forwarded: Record<string, number>;
+  /** Verdicts this host gave on claims it served: `hit`, `miss`, `stale-epoch`, `not-owner`, `beyond-cap`, `no-history`, `pose-mismatch`. */
+  readonly served: Record<string, number>;
+  /** `now - seenB` for every claim served here, ms (D5's distribution). */
+  readonly seenBAgeMs: number[];
+}
+
 export interface ShardHost<E> {
+  combat(): ShardCombatRecord;
   readonly shard: string;
   readonly netcode: HostNetcode<E>;
   readonly handoffs: RegionHandoffs<E>;

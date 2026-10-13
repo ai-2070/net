@@ -897,6 +897,53 @@ spectate.
 - **Records:** the distribution of `seenB` age at B (sets D5) and the
   `no-history` rate.
 
+**Result: S3 built (2026-10-13).** It's in the recipe (`shard.js`,
+`options.combat`), plus one client API:
+`NetcodeClient.sampleAt(hostTime)` → `{ entities, gapMs } | null`, over
+`SnapshotBuffer.sample`. It returns history, never extrapolated, with the
+gap between the two snapshots that bracket the time. B sizes its tolerance
+from that gap and refuses one too wide to judge. A shot is checked at A
+(`fire`), rewound at `seenA`, and forwarded as a `hit` action through
+`regionHandoffs.forward`. The handoff ledger's per-id record makes it
+exactly-once at B, with retry at 50 ms, give-up at 500 ms and retention
+10 s. B checks, in order:
+1. the epoch;
+2. ownership of shooter and target;
+3. the `seenB` cap;
+4. history of A at `seenA` (`no-history`);
+5. `poseA` within `maxSpeed × (gap + jitter) + ε` (`pose-mismatch`);
+
+then the target as it was at `seenB`. Damage lands on the target's current
+state, so mutual kills trade. The simulator gained duplication and
+per-link blocking.
+
+`test/netcode/cross-host-hits.test.ts` (7 tests) proves every item in the
+list above, plus a stale-epoch refusal. Each mutation fails a test:
+- checking the pose against the current view (fails the fast-shooter
+  test, the review's false-rejection case);
+- no ledger dedupe;
+- no rewind cap;
+- no gap limit;
+- no epoch check.
+
+**Records, on the simulator (100 shots each, a shot every 200 ms,
+interpolation 100 ms, 20 Hz, cap 300 ms):**
+
+| One-way latency | Loss | `seenB` age at B, p50 / p95 / max | hit | `beyond-cap` | `no-history` |
+|---|---|---|---|---|---|
+| 20–30 ms | 2% | 174 / 179 / 375 ms | 99 | 1 | 0 |
+| 40–80 ms | 10% | 253 / 376 / 454 ms | 93 | 6 | 1 |
+| 80–140 ms | 10% | 342 / 465 / 569 ms | 11 | 89 | 0 |
+
+**What this says about D5.** The age at B is the interpolation delay, plus
+player → A, plus up to a tick at A, plus A → B. So **300 ms only covers
+players up to about 40 ms one-way**, and at 80–140 ms nearly every
+cross-host hit is refused. Covering a p95 of 465 ms needs a cap near
+500 ms. That's the fairness trade single-host lag compensation already
+makes: a longer rewind lets a high-latency player hit around corners.
+**D5 is left at 300 ms pending a decision.** `combat.maxRewindMs` sets
+it. `no-history` stayed at or below 1% with 10% loss.
+
 #### S7 — The 128-player gate (players only)
 
 The S0b harness with the real game loop: S1 + S2 + S3, 128 players,

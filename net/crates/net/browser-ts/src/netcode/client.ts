@@ -207,6 +207,18 @@ export interface NetcodeClient<E, I> {
   ready(): Promise<void>;
   /** The host clock, as estimated. `null` before the first pong. */
   hostNow(): number | null;
+  /**
+   * The host's entities as of host time `hostTime`, from the snapshots this
+   * client holds, and the gap between the two that bracket it — or `null`
+   * when no two do (too old, or newer than the newest). History, not a
+   * render: never extrapolated, never predicted, and an entity in only one
+   * of the two snapshots is left out.
+   *
+   * What a shard host checks a hit claim against: where another host's
+   * entity was at that host's time (sharded-match plan, "Clocks and hit
+   * claims").
+   */
+  sampleAt(hostTime: number): { readonly entities: Readonly<Record<string, E>>; readonly gapMs: number } | null;
   stats(): NetcodeStats;
   close(): void;
 }
@@ -623,6 +635,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       return readyPromise;
     },
     hostNow,
+    sampleAt: hostTime => snapshots.sample(hostTime, blend),
     stats: () => ({
       clock: clock.estimate(),
       snapshots: snapshotsSeen,

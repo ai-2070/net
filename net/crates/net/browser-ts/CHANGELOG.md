@@ -26,6 +26,12 @@ the README on why it is a sibling package rather than a sub-path.
   epoch. When ownership changes, the old owner's copy lingers for
   `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
   what the fencing dropped.
+- **`NetcodeClient.sampleAt(hostTime)`** returns the host's entities as
+  of a host time, from the snapshots the client holds, plus the gap
+  between the two snapshots around that time. It returns `null` when no
+  two snapshots bracket the time. This is history, never extrapolated: a
+  shard host uses it to check a cross-host hit claim against where the
+  shooter really was. `SnapshotBuffer.sample` is the same read.
 - **An optional epoch on the netcode wire.** `hostNetcode({ epoch })`
   stamps `ep` on every snapshot and drops input frames stamped with
   another epoch (`dropped['stale-epoch']`). `joinNetcode({ epoch })` stamps
