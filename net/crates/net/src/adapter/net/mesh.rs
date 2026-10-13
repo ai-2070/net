@@ -2845,7 +2845,7 @@ struct DispatchCtx {
     /// as this node forwards it (hop count already incremented), so a peer
     /// that attaches later is not blind to what was flooded before it
     /// arrived. See [`MeshNode::relay_announcements`].
-    relay_announcements: Arc<DashMap<u64, CapabilityAnnouncement>>,
+    relay_announcements: Arc<DashMap<u64, HeldAnnouncement>>,
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
@@ -10788,6 +10788,21 @@ fn tenant_of(peers: &DashMap<u64, PeerInfo>, node_id: u64) -> Option<super::rtc:
     peers.get(&node_id)?.admission.tenant()
 }
 
+/// One announcement a hub holds for replay (see
+/// `MeshNode::relay_announcements`), with the tenant its origin was
+/// enrolled for when it was held.
+///
+/// The tenant is recorded, not looked up at replay time: an origin whose
+/// session has since closed is no longer in the peer table, so a lookup
+/// would answer "no tenant" — "meets everyone" — and replay one game's
+/// still-unexpired announcement to every other game's players.
+#[derive(Clone)]
+pub(crate) struct HeldAnnouncement {
+    pub(crate) ann: CapabilityAnnouncement,
+    #[cfg(feature = "webrtc")]
+    pub(crate) tenant: Option<super::rtc::TenantId>,
+}
+
 /// Maps an Admitted enrollment grant (its delegation-chain bytes) to the
 /// tenant it was issued for. Installed by the application
 /// ([`MeshNode::set_enrollment_tenant_resolver`]).
@@ -13236,7 +13251,7 @@ pub struct MeshNode {
     /// signed timestamp, and receivers bound a forwarded announcement's
     /// lifetime by that timestamp too). Origin authentication is the
     /// origin's signature, untouched by replay.
-    relay_announcements: Arc<DashMap<u64, CapabilityAnnouncement>>,
+    relay_announcements: Arc<DashMap<u64, HeldAnnouncement>>,
     /// Origin-side announce rate-limit state. Compared against
     /// `config.min_announce_interval` on every `announce_capabilities_with`
     /// call; within-window calls coalesce to a local self-index
@@ -40366,6 +40381,18 @@ impl MeshNode {
         if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
             stats.note_admission_promoted();
         }
+        // **Discovery on enrollment.** While provisional this session was
+        // shown no tenant's announcements (`announcement_may_reach`), and
+        // the install path that admits a browser (`accept_rtc`) replays
+        // nothing, so without this a leaf that enrolls AFTER another
+        // session of its tenant announced is blind to it until that
+        // origin re-announces — a lobby announced once is never listed.
+        // Replay now that the tenant is known, so the filter is exact.
+        // The leaf dedups on (origin, version): the settle's second pass,
+        // and any copy the live flood also delivered, cost it nothing.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.spawn_relay_replay(node_id);
+        }
         true
     }
 
@@ -41913,14 +41940,28 @@ impl MeshNode {
             // say-so. A newer version supersedes (withdrawal is a newer
             // announcement without the capability).
             if signature_verified {
+                // The origin's tenant as of NOW, while its session is
+                // still in the table (see `HeldAnnouncement`). One already
+                // recorded for this origin is kept when none resolves now
+                // (a newer version forwarded after its direct session
+                // closed): fail closed, never back to "meets everyone".
+                let held_ann = HeldAnnouncement {
+                    ann: forwarded,
+                    #[cfg(feature = "webrtc")]
+                    tenant: tenant_of(&ctx.peers, ann.node_id).or_else(|| {
+                        ctx.relay_announcements
+                            .get(&ann.node_id)
+                            .and_then(|held| held.value().tenant)
+                    }),
+                };
                 match ctx.relay_announcements.entry(ann.node_id) {
                     dashmap::mapref::entry::Entry::Occupied(mut held) => {
-                        if held.get().version < forwarded.version {
-                            held.insert(forwarded);
+                        if held.get().ann.version < held_ann.ann.version {
+                            held.insert(held_ann);
                         }
                     }
                     dashmap::mapref::entry::Entry::Vacant(slot) => {
-                        slot.insert(forwarded);
+                        slot.insert(held_ann);
                     }
                 }
             }
@@ -42205,10 +42246,12 @@ impl MeshNode {
                 .iter()
                 .filter(|entry| entry.value().node_id != sender_node_id)
                 .filter(|entry| {
-                    let meets = super::rtc::tenants_may_meet(
-                        origin_tenant,
-                        entry.value().admission.tenant(),
-                    );
+                    // Not to another tenant's session, and not to one
+                    // that has not enrolled yet: a provisional session
+                    // has no tenant, which must not read as "meets
+                    // everyone" (`announcement_may_reach`).
+                    let meets =
+                        super::rtc::announcement_may_reach(origin_tenant, &entry.value().admission);
                     if !meets {
                         if let Some(stats) = rtc_stats.as_ref() {
                             stats.note_tenant_withheld_announcement();
@@ -42268,7 +42311,7 @@ impl MeshNode {
     /// announcement is never echoed back to it.
     async fn replay_relay_announcements(
         peer: u64,
-        relay: Arc<DashMap<u64, CapabilityAnnouncement>>,
+        relay: Arc<DashMap<u64, HeldAnnouncement>>,
         peers: Arc<DashMap<u64, PeerInfo>>,
         sink: PeerSink,
     ) {
@@ -42284,21 +42327,26 @@ impl MeshNode {
 
     async fn replay_relay_announcements_once(
         peer: u64,
-        relay: &DashMap<u64, CapabilityAnnouncement>,
+        relay: &DashMap<u64, HeldAnnouncement>,
         peers: &DashMap<u64, PeerInfo>,
         sink: &PeerSink,
     ) {
         // P0 slice 2: never replay one tenant's announcements to a session
-        // enrolled for another.
+        // enrolled for another — nor to a session not enrolled YET
+        // (`announcement_may_reach`). The origin's tenant is the one
+        // recorded when it was held, falling back to a live lookup.
         #[cfg(feature = "webrtc")]
-        let recipient_tenant = tenant_of(peers, peer);
+        let Some(recipient_admission) = peers.get(&peer).map(|p| p.admission) else {
+            return;
+        };
         let held: Vec<Vec<u8>> = relay
             .iter()
-            .filter(|e| *e.key() != peer && !e.value().is_expired())
+            .filter(|e| *e.key() != peer && !e.value().ann.is_expired())
             .filter(|e| {
                 #[cfg(feature = "webrtc")]
                 {
-                    super::rtc::tenants_may_meet(tenant_of(peers, *e.key()), recipient_tenant)
+                    let origin_tenant = e.value().tenant.or_else(|| tenant_of(peers, *e.key()));
+                    super::rtc::announcement_may_reach(origin_tenant, &recipient_admission)
                 }
                 #[cfg(not(feature = "webrtc"))]
                 {
@@ -42306,7 +42354,7 @@ impl MeshNode {
                     true
                 }
             })
-            .map(|e| e.value().to_bytes())
+            .map(|e| e.value().ann.to_bytes())
             .collect();
         if held.is_empty() {
             return;

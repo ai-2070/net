@@ -55,6 +55,30 @@ fn install(ctx: &DispatchCtx, peer: u64, addr: SocketAddr, tenant: Option<Tenant
     );
 }
 
+/// Hold an announcement from `origin` for replay, recording `tenant` as
+/// the hold path does (`None` = resolve the origin's tenant live).
+fn hold(ctx: &DispatchCtx, origin: u64, tenant: Option<TenantId>) {
+    ctx.relay_announcements.insert(
+        origin,
+        HeldAnnouncement {
+            ann: CapabilityAnnouncement::new(
+                origin,
+                EntityKeypair::generate().entity_id().clone(),
+                1,
+                crate::adapter::net::behavior::capability::CapabilitySet::new(),
+            ),
+            tenant,
+        },
+    );
+}
+
+/// Make `peer` a provisional (unenrolled browser) session.
+fn make_provisional(ctx: &DispatchCtx, peer: u64) {
+    if let Some(mut entry) = ctx.peers.get_mut(&peer) {
+        entry.admission = PeerAdmission::provisional(std::time::Instant::now());
+    }
+}
+
 async fn socket() -> (tokio::net::UdpSocket, SocketAddr) {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
@@ -110,15 +134,7 @@ async fn attaching_replays_only_the_tenants_own_announcements() {
     install(&ctx, 0xA1, "127.0.0.1:9".parse().unwrap(), Some(GAME_A));
     install(&ctx, 0xB1, "127.0.0.1:9".parse().unwrap(), Some(GAME_B));
     for origin in [0xA1u64, 0xB1] {
-        ctx.relay_announcements.insert(
-            origin,
-            CapabilityAnnouncement::new(
-                origin,
-                EntityKeypair::generate().entity_id().clone(),
-                1,
-                crate::adapter::net::behavior::capability::CapabilitySet::new(),
-            ),
-        );
+        hold(&ctx, origin, None);
     }
     let (b_player, b_addr) = socket().await;
     let (native, native_addr) = socket().await;
@@ -218,4 +234,141 @@ async fn relayed_transit_between_tenants_is_refused() {
         "game A's session may not relay into game B"
     );
     assert_eq!(forwarded(0xA2), 1, "…and may within game A");
+}
+
+/// **The discovery gap the CLI-anchor browser acceptance hit.** A game-A
+/// lobby host announced once; a game-A player connects LATER, sits
+/// provisional while it enrolls, and is promoted. The browser install path
+/// (`accept_rtc`) replays nothing, and a provisional session is shown no
+/// tenant's announcements, so the promotion is the one moment the player
+/// can be caught up — and it must be, with the tenant now known.
+///
+/// Inverse: drop the replay from `promote_admission_with_tenant` and the
+/// player's socket receives nothing (the assertion fails).
+#[tokio::test]
+async fn enrollment_promotion_replays_the_tenants_held_announcements() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    install(&ctx, 0xA1, "127.0.0.1:9".parse().unwrap(), Some(GAME_A));
+    install(&ctx, 0xB1, "127.0.0.1:9".parse().unwrap(), Some(GAME_B));
+    hold(&ctx, 0xA1, None);
+    hold(&ctx, 0xB1, None);
+    let (player, player_addr) = socket().await;
+    install(&ctx, 0xA2, player_addr, None);
+    make_provisional(&ctx, 0xA2);
+
+    let session = node.peer_session_id(0xA2).expect("session");
+    assert!(node.promote_admission_with_tenant(
+        0xA2,
+        session,
+        PeerAddr::Udp(player_addr),
+        Some(GAME_A)
+    ));
+    // The first settle pass (250 ms) lands inside the window; the second
+    // (2 s later) does not.
+    assert_eq!(
+        frames(&player, Duration::from_millis(1500)).await,
+        1,
+        "the promoted game-A player is replayed game A's lobby announcement, and only it"
+    );
+}
+
+/// **Security: an unenrolled session is not a native peer.** A
+/// provisional session has no tenant, and `tenants_may_meet(Some, None)`
+/// is true — so before this rule every game's announcements were flooded
+/// and replayed to any browser that completed the handshake and simply
+/// never enrolled. It now sees only untenanted announcements.
+///
+/// Inverse: restore `tenants_may_meet` in the flood (first assertion
+/// fails) or in the replay (second fails).
+#[tokio::test]
+async fn a_provisional_session_sees_no_tenants_announcements() {
+    const SENDER: u64 = 0xA1;
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    install(&ctx, SENDER, "127.0.0.1:9".parse().unwrap(), Some(GAME_A));
+    install(&ctx, 0x0F, "127.0.0.1:9".parse().unwrap(), None);
+    let (unenrolled, unenrolled_addr) = socket().await;
+    install(&ctx, 0xC1, unenrolled_addr, None);
+    make_provisional(&ctx, 0xC1);
+
+    MeshNode::forward_capability_announcement(b"ann".to_vec(), SENDER, SENDER, &ctx);
+    assert_eq!(
+        frames(&unenrolled, Duration::from_millis(800)).await,
+        0,
+        "game A's announcement is not flooded to an unenrolled session"
+    );
+
+    hold(&ctx, SENDER, None);
+    hold(&ctx, 0x0F, None);
+    MeshNode::replay_relay_announcements_once(
+        0xC1,
+        &ctx.relay_announcements,
+        &ctx.peers,
+        &ctx.sink,
+    )
+    .await;
+    assert_eq!(
+        frames(&unenrolled, Duration::from_millis(800)).await,
+        1,
+        "replay to an unenrolled session carries the native origin's announcement only"
+    );
+}
+
+/// **Security: a held announcement keeps its origin's tenant after the
+/// origin leaves.** The replay used to look the origin's tenant up in the
+/// live peer table; once a game-A host's session closed, its still
+/// unexpired announcement resolved to "no tenant" and was replayed to
+/// every game-B player that attached.
+///
+/// Inverse: replay on the live lookup alone (ignore the recorded tenant)
+/// and the game-B player receives the departed host's announcement.
+#[tokio::test]
+async fn a_departed_origins_announcement_stays_in_its_tenant() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    hold(&ctx, 0xA1, Some(GAME_A));
+    // 0xA1 is NOT in the peer table: its session has closed.
+    let (b_player, b_addr) = socket().await;
+    install(&ctx, 0xB2, b_addr, Some(GAME_B));
+    MeshNode::replay_relay_announcements_once(
+        0xB2,
+        &ctx.relay_announcements,
+        &ctx.peers,
+        &ctx.sink,
+    )
+    .await;
+    assert_eq!(
+        frames(&b_player, Duration::from_millis(800)).await,
+        0,
+        "game B is never replayed a departed game-A origin's announcement"
+    );
+}
+
+/// The hold path records the origin's tenant while its session is live —
+/// the half of the rule above that the replay relies on.
+///
+/// Inverse: hold without recording the tenant and the held entry's tenant
+/// is `None`.
+#[tokio::test]
+async fn holding_an_announcement_records_its_origins_tenant() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    let keypair = EntityKeypair::generate();
+    let origin = keypair.entity_id().node_id();
+    install(&ctx, origin, "127.0.0.1:9".parse().unwrap(), Some(GAME_A));
+    let mut ann = CapabilityAnnouncement::new(
+        origin,
+        keypair.entity_id().clone(),
+        1,
+        crate::adapter::net::behavior::capability::CapabilitySet::new(),
+    );
+    ann.sign(&keypair);
+    MeshNode::handle_capability_announcement(&ann.to_bytes(), origin, &ctx);
+    let held = ctx
+        .relay_announcements
+        .get(&origin)
+        .map(|e| e.value().tenant)
+        .expect("a signed direct announcement is held for replay");
+    assert_eq!(held, Some(GAME_A));
 }

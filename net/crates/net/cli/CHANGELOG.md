@@ -20,6 +20,12 @@ and output shape.
 - Games on one anchor are kept apart: a session is promoted for the game
   its grant names, and the anchor neither floods, replays nor relays
   between sessions of different games.
+  - A visitor that has not enrolled yet sees no game's announcements, and
+    an announcement keeps its game after its host disconnects. Before this,
+    an unenrolled session counted as "no game", which meets everyone.
+  - A visitor is caught up on its game's announcements when enrollment
+    promotes it. Before this, a lobby announced before the visitor arrived
+    stayed invisible to it until the host announced again.
 - **Visitors behind one shared address can all join.** Offers are now
   charged per visitor: per (source IP, credential), default 10 a minute,
   new `--offers-per-credential-per-minute`. `--offers-per-minute` becomes
