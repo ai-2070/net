@@ -170,6 +170,83 @@ joinNetcode({ /* ... */, codec: shipCodec });
   again, and the entity is left out until it arrives
   (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
 
+## Sharded matches: several hosts, one arena
+
+When one host's upload can't carry the match, split the entities across
+hosts. Each player joins **every** host and merges them with `joinShards`.
+Each host owns some entities and is authoritative for those only.
+Ownership is an explicit record, the `ShardAssignment`:
+`{ epoch, hosts: { [shard]: nodeHex }, owner: { [entityId]: shard } }`.
+
+```ts
+import { joinShards } from '@net-mesh/browser/netcode';
+
+const match = joinShards<Ship, Move>({
+  transport: node,
+  label: 'arena.move',
+  assignment,                         // or `ownerOf: (id, assignment) => shard`
+  local: { id: myId, predict: move }, // predicted on the shard that owns you
+  interest: cellsAround(x, z),        // sent to every shard
+});
+draw(match.view());                   // merged: remote interpolated, yours predicted
+match.input(data);                    // to the owning shard only, stamped with the epoch
+match.hostNow('s1');                  // that shard's clock (for hit claims)
+match.setAssignment(next);            // a higher epoch only; returns false otherwise
+match.stats();                        // per shard (silentMs), and what the fencing dropped
+```
+
+- **An entity is drawn only from its owner at the installed epoch.**
+  Another shard's copy is dropped (`droppedNotOwner`).
+- **A shard sending snapshots from another epoch is frozen** at its last
+  drawn state, minus what it no longer owns, until it catches up
+  (`droppedStaleEpoch`) or you install its newer epoch (`heldNewerEpoch`).
+  So a player that installs an assignment before its hosts doesn't see the
+  world blink.
+- **An owner change lingers** at the old owner's last state for `lingerMs`
+  (default 1000), or until the new owner first shows it.
+- **The epoch rides the wire:** `hostNetcode({ epoch })` stamps snapshots
+  and drops input frames from another epoch (`dropped['stale-epoch']`).
+  `joinNetcode({ epoch })` stamps inputs, and `stats().epoch` is the newest
+  snapshot's.
+
+**The host side is a recipe, not an API:**
+`net/crates/net/browser-ts/demo/sharded-arena/shard.js` (`shardHost(lib,
+options)`, typed in `shard.d.ts`). Copy it. It wires:
+- `hostNetcode` sending and applying only what the shard owns;
+- `authorize` limited to the roster plus the other hosts;
+- fog by the player's position on whichever host owns it;
+- a spectator `joinNetcode` to every other host;
+- `regionHandoffs` over a `handoffLink` whose peers come from the
+  assignment.
+
+The page beside it runs 4 hosts × 32 bots on the local mesh.
+
+**Cross-host hits** (`options.combat`, hitscan). A fire input
+`{ fire: { target, seenB } }` (with `seenB = match.hostNow(targetShard) -
+interpolationDelayMs`) is checked at the shooter's host. A shot at another
+shard's target is forwarded as a `hit` action, which the target's host
+applies at most once. That host refuses for:
+- another epoch (`stale-epoch`);
+- a `seenB` older than its rewind cap (`beyond-cap`);
+- no history of the shooter at `seenA` (`no-history`);
+- a claimed shooter pose that doesn't match that history (`pose-mismatch`).
+
+It checks the pose against **`NetcodeClient.sampleAt(hostTime)`**, its own
+past snapshots of the shooter's host, never the current view, so a fast
+shooter isn't falsely refused. An unanswered hit is a miss after 500 ms.
+Mutual kills across hosts trade.
+
+- **The rewind cap is the latency budget.** A claim reaches the target's
+  host aged interpolation delay + player→host + up to a tick + host→host.
+  At a 300 ms cap, players beyond ~40 ms one-way start losing cross-host
+  hits (measured: 93% land at 40–80 ms, 11% at 80–140 ms). Size
+  `combat.maxRewindMs` for your players, knowing a longer rewind lets
+  laggy players hit around corners.
+- Not yet: leases, and the lobby writing the assignment. The assignment
+  is static until those land.
+- Tests: `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
+  `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`.
+
 ## Rules that bite
 
 - **A join that never connects says why.** `await net.ready()` rejects
