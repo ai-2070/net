@@ -201,6 +201,18 @@ async fn hedge_zero_degrades_to_single_call() {
 /// the close of the documented "hedge cancellation gap" — losers
 /// must actually free server-side resources, not just be silently
 /// abandoned.
+///
+/// The backup answers only once the primary's handler is running,
+/// because that is the premise: a loser WITH an in-flight handler.
+/// The first call to a target subscribes to its reply channel and
+/// awaits the membership ack — a network round trip, and up to
+/// ~1.7 s per attempt when that ack is lost — before it publishes
+/// its REQUEST. On a loaded runner the primary was still inside that
+/// subscribe when the 50 ms hedge had already won; dropping its
+/// future then sent nothing, so no handler ran and there was nothing
+/// to cancel (CI: failed in 3.3 s, the wait below, 3/3 on a loaded
+/// `rust-sdk-tests` runner). The gate removes the race from the
+/// premise without touching the timing of the cancellation itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hedge_loser_handler_observes_cancellation() {
     use async_trait::async_trait;
@@ -212,10 +224,12 @@ async fn hedge_loser_handler_observes_cancellation() {
     /// Slow handler that explicitly observes cancellation.
     struct ObserveCancelHandler {
         cancelled: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
     }
     #[async_trait]
     impl RpcHandler for ObserveCancelHandler {
         async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.entered.store(true, Ordering::SeqCst);
             tokio::select! {
                 _ = _ctx.cancellation.cancelled() => {
                     self.cancelled.store(true, Ordering::SeqCst);
@@ -231,10 +245,23 @@ async fn hedge_loser_handler_observes_cancellation() {
             }
         }
     }
-    struct InstantHandler;
+    /// Answers once the primary's handler has entered (see the test
+    /// doc), or fails loudly if it never does.
+    struct InstantHandler {
+        primary_entered: Arc<AtomicBool>,
+    }
     #[async_trait]
     impl RpcHandler for InstantHandler {
         async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.primary_entered.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    return Err(RpcHandlerError::Internal(
+                        "backup gate: the primary's handler never entered".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             Ok(RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: vec![],
@@ -251,16 +278,23 @@ async fn hedge_loser_handler_observes_cancellation() {
     handshake(&caller, &backup).await;
 
     let observed = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
     let _serve_primary = primary
         .serve_rpc(
             "lookup",
             Arc::new(ObserveCancelHandler {
                 cancelled: observed.clone(),
+                entered: entered.clone(),
             }),
         )
         .expect("serve_rpc primary");
     let _serve_backup = backup
-        .serve_rpc("lookup", Arc::new(InstantHandler))
+        .serve_rpc(
+            "lookup",
+            Arc::new(InstantHandler {
+                primary_entered: entered.clone(),
+            }),
+        )
         .expect("serve_rpc backup");
 
     let policy = HedgePolicy {
@@ -289,7 +323,8 @@ async fn hedge_loser_handler_observes_cancellation() {
     }
     assert!(
         observed.load(Ordering::SeqCst),
-        "primary's handler must observe ctx.cancellation after hedge winner returns",
+        "primary's handler must observe ctx.cancellation after hedge winner returns (handler entered: {})",
+        entered.load(Ordering::SeqCst),
     );
 }
 
