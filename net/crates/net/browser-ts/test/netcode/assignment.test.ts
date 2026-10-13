@@ -82,6 +82,25 @@ describe('assignmentProblems', () => {
     };
     expect(assignmentProblems(stacked)).toContain('shard s0 owns two squads of team blue');
   });
+
+  it('checks shapes: arrays are arrays, names are own keys, counters are counters', () => {
+    const a = valid();
+    // A string `npcs` would make `includes` a substring match.
+    const stringNpcs = { ...a, shards: { ...a.shards, s0: { ...a.shards.s0!, npcs: 'npc-12' } } } as unknown as MatchAssignment;
+    expect(assignmentProblems(stringNpcs)).toContain('shard s0: npcs is not an array');
+    const stringMembers = { ...a, squads: { ...a.squads, 'red-2': { team: 'red', members: RED[1]! } } } as unknown as MatchAssignment;
+    expect(assignmentProblems(stringMembers)).toContain('squad red-2: members is not an array');
+    const stringSquads = { ...a, shards: { ...a.shards, s0: { host: H0, squads: 'red-2' } } } as unknown as MatchAssignment;
+    expect(assignmentProblems(stringSquads)).toContain('shard s0: squads is not an array');
+    // A squad name that is a prototype member is unknown, not a function.
+    const proto = { ...a, shards: { ...a.shards, s0: { host: H0, squads: ['red-2', 'blue-1', 'toString'] } } };
+    expect(assignmentProblems(proto)).toContain('shard s0 owns unknown squad toString');
+    expect(shardAssignment(proto).owner).not.toHaveProperty('undefined');
+    expect(assignmentProblems({ ...a, renewals: -1 })).toContain('renewals is not a non-negative integer');
+    expect(assignmentProblems({ ...a, renewals: Number.NaN })).toContain('renewals is not a non-negative integer');
+    expect(assignmentProblems({ ...a, leases: { s0: 0, s1: 1.5 } })).toContain('shard s1 has no lease');
+    expect(assignmentProblems({ ...a, leases: [] } as unknown as MatchAssignment)).toContain('leases is not a record');
+  });
 });
 
 describe('leaseWatch and mayReassign', () => {
@@ -91,17 +110,56 @@ describe('leaseWatch and mayReassign', () => {
     const lease = leaseWatch({ read: () => counter, leaseMs: 300, now: () => at });
     expect(lease.live()).toBe(false);
     counter = 1;
-    expect(lease.live()).toBe(true);
-    at = 299;
-    expect(lease.live()).toBe(true);
-    at = 300;
+    // The first value is a baseline, not a renewal (see the next test).
     expect(lease.live()).toBe(false);
+    at = 50;
     counter = 2;
     expect(lease.live()).toBe(true);
-    expect(lease.lastRenewedAt()).toBe(300);
+    at = 349;
+    expect(lease.live()).toBe(true);
+    at = 350;
+    expect(lease.live()).toBe(false);
+    counter = 3;
+    expect(lease.live()).toBe(true);
+    expect(lease.lastRenewedAt()).toBe(350);
     expect(renewLeases(valid(), ['s1'])).toMatchObject({ leases: { s0: 0, s1: 1 }, renewals: 1 });
     expect(mayReassign(0, 3_000, 3_000, 500)).toBe(false);
     expect(mayReassign(0, 3_500, 3_000, 500)).toBe(true);
+  });
+
+  it('a stale counter seen first grants no lease; it takes a renewal seen to arrive', () => {
+    // A replica holding a counter the lobby wrote long ago — the lobby may
+    // already have reassigned this shard. Seeing it must not make the host
+    // live for a fresh leaseMs.
+    let at = 10_000;
+    const lease = leaseWatch({ read: () => 41, leaseMs: 300, now: () => at });
+    expect(lease.live()).toBe(false);
+    at += 100;
+    expect(lease.live()).toBe(false);
+    expect(lease.lastRenewedAt()).toBeNull();
+  });
+
+  it('the reassignment wait covers delivery delay, not only drift', () => {
+    // Renewed at 0 by the lobby, delivered 800 ms late (more than the drift
+    // margin): the host is live until 800 + 3000 on its clock. Without
+    // maxDeliveryMs the lobby could reassign at 3500 while it still runs.
+    const leaseMs = 3_000;
+    const drift = 500;
+    const delivered = 800;
+    let at = delivered;
+    let counter = 0;
+    const host = leaseWatch({ read: () => counter, leaseMs, now: () => at });
+    host.live(); // the baseline
+    counter = 1; // the renewal written at lobby time 0, arriving now
+    expect(host.live()).toBe(true);
+    at = leaseMs + delivered - 1;
+    expect(host.live()).toBe(true);
+    const maxDeliveryMs = 1_000;
+    // Every instant the old host is still live, the lobby may not reassign.
+    for (let t = 0; t < leaseMs + delivered; t += 50) {
+      expect(mayReassign(0, t, leaseMs, drift, maxDeliveryMs)).toBe(false);
+    }
+    expect(mayReassign(0, leaseMs + drift + maxDeliveryMs, leaseMs, drift, maxDeliveryMs)).toBe(true);
   });
 });
 
@@ -244,6 +302,8 @@ describe('the assignment in the lobby store', () => {
       live: leaseWatch({ read: () => replica.getState().assignment?.renewals, leaseMs: LEASE_MS }).live,
     });
     open.push(match);
+    // The render loop's first frame: the lease watch sees its baseline.
+    match.view();
     await sleep(500);
     expect(match.stats().frozen).toBe(false);
     expect(match.view()[RED[1]!]).toEqual({ x: 1 });

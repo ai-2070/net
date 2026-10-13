@@ -41,7 +41,9 @@ const combat: ShardCombat<Body> = {
 };
 
 /** NPC on host A, player on host B; the NPC takes one shot at P per `fireNpc()`. */
-function arena() {
+function arena(clock: 'date' | 'default' = 'date') {
+  // 'default': no `now` anywhere, as a page runs (the netcode's clock).
+  const now = clock === 'date' ? { now: () => Date.now() } : {};
   // Drops, duplicates and reorders (jitter wider than a tick's spacing of frames).
   const net = simNetwork({ latencyMs: 25, jitterMs: 20, lossRate: 0.1, duplicateRate: 0.3 });
   const assignment: ShardAssignment = { epoch: 1, hosts: { s0: A, s1: B }, owner: { [NPC]: 's0', [P]: 's1' } };
@@ -67,7 +69,7 @@ function arena() {
         }
         return { ...entities, [NPC]: { ...npc, z: npc.z + 0.5 } };
       },
-      now: () => Date.now(),
+      ...now,
     });
   const hosts: [ShardHost<Body>, ShardHost<Body>] = [
     host(A, 's0', { [NPC]: { x: 10, z: 0, hp: 100 } }),
@@ -78,7 +80,7 @@ function arena() {
     label: LABEL,
     assignment,
     local: { id: P, predict: body => body },
-    now: () => Date.now(),
+    ...now,
   });
   const close = () => {
     player.close();
@@ -96,8 +98,8 @@ describe('NPCs across hosts', () => {
     vi.useRealTimers();
   });
 
-  it('hits in both directions are applied exactly once under drop, duplication and reordering', async () => {
-    const m = arena();
+  it.each(['date', 'default'] as const)('hits in both directions are applied exactly once under drop, duplication and reordering (%s clock)', async clock => {
+    const m = arena(clock);
     const [a, b] = m.hosts;
     await vi.advanceTimersByTimeAsync(2_000);
     // Five shots each way, 200 ms apart: a race lost one time in two

@@ -35,7 +35,11 @@
  * When an entity's owner changes, the old owner's last copy lingers for
  * `lingerMs` or until the new owner first shows it, whichever is first —
  * as `joinWorld` lingers a departed region's entities — so a handover does
- * not blink.
+ * not blink. A shard that is rejoined (its host changed, or this player's
+ * owner moved to or from it) keeps showing what it last drew, minus what it
+ * no longer owns, until the new connection delivers its first snapshot: so
+ * a planned move does not blank the rest of either shard for a join round
+ * trip.
  *
  * What this is not: the host's half (simulate only what you own, refuse
  * input for others, leases) is the shard host recipe's (S2), and where the
@@ -134,7 +138,12 @@ export interface ShardedMatch<E, I> {
    * the prediction to the new owner.
    */
   setAssignment(next: ShardAssignment): boolean;
-  /** Resolves once every shard has delivered a snapshot; rejects with the first shard's join failure. */
+  /**
+   * Resolves once every shard has delivered a snapshot; rejects with the
+   * first shard's join failure. Follows rejoins: a shard rejoined by
+   * {@link setAssignment} while this waits is waited on afresh, and the
+   * closed connection it replaced neither resolves nor rejects it.
+   */
   ready(): Promise<void>;
   stats(): ShardedMatchStats;
   close(): void;
@@ -144,7 +153,10 @@ interface Shard<E, I> {
   readonly host: string;
   readonly client: NetcodeClient<E, I>;
   readonly owns: boolean;
-  /** This shard's entities as last drawn — what a held shard shows. */
+  /**
+   * This shard's entities as last drawn — what a held shard shows, and
+   * what a rejoined shard shows until its new connection's first snapshot.
+   */
   drawn: Readonly<Record<string, E>>;
   /** `stats().snapshots` when `view()` last drew it, so fencing counts are per snapshot. */
   seen: number;
@@ -186,7 +198,7 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
 
   const selfOwner = (): string | undefined => (self === undefined ? undefined : ownerOf(self, installed));
 
-  const join = (shard: string, host: string): Shard<E, I> => {
+  const join = (shard: string, host: string, drawn: Readonly<Record<string, E>> = {}): Shard<E, I> => {
     const owns = shard === selfOwner();
     const client = joinNetcode<E, I>({
       ...netcodeOptions,
@@ -197,7 +209,7 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
       sequencer,
       now,
     });
-    return { host, client, owns, drawn: {}, seen: 0, joinedAt: now() };
+    return { host, client, owns, drawn, seen: 0, joinedAt: now() };
   };
 
   for (const [shard, host] of Object.entries(installed.hosts)) shards.set(shard, join(shard, host));
@@ -212,6 +224,18 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
         const fresh = stats.snapshots !== entry.seen;
         entry.seen = stats.snapshots;
         const epoch = stats.epoch;
+        if (stats.snapshots === 0) {
+          // Rejoined, and nothing from the new connection yet: what the old
+          // one last drew holds, minus what this shard no longer owns —
+          // the same rule as a frozen shard, so a rejoin does not blink.
+          const held: Record<string, E> = {};
+          for (const [id, state] of Object.entries(entry.drawn)) {
+            if (ownerOf(id, installed) === shard) held[id] = state;
+          }
+          entry.drawn = held;
+          Object.assign(out, held);
+          continue;
+        }
         if (epoch !== null && epoch !== installed.epoch) {
           // Not at our epoch: nothing it sends now is drawn. It is frozen
           // where it was last drawn, minus what it no longer owns — so a
@@ -285,19 +309,38 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
       }
       installed = candidate;
       const nextSelfOwner = selfOwner();
+      // What a rejoined shard goes on showing until its first snapshot.
+      const carried = new Map<string, Readonly<Record<string, E>>>();
       for (const [shard, entry] of shards) {
         const host = candidate.hosts[shard];
         const ownershipMoved = previousSelfOwner !== nextSelfOwner && (shard === previousSelfOwner || shard === nextSelfOwner);
         if (host === entry.host && !ownershipMoved) continue;
         entry.client.close();
         shards.delete(shard);
+        if (host !== undefined) carried.set(shard, entry.drawn);
       }
       for (const [shard, host] of Object.entries(candidate.hosts)) {
-        if (!shards.has(shard)) shards.set(shard, join(shard, host));
+        if (!shards.has(shard)) shards.set(shard, join(shard, host, carried.get(shard)));
       }
       return true;
     },
-    ready: () => Promise.all([...shards.values()].map(entry => entry.client.ready())).then(() => undefined),
+    ready() {
+      // Waits on the live connections: one replaced while this waits is
+      // dropped from the wait (its close rejects its own `ready()`), and the
+      // set is checked again once the rest settle.
+      const current = (entry: Shard<E, I>) => [...shards.values()].includes(entry);
+      const wait = (): Promise<void> => {
+        const entries = [...shards.values()];
+        return Promise.all(
+          entries.map(entry =>
+            entry.client.ready().catch((error: unknown) => {
+              if (closed || current(entry)) throw error;
+            }),
+          ),
+        ).then(() => (closed || entries.every(current) ? undefined : wait()));
+      };
+      return wait();
+    },
     stats() {
       const at = now();
       const perShard: Record<string, ShardStats> = {};

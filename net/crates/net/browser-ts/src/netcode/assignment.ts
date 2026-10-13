@@ -56,9 +56,19 @@ export interface MatchAssignment {
 
 const HEX16 = /^[0-9a-f]{16}$/;
 
+/** `key` is `record`'s own property (never one inherited from `Object.prototype`, like `toString`). */
+const own = (record: object, key: string): boolean => Object.hasOwn(record, key);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const isCounter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+
 /**
  * What is wrong with `assignment`, in words; empty when it is valid.
  *
+ * - Its shape: `squads`, `shards` and `leases` are records; `members`,
+ *   `squads` and `npcs` are arrays of strings; `epoch`, every lease and
+ *   `renewals` are non-negative safe integers. Names are looked up as own
+ *   keys only, so a squad called `toString` is unknown, not a function.
  * - Every squad is owned by exactly one shard, and every player is in
  *   exactly one squad — so every player is owned by exactly one shard.
  * - **D1:** a shard owns at most one squad of each team, and never the
@@ -68,12 +78,35 @@ const HEX16 = /^[0-9a-f]{16}$/;
  */
 export function assignmentProblems(assignment: MatchAssignment): string[] {
   const problems: string[] = [];
-  if (!Number.isSafeInteger(assignment.epoch) || assignment.epoch < 0) problems.push('epoch is not a non-negative integer');
+  if (!isRecord(assignment)) return ['the assignment is not a record'];
+  if (!isCounter(assignment.epoch)) problems.push('epoch is not a non-negative integer');
+  if (!isCounter(assignment.renewals)) problems.push('renewals is not a non-negative integer');
+  const squads: Readonly<Record<string, unknown>> = isRecord(assignment.squads) ? assignment.squads : {};
+  const shards: Readonly<Record<string, unknown>> = isRecord(assignment.shards) ? assignment.shards : {};
+  const leases: Readonly<Record<string, unknown>> = isRecord(assignment.leases) ? assignment.leases : {};
+  if (!isRecord(assignment.squads)) problems.push('squads is not a record');
+  if (!isRecord(assignment.shards)) problems.push('shards is not a record');
+  if (!isRecord(assignment.leases)) problems.push('leases is not a record');
+  for (const [shard, lease] of Object.entries(leases)) {
+    if (!own(shards, shard)) problems.push(`lease for unknown shard ${shard}`);
+    else if (!isCounter(lease)) problems.push(`shard ${shard}'s lease is not a non-negative integer`);
+  }
   const squadOf = new Map<string, string>();
-  for (const [squad, { team, members }] of Object.entries(assignment.squads)) {
+  const teamOfSquad = new Map<string, string>();
+  for (const [squad, raw] of Object.entries(squads)) {
+    if (!isRecord(raw)) {
+      problems.push(`squad ${squad} is not a record`);
+      continue;
+    }
+    const { team, members } = raw;
     if (typeof team !== 'string' || team.length === 0) problems.push(`squad ${squad} has no team`);
+    else teamOfSquad.set(squad, team);
+    if (!Array.isArray(members)) {
+      problems.push(`squad ${squad}: members is not an array`);
+      continue;
+    }
     for (const member of members) {
-      if (!HEX16.test(member)) problems.push(`squad ${squad}: ${JSON.stringify(member)} is not a node id`);
+      if (typeof member !== 'string' || !HEX16.test(member)) problems.push(`squad ${squad}: ${JSON.stringify(member)} is not a node id`);
       const other = squadOf.get(member);
       if (other !== undefined) problems.push(`player ${member} is in two squads: ${other} and ${squad}`);
       else squadOf.set(member, squad);
@@ -81,38 +114,49 @@ export function assignmentProblems(assignment: MatchAssignment): string[] {
   }
   const ownerOfSquad = new Map<string, string>();
   const hosts = new Map<string, string>();
-  for (const [shard, { host, squads }] of Object.entries(assignment.shards)) {
-    if (!HEX16.test(host)) problems.push(`shard ${shard}: host ${JSON.stringify(host)} is not a node id`);
-    const twice = hosts.get(host);
-    if (twice !== undefined) problems.push(`host ${host} serves two shards: ${twice} and ${shard}`);
-    hosts.set(host, shard);
-    if (!Number.isSafeInteger(assignment.leases[shard])) problems.push(`shard ${shard} has no lease`);
+  const ownerOfNpc = new Map<string, string>();
+  for (const [shard, raw] of Object.entries(shards)) {
+    if (!isRecord(raw)) {
+      problems.push(`shard ${shard} is not a record`);
+      continue;
+    }
+    const { host, squads: owned, npcs } = raw;
+    if (typeof host !== 'string' || !HEX16.test(host)) problems.push(`shard ${shard}: host ${JSON.stringify(host)} is not a node id`);
+    const twice = hosts.get(host as string);
+    if (twice !== undefined) problems.push(`host ${String(host)} serves two shards: ${twice} and ${shard}`);
+    hosts.set(host as string, shard);
+    if (!own(leases, shard) || !isCounter(leases[shard])) problems.push(`shard ${shard} has no lease`);
+    if (!Array.isArray(owned)) problems.push(`shard ${shard}: squads is not an array`);
     const teams = new Set<string>();
-    for (const squad of squads) {
-      const record = assignment.squads[squad];
-      if (record === undefined) {
-        problems.push(`shard ${shard} owns unknown squad ${squad}`);
+    for (const squad of Array.isArray(owned) ? owned : []) {
+      if (typeof squad !== 'string' || !own(squads, squad) || !isRecord(squads[squad])) {
+        problems.push(`shard ${shard} owns unknown squad ${String(squad)}`);
         continue;
       }
       const other = ownerOfSquad.get(squad);
       if (other !== undefined) problems.push(`squad ${squad} is owned by two shards: ${other} and ${shard}`);
       else ownerOfSquad.set(squad, shard);
-      if (teams.has(record.team)) problems.push(`shard ${shard} owns two squads of team ${record.team}`);
-      teams.add(record.team);
-      if (squadOf.get(host) === squad) problems.push(`shard ${shard} owns its own host's squad ${squad}`);
+      const team = teamOfSquad.get(squad);
+      if (team !== undefined) {
+        if (teams.has(team)) problems.push(`shard ${shard} owns two squads of team ${team}`);
+        teams.add(team);
+      }
+      if (squadOf.get(host as string) === squad) problems.push(`shard ${shard} owns its own host's squad ${squad}`);
     }
-  }
-  for (const squad of Object.keys(assignment.squads)) {
-    if (!ownerOfSquad.has(squad)) problems.push(`squad ${squad} is owned by no shard`);
-  }
-  const ownerOfNpc = new Map<string, string>();
-  for (const [shard, { npcs }] of Object.entries(assignment.shards)) {
-    for (const npc of npcs ?? []) {
+    if (npcs !== undefined && !Array.isArray(npcs)) problems.push(`shard ${shard}: npcs is not an array`);
+    for (const npc of Array.isArray(npcs) ? npcs : []) {
+      if (typeof npc !== 'string' || npc.length === 0) {
+        problems.push(`shard ${shard}: npc ${JSON.stringify(npc)} is not an id`);
+        continue;
+      }
       const other = ownerOfNpc.get(npc);
       if (other !== undefined) problems.push(`npc ${npc} is owned by two shards: ${other} and ${shard}`);
       else ownerOfNpc.set(npc, shard);
       if (squadOf.has(npc)) problems.push(`npc ${npc} has a player's id`);
     }
+  }
+  for (const squad of Object.keys(squads)) {
+    if (!ownerOfSquad.has(squad)) problems.push(`squad ${squad} is owned by no shard`);
   }
   return problems;
 }
@@ -121,7 +165,10 @@ export function assignmentProblems(assignment: MatchAssignment): string[] {
 export function shardAssignment(assignment: MatchAssignment): ShardAssignment {
   const owner: Record<string, string> = {};
   for (const [shard, { squads, npcs }] of Object.entries(assignment.shards)) {
-    for (const squad of squads) for (const member of assignment.squads[squad]?.members ?? []) owner[member] = shard;
+    for (const squad of squads) {
+      const record = Object.hasOwn(assignment.squads, squad) ? assignment.squads[squad] : undefined;
+      for (const member of record?.members ?? []) owner[member] = shard;
+    }
     for (const npc of npcs ?? []) owner[npc] = shard;
   }
   const hosts: Record<string, string> = {};
@@ -175,12 +222,27 @@ export function renewLeases(assignment: MatchAssignment, renew?: Iterable<string
 
 /**
  * Whether the lobby may give `shard`'s entities to another host: only once
- * `leaseMs` plus a clock-drift margin has passed since it last renewed that
- * lease, so the old host has stopped on any clock that drifted less than
- * the margin.
+ * `leaseMs` + `driftMarginMs` + `maxDeliveryMs` has passed since it last
+ * renewed that lease (`lastRenewedAt`: when the lobby WROTE the renewal, on
+ * its own clock).
+ *
+ * The host dates its lease from when the renewal REACHES it
+ * ({@link leaseWatch}), so a renewal delivered `d` ms late keeps it live
+ * until `lastRenewedAt + d + leaseMs` (its clock). The wait covers that
+ * only for `d <= maxDeliveryMs` and clock-rate drift within
+ * `driftMarginMs`: size `maxDeliveryMs` from the store's measured
+ * replication delay (and its reconnect timeout — a replica that resyncs
+ * after a stall delivers late). Default 0, which assumes instant delivery:
+ * not sound on a real network.
  */
-export function mayReassign(lastRenewedAt: number, now: number, leaseMs: number, driftMarginMs: number): boolean {
-  return now - lastRenewedAt >= leaseMs + driftMarginMs;
+export function mayReassign(
+  lastRenewedAt: number,
+  now: number,
+  leaseMs: number,
+  driftMarginMs: number,
+  maxDeliveryMs = 0,
+): boolean {
+  return now - lastRenewedAt >= leaseMs + driftMarginMs + Math.max(0, maxDeliveryMs);
 }
 
 /** {@link leaseWatch}'s argument. */
@@ -196,26 +258,40 @@ export interface LeaseWatchOptions {
 export interface LeaseWatch {
   /** `true` while the counter moved within the last `leaseMs`. */
   live(): boolean;
-  /** When the counter last moved (this clock), or `null` before it was first seen. */
+  /** When the counter last moved (this clock), or `null` before it was first seen to move. */
   lastRenewedAt(): number | null;
 }
 
 /**
- * Watch a lease counter. Live from the first time a counter is seen until
- * it stands still for `leaseMs`; live again the moment it moves. Judged
- * entirely on this node's clock, which is what lets it fence a node that
- * cannot hear the lobby: nothing has to arrive for it to expire.
+ * Watch a lease counter. Live once the counter is seen to MOVE, until it
+ * stands still for `leaseMs`; live again the moment it moves again.
+ *
+ * The first value read is only a baseline, never a lease: a replica can
+ * hold a counter the lobby wrote long ago (a resync, a host that joins
+ * late), and treating its first sighting as a renewal would grant a full
+ * `leaseMs` the lobby never gave — past the point it may reassign. So a
+ * new watcher waits for one renewal round (`leaseMs / 3`) before it is live.
+ *
+ * Judged entirely on this node's clock, from when a renewal arrives, which
+ * is what lets it fence a node that cannot hear the lobby: nothing has to
+ * arrive for it to expire. A late renewal therefore extends it by its
+ * delivery delay; {@link mayReassign}'s `maxDeliveryMs` is the bound that
+ * covers that.
  */
 export function leaseWatch(options: LeaseWatchOptions): LeaseWatch {
   const now = options.now ?? (() => Date.now());
   let seen: number | undefined;
+  let baseline = true;
   let movedAt: number | null = null;
   const look = () => {
     const value = options.read();
-    if (value !== undefined && value !== seen) {
-      seen = value;
-      movedAt = now();
+    if (value === undefined || value === seen) return;
+    seen = value;
+    if (baseline) {
+      baseline = false;
+      return;
     }
+    movedAt = now();
   };
   return {
     live() {

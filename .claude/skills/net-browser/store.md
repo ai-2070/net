@@ -341,7 +341,10 @@ writes.
   Trading is not built — do not fake it with two independent actions.
 - **Prefer a lobby over hand-rolled discovery.** `createLobby({ node, game,
   name, capacity, info?, visibility?, …hostStore options })` hosts the store,
-  gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own;
+  gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own
+  (every `LOBBY_ANNOUNCE_MS`, 30 s; a FAILED announcement, the lobby's or a
+  joiner's seek tag, is retried after `ANNOUNCE_RETRY_MS`, 1 s, doubling to
+  `ANNOUNCE_RETRY_MAX_MS`, 8 s);
   `listLobbies({ node, game })` returns `{ code, name, players, capacity, info,
   host, store }`; `joinLobby({ node, definition, game, code | lobby })` finds
   the host and returns a `joinStore` handle (await `ready()`). Capacity counts

@@ -22,8 +22,26 @@ with `joinShards`. This is slice S2 of
   lives in memory, and no `ghosting`, because every host already
   spectates every other. It carries forwarded actions now and planned
   moves later.
-- **A static assignment** `{ epoch, hosts, owner }`. There's no lobby and
-  no leases yet (S4).
+- **The assignment** `{ epoch, hosts, owner }`, replaced with
+  `setAssignment(next)`. A next epoch that isn't a safe integer above the
+  installed one is refused. A host that the new assignment no longer
+  names for its shard stops: it simulates, sends and serves nothing. The
+  hosts it admits and spectates follow `next.hosts`.
+- **One clock.** `now` defaults to the netcode's own clock
+  (`performance.now()`), the one players' `hostNow()` estimates. The host
+  hands it to `hostNetcode`, every spectator and the handoffs, and dates
+  hits, NPC shots and path points with it. `host.now()` reads it: path
+  points go on that clock.
+- **Two handoff timings.** Hit forwards give up after 500 ms
+  (`actionTiming`); planned moves keep the handoff defaults, so a move is
+  never left live nowhere, nor admitted twice.
+- **NPC paths** (`options.paths`). After the announce window a path NPC
+  leaves players' snapshots but not the other hosts' or the rewind
+  history, so it can still be hit, shoot, and be restored if its host is
+  lost (it comes back live). A refused path write switches it back to
+  live. When it dies, or is lost with nothing to restore it from, its
+  record is retired (`mode: 'live'`, no points) and clients stop drawing
+  it.
 
 The library comes in as a parameter, the way `demo/game.js` takes
 `defineStore`. The page passes the built package; the test passes the

@@ -212,7 +212,9 @@ refreshed — so discovery code runs offline unchanged. It is evidence about gam
 logic, not about whether two browsers can reach each other.
 
 An announcement is a lease, so both sides re-announce on a timer; a joiner that
-looks a few seconds late otherwise reports that the host never announced.
+looks a few seconds late otherwise reports that the host never announced. A
+failed announcement is retried within a second or so (doubling to 8 s), not at
+the next 30 s refresh.
 
 ### A dedicated host in Node
 

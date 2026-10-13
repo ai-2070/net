@@ -21,7 +21,8 @@ around it.
 
 A region host serves one store per region, named by region (several may share a
 node), and keeps announcing them. An announcement is a lease, so
-`announceRegions` re-announces every 30 seconds:
+`announceRegions` re-announces every 30 seconds, and retries a failed
+announcement sooner (after 1 s, doubling to 8 s):
 
 ```typescript
 import { hostStore } from '@net-mesh/browser';
@@ -129,8 +130,11 @@ duplicate an entity.
   counts what was refused, by reason.
 - **Timing** (`timing`): `retryMs` (250), `giveUpMs` (60 000) and
   `handledRetentionMs` (600 000), which must exceed `giveUpMs`. A target that
-  forgot a decision could admit a late re-offer a second time. `admit(entity,
-  state)` may refuse an arrival with a reason.
+  forgot a decision could admit a late re-offer a second time. Forwarded
+  actions take the same three from `actionTiming` when set (default:
+  `timing`), so a short-lived action such as a hit can give up after 500 ms
+  without shortening entity handoffs. `admit(entity, state)` may refuse an
+  arrival with a reason.
 
 ## Across the border
 

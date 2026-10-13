@@ -92,7 +92,14 @@ function frame() { draw(net.view()); requestAnimationFrame(frame); }
   64 characters. The set crosses the lossy carrier as a versioned frame
   repeated until a snapshot acknowledges it, so it survives loss.
 - The default `interpolate` lerps numeric fields (nested too) and takes the
-  rest from the newer state; supply your own for angles that wrap.
+  rest from the newer state. With a `codec`, the default is
+  `codec.interpolate`, which turns `angle()` fields the short way (in the
+  correction blend too); without one, supply your own for angles that wrap
+  (`lerpAngle(from, to, alpha)` is exported for it).
+- **Acks trim every client's pending inputs**, predicting (`local`) or not,
+  so a backlog frame (up to 64 inputs, after a change of owner) goes back to
+  `inputRedundancy` once acknowledged. Under `joinShards` only the client
+  that owns the player trims the shared sequencer.
 - **`interpolationDelayMs` is fixed.** Over bursty links (a relayed pair, a
   busy Wi-Fi) a fixed delay either stutters or adds lag everyone feels. If it
   stutters, raise it; a custom loop can adapt it (see below).
@@ -165,10 +172,20 @@ joinNetcode({ /* ... */, codec: shipCodec });
   entity the codec refuses (an extra field, a value out of range) sends that
   player JSON for that tick and counts `dropped['codec-write-failed']`.
 - **Values arrive quantized.** Reconciliation compares within the codec's
-  quanta (`codec.near`), so quantization is not a correction.
+  quanta (`codec.near`), so quantization is not a correction. A NaN or
+  infinite `float32()` off the wire refuses the frame.
 - **Ids travel as indexes** the host never reuses; a lost name is asked for
   again, and the entity is left out until it arrives
   (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
+  The host honours a `u` request for an index at most once per 100 ms
+  (`dropped['name-request-throttled']`). Ids unseen for `NAME_FORGET_MS`
+  (10 s) are forgotten and named afresh on return (the player keeps names
+  30 s), so projectiles do not grow the tables all match.
+- **Binary snapshots carry the host's instance** (wire version 2, part of
+  the fingerprint). A host re-created under the same label resets the
+  player's names and snapshots instead of being read through the old
+  names; a pre-instance package has another fingerprint, so a mixed pair
+  runs on JSON.
 
 ## Sharded matches: several hosts, one arena
 
@@ -255,20 +272,30 @@ Mutual kills across hosts trade.
   - `authorizeTeams` admits `team:<name>` audiences.
 - **Leases fence what can't hear the lobby.** The lobby bumps counters with
   `renewLeases` every `leaseMs / 3`. `leaseWatch({ read, leaseMs })` judges
-  one on this node's own clock:
+  one on this node's own clock, from when a renewal arrives:
   - a host passes it as `hostNetcode({ live })` and stops simulating and
     sending without it;
   - a player passes one over `renewals` as `joinShards({ live })` and
     freezes (`stats().frozen`: show "reconnecting").
+  - The first value it reads is a baseline, not a lease (a replica can
+    hold a counter written long ago). It is live once a renewal is seen
+    to arrive, about `leaseMs / 3` after it starts. Poll it every tick or
+    frame: it notices a move only when asked.
 
   Reassign a lost host's entities only once `mayReassign(lastRenewedAt,
-  now, leaseMs, driftMarginMs)` says so.
+  now, leaseMs, driftMarginMs, maxDeliveryMs)` says so. `maxDeliveryMs`
+  bounds how late a renewal can reach a host: one delivered later keeps
+  that host live past the reassignment. Size it from the store's measured
+  replication delay; the default 0 assumes instant delivery.
 - **Planned moves carry the input boundary.** The recipe's
   `movePlayer(peer, toShard)` freezes the entity together with
   `hostNetcode.releasePlayer(peer)`'s `{ lastApplied }` in one
   synchronous turn. The new owner adopts it (`adoptPlayer`), so an input
   the old host applied is never applied again, even when its
-  acknowledgement was lost. `joinShards` shares one input sequence across
+  acknowledgement was lost. The boundary waits for the player however late
+  it arrives: a record that times out first, or a peer `authorize` refuses
+  for now (`dropped['adopt-unauthorized']`), keeps it for when the player is
+  admitted. `joinShards` shares one input sequence across
   shards (`createInputSequencer`). Raise the epoch when the handoff
   reports `moved`.
 - **A lost host is a rollback.** After the lease wait, reassign its
@@ -286,6 +313,19 @@ Mutual kills across hosts trade.
   source with the higher mode version `mv`. Never put a fogged NPC on a
   path: the record goes to every reader. Measured with 50 NPCs: 47 KB/s
   live, 1.6 KB/s on paths, per viewer.
+  - The saving is for players only. The recipe keeps sending a path NPC
+    to the other hosts and into its own rewind history, so it can still
+    be hit, shoot, and be restored when its host is lost (it comes back
+    live under a new `mv`).
+  - A refused path write switches the NPC back to live under a further
+    `mv`. A path NPC that dies, or can't be restored, gets its record
+    retired (`mode: 'live'`, no points). `npcModes` holds a live NPC no
+    snapshot shows for `carryMs`, then stops drawing it.
+- **One clock per host.** The recipe's `now` defaults to the netcode's
+  (`performance.now()`), the clock `hostNow()` estimates. Hits, NPC shots
+  and path points are all on it; `host.now()` reads it for path points.
+  Don't pass `Date.now` to one piece and leave the rest on the default:
+  every forwarded hit is then refused `beyond-cap`.
 - Tests: `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
   `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`,
   `test/netcode/assignment.test.ts`, `test/netcode/planned-move.test.ts`,
@@ -299,7 +339,10 @@ Mutual kills across hosts trade.
   `no-announcement` means this node never heard the host announce, so it
   cannot reach it. A lobby announces for you; a page that joins a host
   directly must make sure the host announces and query its tag first.
-  `stats().connectOutcome` shows the last `connectPeer` outcome.
+  `stats().connectOutcome` shows the last `connectPeer` outcome. After a
+  direct attempt ends relayed, or `connectPeer` rejects, the next offer
+  waits `directRetryMs` (default 30 s); reopened streams ride the session
+  there is meanwhile.
 
 - **Lossy streams are `connect()`-only.** `openSession()` refuses
   `lossy: true`; games run on `connect()` anyway (stores need it too).
@@ -318,8 +361,9 @@ Mutual kills across hosts trade.
 - **Snapshots are JSON unless both ends have a codec** (Compact snapshots, above).
 - **Building blocks are exported too**, for a custom loop: `ClockEstimator`
   (NTP-style offset from the lowest-RTT samples), `SnapshotBuffer`
-  (time-ordered snapshots with interpolated reads) and `lerpNumbers` (the
-  default interpolator).
+  (time-ordered snapshots with interpolated reads; `sample` at a snapshot's
+  exact time returns that snapshot whole), `lerpNumbers` (the default
+  interpolator) and `lerpAngle`.
 - The **anchor must be the same release** as the package: an older anchor
   treats the lossy channel as its only one.
 - Source: `net/crates/net/browser-ts/src/netcode/`, tests

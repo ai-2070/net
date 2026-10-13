@@ -39,7 +39,9 @@ const combat: ShardCombat<Body> = {
   maxSpeed: 40,
 };
 
-function arena(sim: SimOptions, damage = combat.damage) {
+/** `clock: 'default'` leaves every `now` unset: the recipe's and the netcode's own clock, as a page runs. */
+function arena(sim: SimOptions, damage = combat.damage, clock: 'date' | 'default' = 'date') {
+  const now = clock === 'date' ? { now: () => Date.now() } : {};
   const net = simNetwork(sim);
   const assignment: ShardAssignment = { epoch: 1, hosts: { s0: A, s1: B }, owner: { [SHOOTER]: 's0', [TARGET]: 's1' } };
   const host = (id: string, shard: string, initial: Record<string, Body>) =>
@@ -52,7 +54,7 @@ function arena(sim: SimOptions, damage = combat.damage) {
       initial,
       apply,
       combat: { ...combat, damage },
-      now: () => Date.now(),
+      ...now,
     });
   const hosts: [ShardHost<Body>, ShardHost<Body>] = [
     host(A, 's0', { [SHOOTER]: { x: 0, z: 0, hp: 100, ammo: 10 } }),
@@ -65,7 +67,7 @@ function arena(sim: SimOptions, damage = combat.damage) {
       assignment,
       local: { id, predict: apply },
       interpolationDelayMs: DELAY_MS,
-      now: () => Date.now(),
+      ...now,
     });
   const players = { shooter: player(SHOOTER), target: player(TARGET) };
   /** `who` fires at `at`, with `seenB` read the way a client reads it: the target's host clock, minus the delay. */
@@ -102,6 +104,25 @@ describe('cross-host hits', () => {
     // S3's record: how old `seenB` was when B judged it.
     expect(b.combat().seenBAgeMs).toHaveLength(1);
     expect(b.combat().seenBAgeMs[0]).toBeGreaterThanOrEqual(DELAY_MS);
+    m.close();
+  });
+
+  it('lands a cross-host hit on the default clock (no `now` passed anywhere)', async () => {
+    // Every other test here passes `now: () => Date.now()`. A page passes
+    // none: the recipe must then date hits on the same clock as the
+    // netcode, which `seenB` (from `hostNow()`) is on.
+    const m = arena({ latencyMs: 30, jitterMs: 10 }, combat.damage, 'default');
+    await vi.advanceTimersByTimeAsync(2_000);
+    m.fire(m.players.shooter, TARGET, 's1');
+    await vi.advanceTimersByTimeAsync(1_000);
+    const [a, b] = m.hosts;
+    expect(b.combat().served).toEqual({ hit: 1 });
+    expect(a.combat().forwarded).toEqual({ hit: 1 });
+    expect(b.world()[TARGET]!.hp).toBe(50);
+    // `seenB` was judged on B's own clock: its age is the view delay plus
+    // the trip, not a difference between two clocks.
+    expect(b.combat().seenBAgeMs[0]).toBeGreaterThanOrEqual(DELAY_MS);
+    expect(b.combat().seenBAgeMs[0]).toBeLessThan(500);
     m.close();
   });
 

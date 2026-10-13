@@ -18,6 +18,8 @@ const PA = '00000000000000e1'; // owned by s0, on host A — the host that is lo
 const PB = '00000000000000e2'; // owned by s1, on host B
 const LEASE_MS = 300;
 const DRIFT_MS = 100;
+/** How late a renewal can reach a host here (20 ms latency + 5 ms jitter, rounded up): part of the reassignment wait. */
+const MAX_DELIVERY_MS = 50;
 
 interface Body {
   readonly x: number;
@@ -90,7 +92,7 @@ function arena() {
   };
   /** The lobby's reassignment of a lost shard's entities, once the lease wait allows. */
   const reassign = (from: 's0', to: 's1') => {
-    if (!mayReassign(lastRenewedAt[from]!, Date.now(), LEASE_MS, DRIFT_MS)) return false;
+    if (!mayReassign(lastRenewedAt[from]!, Date.now(), LEASE_MS, DRIFT_MS, MAX_DELIVERY_MS)) return false;
     const owner = { ...assignment.owner };
     for (const [id, shard] of Object.entries(owner)) if (shard === from) owner[id] = to;
     assignment = { ...assignment, epoch: assignment.epoch + 1, owner };
@@ -181,7 +183,7 @@ describe('a host lost', () => {
     // PB (on B) fires at PA (owned by the host just lost).
     const shooter = m.players[PB]!;
     shooter.input({ fire: { target: PA, seenB: shooter.hostNow('s0')! - 100 } });
-    await vi.advanceTimersByTimeAsync(LEASE_MS + DRIFT_MS + 50);
+    await vi.advanceTimersByTimeAsync(LEASE_MS + DRIFT_MS + MAX_DELIVERY_MS);
     const observed = m.hosts.s1.observed('s0')![PA]!;
     expect(m.reassign('s0', 's1')).toBe(true);
     await vi.advanceTimersByTimeAsync(1_000);
@@ -192,5 +194,69 @@ describe('a host lost', () => {
     expect(m.hosts.s1.world()[PA]!.hp).toBe(observed.hp);
     expect(observed.hp).toBe(100);
     m.close();
+  });
+});
+
+// SHARD-7: installing an assignment is defence in depth — a bad epoch is
+// refused, a host that no longer serves its shard stops, and the hosts it
+// trusts and spectates follow the assignment.
+describe('shardHost.setAssignment', () => {
+  const C = '00000000000000c0';
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function trio() {
+    const net = simNetwork({ latencyMs: 20 });
+    const first: ShardAssignment = { epoch: 1, hosts: { s0: A, s1: B }, owner: { [PA]: 's0', [PB]: 's1' } };
+    const host = (id: string, shard: string, assignment: ShardAssignment, initial: Record<string, Body>) =>
+      shardHost<Body, Act>(lib, { transport: net.node(id), label: LABEL, assignment, shard, roster: [PA, PB], initial, apply });
+    const a = host(A, 's0', first, { [PA]: { x: 0, z: 0, hp: 100 } });
+    const b = host(B, 's1', first, { [PB]: { x: 5, z: 0, hp: 100 } });
+    return { net, first, host, a, b };
+  }
+
+  it('refuses an epoch that is not a safe integer above the installed one — and a rollback after it', async () => {
+    const m = trio();
+    await vi.advanceTimersByTimeAsync(500);
+    for (const epoch of [Number.NaN, undefined, 1.5, 1, 0, Number.MAX_SAFE_INTEGER + 2]) {
+      expect(m.b.setAssignment({ ...m.first, epoch } as unknown as ShardAssignment)).toBe(false);
+    }
+    // Had NaN been installed, every later comparison would be false and
+    // this rollback to an older epoch would be taken.
+    expect(m.b.setAssignment({ ...m.first, epoch: 0, owner: {} })).toBe(false);
+    expect(m.b.world()[PB]).toBeDefined();
+    expect(m.b.setAssignment({ ...m.first, epoch: 2 })).toBe(true);
+    m.a.close();
+    m.b.close();
+  });
+
+  it('stops serving a shard the assignment gives another host; the others trust and spectate the new host', async () => {
+    const m = trio();
+    await vi.advanceTimersByTimeAsync(1_000);
+    // s0 moves to host C (A leaves the match cleanly; C restores nothing,
+    // it starts from PA's state as the lobby hands it over).
+    const second: ShardAssignment = { ...m.first, epoch: 2, hosts: { s0: C, s1: B } };
+    const c = m.host(C, 's0', second, { [PA]: m.a.world()[PA]! });
+    expect(m.a.setAssignment(second)).toBe(true);
+    expect(m.b.setAssignment(second)).toBe(true);
+    // A holds and sends nothing for s0 any more, and serves no hits.
+    expect(m.a.world()).toEqual({});
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(m.a.world()).toEqual({});
+    // B admits C (its `authorize` follows the hosts) and spectates C, not A.
+    expect(c.observed('s1')?.[PB]).toBeDefined();
+    expect(m.b.observed('s0')?.[PA]).toEqual(c.world()[PA]);
+    // (C is on no roster: only a hosts set that followed the assignment admits it.)
+    expect(m.b.netcode.players()).toContain(C);
+    expect(m.b.netcode.dropped.unauthorized ?? 0).toBe(0);
+    // And A, serving nothing, spectates nothing.
+    expect(m.a.observed('s1')).toBeNull();
+    m.a.close();
+    m.b.close();
+    c.close();
   });
 });

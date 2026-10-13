@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { shardHost } from '../../demo/sharded-arena/shard.js';
-import type { ShardHost } from '../../demo/sharded-arena/shard.js';
+import type { ShardCombat, ShardHost } from '../../demo/sharded-arena/shard.js';
 import { hostNetcode, joinNetcode, joinShards } from '../../src/netcode/index.js';
 import type { ShardAssignment, ShardedMatch } from '../../src/netcode/index.js';
 import { handoffLink, regionHandoffs, regionState } from '../../src/world/index.js';
@@ -29,7 +29,15 @@ interface Step {
 const apply = (body: Body, input: Step): Body => ({ ...body, x: body.x + input.dx });
 
 /** Two hosts and one player owned by s0; a stand-in lobby that raises the epoch when a move reports `moved`. */
-function arena(sim: SimOptions, lobbyDelayMs = 0) {
+/** Combat on: the hit-forward timing (500 ms give-up) is in play beside the move. */
+const combat: ShardCombat<Body> = {
+  fire: shooter => shooter,
+  hits: () => false,
+  damage: target => target,
+  maxSpeed: 40,
+};
+
+function arena(sim: SimOptions, lobbyDelayMs = 0, withCombat = false) {
   const net = simNetwork(sim);
   let assignment: ShardAssignment = { epoch: 1, hosts: { s0: A, s1: B }, owner: { [P]: 's0' } };
   const events: HandoffEvent[] = [];
@@ -56,6 +64,7 @@ function arena(sim: SimOptions, lobbyDelayMs = 0) {
       initial,
       apply,
       onHandoffEvent,
+      ...(withCombat ? { combat } : {}),
       now: () => Date.now(),
     });
   hosts.push(host(A, 's0', { [P]: { x: 0, z: 0 } }), host(B, 's1', {}));
@@ -130,6 +139,24 @@ describe('planned moves', () => {
     m.match.input({ dx: 1 });
     await vi.advanceTimersByTimeAsync(300);
     expect(b.world()[P]).toEqual({ x: 42, z: 0 });
+    m.close();
+  });
+
+  it('with combat on, a move whose target is silent for longer than a hit may wait still lands — once, live on one host', async () => {
+    const m = arena({ latencyMs: 20 }, 0, true);
+    const [a, b] = m.hosts as [ShardHost<Body>, ShardHost<Body>];
+    await vi.advanceTimersByTimeAsync(1_500);
+    // The link between the hosts is down for 800 ms: longer than a hit
+    // forward's 500 ms give-up, well within a handoff's.
+    m.net.block(A, B, 800);
+    m.net.block(B, A, 800);
+    await a.movePlayer(P, 's1');
+    await vi.advanceTimersByTimeAsync(600);
+    expect(m.events.map(event => event.type)).not.toContain('unresolved');
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(m.events.map(event => event.type)).toEqual(['admitted', 'moved']);
+    expect(liveOn(m.hosts)).toEqual(['s1']);
+    expect(b.world()[P]).toEqual({ x: 0, z: 0 });
     m.close();
   });
 

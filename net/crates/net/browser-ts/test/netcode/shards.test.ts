@@ -206,6 +206,68 @@ describe('joinShards', () => {
     b.host.close();
   });
 
+  it('a rejoined shard keeps showing everything else it owns until the new connection delivers (no blink on a move)', async () => {
+    const net = simNetwork({ latencyMs: 40 });
+    let epoch = 1;
+    let mine: Ship = { x: 0 };
+    const owner1 = { [ME]: 'a', a1: 'a', a2: 'a', b1: 'b', b2: 'b' };
+    const owner2 = { ...owner1, [ME]: 'b' };
+    const a = shardHost(net, HOSTS.a, (): Record<string, Ship> => (epoch === 1 ? { [ME]: mine, a1: { x: 1 }, a2: { x: 2 } } : { a1: { x: 1 }, a2: { x: 2 } }), () => epoch);
+    const b = shardHost(net, HOSTS.b, (): Record<string, Ship> => (epoch === 1 ? { b1: { x: 10 }, b2: { x: 20 } } : { [ME]: mine, b1: { x: 10 }, b2: { x: 20 } }), () => epoch);
+    const match = joinShards<Ship, Move>({
+      transport: net.node(ME),
+      label: LABEL,
+      now: () => Date.now(),
+      local: { id: ME, predict: move },
+      assignment: { epoch: 1, hosts: { a: HOSTS.a, b: HOSTS.b }, owner: owner1 },
+    });
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(Object.keys(match.view()).sort()).toEqual([ME, 'a1', 'a2', 'b1', 'b2'].sort());
+    // A planned move: this player's owner goes a → b, so BOTH shards are
+    // rejoined. Every other entity on them must stay on screen meanwhile.
+    mine = { x: 5 };
+    epoch = 2;
+    expect(match.setAssignment({ epoch: 2, hosts: { a: HOSTS.a, b: HOSTS.b }, owner: owner2 })).toBe(true);
+    let missing = 0;
+    for (let t = 0; t < 1_000; t += 10) {
+      const view = match.view();
+      for (const id of [ME, 'a1', 'a2', 'b1', 'b2']) if (view[id] === undefined) missing += 1;
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    expect(missing).toBe(0);
+    expect(match.view()).toMatchObject({ [ME]: { x: 5 }, a1: { x: 1 }, b2: { x: 20 } });
+    match.close();
+    a.host.close();
+    b.host.close();
+  });
+
+  it('ready() waits on the connections that are live, across a rejoin', async () => {
+    const net = simNetwork({ latencyMs: 20 });
+    const a = shardHost(net, HOSTS.a, () => ({ a1: { x: 1 } }), () => 1);
+    const b = shardHost(net, HOSTS.b, () => ({ b1: { x: 10 } }), () => 1);
+    const c = shardHost(net, HOSTS.c, () => ({ b1: { x: 10 } }), () => 1);
+    const match = joinShards<Ship, Move>({
+      transport: net.node(ME),
+      label: LABEL,
+      now: () => Date.now(),
+      assignment: { epoch: 1, hosts: { a: HOSTS.a, b: HOSTS.b }, owner: { a1: 'a', b1: 'b' } },
+    });
+    let outcome: string | null = null;
+    match.ready().then(
+      () => (outcome = 'ready'),
+      (error: unknown) => (outcome = `failed: ${String(error)}`),
+    );
+    // Shard b moves to host c before anything arrived: its first connection
+    // is closed. That is not a join failure, and the wait follows c.
+    match.setAssignment({ epoch: 2, hosts: { a: HOSTS.a, b: HOSTS.c }, owner: { a1: 'a', b1: 'b' } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(outcome).toBe('ready');
+    expect(match.stats().shards.b!.host).toBe(HOSTS.c);
+    expect(match.stats().shards.b!.snapshots).toBeGreaterThan(0);
+    match.close();
+    for (const { host } of [a, b, c]) host.close();
+  });
+
   it('a silent host shows in stats', async () => {
     const net = simNetwork({ latencyMs: 20 });
     const a = shardHost(net, HOSTS.a, () => ({ a1: { x: 1 } }), () => 1);

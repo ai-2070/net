@@ -172,10 +172,17 @@ Ownership is an explicit contract and is kept above the leaf and core wire.
   - A client that hasn't heard from the coordinator for `leaseMs` freezes
     its view and shows "reconnecting".
   - The lobby node gives a lost host's entities to another host **only after
-    `leaseMs` plus a clock-drift margin** has passed since it last renewed
-    that lease.
+    `leaseMs` plus a clock-drift margin plus the longest renewal delivery
+    delay** has passed since it last renewed that lease. A host dates its
+    lease from when a renewal reaches it, so a renewal delivered `d` ms
+    late keeps it live `d` ms longer (changed 2026-10-13, review SHARD-6:
+    the margin covered drift only).
+  - A host's first sight of a counter is a baseline, not a lease: a replica
+    can hold a value written long ago. It is live once a renewal is seen to
+    arrive.
 - **The guarantee, stated narrowly:** no entity is simulated by two hosts at
-  the same time, provided clock drift between hosts stays inside the margin.
+  the same time, provided clock drift between hosts stays inside the margin
+  and no renewal reaches a host later than the delivery bound.
   The cost: if the lobby node is unreachable for longer than `leaseMs`, the
   whole match pauses. The lobby node is already a single point of failure
   (lobbies plan G6), and this makes it one explicitly.
@@ -1004,7 +1011,8 @@ Ownership is by squad, which is D1's unit:
   epoch not above the installed one.
 - `renewLeases` is one renewal round.
 - `leaseWatch` judges a counter on this node's own clock.
-- `mayReassign` is the `leaseMs + margin` wait.
+- `mayReassign` is the `leaseMs + drift margin + delivery bound` wait
+  (`maxDeliveryMs`, default 0; review SHARD-6).
 - `authorizeTeams` handles `team:<name>` audiences.
 
 `hostNetcode({ live })` stops stepping and sending, and drops inputs, once
@@ -1303,6 +1311,7 @@ features.
 | **False rejections in the hit check.** Clock jitter or lost snapshots make legitimate hits fail. | S3 measures `no-history` and rejection rates. Widen the tolerance with measured jitter before raising the cap. |
 | **Lobby node outage pauses the match** (leases). | Accepted and stated. Recovering when the lobby node itself fails is out of scope (G6). |
 | **Clock drift beyond the lease margin** breaks the no-double-simulation guarantee. | Size the margin from S0b's measured drift. Hosts also refuse to simulate an entity a newer-epoch snapshot shows elsewhere (best effort). |
+| **A renewal delivered later than `maxDeliveryMs`** keeps the old host live past the reassignment. | Size `maxDeliveryMs` from the store's measured replication delay, reconnects included (S0b records renewal timing). |
 | **Trust.** Each host sees the whole match and decides for what it owns. Under B it also controls what its players see. | Documented: player hosts are for casual matches; ranked play needs a dedicated host. No anti-cheat claim. |
 | **The estimates are wrong.** | S0 and S0b come first, with a stop rule. |
 

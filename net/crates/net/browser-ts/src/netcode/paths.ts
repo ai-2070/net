@@ -11,7 +11,11 @@
  * - the client draws from **whichever source shows the highest `mv`**;
  * - if that says `'path'` and the record has not arrived yet, the last live
  *   motion is carried forward for at most `carryMs` (500), then held;
- * - a switch of source blends over `smoothingMs` (100), so it never jumps.
+ * - a switch of source blends over `smoothingMs` (100), so it never jumps;
+ * - an NPC whose highest `mv` says `'live'` but that no snapshot shows any
+ *   more (dead, or out of interest) is held for `carryMs`, then no longer
+ *   drawn — which is how a retired path record (`'live'`, no points)
+ *   clears it.
  *
  * ```ts
  * const modes = npcModes<Npc>();
@@ -104,13 +108,16 @@ export function pathAction<S extends object>(options: {
     context: { readonly peer: string; getState(): unknown; setState(update: Partial<S>): void },
   ): { readonly mv: number } => {
     const state = context.getState() as S;
+    if (typeof input?.npc !== 'string') throw new Error('npc is not a string');
     const assignment = options.assignment(state);
-    const owner = Object.values(assignment?.shards ?? {}).find(shard => shard.npcs?.includes(input.npc));
+    // An array check, not just `includes`: on a string, `includes` would be
+    // a substring match.
+    const owner = Object.values(assignment?.shards ?? {}).find(shard => Array.isArray(shard.npcs) && shard.npcs.includes(input.npc));
     if (owner === undefined || owner.host !== context.peer) throw new Error(`only the host that owns ${input.npc} writes its path`);
     const problems = pathProblems(input.path);
     if (problems.length > 0) throw new Error(`invalid path: ${problems.join('; ')}`);
     const records = ((state as Record<string, unknown>)[field] ?? {}) as Readonly<Record<string, NpcPath>>;
-    const held = records[input.npc];
+    const held = Object.hasOwn(records, input.npc) ? records[input.npc] : undefined;
     if (held !== undefined && input.path.mv <= held.mv) throw new Error(`mv ${input.path.mv} is not above ${held.mv}`);
     context.setState({ [field]: { ...records, [input.npc]: input.path } } as Partial<S>);
     return { mv: input.path.mv };
@@ -140,8 +147,14 @@ export interface NpcModes<E extends ModedEntity> {
     records: Readonly<Record<string, NpcPath>> | null | undefined,
     ownerNow: (id: string) => number | null,
   ): Readonly<Record<string, E>>;
-  /** Times a path was due but its record had not arrived: carried forward, then held. */
-  readonly stats: () => { readonly carried: number; readonly switches: number };
+  /**
+   * `carried`: times a path was due but its record had not arrived (carried
+   * forward, then held). Not counted while the record is here and only the
+   * owner's clock is unknown: that is held, not carried. `tracks`: NPCs
+   * being followed (pruned once absent from both sources for longer than
+   * `carryMs + smoothingMs`).
+   */
+  readonly stats: () => { readonly carried: number; readonly switches: number; readonly tracks: number };
 }
 
 interface Track<E> {
@@ -154,6 +167,12 @@ interface Track<E> {
   blend: { from: E; at: number } | null;
   /** When a carry began. */
   carriedSince: number | null;
+  /** The newest snapshot entry, in either mode: the base a path pose is built on (hp and the rest stay current). */
+  last: E | null;
+  /** Since when its mode has been `'live'` with no snapshot entry (`null`: it has one, or is not live). */
+  missingSince: number | null;
+  /** When either source last showed it: absent long enough, the track is pruned. */
+  seenAt: number;
   /**
    * The highest mode version any snapshot showed, and its mode — kept
    * after the entry leaves the view, which is exactly what a path NPC's
@@ -185,11 +204,24 @@ export function npcModes<E extends ModedEntity>(options: NpcModesOptions = {}): 
       for (const id of ids) {
         let track = tracks.get(id);
         if (track === undefined) {
-          track = { live: null, previousLive: null, drawn: null, source: null, blend: null, carriedSince: null, seen: null };
+          track = {
+            live: null,
+            previousLive: null,
+            drawn: null,
+            source: null,
+            blend: null,
+            carriedSince: null,
+            seen: null,
+            last: null,
+            missingSince: null,
+            seenAt: at,
+          };
           tracks.set(id, track);
         }
-        const entry = view[id];
-        const record = records?.[id];
+        track.seenAt = at;
+        const entry = Object.hasOwn(view, id) ? view[id] : undefined;
+        const record = records !== null && records !== undefined && Object.hasOwn(records, id) ? records[id] : undefined;
+        if (entry !== undefined) track.last = entry;
         if (entry !== undefined && entry.mode !== 'path' && (track.live === null || track.live.state !== entry)) {
           track.previousLive = track.live;
           track.live = { state: entry, at };
@@ -204,14 +236,40 @@ export function npcModes<E extends ModedEntity>(options: NpcModesOptions = {}): 
         const mv = Math.max(entryMv, recordMv);
         let target: E | null = null;
         let source: Track<E>['source'] = null;
+        if (mode !== 'live') track.missingSince = null;
         if (mode === 'live') {
-          target = entry !== undefined && entry.mode !== 'path' ? entry : track.drawn;
+          if (entry !== undefined && entry.mode !== 'path') {
+            track.missingSince = null;
+            target = entry;
+          } else {
+            // Live, but no snapshot shows it: held for carryMs (its entry
+            // may be a tick behind a switch back to live), then gone.
+            track.missingSince ??= at;
+            if (at - track.missingSince > carryMs || track.drawn === null) {
+              delete out[id];
+              track.drawn = null;
+              track.source = null;
+              track.blend = null;
+              continue;
+            }
+            target = track.drawn;
+          }
           source = 'live';
         } else if (record !== undefined && record.mode === 'path' && record.mv >= mv) {
           const clock = ownerNow(id);
-          const point = clock === null ? null : pathAt(record.points, clock - delay);
-          const base = track.live?.state ?? entry ?? track.drawn;
-          if (point !== null && base !== undefined && base !== null) {
+          // The freshest state there is: in the announce window the entry
+          // itself, after it the last one any snapshot showed.
+          const base = entry ?? track.last ?? track.live?.state ?? track.drawn;
+          if (clock === null) {
+            // The record is here; only the owner's clock is not yet. Hold
+            // what was drawn: nothing is late, so this is not a carry.
+            const held = track.drawn ?? base;
+            if (held === null) delete out[id];
+            else out[id] = held;
+            continue;
+          }
+          const point = pathAt(record.points, clock - delay);
+          if (point !== null && base !== null) {
             target = place(base, point, mv, 'path');
             source = 'path';
           }
@@ -263,8 +321,13 @@ export function npcModes<E extends ModedEntity>(options: NpcModesOptions = {}): 
         track.drawn = drawn;
         out[id] = drawn;
       }
+      // An NPC neither source shows any more is forgotten, once it has been
+      // gone longer than anything here could still carry or blend it.
+      for (const [id, track] of tracks) {
+        if (!ids.has(id) && at - track.seenAt > carryMs + smoothing) tracks.delete(id);
+      }
       return out;
     },
-    stats: () => ({ carried, switches }),
+    stats: () => ({ carried, switches, tracks: tracks.size }),
   };
 }

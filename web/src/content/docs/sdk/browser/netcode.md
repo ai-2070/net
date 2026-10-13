@@ -118,7 +118,7 @@ function frame() {
 | Option | Default | |
 |---|---|---|
 | `interpolationDelayMs` | 100 | how far behind the host clock others render |
-| `interpolate` | `lerpNumbers` | blend two states; numeric fields, nested too |
+| `interpolate` | `lerpNumbers` (the codec's blend with a `codec`) | blend two states; numeric fields, nested too |
 | `correctionSmoothingMs` | 100 | how long a correction takes to show |
 | `extrapolateMs` | 0 | carry others on through a late snapshot |
 | `inputRedundancy` | 8 | unacknowledged inputs repeated per input frame |
@@ -126,13 +126,15 @@ function frame() {
 | `interest` | none | interest keys to receive |
 
 `stats()` reports `clock` (`offsetMs`, `rttMs`, `jitterMs`, `samples`),
-`snapshots`, `lateSnapshots` (reordered by the carrier), `pendingInputs`,
+`snapshots`, `lateSnapshots` (reordered by the carrier), `pendingInputs`
+(dropped once the host acknowledges them, whether or not the client predicts),
 `corrections`, `partialSnapshots` (chunked snapshots completed with carried-over
 entities), `binaryFrames` and `unnamedEntities` (compact snapshots, below). `hostNow()` is the host clock as estimated, and `close()` stops the
 player.
 
 The building blocks are exported too: `ClockEstimator` (NTP-style, trusting the
-lowest-RTT samples), `SnapshotBuffer` and `lerpNumbers`.
+lowest-RTT samples), `SnapshotBuffer`, `lerpNumbers`, and `lerpAngle` (an
+angle the short way round, for a custom `interpolate`).
 
 ## Compact snapshots
 
@@ -161,10 +163,21 @@ joinNetcode({ /* ... */, codec: shipCodec });
   entity the codec refuses (an extra field, a value out of range) sends that
   player JSON for that tick and counts `dropped['codec-write-failed']`.
 - **Values arrive quantized.** Reconciliation compares within the codec's
-  quanta (`codec.near`), so quantization is not a correction.
+  quanta (`codec.near`), so quantization is not a correction. A `float32()`
+  that arrives as NaN or an infinity refuses the frame.
+- **Angles turn the short way.** With a codec and no `interpolate` of its
+  own, a player blends with `codec.interpolate`: an `angle()` field goes from
+  350° to 10° through 0°, in interpolation and in a correction alike.
 - **Ids travel as indexes** the host never reuses; a lost name is asked for
   again, and the entity is left out until it arrives
   (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
+  An id no player has been shown for 10 s is forgotten and named afresh if
+  it returns, so short-lived ids do not grow the tables all match. Every
+  binary snapshot carries the host's instance: a host re-created under the
+  same label is never read through the old one's names.
+- **The fingerprint covers the wire version too.** A package from before
+  instance-stamped snapshots has another fingerprint for the same schema,
+  so a mixed pair runs on JSON.
 
 ## Several hosts: a sharded match
 
@@ -195,7 +208,10 @@ onKey(input => match.input(input));   // sent only to the shard that owns you
   their epoch (`hostNetcode({ epoch })`). A host still sending from
   another epoch is frozen at what you last saw from it, so the world
   doesn't blink while everyone catches up. An entity that changes owner
-  lingers briefly at its last position.
+  lingers briefly at its last position. A shard that has to be rejoined
+  (its host changed, or you moved to or from it) keeps showing what it
+  last drew until the new connection's first snapshot, and `ready()`
+  waits on the new connection, not the closed one.
 - **`stats()`** reports each shard, including how long it has been silent,
   and counts what the ownership and epoch rules dropped.
 
@@ -213,7 +229,10 @@ is the recipe to copy.
   `no-announcement` means this node never heard the host announce, so it
   cannot reach it. A lobby announces for you; a page that joins a host
   directly must make sure the host announces and query its tag first.
-  `stats().connectOutcome` shows the last `connectPeer` outcome.
+  `stats().connectOutcome` shows the last `connectPeer` outcome. After a
+  direct attempt ends relayed, or `connectPeer` rejects, the client waits
+  `directRetryMs` (default 30 s) before offering again, and reopens its
+  stream on the session there is meanwhile.
 
 - **The lossy carrier is `connect()`-only.** A follower tab's `openSession()`
   refuses `lossy: true`. Games run on `connect()` anyway, as stores do.
