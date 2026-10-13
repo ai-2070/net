@@ -326,11 +326,15 @@ Mutual kills across hosts trade.
   and path points are all on it; `host.now()` reads it for path points.
   Don't pass `Date.now` to one piece and leave the rest on the default:
   every forwarded hit is then refused `beyond-cap`.
-- Tests: `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
-  `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`,
-  `test/netcode/assignment.test.ts`, `test/netcode/planned-move.test.ts`,
-  `test/netcode/host-crash.test.ts`, `test/netcode/npc.test.ts`,
-  `test/netcode/npc-paths.test.ts`.
+- Tests:
+  `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/sharded-arena.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/cross-host-hits.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/assignment.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/planned-move.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/host-crash.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/npc.test.ts`,
+  `net/crates/net/browser-ts/test/netcode/npc-paths.test.ts`.
 
 ## Rules that bite
 
@@ -368,5 +372,6 @@ Mutual kills across hosts trade.
   treats the lossy channel as its only one.
 - Source: `net/crates/net/browser-ts/src/netcode/`, tests
   `net/crates/net/browser-ts/test/netcode/netcode.test.ts` (a simulated
-  lossy, laggy network), `test/netcode/codec.test.ts` (compact snapshots) and `net/crates/net/sdk-ts/test/store_transport.test.ts`
+  lossy, laggy network), `net/crates/net/browser-ts/test/netcode/codec.test.ts` (compact
+  snapshots) and `net/crates/net/sdk-ts/test/store_transport.test.ts`
   (a native dedicated host).

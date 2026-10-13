@@ -343,3 +343,21 @@ again, the loop `directRetryMs` was added to stop.
    clock / a non-`local` client.
 3. WIRE-1, SHARD-2, LEAF-3, ANCHOR-1.
 4. The rest.
+
+---
+
+## Repair log
+
+Every finding is fixed except LEAF-2, which does not hold. Each fix has a
+test that fails when the fix is reverted.
+
+| Findings | Commit | Notes |
+|---|---|---|
+| LEAF-1, 3, 4, 5 | `80f98daea`, `aa0a70607` | LEAF-3: a relayed message 1 may re-establish over exactly the routed session a retirement restored. LEAF-5 adds `retryReport().channelClosed`. |
+| LEAF-2 | — | **Does not hold.** A re-offer from a leaf with no session first sends a relayed message 1 (`ensure_relayed_session`), which the peer refuses while it holds any session. And `peer_accept_offer` sets the relay to the anchor before replacing the link, so B's traffic goes relayed and the orphan check ignores it. Related gap, not created by this branch: the side that loses the link first can't reconnect until the other side notices the loss itself. |
+| NET-1..12 | `7efb68f0c` | NET-2 changes the binary wire format, additively (kinds 3/4, instance id; the fingerprint gains a wire version, so peers from before this change fall back to JSON). |
+| SHARD-1..9 | `6ecb3eadf` | SHARD-2: path NPCs now stay in snapshots to other hosts, so N2's upload saving applies to players only. SHARD-6: `mayReassign` takes `maxDeliveryMs`; dating a lease from the renewal's own timestamp is deferred, because no lobby clock estimate exists. |
+| WIRE-1..3, ANCHOR-1 | `53125390a` | WIRE-1: grants carry only a byte count, so loss can't be told from in-flight bytes until outstanding bytes exceed one horizon's sends. A stream sending less than its window per horizon (the game case) reclaims loss within two horizons. ANCHOR-1: at most 32 visitor budgets per source; when a visitor has no room for one, it is admitted on the per-IP backstop (`bootstrap_visitor_budget_degraded`). |
+
+Open, from the repairs: other shard hosts never drop a replaced host from
+`players()` (that timeout lives in netcode core).

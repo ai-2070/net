@@ -193,7 +193,11 @@ const match = joinShards<Ship, Move>({
   transport: node,
   label: 'arena.move',
   // Who hosts which shard, and who owns which entity, at one epoch.
-  assignment: { epoch: 1, hosts: { s0: hostA, s1: hostB }, owner: { [myId]: 's0', [rivalId]: 's1' } },
+  assignment: {
+    epoch: 1,
+    hosts: { s0: hostA, s1: hostB },
+    owner: { [myId]: 's0', [rivalId]: 's1' },
+  },
   local: { id: myId, predict: move },
 });
 
