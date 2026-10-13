@@ -74,6 +74,13 @@ export interface JoinShardsOptions<E, I>
   readonly interest?: readonly string[];
   /** How long an entity whose owner changed keeps its old owner's last state, ms. Default 1000. */
   readonly lingerMs?: number;
+  /**
+   * Whether this player still hears the lobby (`leaseWatch` over the
+   * assignment's `renewals`). While `false` the view is frozen where it
+   * was, inputs are not sent (`inputsFrozen`), and `stats().frozen` is
+   * `true` — the game shows "reconnecting".
+   */
+  live?(): boolean;
 }
 
 /** Per-shard state, as {@link ShardedMatch.stats} reports it. */
@@ -97,6 +104,10 @@ export interface ShardedMatchStats {
   readonly heldNewerEpoch: number;
   /** Inputs not sent: no shard owns this player at the installed epoch. */
   readonly inputsUnowned: number;
+  /** Inputs not sent because the view was frozen (`live` false). */
+  readonly inputsFrozen: number;
+  /** The view is frozen: this player does not hear the lobby. */
+  readonly frozen: boolean;
 }
 
 /** The running merged view. */
@@ -149,9 +160,19 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
   let droppedStaleEpoch = 0;
   let heldNewerEpoch = 0;
   let inputsUnowned = 0;
+  let inputsFrozen = 0;
+  let frozenView: Readonly<Record<string, E>> = {};
+  const live = () => options.live?.() ?? true;
   // Everything a shard's `joinNetcode` takes as given; the rest is per shard.
-  const { assignment: _assignment, ownerOf: _ownerOf, local: _local, interest: _interest, lingerMs: _lingerMs, ...netcodeOptions } =
-    options;
+  const {
+    assignment: _assignment,
+    ownerOf: _ownerOf,
+    local: _local,
+    interest: _interest,
+    lingerMs: _lingerMs,
+    live: _live,
+    ...netcodeOptions
+  } = options;
 
   const selfOwner = (): string | undefined => (self === undefined ? undefined : ownerOf(self, installed));
 
@@ -172,6 +193,7 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
 
   return {
     view() {
+      if (!live()) return frozenView;
       const out: Record<string, E> = {};
       const at = now();
       for (const [shard, entry] of shards) {
@@ -213,10 +235,15 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
         if (until <= at) lingering.delete(id);
         else if (!(id in out)) out[id] = state;
       }
+      frozenView = out;
       return out;
     },
     input(data: I) {
       if (closed) return;
+      if (!live()) {
+        inputsFrozen += 1;
+        return;
+      }
       const owner = selfOwner();
       const entry = owner === undefined ? undefined : shards.get(owner);
       if (entry === undefined || !entry.owns) {
@@ -274,6 +301,8 @@ export function joinShards<E, I>(options: JoinShardsOptions<E, I>): ShardedMatch
         droppedStaleEpoch,
         heldNewerEpoch,
         inputsUnowned,
+        inputsFrozen,
+        frozen: !live(),
       };
     },
     close() {

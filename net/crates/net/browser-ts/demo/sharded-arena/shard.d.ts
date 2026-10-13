@@ -47,6 +47,8 @@ export interface ShardHostOptions<E extends Placed, I> {
   readonly autoTick?: boolean;
   /** More cross-host actions this shard serves, beside combat's `hit`. */
   readonly actions?: Readonly<Record<string, BorderAction<E>>>;
+  /** Whether this host still holds its lease (S4: `leaseWatch` over its lease in the lobby store). */
+  live?(): boolean;
   /** Cross-host hits (S3). A fire input carries `{ fire: { target, seenB } }`. */
   readonly combat?: ShardCombat<E>;
   readonly now?: () => number;

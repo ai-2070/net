@@ -978,6 +978,46 @@ state. These slices define what moves with it.
   - a client cut off from the coordinator freezes within `leaseMs`;
   - forwarded actions carrying a stale `ep` are refused.
 
+**Result: S4 built ahead of S7, by decision (2026-10-13), except host
+selection.** `src/netcode/assignment.ts`. The record the lobby store
+holds is
+`{ epoch, shards: { [name]: { host, squads } }, squads: { [id]: { team, members } }, leases, renewals }`.
+Ownership is by squad, which is D1's unit:
+- `assignmentProblems` is the validator. It checks that each squad and
+  each player is owned exactly once, that a shard owns at most one squad
+  per team and never its own host's squad, and that hosts are distinct
+  and every shard has a lease.
+- `shardAssignment` is the view `joinShards` reads.
+- `assignAction({ lobby })` is the store action that installs a record.
+  It refuses any caller but the lobby node, an invalid record, and an
+  epoch not above the installed one.
+- `renewLeases` is one renewal round.
+- `leaseWatch` judges a counter on this node's own clock.
+- `mayReassign` is the `leaseMs + margin` wait.
+- `authorizeTeams` handles `team:<name>` audiences.
+
+`hostNetcode({ live })` stops stepping and sending, and drops inputs, once
+its lease is lost. `joinShards({ live })` freezes the view and holds
+inputs (`stats().frozen`). The recipe passes `live` through and refuses
+hit claims while it's down (`lease-lost`). Stale-`ep` forwarded actions
+were already refused in S3.
+
+`test/netcode/assignment.test.ts` (8 tests) proves every item in the S4
+list. The writes go through a real lobby store on the local mesh. Both
+lease tests partition a node that's left running, by dropping what the
+lobby sends it. The host stops within `leaseMs` and serves again when
+healed; a player freezes within `leaseMs`. The partition test passed
+5 of 5 runs. Mutation checks each fail a test:
+- anyone may assign;
+- no D1 own-squad rule;
+- a squad owned twice allowed;
+- the host ignoring its lease;
+- the player ignoring its lease.
+
+**Not built: host selection by a real network probe.** On the local mesh
+a probe measures nothing, so it waits for the real-browser runs. Until
+then the lobby node assigns hosts itself.
+
 #### S5 — Planned moves: rebalancing and a host leaving cleanly
 
 **The contract:** an entity's state and its processed-input boundary move

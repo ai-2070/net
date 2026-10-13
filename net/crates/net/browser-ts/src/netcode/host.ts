@@ -117,6 +117,15 @@ export interface HostNetcodeOptions<E, I> {
    * An input frame with no epoch is applied, as from any plain player.
    */
   epoch?(): number;
+  /**
+   * Sharded matches: whether this host still holds its lease (`leaseWatch`
+   * in `assignment.ts`), asked every tick. While `false` the host neither
+   * simulates nor sends — a host cut off from the lobby must stop before
+   * the lobby gives its entities to another — and inputs that arrive are
+   * dropped (`dropped['lease-lost']`), not saved for later. Clock pings are
+   * still answered.
+   */
+  live?(): boolean;
   readonly now?: Now;
 }
 
@@ -417,6 +426,17 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     const time = now();
     const dtMs = tick === 0 ? tickMs : time - lastTickAt;
     lastTickAt = time;
+    if (options.live !== undefined && !options.live()) {
+      for (const player of players.values()) {
+        if (player.pending.size > 0) {
+          dropped['lease-lost'] = (dropped['lease-lost'] ?? 0) + player.pending.size;
+          // Applied as if seen, so a repeat of these inputs is not applied later either.
+          player.lastApplied = Math.max(player.lastApplied, ...player.pending.keys());
+          player.pending.clear();
+        }
+      }
+      return;
+    }
     for (const [peer, player] of players) {
       if (time - player.lastHeard > playerTimeoutMs) {
         player.stream?.close();

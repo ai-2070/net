@@ -26,6 +26,21 @@ the README on why it is a sibling package rather than a sub-path.
   epoch. When ownership changes, the old owner's copy lingers for
   `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
   what the fencing dropped.
+- **Sharded matches get an assignment record and leases**
+  (`@net-mesh/browser/netcode`). `MatchAssignment` lives in the lobby's
+  store and gives shard hosts, the squads each shard owns, and a lease
+  per host:
+  - `assignmentProblems` validates it: each player is owned exactly once,
+    and no host owns its own squad.
+  - `assignAction({ lobby })` is the store action only the lobby node may
+    call.
+  - `renewLeases` bumps the counters.
+  - `leaseWatch` judges a counter on this node's own clock.
+  - `shardAssignment` gives the `joinShards` view.
+  - `authorizeTeams` admits `team:<name>` audiences.
+
+  `hostNetcode({ live })` stops simulating and sending once its lease is
+  lost. `joinShards({ live })` freezes the view (`stats().frozen`).
 - **`NetcodeClient.sampleAt(hostTime)`** returns the host's entities as
   of a host time, from the snapshots the client holds, plus the gap
   between the two snapshots around that time. It returns `null` when no

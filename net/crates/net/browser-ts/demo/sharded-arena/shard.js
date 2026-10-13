@@ -22,7 +22,9 @@
  *   peers read from the assignment. No `persist` (the match lives in memory,
  *   D6) and no `ghosting` (every host already spectates every other). It
  *   carries forwarded actions now and planned moves later (S5).
- * - **A static assignment**: no lobby, no leases yet (S4).
+ * - **The assignment**, static here; with `options.live` (a `leaseWatch`
+ *   over this shard's lease in the lobby store, S4) the host stops
+ *   simulating, sending and serving hits the moment its lease runs out.
  * - **Cross-host hits** (S3, `options.combat`), hitscan. A fire input
  *   `{ fire: { target, seenB } }` is checked here (the shooter's host, A)
  *   and, for a target another shard owns, forwarded to its host (B) as a
@@ -151,6 +153,7 @@ export function shardHost(lib, options) {
       count(record.served, reason);
       return output ?? reason;
     };
+    if (options.live !== undefined && !options.live()) return verdict('lease-lost');
     if (typeof claim !== 'object' || claim === null || claim.ep !== assignment.epoch) return verdict('stale-epoch');
     if (fromShard === undefined || owner(claim.shooter) !== fromShard) return verdict('not-owner');
     if (owner(claim.target) !== shard || entities[claim.target] === undefined) return verdict('not-owner');
@@ -181,6 +184,7 @@ export function shardHost(lib, options) {
     maxRewindMs,
     autoTick: options.autoTick,
     epoch: () => assignment.epoch,
+    ...(options.live === undefined ? {} : { live: options.live }),
     authorize: peer => roster.has(peer) || hosts.has(peer),
     step: ({ inputs }) => {
       let entities = region.entities;
