@@ -216,6 +216,8 @@ fn pair() -> Pair {
         handshakes: HashMap::new(),
         admissions: HashMap::new(),
         displaced_relays: HashMap::new(),
+        restored_routed: HashMap::new(),
+        loss_reports: crate::retry::LossReports::default(),
         next_routed: 0,
         anchor_candidates: VecDeque::new(),
         // This leaf did not bootstrap through an anchor, so there
@@ -1188,6 +1190,340 @@ async fn an_establishment_abandoned_by_its_offerer_returns_the_pair_to_its_relay
         .unwrap_or_else(|_| panic!("a settled attempt is still readable"));
     assert_eq!(reading.state, "failed");
     assert!(!reading.direct);
+    p.leaf.close();
+}
+
+/// Bring the pair to a pending admission over a really open channel:
+/// a routed session (relayed through the anchor unless `relayed` is
+/// false), this leaf's attempt, and the peer's message 1 answered
+/// directly. The attempt it happened under.
+async fn pending_admission(p: &Pair, relayed: bool) -> Attempt {
+    p.install_session();
+    if relayed {
+        with_node(&p.leaf.inner, |guard| {
+            let anchor = guard.anchor;
+            guard.node.set_peer_relay(p.peer_id, anchor);
+        });
+    }
+    let d = p.offer(20_000).await;
+    let attempt = p.attempt(d);
+    p.open_channel(d).await;
+    if !relayed {
+        // The offer path puts the relay back for a pair that holds a
+        // session; the shape under test is one that had none when
+        // message 1 arrived.
+        with_node(&p.leaf.inner, |guard| {
+            guard.node.clear_peer_relay(p.peer_id);
+        });
+    }
+    let our_noise = *p.leaf.inner.borrow().node.identity().noise().public_key();
+    let msg1 = p
+        .peer
+        .borrow_mut()
+        .begin_handshake(p.us, &PSK, &our_noise, 1)
+        .expect("the peer's message 1");
+    with_node(&p.leaf.inner, |guard| {
+        guard.on_handshake(p.peer_id, &msg1, false);
+    });
+    assert_eq!(
+        p.leaf.inner.borrow().admissions.get(&p.peer_id),
+        Some(&attempt),
+        "message 1 is admitted under this attempt"
+    );
+    attempt
+}
+
+/// Run the node's sweep as of a moment past the proof deadline, so an
+/// unproven admission expires without the witness waiting it out.
+fn expire_the_proof_window(p: &Pair) {
+    with_node(&p.leaf.inner, |guard| {
+        let later = clock::now()
+            + core::time::Duration::from_millis(crate::establish::PROOF_DEADLINE_MS + 1_000);
+        guard.node.tick(later);
+        guard.pump();
+    });
+}
+
+/// The attempt deadline that passes while a proof is pending and the
+/// offerer has already CLOSED the channel retires the admission the
+/// non-destructive way — routed session kept, relay restored,
+/// `Relayed` — and is not reported as an ICE timeout.
+///
+/// Review LEAF-1: the deadline waited for the proof only while the
+/// channel was open. A slow answerer whose offerer had given up and
+/// closed its channel fell through to `settle_peer_deadline`: the
+/// STUN probe labelled an ICE path that connected `iceTimeout` /
+/// `udpBlocked`, and `settle`'s destructive branch dropped the routed
+/// session the offerer kept — after which every relayed packet from
+/// the offerer was refused `no_session` and nothing repaired the pair.
+///
+/// Inverse: make the wait-for-proof branch require `open` again — the
+/// reading says `iceTimeout` and the routed session is gone.
+#[wasm_bindgen_test]
+async fn a_pending_proof_whose_channel_closed_returns_the_pair_to_its_relay_at_the_deadline() {
+    let p = pair();
+    let attempt = pending_admission(&p, true).await;
+
+    // The offerer gives up and closes its end; this end's channel
+    // really closes.
+    p.peer_transport.close(p.us);
+    for _ in 0..80 {
+        if !p.transport().is_open(p.peer_id) {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert!(!p.transport().is_open(p.peer_id), "the channel closed");
+
+    // The attempt's deadline passes INSIDE the proof window.
+    with_node(&p.leaf.inner, |guard| {
+        if let Some(dialog) = guard.peers.get_mut(&p.peer_id) {
+            dialog.deadline = crate::clock::Deadline::in_ms(0);
+        }
+    });
+    assert!(
+        p.leaf
+            .inner
+            .borrow()
+            .node
+            .provisional_attempt(p.peer_id)
+            .is_some(),
+        "the proof window is still open: the attempt deadline came first"
+    );
+    let (relayed, blocked) = (p.counter("ice_relayed"), p.counter("udp_blocked"));
+    let reading = p
+        .leaf
+        .service_peer(attempt)
+        .await
+        .unwrap_or_else(|_| panic!("the attempt is live"));
+
+    assert_eq!(
+        reading.state, "failed",
+        "ICE connected: the attempt is neither an ICE timeout nor UDP-blocked"
+    );
+    assert!(!reading.direct);
+    assert!(
+        p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "the routed session the offerer kept is kept here too"
+    );
+    assert_eq!(
+        p.leaf.inner.borrow().node.peer_relay(p.peer_id),
+        Some(ANCHOR),
+        "and the pair is back on the relay message 1 displaced"
+    );
+    assert!(p.leaf.inner.borrow().admissions.is_empty());
+    assert!(
+        p.leaf
+            .inner
+            .borrow()
+            .node
+            .provisional_attempt(p.peer_id)
+            .is_none(),
+        "the unproven establishment is destroyed with its attempt"
+    );
+    assert_eq!(p.counter("ice_relayed"), relayed + 1, "§9 step 6's term");
+    assert_eq!(p.counter("udp_blocked"), blocked, "no UDP-blocked claim");
+    p.leaf.close();
+}
+
+/// A retired admission that displaced NO relay still leaves its
+/// session a route: the anchor.
+///
+/// Review LEAF-4: with nothing recorded to restore, the retirement
+/// closed the channel and left the session with no relay entry and no
+/// link — live in the table, reaching nobody, and with no trigger to
+/// repair it.
+///
+/// Inverse: restore only a recorded relay — the relay entry is `None`.
+#[wasm_bindgen_test]
+async fn an_unproven_admission_that_displaced_no_relay_still_leaves_its_session_a_route() {
+    let p = pair();
+    pending_admission(&p, false).await;
+    assert!(
+        p.leaf.inner.borrow().displaced_relays.is_empty(),
+        "message 1 displaced nothing"
+    );
+
+    expire_the_proof_window(&p);
+
+    assert!(p.leaf.inner.borrow().admissions.is_empty());
+    assert!(p.leaf.inner.borrow().node.has_session(p.peer_id));
+    assert!(
+        !p.transport().is_open(p.peer_id),
+        "the attempt's channel is closed with it"
+    );
+    assert_eq!(
+        p.leaf.inner.borrow().node.peer_relay(p.peer_id),
+        Some(ANCHOR),
+        "so the session's one route is the anchor"
+    );
+    p.leaf.close();
+}
+
+/// The offerer that received message 2 installed the direct keys over
+/// its routed ones; when its proof is lost the answerer restores a
+/// routed session the offerer no longer holds. The offerer's repair —
+/// a ROUTED reconnection, §9 step 5 — must then be admitted, or where
+/// UDP is blocked the pair holds mismatched keys for good.
+///
+/// Review LEAF-3: a relayed message 1 was refused while the answerer
+/// held any session, the restored one included.
+///
+/// Inverse: drop the `reestablishable` term from the relayed admission
+/// rule — the routed reconnection is refused and nothing is parked.
+/// The control half pins the rule's other side: a relayed message 1
+/// over an ordinary session is still refused.
+#[wasm_bindgen_test]
+async fn a_routed_session_restored_by_a_retirement_admits_the_peers_routed_reconnection() {
+    let p = pair();
+    let our_noise = *p.leaf.inner.borrow().node.identity().noise().public_key();
+    pending_admission(&p, true).await;
+
+    // Before anything is retired the routed session is an ordinary
+    // one (its relayed refusal is pinned by
+    // `a_relayed_message_1_over_an_ordinary_session_is_still_refused`).
+    let routed = p.leaf.inner.borrow().node.session_incarnation(p.peer_id);
+    assert!(
+        !p.leaf.inner.borrow().reestablishable(p.peer_id),
+        "an ordinary session is not open to re-establishment"
+    );
+
+    // Message 2 really reaches the offerer, which installs on it —
+    // and its establishment proof is lost.
+    for _ in 0..80 {
+        if !p.peer_inbox.borrow().is_empty() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    {
+        let mut peer = p.peer.borrow_mut();
+        let mut installed = false;
+        while let Some((from, bytes)) = p.peer_inbox.borrow_mut().pop_front() {
+            if let Inbound::Handshake { from, packet, .. } = peer.classify_datagram(from, bytes) {
+                peer.complete_handshake(from, &packet)
+                    .expect("the offerer completes on message 2");
+                installed = true;
+            }
+        }
+        assert!(installed, "message 2 reached the offerer");
+        assert!(
+            !peer.take_outbound().is_empty(),
+            "the proof was queued — and is lost here"
+        );
+    }
+
+    expire_the_proof_window(&p);
+    assert_eq!(p.terminal(), Some((IceTerm::Relayed, "failed")));
+    assert_eq!(
+        p.leaf.inner.borrow().node.session_incarnation(p.peer_id),
+        routed,
+        "this side restored the routed session"
+    );
+    assert!(p.leaf.inner.borrow().reestablishable(p.peer_id));
+
+    // The offerer's channel closed under it, so it drops the session
+    // it installed there and reconnects through the anchor.
+    p.peer
+        .borrow_mut()
+        .drop_session(p.us, "witness: its channel closed");
+    let reconnect = p
+        .peer
+        .borrow_mut()
+        .begin_handshake(p.us, &PSK, &our_noise, 0)
+        .expect("the routed reconnection's message 1");
+    with_node(&p.leaf.inner, |guard| {
+        guard.on_handshake(p.peer_id, &reconnect, true);
+    });
+    assert!(
+        p.leaf
+            .inner
+            .borrow()
+            .node
+            .provisional_attempt(p.peer_id)
+            .is_some(),
+        "the routed reconnection is admitted over the restored session"
+    );
+    assert_eq!(
+        p.leaf.inner.borrow().node.session_incarnation(p.peer_id),
+        routed,
+        "admitted, not installed: only its proof replaces the session"
+    );
+    p.leaf.close();
+}
+
+/// A relayed message 1 over an ORDINARY session is still refused: the
+/// re-establishment exception is the restored session's alone.
+#[wasm_bindgen_test]
+async fn a_relayed_message_1_over_an_ordinary_session_is_still_refused() {
+    let p = pair();
+    p.install_session();
+    with_node(&p.leaf.inner, |guard| {
+        let anchor = guard.anchor;
+        guard.node.set_peer_relay(p.peer_id, anchor);
+    });
+    let our_noise = *p.leaf.inner.borrow().node.identity().noise().public_key();
+    let msg1 = p
+        .peer
+        .borrow_mut()
+        .begin_handshake(p.us, &PSK, &our_noise, 0)
+        .expect("a message 1");
+    with_node(&p.leaf.inner, |guard| {
+        guard.on_handshake(p.peer_id, &msg1, true);
+    });
+    assert!(
+        p.leaf
+            .inner
+            .borrow()
+            .node
+            .provisional_attempt(p.peer_id)
+            .is_none(),
+        "nothing a relay carries may displace a live session"
+    );
+    p.leaf.close();
+}
+
+/// One channel's loss, seen by both detectors, files ONE trigger, and
+/// files it as the close it was.
+///
+/// Review LEAF-5: the far end's close and the same channel's later
+/// ICE `failed` each filed an `IceFailed` trigger; the policy
+/// coalesced the second, but the ledger counted the loss twice and
+/// named a channel close an ICE failure.
+///
+/// Inverse: drop the `loss_reports` check from the ICE drain — two
+/// triggers; or file the close as `IceFailed` — the source is wrong.
+#[wasm_bindgen_test]
+async fn a_channel_close_and_its_later_ice_failure_file_one_trigger() {
+    let p = pair();
+    direct_session(&p).await;
+    let ours = p
+        .transport()
+        .channel_id(p.peer_id)
+        .expect("this leaf's link exists");
+    let before = p.leaf.inner.borrow().retry_triggers.borrow().len();
+
+    p.transport().report_channel_close(p.peer_id, ours);
+    with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
+    p.transport().report_ice_loss(p.peer_id, ours);
+    with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
+
+    let filed: Vec<RetryTrigger> = p
+        .leaf
+        .inner
+        .borrow()
+        .retry_triggers
+        .borrow()
+        .iter()
+        .skip(before)
+        .copied()
+        .collect();
+    assert_eq!(
+        filed,
+        vec![(crate::retry::TriggerSource::ChannelClosed, Some(p.peer_id))],
+        "one loss, one trigger, named for what was observed first"
+    );
+    assert!(!p.leaf.inner.borrow().node.has_session(p.peer_id));
     p.leaf.close();
 }
 

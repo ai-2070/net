@@ -516,6 +516,31 @@ pub(crate) struct Inner {
     /// expires unproven ([`Inner::pump`]) — §9 step 6, "the routed
     /// session is simply never replaced".
     displaced_relays: HashMap<NodeId, NodeId>,
+    /// Sessions an unproven admission's retirement handed back to the
+    /// relay, keyed by peer, each with the incarnation it restored.
+    ///
+    /// **The one session a relayed message 1 may re-establish over.**
+    /// The answerer cannot tell whether the offerer received message
+    /// 2: if it did not, the offerer still holds the routed session
+    /// this side restored and nothing more is needed; if it did, the
+    /// offerer installed the direct keys over its routed ones and
+    /// holds a session this side never promoted. The retirement closes
+    /// the channel, so the offerer's close handler drops that session
+    /// and files its repair — and §9 step 5's repair is a ROUTED
+    /// reconnection, whose relayed message 1 the ordinary rule refuses
+    /// while this side holds any session. Where UDP is blocked that
+    /// refusal left the pair with mismatched keys and no way back.
+    /// So a relayed message 1 is admitted over exactly this session
+    /// ([`Inner::reestablishable`]), and only while it is still the
+    /// incarnation restored. Admission parks a provisional
+    /// establishment and nothing more: the session is replaced only
+    /// by a verified establishment proof, so a replayed message 1
+    /// still displaces nothing.
+    restored_routed: HashMap<NodeId, u64>,
+    /// Which channel's loss has already been filed as a re-attempt
+    /// trigger, so a channel close and the same channel's later ICE
+    /// `failed` file one trigger, not two.
+    loss_reports: crate::retry::LossReports,
     /// The session each open DataChannel's handshake installed, and
     /// the identity of the channel it installed it over, keyed by
     /// peer.
@@ -737,7 +762,10 @@ impl Inner {
     /// *relayed* message 1 may only ESTABLISH — it is refused when a
     /// session already exists — so nothing a relay replays can
     /// displace a live session, let alone downgrade a direct one to
-    /// a relayed one. A *direct* message 1 may replace, because it
+    /// a relayed one. (One exception, and it is not a displacement: a
+    /// routed session an unproven admission's retirement restored may
+    /// be re-established over, because the peer may no longer hold its
+    /// keys — [`Inner::restored_routed`].) A *direct* message 1 may replace, because it
     /// arrived on a DataChannel this leaf negotiated with that peer
     /// inside an attempt it is driving; that is §9 step 4.
     ///
@@ -902,8 +930,11 @@ impl Inner {
                 // Establish only, and only for a peer whose signed
                 // announcement this leaf verified — which
                 // `classify_datagram` already required to resolve
-                // `from` at all.
-                !self.node.has_session(from)
+                // `from` at all. The one session it may re-establish
+                // over is a routed one an unproven admission's
+                // retirement restored, whose keys the peer may no
+                // longer hold ([`Inner::restored_routed`]).
+                !self.node.has_session(from) || self.reestablishable(from)
             } else {
                 // Replace, but only inside an attempt this leaf is
                 // driving AND that has not already ended. A direct
@@ -1145,10 +1176,15 @@ impl Inner {
             // The re-attempt trigger files regardless of the fence:
             // a dying link is a fact about the pair, and whether this
             // leaf OWNS the repair is the policy's question
-            // ([`crate::retry`]), not this fence's.
-            self.retry_triggers
-                .borrow_mut()
-                .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+            // ([`crate::retry`]), not this fence's. Once per channel,
+            // though: a channel whose far-end close already filed
+            // its loss (below, on an earlier drain) is not a second
+            // loss when ICE gives up on it too.
+            if self.loss_reports.first(peer, channel) {
+                self.retry_triggers
+                    .borrow_mut()
+                    .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+            }
         }
         // **The far end closed the channel a session rides.** The
         // second detector, and the fast one: ICE takes its consent
@@ -1166,11 +1202,14 @@ impl Inner {
         // only for the channel a session was installed over. A
         // channel that closes before anything installed is an
         // attempt's business, and its deadline settles it.
+        //
+        // Filed as what it is — a close, not an ICE failure — and
+        // only once per channel ([`Inner::loss_reports`]).
         for (peer, channel) in self.transport.take_channel_closes() {
-            if self.drop_installed_over(peer, channel) {
+            if self.drop_installed_over(peer, channel) && self.loss_reports.first(peer, channel) {
                 self.retry_triggers
                     .borrow_mut()
-                    .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+                    .push_back((crate::retry::TriggerSource::ChannelClosed, Some(peer)));
             }
         }
     }
@@ -1303,16 +1342,52 @@ impl Inner {
             .map(|(peer, attempt)| (*peer, *attempt))
             .collect();
         for (peer, attempt) in expired {
-            // Removed BEFORE the settle, so the settle's destructive
-            // branch (which keys on a live admission) is not taken.
-            self.admissions.remove(&peer);
-            if let Some(relay) = self.displaced_relays.remove(&peer) {
-                if self.node.has_session(peer) && self.node.peer_relay(peer).is_none() {
-                    self.node.set_peer_relay(peer, relay);
-                }
-            }
-            self.settle(attempt, IceTerm::Relayed, "failed");
+            self.retire_unproven(peer, attempt);
         }
+    }
+
+    /// Retire `peer`'s admission, owned by `attempt`, as unproven: the
+    /// pair goes back to its routed session over the relay, and the
+    /// attempt ends `Relayed`. `true` if the term applied.
+    ///
+    /// The one non-destructive retirement, shared by the proof
+    /// deadline ([`Inner::retire_unproven_admissions`]) and the
+    /// attempt deadline when the channel closed under a pending proof
+    /// (`service_peer`) — which used to fall through to the STUN probe
+    /// and `settle`'s destructive branch, dropping the routed session
+    /// the offerer kept and labelling an ICE path that connected
+    /// `iceTimeout` / `udpBlocked`.
+    ///
+    /// **The session is never left without a route.** The relay
+    /// message 1 displaced goes back; when none was recorded (the
+    /// pair held a session with no relay entry when message 1
+    /// arrived), the anchor — the only relay a leaf uses — stands in:
+    /// the attempt's channel is closed below, so a session left with
+    /// neither would reach nobody while reading as live. And the
+    /// restored session is recorded as one the peer may re-establish
+    /// over ([`Inner::restored_routed`]).
+    fn retire_unproven(&mut self, peer: NodeId, attempt: Attempt) -> bool {
+        // Removed BEFORE the settle, so the settle's destructive
+        // branch (which keys on a live admission) is not taken.
+        self.admissions.remove(&peer);
+        let displaced = self.displaced_relays.remove(&peer);
+        if let Some(incarnation) = self.node.session_incarnation(peer) {
+            if self.node.peer_relay(peer).is_none() {
+                self.node
+                    .set_peer_relay(peer, displaced.unwrap_or(self.anchor));
+            }
+            self.restored_routed.insert(peer, incarnation);
+        }
+        self.settle(attempt, IceTerm::Relayed, "failed")
+    }
+
+    /// Whether `peer`'s session is still the one an unproven
+    /// admission's retirement restored, so a relayed message 1 may
+    /// re-establish over it ([`Inner::restored_routed`]).
+    fn reestablishable(&self, peer: NodeId) -> bool {
+        self.restored_routed
+            .get(&peer)
+            .is_some_and(|restored| self.node.session_incarnation(peer) == Some(*restored))
     }
 
     /// Put everything the node queued on the wire and collect
@@ -1812,6 +1887,8 @@ impl Inner {
         self.handshakes.clear();
         self.admissions.clear();
         self.displaced_relays.clear();
+        self.restored_routed.clear();
+        self.loss_reports.clear();
         self.channel_installations.clear();
         self.retry.forget_all();
         self.unregister_retry_listeners();
@@ -2045,6 +2122,8 @@ impl LeafNode {
             handshakes: HashMap::new(),
             admissions: HashMap::new(),
             displaced_relays: HashMap::new(),
+            restored_routed: HashMap::new(),
+            loss_reports: crate::retry::LossReports::default(),
             channel_installations: HashMap::new(),
             next_routed: 0,
             anchor_candidates: VecDeque::new(),
@@ -2335,7 +2414,7 @@ impl LeafNode {
     /// The re-attempt owner's ledger, as JSON.
     ///
     /// `{"armed":<bool>,"online":"<n>","iceFailed":"<n>",
-    /// "triggers":"<n>","started":"<n>","coalesced":"<n>",
+    /// "channelClosed":"<n>","triggers":"<n>","started":"<n>","coalesced":"<n>",
     /// "notEligible":"<n>","openEpisodes":<n>,"owned":<n>,
     /// "last":"<disposition>"|null}`.
     ///
@@ -2357,12 +2436,13 @@ impl LeafNode {
             .retry_last
             .map_or_else(|| "null".to_string(), json_string);
         format!(
-            "{{\"armed\":{},\"online\":\"{}\",\"iceFailed\":\"{}\",\"triggers\":\"{}\",\
-             \"started\":\"{}\",\"coalesced\":\"{}\",\"notEligible\":\"{}\",\
+            "{{\"armed\":{},\"online\":\"{}\",\"iceFailed\":\"{}\",\"channelClosed\":\"{}\",\
+             \"triggers\":\"{}\",\"started\":\"{}\",\"coalesced\":\"{}\",\"notEligible\":\"{}\",\
              \"discardedUnarmed\":\"{}\",\"openEpisodes\":{},\"owned\":{},\"last\":{last}}}",
             guard.retry.is_armed(),
             ledger.online,
             ledger.ice_failed,
+            ledger.channel_closed,
             ledger.triggers(),
             ledger.started,
             ledger.coalesced,
@@ -3609,18 +3689,38 @@ impl LeafNode {
             } else {
                 "gathering"
             }
-        } else if open
-            && with_node(&self.inner, |guard| {
-                guard.admissions.get(&peer) == Some(&attempt)
-            })
-        {
-            // The offerer's message 1 arrived and its proof is still
-            // in flight: settling here would take `settle`'s
+        } else if with_node(&self.inner, |guard| {
+            guard.admissions.get(&peer) == Some(&attempt)
+        }) {
+            // The offerer's message 1 arrived and its proof has not.
+            // Never `settle_peer_deadline`: its settle would take the
             // destructive branch and drop the routed session the
-            // offerer may still be using. The proof window is bounded
-            // ([`crate::establish::PROOF_DEADLINE_MS`]); it ends in a
-            // promotion or in [`Inner::retire_unproven_admissions`].
-            "open"
+            // offerer may still be using, and its STUN probe would
+            // label an ICE path that CONNECTED a timeout.
+            if open {
+                // The proof can still arrive. Its window is bounded
+                // ([`crate::establish::PROOF_DEADLINE_MS`]); it ends
+                // in a promotion or in
+                // [`Inner::retire_unproven_admissions`].
+                "open"
+            } else {
+                // The channel the proof would ride is gone — the
+                // offerer gave up and closed it — so nothing can
+                // promote this admission: retire it now, the same
+                // non-destructive way the proof deadline would.
+                with_node(&self.inner, |guard| {
+                    if guard.retire_unproven(peer, attempt) {
+                        "failed"
+                    } else {
+                        guard
+                            .peers
+                            .get(&peer)
+                            .filter(|dialog| dialog.dialog == attempt.dialog)
+                            .and_then(|dialog| dialog.terminal)
+                            .map_or("failed", |(_, state)| state)
+                    }
+                })
+            }
         } else if open {
             // ICE connected and the session did not install inside
             // the attempt's bound. `udp_blocked` is unclaimable — a

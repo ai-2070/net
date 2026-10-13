@@ -55,6 +55,13 @@ pub enum TriggerSource {
     /// An ICE `disconnected` → `failed` transition on a peer's
     /// `RTCPeerConnection`.
     IceFailed,
+    /// The far end closed the Net DataChannel a session was installed
+    /// over — the fast loss detector, and the one that fires while
+    /// the path itself stays healthy (a responder closing a channel
+    /// it holds no session for). Its own source rather than
+    /// `IceFailed`: ICE did not fail, and a report that counted it
+    /// there would send an operator looking at the wrong layer.
+    ChannelClosed,
 }
 
 impl TriggerSource {
@@ -63,6 +70,7 @@ impl TriggerSource {
         match self {
             Self::Online => "online",
             Self::IceFailed => "iceFailed",
+            Self::ChannelClosed => "channelClosed",
         }
     }
 }
@@ -134,6 +142,9 @@ pub struct RetryLedger {
     pub online: u64,
     /// Triggers filed by the ICE `disconnected` → `failed` watcher.
     pub ice_failed: u64,
+    /// Triggers filed by a remote close of the channel a session was
+    /// installed over.
+    pub channel_closed: u64,
     /// Re-attempts this owner STARTED. The number the witness
     /// asserts is one.
     pub started: u64,
@@ -155,7 +166,7 @@ pub struct RetryLedger {
 impl RetryLedger {
     /// Every trigger this owner saw, whatever it decided.
     pub const fn triggers(&self) -> u64 {
-        self.online + self.ice_failed
+        self.online + self.ice_failed + self.channel_closed
     }
 }
 
@@ -338,6 +349,7 @@ impl RetryPolicy {
         match source {
             TriggerSource::Online => self.ledger.online += 1,
             TriggerSource::IceFailed => self.ledger.ice_failed += 1,
+            TriggerSource::ChannelClosed => self.ledger.channel_closed += 1,
         }
         if !self.armed {
             self.ledger.discarded_unarmed += 1;
@@ -381,6 +393,40 @@ impl RetryPolicy {
             .values()
             .filter(|deadline| !deadline.expired_at(now))
             .count()
+    }
+}
+
+/// Which channel's loss has already been filed as a trigger, per peer
+/// — so ONE loss files ONE trigger whichever detectors observe it.
+///
+/// A dying channel is usually seen twice: the far end's SCTP close
+/// arrives in a round trip, and ICE walks `disconnected` → `failed`
+/// a consent timeout later, both naming the same channel
+/// (the transport's `IceLoss` identity). [`RetryPolicy::note`]
+/// coalesces the second into the first's episode, so no second
+/// re-attempt started — but the ledger counted the loss twice, once
+/// under the wrong source. Filtered here, before the policy, so the
+/// ledger counts observations of distinct losses.
+///
+/// One entry per peer — the latest channel filed — because a report
+/// for an OLDER channel of the peer's is a different loss (a
+/// predecessor's) and is filed in its own right, and a successor
+/// channel always carries a fresh identity.
+#[derive(Debug, Default)]
+pub struct LossReports {
+    filed: HashMap<NodeId, u64>,
+}
+
+impl LossReports {
+    /// `true` the first time a loss of `channel` is reported for
+    /// `peer`; `false` for every later report of the same channel.
+    pub fn first(&mut self, peer: NodeId, channel: u64) -> bool {
+        self.filed.insert(peer, channel) != Some(channel)
+    }
+
+    /// Forget every filed loss: the node is going away.
+    pub fn clear(&mut self) {
+        self.filed.clear();
     }
 }
 
@@ -817,5 +863,39 @@ mod tests {
         assert!(!watch.observe(IceLinkState::Disconnected));
         assert!(!watch.observe(IceLinkState::Completed));
         assert!(!watch.observe(IceLinkState::Failed));
+    }
+
+    /// A channel close is counted as what it is, not as an ICE
+    /// failure, and still counts as a trigger.
+    #[test]
+    fn a_channel_close_is_its_own_trigger_source() {
+        let mut policy = owner(WINDOW_MS, &[PEER]);
+        let now = clock::now();
+        assert!(matches!(
+            policy.note(PEER, TriggerSource::ChannelClosed, now, true),
+            RetryDecision::Start(_)
+        ));
+        let ledger = policy.ledger();
+        assert_eq!(
+            (ledger.channel_closed, ledger.ice_failed, ledger.triggers()),
+            (1, 0, 1)
+        );
+        assert_eq!(TriggerSource::ChannelClosed.as_str(), "channelClosed");
+    }
+
+    /// One channel's loss, seen by both detectors in either order,
+    /// is filed once; a different channel of the same peer is a
+    /// different loss, and so is another peer's.
+    #[test]
+    fn one_channels_loss_is_filed_once_whichever_detector_sees_it() {
+        let mut losses = LossReports::default();
+        assert!(losses.first(PEER, 7), "the close files");
+        assert!(!losses.first(PEER, 7), "the later ICE failure does not");
+        assert!(!losses.first(PEER, 7), "nor does any further report");
+        assert!(losses.first(OTHER, 7), "another peer's channel is its own");
+        assert!(losses.first(PEER, 8), "a successor channel's loss is new");
+        assert!(losses.first(PEER, 7), "and a predecessor's late report too");
+        losses.clear();
+        assert!(losses.first(PEER, 7));
     }
 }
