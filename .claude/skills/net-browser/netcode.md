@@ -242,8 +242,24 @@ Mutual kills across hosts trade.
   hits (measured: 93% land at 40–80 ms, 11% at 80–140 ms). Size
   `combat.maxRewindMs` for your players, knowing a longer rewind lets
   laggy players hit around corners.
-- Not yet: leases, and the lobby writing the assignment. The assignment
-  is static until those land.
+- **The assignment lives in the lobby's store** as a `MatchAssignment`
+  (`{ epoch, shards: { [name]: { host, squads } }, squads, leases, renewals }`):
+  - `assignmentProblems` validates it: each player owned once, and no host
+    owning its own squad.
+  - `assignAction({ lobby })` is the store action only the lobby node may
+    call.
+  - `shardAssignment(record)` is what `joinShards` takes.
+  - `authorizeTeams` admits `team:<name>` audiences.
+- **Leases fence what can't hear the lobby.** The lobby bumps counters with
+  `renewLeases` every `leaseMs / 3`. `leaseWatch({ read, leaseMs })` judges
+  one on this node's own clock:
+  - a host passes it as `hostNetcode({ live })` and stops simulating and
+    sending without it;
+  - a player passes one over `renewals` as `joinShards({ live })` and
+    freezes (`stats().frozen`: show "reconnecting").
+
+  Reassign a lost host's entities only once `mayReassign(lastRenewedAt,
+  now, leaseMs, driftMarginMs)` says so.
 - Tests: `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
   `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`.
 
