@@ -260,8 +260,24 @@ Mutual kills across hosts trade.
 
   Reassign a lost host's entities only once `mayReassign(lastRenewedAt,
   now, leaseMs, driftMarginMs)` says so.
+- **Planned moves carry the input boundary.** The recipe's
+  `movePlayer(peer, toShard)` freezes the entity together with
+  `hostNetcode.releasePlayer(peer)`'s `{ lastApplied }` in one
+  synchronous turn. The new owner adopts it (`adoptPlayer`), so an input
+  the old host applied is never applied again, even when its
+  acknowledgement was lost. `joinShards` shares one input sequence across
+  shards (`createInputSequencer`). Raise the epoch when the handoff
+  reports `moved`.
+- **A lost host is a rollback.** After the lease wait, reassign its
+  entities. The new owner restores each one from the last snapshot it
+  observed (`NetcodeClient.latest()`), and the player resumes from its
+  next input (`adoptPlayer(peer, { resume: true })` drops what was
+  pending). A hit in flight to the lost host is a miss, and is never
+  re-sent.
 - Tests: `net/crates/net/browser-ts/test/netcode/shards.test.ts`,
-  `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`.
+  `test/netcode/sharded-arena.test.ts`, `test/netcode/cross-host-hits.test.ts`,
+  `test/netcode/assignment.test.ts`, `test/netcode/planned-move.test.ts`,
+  `test/netcode/host-crash.test.ts`.
 
 ## Rules that bite
 
