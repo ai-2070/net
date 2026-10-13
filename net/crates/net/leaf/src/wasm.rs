@@ -692,8 +692,18 @@ impl Inner {
             };
             match self.node.classify_datagram(transport_peer, bytes) {
                 Inbound::Refused => {}
-                Inbound::Session { from, packet, .. } => {
+                Inbound::Session {
+                    from,
+                    packet,
+                    relayed,
+                } => {
+                    let orphaned = self.orphaned(from, transport_peer, relayed);
                     self.node.on_datagram(from, packet, now);
+                    // Re-read after: the packet itself may have been
+                    // what installed a session (a promoted proof).
+                    if orphaned && !self.node.has_session(from) {
+                        self.close_orphaned_link(from);
+                    }
                 }
                 Inbound::Handshake {
                     from,
@@ -1124,33 +1134,14 @@ impl Inner {
             // installed ([`Inner::channel_installations`]): the
             // reporting channel's own identity, and the incarnation
             // it installed. The identity is the half that matters
-            // across a re-attempt — the trigger that exists is not
-            // "a predecessor channel's late close" (`closed` is not a
-            // loss and files nothing) but the predecessor channel's
-            // late ICE `disconnected` → `failed` transition, and such
-            // a report still queued after a successor's install names
+            // across a re-attempt — a predecessor channel's late ICE
+            // `disconnected` → `failed` transition (or its late
+            // remote close, below) still queued after a successor's install names
             // the predecessor's channel and must not remove the
             // successor's entry. A report that matches no entry is no
             // loss this table knows; the entry it failed to match is
             // left in place for the channel it actually belongs to.
-            //
-            // This drain is the module's only transport-loss
-            // detector: the DataChannel installs no `onclose`
-            // handler, and the ICE `disconnected` → `failed` watcher
-            // is what reports a link that is gone.
-            let matched = self
-                .channel_installations
-                .get(&peer)
-                .filter(|installed| installed.channel == channel)
-                .copied();
-            if let Some(installed) = matched {
-                self.channel_installations.remove(&peer);
-                self.node.drop_session_if_incarnation(
-                    peer,
-                    installed.incarnation,
-                    "the DataChannel closed",
-                );
-            }
+            self.drop_installed_over(peer, channel);
             // The re-attempt trigger files regardless of the fence:
             // a dying link is a fact about the pair, and whether this
             // leaf OWNS the repair is the policy's question
@@ -1159,6 +1150,100 @@ impl Inner {
                 .borrow_mut()
                 .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
         }
+        // **The far end closed the channel a session rides.** The
+        // second detector, and the fast one: ICE takes its consent
+        // timeout to walk to `failed` after the far end goes away,
+        // and a close arrives in a round trip. It is also the only
+        // one that fires when the far end closed the channel while
+        // the path itself stayed healthy — which is exactly what a
+        // peer does with a channel it holds no session for
+        // ([`Inner::close_orphaned_link`]). Without it an initiator
+        // whose session the responder never installed sent into the
+        // void for as long as ICE stayed up: S0b's 1 × 96 run lost 3
+        // players that way for its whole 240 s.
+        //
+        // Narrower than the ICE source on purpose: a close is a loss
+        // only for the channel a session was installed over. A
+        // channel that closes before anything installed is an
+        // attempt's business, and its deadline settles it.
+        for (peer, channel) in self.transport.take_channel_closes() {
+            if self.drop_installed_over(peer, channel) {
+                self.retry_triggers
+                    .borrow_mut()
+                    .push_back((crate::retry::TriggerSource::IceFailed, Some(peer)));
+            }
+        }
+    }
+
+    /// Drop the session `channel` installed for `peer`, when that is
+    /// still the session the channel carries; `true` if it dropped.
+    ///
+    /// The fence both loss detectors share: the reporting channel's
+    /// own identity and the incarnation it installed
+    /// ([`Inner::channel_installations`]).
+    fn drop_installed_over(&mut self, peer: NodeId, channel: u64) -> bool {
+        let matched = self
+            .channel_installations
+            .get(&peer)
+            .filter(|installed| installed.channel == channel)
+            .copied();
+        let Some(installed) = matched else {
+            return false;
+        };
+        self.channel_installations.remove(&peer);
+        self.node
+            .drop_session_if_incarnation(peer, installed.incarnation, "the DataChannel closed")
+    }
+
+    /// Close the direct link to `peer`: it delivered a sealed packet
+    /// and this leaf holds nothing that could ever open one from it.
+    ///
+    /// No session, no establishment parked or pending promotion, and
+    /// no handshake in flight — so every packet on this link is
+    /// refused `no_session` for as long as the link lives, and the
+    /// far end, which believes it holds a session, never learns.
+    /// That is the S0b ghost: an initiator that installed on message
+    /// 2 while this end never promoted (an expired proof, or a
+    /// superseded admission), sending at 20 Hz into a link this end
+    /// would have kept open indefinitely. Closing it is the one
+    /// signal both ends already understand: the far end's channel
+    /// `close` drops the session it installed over it
+    /// ([`Inner::harvest_ice_failures`]) and files its re-attempt.
+    ///
+    /// A live attempt is settled `Failed` (which closes the channel
+    /// with everything else it owns); a link with no live attempt is
+    /// closed directly.
+    fn close_orphaned_link(&mut self, peer: NodeId) {
+        let live = self
+            .peers
+            .get(&peer)
+            .filter(|dialog| dialog.terminal.is_none())
+            .map(|dialog| Attempt {
+                peer,
+                dialog: dialog.dialog,
+            });
+        if !live.is_some_and(|attempt| self.settle(attempt, IceTerm::Failed, "failed")) {
+            self.transport.close(peer);
+        }
+        self.channel_installations.remove(&peer);
+        console_error(&format!(
+            "net-mesh-leaf: closed the direct link to {peer:016x}: it carries traffic \
+             for a session this leaf does not hold"
+        ));
+    }
+
+    /// Whether a sealed packet `from` arriving directly could only
+    /// be refused `no_session`, now and later: nothing installed,
+    /// parked, promoted or in flight could open it.
+    fn orphaned(&self, from: NodeId, transport_peer: NodeId, relayed: bool) -> bool {
+        !relayed
+            && from == transport_peer
+            && from != self.anchor
+            && !self.node.has_session(from)
+            && self.node.provisional_attempt(from).is_none()
+            && !self.node.verified_admission_pending(from)
+            && !self.node.is_handshaking(from)
+            && self.transport.is_open(from)
     }
 
     /// Deliver, then run the node's time-driven work: retransmit

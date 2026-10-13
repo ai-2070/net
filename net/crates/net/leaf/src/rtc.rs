@@ -338,6 +338,8 @@ impl Drop for PeerLink {
         if let Some(channel) = &self.channel {
             channel.set_onmessage(None);
             channel.set_onbufferedamountlow(None);
+            // A close this leaf makes is not the far end's.
+            channel.set_onclose(None);
             channel.close();
         }
         if let Some(lossy) = &self.lossy {
@@ -387,6 +389,14 @@ pub struct RtcLeafTransport {
     /// ([`crate::retry::RetryPolicy`]) rather than deciding for
     /// themselves.
     ice_failures: Rc<RefCell<VecDeque<IceLoss>>>,
+    /// Peers whose Net channel the REMOTE end closed, each with the
+    /// identity of the channel that closed ([`IceLoss`]'s shape).
+    ///
+    /// Queued for the reason [`Self::ice_failures`] is. Only a
+    /// remote close lands here: every local close detaches the
+    /// handler first ([`PeerLink`]'s `Drop`), so this leaf never
+    /// reports its own closes back to itself.
+    channel_closes: Rc<RefCell<VecDeque<IceLoss>>>,
 }
 
 impl RtcLeafTransport {
@@ -400,7 +410,31 @@ impl RtcLeafTransport {
             next_channel: Rc::new(core::cell::Cell::new(0)),
             stats: Rc::new(RtcLinkCounters::default()),
             ice_failures: Rc::new(RefCell::new(VecDeque::new())),
+            channel_closes: Rc::new(RefCell::new(VecDeque::new())),
         }
+    }
+
+    /// Take the remote channel closes filed since the last call,
+    /// each naming the channel that closed.
+    ///
+    /// Not a loss on its own: a close is acted on only when it names
+    /// the channel a live session was installed over
+    /// (`crate::wasm::Inner::harvest_ice_failures`). It is the fast
+    /// half of loss detection — ICE takes its consent timeout to
+    /// walk to `failed` after the far end goes away, and the SCTP
+    /// close arrives in a round trip.
+    pub fn take_channel_closes(&self) -> Vec<IceLoss> {
+        self.channel_closes.borrow_mut().drain(..).collect()
+    }
+
+    /// File one remote channel close, as the channel's `close`
+    /// handler does. Test seam only, for the reason
+    /// [`Self::report_ice_loss`] is one.
+    #[cfg(test)]
+    pub(crate) fn report_channel_close(&self, peer: NodeId, channel_id: u64) {
+        self.channel_closes
+            .borrow_mut()
+            .push_back((peer, channel_id));
     }
 
     /// The transport's ledger, in the native `RtcStats` field names.
@@ -551,6 +585,12 @@ impl RtcLeafTransport {
             peer,
             &channel,
         );
+        let closed = close_handler(
+            Rc::downgrade(&self.channel_closes),
+            peer,
+            channel_id,
+            &channel,
+        );
 
         // Replacing a link IS closing it. The incumbent is taken
         // out here and dropped below, outside the borrow: its
@@ -570,7 +610,7 @@ impl RtcLeafTransport {
                 retained_bytes: 0,
                 discarded_at_close: 0,
                 stats: Rc::clone(&self.stats),
-                _closures: vec![low, ice_state],
+                _closures: vec![low, ice_state, closed],
                 _message: Some(message),
                 _ice: Some(ice),
                 _data_channel: None,
@@ -629,6 +669,7 @@ impl RtcLeafTransport {
         let peers = Rc::downgrade(&self.peers);
         let inbound = Rc::clone(&self.inbound);
         let stats = Rc::clone(&self.stats);
+        let closes = Rc::downgrade(&self.channel_closes);
         let on_data_channel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
             channel.set_binary_type(RtcDataChannelType::Arraybuffer);
@@ -662,8 +703,12 @@ impl RtcLeafTransport {
                 // a label disagreement into a silent hang instead of
                 // a handshake that fails with a reason.
                 if link.channel.is_none() {
+                    // This link's identity, not whichever link holds
+                    // the peer when the close is drained ([`IceLoss`]).
+                    let closed = close_handler(closes.clone(), peer, link.channel_id, &channel);
                     link._message = Some(message);
                     link._closures.push(low);
+                    link._closures.push(closed);
                     link.channel = Some(channel);
                 }
             }
@@ -1153,6 +1198,28 @@ fn low_water_handler(
         }
     }) as Box<dyn FnMut(JsValue)>);
     channel.set_onbufferedamountlow(Some(closure.as_ref().unchecked_ref()));
+    closure
+}
+
+/// The Net channel's `close` handler: file the close, naming this
+/// link's channel, for the tick to drain.
+///
+/// Fires only for a close the far end made — or the engine made for
+/// it, the association having died — because every local close
+/// detaches this handler first ([`PeerLink`]'s `Drop`). `Weak` for
+/// the reason [`low_water_handler`]'s is.
+fn close_handler(
+    closes: Weak<RefCell<VecDeque<IceLoss>>>,
+    peer: NodeId,
+    channel_id: u64,
+    channel: &RtcDataChannel,
+) -> Closure<dyn FnMut(JsValue)> {
+    let closure = Closure::wrap(Box::new(move |_event: JsValue| {
+        if let Some(closes) = closes.upgrade() {
+            closes.borrow_mut().push_back((peer, channel_id));
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    channel.set_onclose(Some(closure.as_ref().unchecked_ref()));
     closure
 }
 

@@ -65,6 +65,17 @@ the README on why it is a sibling package rather than a sub-path.
   now routed by peer and stream id inside the wasm, on both the
   `connect()` and the `openSession()` paths (`net-mesh-leaf`). What a
   listener receives is unchanged.
+- **A direct connection one side no longer recognises now recovers.** If
+  a host held no session for a player that was still sending to it over
+  an open direct channel, every packet was dropped and nothing noticed:
+  the player's sends never fail and the connection stayed healthy. A
+  1 × 96 run lost 3 players that way for its whole 240 s. The side
+  without a session now closes that channel (and logs `closed the direct
+  link`). The other side treats a channel closed by its peer as a lost
+  session, exactly as it already treated an ICE failure, and connects
+  again. Before, only ICE could report a loss, which takes its 30 s
+  consent timeout after a peer leaves and never fires while the path is
+  healthy.
 - **Fewer clock pings once the clock has settled:** `pingRate` (default
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers

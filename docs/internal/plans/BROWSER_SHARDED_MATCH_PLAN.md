@@ -721,10 +721,37 @@ confirmed: the host's 5 s `PROOF_DEADLINE_MS` expired before a proof
 from a slow, loaded run arrived. The proof is sent once, so the
 initiator has a session the responder never installs. A diagnostic on
 the retirement path saw no retirement in the four runs that followed,
-all clean. If the multi-machine run shows it again, the candidate fixes
-are, at the protocol level, a responder that closes the channel of an
-establishment it retires plus an initiator that treats that close as a
-loss, and, in `joinNetcode`, re-establishing after a silence.
+all clean.
+
+**Fixed without depending on the cause.** A retired establishment already
+closed its channel, so whatever left these three hosts holding nothing
+also left the channel open. The leaf now repairs the state itself,
+however it arose:
+
+- A sealed packet arriving directly from a peer this leaf can't open, now
+  or later, closes that link. "Can't open" means no session, no
+  establishment parked or promoted, and no handshake in flight.
+- A channel the far end closes drops the session that was installed over
+  it and files the re-attempt. It is fenced on channel identity, as ICE
+  loss reports are.
+
+Before this, only ICE `disconnected` → `failed` counted as a loss. That
+takes the consent timeout after the far end leaves, and never fires
+while the path stays healthy. Witnesses:
+`a_ghost_session_is_closed_by_its_responder_and_reported_at_its_initiator`
+and
+`the_far_end_closing_an_installed_channel_drops_exactly_its_session`.
+Each has a mutation check, and the close has one for its fence. After
+the fix, 1 × 96 and 1 × 128 both passed every gate, and the close fired
+in neither run:
+
+| 1 host × N | Joined, direct | fps | Tick p95 | Wire up (mean / max) | Payload | Overhead | busy |
+|---|---|---|---|---|---|---|---|
+| 96 | 96/96 | 60 | 8.8 ms | 6.89 / 7.14 Mbit/s | 3.88 | 1.78× | 0.50 |
+| 128 | 128/128 | 60 | 14.3 ms | 9.72 / 9.96 Mbit/s | 5.29 | 1.84× | 0.62 |
+
+The 128 run's 9.96 Mbit/s peak is at the edge of the 10 Mbit/s budget.
+Upload is the ceiling.
 
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It

@@ -2162,10 +2162,9 @@ async fn a_predecessor_channels_late_loss_report_cannot_drop_the_successors_sess
         .expect("the predecessor's session is installed");
 
     // The predecessor's ICE gives up and its watcher files the loss
-    // report — PARKED, because the drain runs later. This is the
-    // trigger that exists (a `disconnected` → `failed` transition),
-    // not the "late close" older comments named: `closed` is not a
-    // loss and files nothing.
+    // report — PARKED, because the drain runs later. (A remote
+    // channel close is the other source, and shares this fence:
+    // `a_ghost_session_is_closed_by_its_responder_and_dropped_by_its_initiator`.)
     p.transport()
         .report_ice_loss(p.peer_id, predecessor_channel);
 
@@ -2233,6 +2232,130 @@ async fn a_predecessor_channels_late_loss_report_cannot_drop_the_successors_sess
         !p.leaf.inner.borrow().node.has_session(p.peer_id),
         "a loss report from the channel that installed the session still drops it"
     );
+    p.leaf.close();
+}
+
+/// Drive the pair to a real direct session over a real channel, with
+/// the peer as initiator and this leaf as responder; the dialog that
+/// did it.
+async fn direct_session(p: &Pair) -> DialogId {
+    p.install_session();
+    let dialog = p.answer_a_real_offer().await;
+    p.open_answer(dialog).await;
+    p.peer_initiates_direct_handshake();
+    for _ in 0..40 {
+        with_node(&p.leaf.inner, |guard| guard.pump());
+        p.pump_peer();
+        if p.terminal().is_some() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        p.terminal(),
+        Some((IceTerm::Direct, "open")),
+        "the pair really installs a direct session"
+    );
+    dialog
+}
+
+/// The S0b ghost session: a responder that holds no session for a
+/// peer still sending to it over a live direct channel closes that
+/// channel, and the initiator's end of it reports the close.
+///
+/// Seen once in a 1 × 96 run: three players had installed on message
+/// 2 and sent at 20 Hz over open channels; the host held no session
+/// for any of them, refused every packet `no_session` (6 456 of
+/// them), and nothing recovered in 240 s — the initiator's sends
+/// never fail and ICE stayed healthy. The way the responder came to
+/// hold nothing is beside the point here (an expired proof, a
+/// superseded admission); it is modelled by dropping the session,
+/// and the claim is what happens after.
+#[wasm_bindgen_test]
+async fn a_ghost_session_is_closed_by_its_responder_and_reported_at_its_initiator() {
+    let p = pair();
+    direct_session(&p).await;
+    let peer_channel = p
+        .peer_transport
+        .channel_id(p.us)
+        .expect("the peer's link exists");
+
+    with_node(&p.leaf.inner, |guard| {
+        guard.node.drop_session(p.peer_id, "witness: the ghost");
+    });
+    // The peer still believes in its session and sends under it,
+    // directly.
+    p.peer
+        .borrow_mut()
+        .publish(p.us, "chat", b"anyone there")
+        .expect("the peer holds its session");
+    p.pump_peer();
+    p.await_arrival().await;
+
+    assert!(
+        p.transport().channel_id(p.peer_id).is_none(),
+        "a direct link carrying only packets no session can open is closed"
+    );
+    assert_eq!(p.counter("no_session"), 1, "the packet itself was refused");
+
+    let mut reported = Vec::new();
+    for _ in 0..80 {
+        reported.extend(p.peer_transport.take_channel_closes());
+        if !reported.is_empty() {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert_eq!(
+        reported,
+        vec![(p.us, peer_channel)],
+        "the initiator's channel reports the far end's close, naming itself"
+    );
+    p.leaf.close();
+}
+
+/// A far end that closes the channel a session was installed over
+/// drops exactly that session and files the re-attempt — and a close
+/// that names another channel drops nothing.
+///
+/// The initiator half of the ghost repair: before, a channel close
+/// was not a loss at all, so only ICE's consent timeout could end a
+/// session whose far end had gone, and it never did while the path
+/// stayed healthy.
+#[wasm_bindgen_test]
+async fn the_far_end_closing_an_installed_channel_drops_exactly_its_session() {
+    let p = pair();
+    direct_session(&p).await;
+    let ours = p
+        .transport()
+        .channel_id(p.peer_id)
+        .expect("this leaf's link exists");
+    let triggers = || p.leaf.inner.borrow().retry_triggers.borrow().len();
+    let before = triggers();
+
+    // A close naming some other channel of this peer's: no loss.
+    p.transport().report_channel_close(p.peer_id, ours + 1);
+    with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
+    assert!(
+        p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "a close of a channel the session does not ride drops nothing"
+    );
+    assert_eq!(triggers(), before, "and files nothing");
+
+    // The far end really closes; this leaf's channel really reports it.
+    p.peer_transport.close(p.us);
+    for _ in 0..80 {
+        with_node(&p.leaf.inner, |guard| guard.harvest_ice_failures());
+        if !p.leaf.inner.borrow().node.has_session(p.peer_id) {
+            break;
+        }
+        gloo_timer_sleep(TICK_MS).await.ok();
+    }
+    assert!(
+        !p.leaf.inner.borrow().node.has_session(p.peer_id),
+        "the session goes with the channel the far end closed"
+    );
+    assert_eq!(triggers(), before + 1, "and the re-attempt is filed");
     p.leaf.close();
 }
 
