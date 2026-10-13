@@ -28,7 +28,11 @@ and output shape.
   issuance ceiling is unchanged. Before this, the eleventh player behind
   one carrier NAT, campus or LAN party was refused `rate_limited` inside a
   minute. A credential shared by every visitor (`anchor credential mint`)
-  is still charged per address, exactly as before.
+  is still charged per address, exactly as before. One address holds at
+  most 32 per-visitor budgets; a visitor with no room for one (that limit,
+  or the anchor-wide table full) is admitted on the per-address backstop
+  instead of refused, counted as `bootstrap_visitor_budget_degraded` in
+  `anchor stats`.
 - `--credential-issuer` is now optional when `--issuer-identity` is given.
 - `--inspect-target` omits `credential_issuer_fingerprint` when only
   `--issuer-identity` names the issuer (inspection reads no key files).

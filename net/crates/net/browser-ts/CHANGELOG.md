@@ -155,6 +155,39 @@ the README on why it is a sibling package rather than a sub-path.
   4/s) until 8 samples, then `settledPingRate` (default 1/s). Every pong
   pays a packet's fixed transport overhead; measured in real browsers
   (1 host × 32 players) host upload fell from 2.19 to 1.82 Mbit/s.
+- **Review fixes to this release's netcode** (sharded-match review):
+  - A client drops acknowledged inputs with or without `local`, so it no
+    longer sends 64-input frames for good after a backlog.
+  - Binary snapshots carry the host's instance: a host re-created under the
+    same label is no longer drawn under the old ids. The codec fingerprint
+    gains a wire version, so peers from before this change use JSON.
+  - `angle()` fields interpolate the short way (`lerpAngle`,
+    `EntityCodec.interpolate`, the default with a codec).
+  - `adoptPlayer`'s input boundary survives a slow first frame or an
+    `authorize` refusal (`dropped['adopt-unauthorized']`).
+  - A rejected `connectPeer` also waits `directRetryMs` before re-offering.
+  - Name tables forget ids unseen for 10 s (`NAME_FORGET_MS`); a `u` request
+    is honoured once per 100 ms per index, only for indexes that player was
+    shown (`dropped['name-request-throttled']`).
+  - Input seqs must be positive safe integers; `float32()` refuses NaN and
+    infinities; `sampleAt` at a snapshot's exact time includes entities that
+    first appear in it.
+  - A failed announcement (lobby, seek tag, region host) is retried after
+    1 s, doubling to 8 s (`ANNOUNCE_RETRY_MS`, `ANNOUNCE_RETRY_MAX_MS`).
+  - `joinShards`: a rejoined shard keeps its last state until its first
+    snapshot; `ready()` follows rejoins.
+  - `leaseWatch` takes its first reading as a baseline, not a lease;
+    `mayReassign` takes a `maxDeliveryMs` margin.
+  - `assignmentProblems` validates shapes, own keys and `renewals`;
+    `pathAction` matches NPC ids exactly. `npcModes` prunes its tracks,
+    builds path poses on the freshest entry, stops drawing a live NPC no
+    snapshot shows, and `stats()` reports `tracks`.
+  - `regionHandoffs` gains `actionTiming` for forwarded actions.
+  - The shard host recipe uses the netcode clock throughout (cross-host hits
+    were refused `beyond-cap` with the old `Date.now` default), keeps path
+    NPCs hittable and recoverable, and validates `setAssignment`.
+  - `retryReport()` gains `channelClosed`: a far-end channel close is its
+    own re-attempt trigger, and one channel's loss counts once.
 
 ## 0.43.0 — one identity per origin, bounded streams
 
