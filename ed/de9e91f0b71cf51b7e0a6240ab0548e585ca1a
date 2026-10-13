@@ -1,0 +1,21 @@
+net/crates/net/docs/releases/RELEASE_v0.44_ACE_OF_SPADES.md
+  s_d8b00bedd146e9::t_cad27dee5a6bd4 125
+web/src/content/docs/releases/RELEASE_v0.44_ACE_OF_SPADES.md
+  s_d8b00bedd146e9::t_f8fccae178a0b0 129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "edde9e91f0b71cf51b7e0a6240ab0548e585ca1a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
