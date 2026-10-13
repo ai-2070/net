@@ -1,0 +1,36 @@
+net/crates/net/browser-ts/demo/sharded-arena/shard.js
+  s_d71d2b607c2060::t_f6488954951c5b 26-32,56-65,92-176,180-181,192-195,227-229,237-238
+net/crates/net/browser-ts/demo/sharded-arena/shard.d.ts
+  s_d71d2b607c2060::t_cab875d1bce794 48,50-51,55-84,86
+net/crates/net/browser-ts/test/netcode/cross-host-hits.test.ts
+  s_d71d2b607c2060::t_ce48da0e1866e4 1-133,142-233
+  s_d71d2b607c2060::t_1df076ca126d8a 134-141
+net/crates/net/browser-ts/src/netcode/interpolate.ts
+  s_d71d2b607c2060::t_c9259419bcccc2 76-104
+net/crates/net/browser-ts/test/netcode/netcode.test.ts
+  s_d71d2b607c2060::t_47aca9101c7ec6 79-95
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_4008827ea91b81 900-946
+net/crates/net/browser-ts/src/netcode/client.ts
+  s_d71d2b607c2060::t_c9259419bcccc2 210-221,638
+net/crates/net/browser-ts/test/netcode/sim.ts
+  s_d71d2b607c2060::t_8c6f2d9d5c196e 18-23,53-54,74-91,110-114
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d71d2b607c2060::t_ecdbe7e6f88114 29-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "53aef64a3489514393fc40ec9e569089b07f665f",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
