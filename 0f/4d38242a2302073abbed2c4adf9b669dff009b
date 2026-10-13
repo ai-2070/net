@@ -1,0 +1,37 @@
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_564e6b10c09cff 724-754
+net/crates/net/leaf/src/rtc.rs
+  s_d71d2b607c2060::t_34cd9073f95584 613
+  s_d71d2b607c2060::t_6ee0729510bb6b 392-399,413,417-438
+  s_d71d2b607c2060::t_b8a78bed1a5582 588-593
+  s_d71d2b607c2060::t_24e24b14a04607 706-708,711
+  s_d71d2b607c2060::t_8ec170d49edcf0 672
+  s_d71d2b607c2060::t_28237e0195c9a8 341-342
+  s_d71d2b607c2060::t_1d8ea36da94b40 1204-1225
+  s_d71d2b607c2060::t_796a8197811e5a 439
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d71d2b607c2060::t_92b178ee15e40c 68-78
+net/crates/net/leaf/src/wasm.rs
+  s_d71d2b607c2060::t_fd97922df322f3 1144,1153-1246
+  s_d71d2b607c2060::t_babf53bb4ba7b9 695-700,702-706
+  s_d71d2b607c2060::t_745e25a255e00a 1137-1139
+net/crates/net/leaf/src/wasm_witnesses.rs
+  s_d71d2b607c2060::t_9a95425c86ac9c 2165-2167
+  s_d71d2b607c2060::t_1bc12566eee807 2238-2361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0f4d38242a2302073abbed2c4adf9b669dff009b",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
