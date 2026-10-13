@@ -91,7 +91,45 @@ function coordinatorApi(base, pin, path, body) {
   });
 }
 
-async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerMs = 0 }) {
+/**
+ * A CPU profile of one host page's main thread, summarised by self time:
+ * where the host's busy time goes, so a saturated host can be told apart
+ * from a machine shared with dozens of player tabs (only the first is
+ * work a second machine would not take away).
+ */
+async function profileHost(cdp, ms) {
+  await cdp.send('Profiler.enable');
+  await cdp.send('Profiler.setSamplingInterval', { interval: 200 });
+  await cdp.send('Profiler.start');
+  await sleep(ms);
+  const { profile } = await cdp.send('Profiler.stop');
+  await cdp.send('Profiler.disable');
+  // The raw profile too, for DevTools' Performance panel.
+  const saved = join(here, 'work', 'host0.cpuprofile');
+  mkdirSync(dirname(saved), { recursive: true });
+  writeFileSync(saved, JSON.stringify(profile));
+  log(`host 0 CPU profile saved: ${saved}`);
+  const self = new Map();
+  const byId = new Map(profile.nodes.map(node => [node.id, node]));
+  const dt = profile.timeDeltas ?? [];
+  let total = 0;
+  profile.samples.forEach((id, i) => {
+    const node = byId.get(id);
+    const { functionName, url } = node.callFrame;
+    const file = url ? url.slice(url.lastIndexOf('/') + 1) : '';
+    const key = `${functionName || '(anonymous)'}${file ? ` ${file}` : ''}`;
+    const us = dt[i] ?? 0;
+    total += us;
+    self.set(key, (self.get(key) ?? 0) + us);
+  });
+  const idle = self.get('(idle)') ?? 0;
+  log(`host 0 CPU profile, ${(total / 1e6).toFixed(1)} s sampled, ${((1 - idle / total) * 100).toFixed(0)}% not idle; top self time:`);
+  for (const [key, us] of [...self].sort((a, b) => b[1] - a[1]).slice(0, 30)) {
+    log(`  ${((us / total) * 100).toFixed(1).padStart(5)}%  ${key}`);
+  }
+}
+
+async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerMs = 0, profileMs = 0 }) {
   const browser = await chromium.launch({
     headless: !headed,
     ...(chrome ? { executablePath: chrome } : {}),
@@ -107,7 +145,19 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
     page.on('console', message => {
       if (message.type() === 'error') log(`[${role}] ${message.text()}`);
     });
-    await page.goto(`${base}/?role=${role}`);
+    // A navigation can fail on a transient host event (Windows reports
+    // net::ERR_NETWORK_CHANGED when an adapter flaps): retry it rather
+    // than abandon every page still to open.
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await page.goto(`${base}/?role=${role}`);
+        break;
+      } catch (error) {
+        if (attempt >= 3) throw error;
+        log(`[${role}] navigation failed (${error.message.split('\n')[0]}); retrying`);
+        await sleep(1000);
+      }
+    }
     const entry = { role, page, cdp: null, last: null };
     if (role === 'host') {
       entry.cdp = await context.newCDPSession(page);
@@ -143,6 +193,7 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
     }
   }, 1000);
 
+  let profiled = false;
   for (;;) {
     await sleep(2000);
     let state;
@@ -153,6 +204,11 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
       continue;
     }
     if (state.phase === 'done') break;
+    const first = pages.find(entry => entry.cdp !== null);
+    if (profileMs > 0 && !profiled && state.phase === 'measuring' && first) {
+      profiled = true;
+      profileHost(first.cdp, profileMs).catch(error => log(`profile: ${error.message}`));
+    }
   }
   clearInterval(sampler);
   let anyFailedPlayer = false;
@@ -190,7 +246,7 @@ if (mode === 'browsers') {
   const base = arg('coordinator');
   const pin = arg('spki');
   if (!base || !pin) throw new Error('browsers: pass --coordinator <https url> and --spki <pin> (the coordinator prints both)');
-  await runBrowsers({ base, pin, hosts: num('hosts', 0), players: num('players', 0), chrome: arg('chrome'), headed: flag('headed'), staggerMs: num('stagger-ms', 0) });
+  await runBrowsers({ base, pin, hosts: num('hosts', 0), players: num('players', 0), chrome: arg('chrome'), headed: flag('headed'), staggerMs: num('stagger-ms', 0), profileMs: num('profile-ms', 0) });
   process.exit(0);
 }
 
@@ -499,7 +555,7 @@ log(`other machines:\n  node run.mjs browsers --coordinator ${origin} --spki ${s
 
 const local =
   localHosts + localPlayers > 0
-    ? runBrowsers({ base: origin, pin: spkiPin, hosts: localHosts, players: localPlayers, chrome: arg('chrome'), headed: flag('headed'), staggerMs: num('stagger-ms', 0) }).catch(error => log(`local browsers: ${error.message}`))
+    ? runBrowsers({ base: origin, pin: spkiPin, hosts: localHosts, players: localPlayers, chrome: arg('chrome'), headed: flag('headed'), staggerMs: num('stagger-ms', 0), profileMs: num('profile-ms', 0) }).catch(error => log(`local browsers: ${error.message}`))
     : null;
 
 // Join → measure → verdict.
