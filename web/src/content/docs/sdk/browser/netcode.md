@@ -166,6 +166,46 @@ joinNetcode({ /* ... */, codec: shipCodec });
   again, and the entity is left out until it arrives
   (`stats().unnamedEntities`). `stats().binaryFrames` counts binary snapshots.
 
+## Several hosts: a sharded match
+
+One host's upload carries roughly 128 players at 20 Hz with compact
+snapshots. Past that, or with many NPCs, split the match. Each host owns
+some of the entities and is authoritative for those alone. Each player
+joins every host, and `joinShards` merges them into one view:
+
+```ts
+import { joinShards } from '@net-mesh/browser/netcode';
+
+const match = joinShards<Ship, Move>({
+  transport: node,
+  label: 'arena.move',
+  // Who hosts which shard, and who owns which entity, at one epoch.
+  assignment: { epoch: 1, hosts: { s0: hostA, s1: hostB }, owner: { [myId]: 's0', [rivalId]: 's1' } },
+  local: { id: myId, predict: move },
+});
+
+renderLoop(() => draw(match.view())); // every shard's own entities; yours predicted
+onKey(input => match.input(input));   // sent only to the shard that owns you
+```
+
+- **An entity is drawn only from the shard that owns it.** A copy from any
+  other host is ignored, so a host can't show you what it doesn't own.
+- **The assignment changes by epoch.** `setAssignment(next)` installs a
+  higher epoch and ignores anything else. Hosts stamp each snapshot with
+  their epoch (`hostNetcode({ epoch })`). A host still sending from
+  another epoch is frozen at what you last saw from it, so the world
+  doesn't blink while everyone catches up. An entity that changes owner
+  lingers briefly at its last position.
+- **`stats()`** reports each shard, including how long it has been silent,
+  and counts what the ownership and epoch rules dropped.
+
+Each host runs `hostNetcode` for the entities it owns, plus a spectator
+`joinNetcode` to every other host so it knows the whole world. A
+cross-host hit is checked by the shooter's host and decided by the
+target's host, against its own history of the shooter
+(`NetcodeClient.sampleAt`). The browser package's `demo/sharded-arena/`
+is the recipe to copy.
+
 ## Rules that bite
 
 - **A join that never connects says why.** `await net.ready()` rejects
