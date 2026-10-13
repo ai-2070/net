@@ -4351,7 +4351,11 @@ fn spawn_cancel_publish(
         let mut buf = meta.to_bytes().to_vec();
         encode_rpc_route(&mut buf, request_channel_hash);
         let payload = Bytes::from(buf);
-        let _ = mesh
+        // Best-effort by design (the peer's keep-alive expiry is the
+        // backstop), but a swallowed failure is invisible: say so at
+        // debug level, so a loser that never got its CANCEL can be
+        // told apart from one whose CANCEL was never sent.
+        if let Err(e) = mesh
             .publish_to_peer(
                 target,
                 request_channel_hash,
@@ -4359,7 +4363,15 @@ fn spawn_cancel_publish(
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
-            .await;
+            .await
+        {
+            tracing::debug!(
+                call_id,
+                target_node = format!("{target:#x}"),
+                error = %e,
+                "rpc CANCEL: publish failed; relying on the peer's keep-alive expiry",
+            );
+        }
     });
 }
 
