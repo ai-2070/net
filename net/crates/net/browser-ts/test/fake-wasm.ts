@@ -423,7 +423,7 @@ export class FakeNode implements LeafWasmNode {
   retry_report(): string {
     return (
       this.behaviour.retryReportJson ??
-      `{"armed":${this.armings > 0},"online":"0","iceFailed":"0","triggers":"0",\
+      `{"armed":${this.armings > 0},"online":"0","iceFailed":"0","channelClosed":"0","triggers":"0",\
 "started":"0","coalesced":"0","notEligible":"0","openEpisodes":0,"owned":0,"last":null}`
     );
   }
