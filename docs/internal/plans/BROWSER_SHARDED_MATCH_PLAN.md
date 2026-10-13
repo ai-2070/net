@@ -697,6 +697,35 @@ About 24% of what remains is the harness's deliberate 4 ms per-frame
 burn, so the host's real netcode work at 64 players is about 30% of one
 core.
 
+**One host past 64, on one machine (2026-10-13).** With the routing fix,
+one 24-thread machine runs a single host and up to 128 player tabs:
+
+| 1 host × N | Joined, direct | fps | Tick p95 | Wire up | Payload | Overhead | CDP busy |
+|---|---|---|---|---|---|---|---|
+| 96 (3 runs) | 96/96 | 60 | 8.2–9.2 ms | 6.91–6.95 Mbit/s | 3.76–3.93 | 1.76–1.85× | 0.49–0.50 |
+| 128 | 128/128, first snapshot ≤ 3.3 s | 60 | 16.8 ms | 9.10 Mbit/s | 5.20 | 1.75× | 0.65 |
+
+Every gate passes at 128. **Upload is now the binding limit**: 9.1 of the
+10 Mbit/s budget, with the transport adding about 75% to the payload.
+CPU is not: the host's main thread was 65% non-idle at 128, 24 points of
+it the harness's deliberate render burn.
+
+One earlier 1 × 96 run joined 93/96. Each of the 3 stuck players had
+completed an establishment and kept sending at 20 Hz over a still-open
+direct channel (its RTCPeerConnection `connected`, no send refused),
+while the host held no session for it: 6,456 `no_session` drops, about
+3 players × 20/s × 100 s. Nothing recovered it in 240 s. The fire-and-
+forget sends never fail, so the netcode client never reopens, and the
+leaf does not treat a DataChannel close as a loss. Suspected cause, not
+confirmed: the host's 5 s `PROOF_DEADLINE_MS` expired before a proof
+from a slow, loaded run arrived. The proof is sent once, so the
+initiator has a session the responder never installs. A diagnostic on
+the retirement path saw no retirement in the four runs that followed,
+all clean. If the multi-machine run shows it again, the candidate fixes
+are, at the protocol level, a responder that closes the channel of an
+establishment it retires plus an initiator that treats that close as a
+loss, and, in `joinNetcode`, re-establishing after a silence.
+
 **Still open for S0b:** the multi-machine run at 4 hosts × 127 players
 (and 1 × 128 for the single-host case the codec made plausible). It
 needs ≥ 3 machines.
