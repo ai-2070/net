@@ -26,6 +26,11 @@ the README on why it is a sibling package rather than a sub-path.
   epoch. When ownership changes, the old owner's copy lingers for
   `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
   what the fencing dropped.
+- **Recovering a lost host's players.** `NetcodeClient.latest()` returns
+  the newest snapshot as the host sent it: the state a surviving host
+  restores a lost host's entities from. `adoptPlayer(peer, { resume: true
+  })` takes such a player's inputs from its next frame on, dropping what
+  it had pending (`dropped['resumed']`).
 - **Planned moves between hosts.**
   - `hostNetcode`'s `releasePlayer(peer)` returns `{ lastApplied }` and
     stops taking that player's inputs, unapplied and unacknowledged;

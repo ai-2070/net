@@ -102,8 +102,14 @@ export interface ShardHost<E> {
   world(): Readonly<Record<string, E>>;
   /** Move `peer`'s entity to `toShard`, with its input boundary (S5). */
   movePlayer(peer: string, toShard: string): Promise<HandoffId>;
-  /** Install a newer assignment with the same hosts; `false` for an older or equal epoch. */
+  /**
+   * Install a newer assignment with the same hosts; `false` for an older or
+   * equal epoch. Entities it hands this shard from a lost host are restored
+   * from observation (S6); ones it takes away are dropped here.
+   */
   setAssignment(next: ShardAssignment): boolean;
+  recovered(): readonly string[];
+  observed(shard: string): Readonly<Record<string, E>> | null;
   known(): Readonly<Record<string, E>>;
   close(): void;
 }

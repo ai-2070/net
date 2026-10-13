@@ -1108,6 +1108,49 @@ players see it. The policy:
   owner's last observation. A hit that was in flight to the dead host is
   counted as a miss and never applied twice.
 
+**Result: S6 built (2026-10-13).**
+
+- `NetcodeClient.latest()` is the newest snapshot as the host sent it.
+- `hostNetcode.adoptPlayer(peer, { resume: true })`: a restored entity
+  has no boundary to hand over, so the first input frame sets it at that
+  frame's newest input and none of it is applied. The pending inputs the
+  table above says are dropped are dropped here, counted as
+  `dropped['resumed']`.
+- The recipe's `setAssignment` restores an entity that arrives with no
+  planned move (its old owner was lost) from `observed(oldShard)`, the
+  spectator's latest snapshot. It also drops every entity the new
+  assignment takes from this shard, so a host that was cut off and later
+  heals doesn't go on simulating what it lost. `recovered()` lists what
+  was restored.
+
+`test/netcode/host-crash.test.ts` (2 tests). A stand-in lobby renews
+leases, cuts host A off from everything while A keeps running, and
+reassigns only once `mayReassign` allows (a call before then returns
+false).
+- **Test 1:**
+  - A stops advancing its entity within `leaseMs` of the cut;
+  - B restores PA exactly as it last observed it, and PA's player
+    resumes on B (`resumed` > 0);
+  - A then heals with its lease and doesn't take PA back.
+
+  Across all of it, the overlap counter stays at **zero**. It's sampled
+  every 5 ms from which host actually advanced each entity, not from what
+  hosts report.
+- **Test 2:** a hit in flight to the lost host ends `unresolved` (a miss).
+  It isn't re-sent to the new owner, and the restored target's health is
+  the observed 100.
+
+Mutation checks each fail a test:
+- the host ignoring its lease;
+- no recovery;
+- no resume (pending replayed onto the rolled-back state);
+- a healed host keeping what it lost.
+
+Score and objectives stay with the lobby store, as the table says. The
+lobby's own failure detection is a stand-in here: the test cuts the host
+and the lobby stops renewing. Wiring it to the store's presence is the
+lobby integration a real game does.
+
 ### Phase 4 — NPCs
 
 #### N1 — NPC ownership and hits across hosts

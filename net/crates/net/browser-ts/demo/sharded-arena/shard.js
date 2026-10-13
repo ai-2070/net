@@ -84,6 +84,8 @@ export function shardHost(lib, options) {
   // Players frozen for a move away: shown (never simulated) until the
   // assignment moves them.
   const departing = new Map();
+  // Restored from observation after a host was lost.
+  const recovered = [];
 
   // The world: this shard's own entities, as a handoff region.
   let region = lib.regionState(regionOf(shard), options.initial ?? {});
@@ -299,12 +301,46 @@ export function shardHost(lib, options) {
       region = { ...region, entities: { ...region.entities, [peer]: { [MOVED]: { state, lastApplied } } } };
       return handoffs.handoff(peer, regionOf(toShard));
     },
-    /** Install a newer assignment (same hosts; S5 moves owners, not hosts). */
+    /**
+     * Install a newer assignment (same hosts: moves change owners, not
+     * hosts). An entity it gives this shard that did not arrive by a
+     * planned move belonged to a host that was lost (S6): it is RESTORED
+     * from the last state this host observed of it — a rollback the
+     * players see — and its player resumes from its next input. One it
+     * takes from this shard is dropped here at once: a host that was cut
+     * off and healed must not go on simulating what it no longer owns.
+     */
     setAssignment(next) {
       if (next.epoch <= assignment.epoch) return false;
+      const previous = assignment;
       assignment = next;
+      let entities = region.entities;
+      for (const id of Object.keys(entities)) {
+        if (owner(id) !== shard) {
+          const { [id]: _gone, ...rest } = entities;
+          entities = rest;
+        }
+      }
+      for (const [id, now] of Object.entries(next.owner ?? {})) {
+        if (now !== shard || entities[id] !== undefined) continue;
+        const was = previous.owner?.[id];
+        if (was === undefined || was === shard) continue;
+        const observed = spectators.get(was)?.latest()?.entities[id];
+        if (observed === undefined) {
+          count(record.forwarded, 'unrecovered');
+          continue;
+        }
+        entities = { ...entities, [id]: observed };
+        netcode.adoptPlayer(id, { resume: true });
+        recovered.push(id);
+      }
+      if (entities !== region.entities) region = { ...region, entities };
       return true;
     },
+    /** Entities this host restored from observation after a host was lost (S6). */
+    recovered: () => [...recovered],
+    /** What this host last observed of `name`'s shard, as that host sent it. */
+    observed: name => spectators.get(name)?.latest()?.entities ?? null,
     /** The whole match as this host knows it: its own entities, plus every other host's as spectated. */
     known: () => {
       const all = {};

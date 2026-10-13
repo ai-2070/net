@@ -156,8 +156,14 @@ export interface HostNetcode<E> {
    * Take `peer`'s inputs from `lastApplied + 1` on: the other half of a
    * planned move. Inputs at or below it — already in the state the entity
    * arrived with — are never applied here.
+   *
+   * `{ resume: true }` is the crash-recovery form (S6), for an entity
+   * restored from an observation with no boundary to hand over: the first
+   * input frame from `peer` sets the boundary at its newest input and none
+   * of it is applied. The player's pending inputs are dropped (they were
+   * made against a state that was rolled back) and it carries on from there.
    */
-  adoptPlayer(peer: string, from: { readonly lastApplied: number }): void;
+  adoptPlayer(peer: string, from: { readonly lastApplied: number } | { readonly resume: true }): void;
   /** Frames dropped and why. */
   readonly dropped: Readonly<Record<string, number>>;
   /** The last error a send or stream open raised, for diagnosis; `null` if none. */
@@ -182,6 +188,8 @@ interface Player<I> {
   requested: Set<number>;
   /** Released by a planned move: inputs are not taken until adopted again. */
   released: boolean;
+  /** Adopted after a crash: the next input frame sets the boundary, and none of it is applied. */
+  resuming: boolean;
 }
 
 /** History kept: enough ticks to cover the rewind cap with room. */
@@ -319,6 +327,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       named: new Set(),
       requested: new Set(),
       released: false,
+      resuming: false,
     };
     players.set(peer, player);
     return player;
@@ -429,6 +438,14 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
         }
         if (player.released) {
           drop('released');
+          return;
+        }
+        if (player.resuming) {
+          player.resuming = false;
+          let newest = player.lastApplied;
+          for (const input of frame.i) if (Number.isInteger(input.seq)) newest = Math.max(newest, input.seq);
+          player.lastApplied = newest;
+          dropped['resumed'] = (dropped['resumed'] ?? 0) + frame.i.length;
           return;
         }
         for (const input of frame.i) {
@@ -543,10 +560,15 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       player.released = true;
       return { lastApplied: player.lastApplied };
     },
-    adoptPlayer(peer: string, from: { readonly lastApplied: number }) {
+    adoptPlayer(peer: string, from: { readonly lastApplied: number } | { readonly resume: true }) {
       const player = playerFor(peer);
       if (player === null) return;
       player.released = false;
+      if ('resume' in from) {
+        player.resuming = true;
+        player.pending.clear();
+        return;
+      }
       player.lastApplied = Math.max(player.lastApplied, from.lastApplied);
       for (const seq of [...player.pending.keys()]) if (seq <= player.lastApplied) player.pending.delete(seq);
     },

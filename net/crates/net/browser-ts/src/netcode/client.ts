@@ -245,6 +245,12 @@ export interface NetcodeClient<E, I> {
    * claims").
    */
   sampleAt(hostTime: number): { readonly entities: Readonly<Record<string, E>>; readonly gapMs: number } | null;
+  /**
+   * The newest snapshot this client holds, as the host sent it (not
+   * interpolated, not predicted), or `null`. What a shard host restores a
+   * crashed host's entities from: the last state it observed.
+   */
+  latest(): { readonly time: number; readonly tick: number; readonly entities: Readonly<Record<string, E>> } | null;
   stats(): NetcodeStats;
   close(): void;
 }
@@ -676,6 +682,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     },
     hostNow,
     sampleAt: hostTime => snapshots.sample(hostTime, blend),
+    latest: () => snapshots.latest(),
     stats: () => ({
       clock: clock.estimate(),
       snapshots: snapshotsSeen,
