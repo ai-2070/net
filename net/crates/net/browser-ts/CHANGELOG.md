@@ -129,7 +129,10 @@ the README on why it is a sibling package rather than a sub-path.
   of the players: at 64 players on one anchor a 2 s refresh pinned the
   host's anchor link at its SCTP advisory, starving every relayed pair. A
   change of players is still announced at once, and an announcement lives
-  300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has.
+  300 s. `joinLobby` gains `announceEveryMs`, as `createLobby` has. A lobby
+  with a free seat still refreshes every 2 s (`OPEN_LOBBY_ANNOUNCE_MS`): a
+  node that just connected sees a lobby only at its next refresh, and one
+  host refreshing is linear in the peers, not square.
 - **Stream data is routed to its stream, not filtered by every stream.**
   Each `LeafStream`'s listener used to receive every node event and read
   it to find its own, so a host with one stream per player paid players ×

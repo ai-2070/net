@@ -400,7 +400,8 @@ subscription at once. `lobby.self` is the host's own player (below).
   a moment to reach a node that just connected. Poll `listLobbies` every half
   second for a few seconds before showing "no games".
 - **A closed tab's lobby stays listed for a moment.** The host refreshes its
-  announcement every 30 seconds and a tab killed outright withdraws nothing, so its listing
+  announcement every 2 seconds while a seat is free (30 once full), and a tab killed
+  outright withdraws nothing, so its listing
   lasts until the announcement lapses, and joining it answers `not-found`.
 - **Close a joined lobby before creating one on the same node.** Leaving a
   lobby announces the node's own `tags` again, which replaces the whole tag set

@@ -342,7 +342,9 @@ writes.
 - **Prefer a lobby over hand-rolled discovery.** `createLobby({ node, game,
   name, capacity, info?, visibility?, …hostStore options })` hosts the store,
   gives the host `lobby.self` (a `hostPlayer`), and re-announces on its own
-  (every `LOBBY_ANNOUNCE_MS`, 30 s; a FAILED announcement, the lobby's or a
+  (every `OPEN_LOBBY_ANNOUNCE_MS`, 2 s, while a seat is free, because a node
+  that just connected sees a lobby only at its next refresh; every
+  `LOBBY_ANNOUNCE_MS`, 30 s, once full; a FAILED announcement, the lobby's or a
   joiner's seek tag, is retried after `ANNOUNCE_RETRY_MS`, 1 s, doubling to
   `ANNOUNCE_RETRY_MAX_MS`, 8 s);
   `listLobbies({ node, game })` returns `{ code, name, players, capacity, info,
@@ -360,7 +362,7 @@ writes.
     Announcements take a moment to reach a node that just connected. Poll
     every 500 ms for about 4 s before showing "no games".
   - **A closed tab's lobby stays listed until its announcement lapses.** The
-    host refreshes its announcement every `LOBBY_ANNOUNCE_MS` (30 s); a tab killed outright
+    host refreshes its announcement (every 2 s with a seat free, 30 s once full); a tab killed outright
     withdraws nothing. Expect a stale entry for a short while, and a
     `joinLobby` that answers `not-found`.
   - **Close a joined lobby before creating one on the same node.** Closing

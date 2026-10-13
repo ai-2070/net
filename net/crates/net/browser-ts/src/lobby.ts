@@ -132,6 +132,21 @@ export const LOBBY_CODE_LENGTH = 6;
  */
 export const LOBBY_ANNOUNCE_MS = 30_000;
 
+/**
+ * Re-announce interval, ms, of a lobby that still has a free seat.
+ *
+ * A leaf only knows the announcements it received after it connected:
+ * nothing replays earlier ones to a newcomer. So a player who opens the
+ * lobby list sees a lobby only at that lobby's next refresh, and at
+ * {@link LOBBY_ANNOUNCE_MS} that was up to 30 s of an empty list (found by
+ * the CLI-anchor acceptance run). The square-law load measured at 2 s came
+ * from EVERY node refreshing; one host per lobby refreshing is linear in
+ * the peers, so a joinable lobby keeps the short cadence and a full one,
+ * which no newcomer can join, drops to {@link LOBBY_ANNOUNCE_MS}. Joiners'
+ * seek tags stay at {@link LOBBY_ANNOUNCE_MS}.
+ */
+export const OPEN_LOBBY_ANNOUNCE_MS = 2_000;
+
 /** The first retry after a failed announcement, ms (lobbies, seek tags, region hosts). */
 export const ANNOUNCE_RETRY_MS = 1_000;
 /** The longest wait between retries of a failing announcement, ms. */
@@ -325,7 +340,11 @@ export type CreateLobbyOptions<S extends object, A extends ActionSpec, I extends
     readonly maxEventBytes?: number;
     /** Other tags this node should keep announcing while the lobby is open. */
     readonly tags?: readonly string[];
-    /** Re-announce interval. Default {@link LOBBY_ANNOUNCE_MS}. */
+    /**
+     * Re-announce interval, used whether or not a seat is free. Default:
+     * {@link OPEN_LOBBY_ANNOUNCE_MS} while a seat is free,
+     * {@link LOBBY_ANNOUNCE_MS} once full.
+     */
     readonly announceEveryMs?: number;
   };
 
@@ -496,7 +515,15 @@ export async function createLobby<S extends object, A extends ActionSpec, I exte
   });
 
   announce();
-  const timer = setInterval(announce, announceEveryMs ?? LOBBY_ANNOUNCE_MS);
+  // Short while a newcomer could still take a seat, long once full: the
+  // interval is chosen again at every refresh.
+  const refreshMs = () =>
+    announceEveryMs ?? (players().length < capacity ? OPEN_LOBBY_ANNOUNCE_MS : LOBBY_ANNOUNCE_MS);
+  let timer: ReturnType<typeof setTimeout> = setTimeout(function refresh() {
+    if (closed) return;
+    announce();
+    timer = setTimeout(refresh, refreshMs());
+  }, refreshMs());
 
   return {
     code,
@@ -525,7 +552,7 @@ export async function createLobby<S extends object, A extends ActionSpec, I exte
     close: async () => {
       if (closed) return;
       closed = true;
-      clearInterval(timer);
+      clearTimeout(timer);
       if (retry !== null) clearTimeout(retry);
       stopMembership();
       listeners.clear();

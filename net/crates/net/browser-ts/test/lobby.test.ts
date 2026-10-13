@@ -3,14 +3,16 @@
  * presence, and what a list refuses to believe.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createLobby,
   joinLobby,
   listLobbies,
+  LOBBY_ANNOUNCE_MS,
   LobbyError,
   lobbyCodeFromUrl,
+  OPEN_LOBBY_ANNOUNCE_MS,
   normalizeLobbyCode,
   type Lobby,
 } from '../src/lobby.js';
@@ -117,6 +119,41 @@ describe('lobbies', () => {
       listed = await listLobbies({ node: mesh.node(), game: 'lobby-test' });
     }
     expect(listed.map(entry => entry.code)).toEqual([lobby.code]);
+  });
+
+  // A leaf only knows announcements it received after connecting, so a
+  // newcomer sees a lobby at its next refresh: a joinable lobby must not
+  // make it wait LOBBY_ANNOUNCE_MS (the CLI-anchor acceptance run's empty
+  // list). A full one, which nobody new can join, drops to the long cadence.
+  it('refreshes a joinable lobby on the short cadence and a full one on the long', async () => {
+    vi.useFakeTimers();
+    try {
+      const mesh = createLocalMesh();
+      const inner = mesh.node();
+      const counted = (count: { n: number }) => ({
+        ...inner,
+        announce: async (tags: readonly string[]) => {
+          count.n += 1;
+          return inner.announce(tags);
+        },
+      });
+      const joinable = { n: 0 };
+      const full = { n: 0 };
+      await lobbyOn(mesh, { node: counted(joinable) });
+      await lobbyOn(mesh, { node: counted(full), capacity: 1 });
+      await vi.advanceTimersByTimeAsync(0);
+      joinable.n = 0;
+      full.n = 0;
+
+      await vi.advanceTimersByTimeAsync(OPEN_LOBBY_ANNOUNCE_MS * 3);
+      expect(joinable.n).toBe(3);
+      expect(full.n).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(LOBBY_ANNOUNCE_MS);
+      expect(full.n).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('joins by code — typed loosely — and plays; the host sees the player arrive', async () => {
