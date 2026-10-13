@@ -3203,6 +3203,7 @@ jobs:
             visitors_behind_one_address_each_get_their_own_offer_budget
             a_shared_credential_is_charged_per_address_not_globally
             a_forged_credential_cannot_spend_a_visitors_budget
+            a_visitor_with_no_room_for_a_budget_is_admitted_on_the_backstop
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features "$FEATURES" --test rtc_bootstrap_listener \

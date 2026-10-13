@@ -332,6 +332,11 @@ struct IceStatsRow {
     /// sources and this one was new. Absent from an older anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_rate_table_full: Option<u64>,
+    /// Bootstrap offers admitted on the per-source backstop alone
+    /// because no per-visitor budget was available. Absent from an
+    /// older anchor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_visitor_budget_degraded: Option<u64>,
 }
 
 /// The one-line prose form of the denominator, printed with every
@@ -599,6 +604,7 @@ async fn run_stats(
         caveat: ICE_CAVEAT,
         bootstrap_rate_limited: stats.bootstrap_rate_limited,
         bootstrap_rate_table_full: stats.bootstrap_rate_table_full,
+        bootstrap_visitor_budget_degraded: stats.bootstrap_visitor_budget_degraded,
     };
     emit_value(OutputFormat::resolve_oneshot(output), &row)
         .map_err(|e| generic(format!("write anchor stats: {e}")))?;

@@ -27,7 +27,7 @@ use net_sdk::enrollment::InviteToken;
 use net_sdk::identity::Identity;
 use net_sdk::rtc_bootstrap::{
     bootstrap_router, serve_bootstrap, AnchorInfo, BootstrapConfig, BootstrapTls, ErrorBody,
-    OfferResponse,
+    OfferResponse, VISITOR_BUDGETS_PER_SOURCE,
 };
 use tower::ServiceExt as _;
 
@@ -423,6 +423,47 @@ async fn a_forged_credential_cannot_spend_a_visitors_budget() {
     assert!(
         status == StatusCode::OK || refusal_of(&body) != "rate_limited",
         "the forgeries spent the genuine visitor's budget: {status}"
+    );
+}
+
+/// Review ANCHOR-1: one address presenting more credentials than it may
+/// hold per-visitor budgets for is not refused for want of room. The
+/// visitors past [`VISITOR_BUDGETS_PER_SOURCE`] are admitted on the
+/// per-address backstop and counted, and the visitors that DO hold a
+/// budget are still held to it. Before, the per-visitor table had no
+/// per-source cap, and once full it refused every new visitor
+/// anchor-wide.
+///
+/// Inverse: refuse in `admit_visitor` when there is no room — the
+/// visitors past the cap come back `rate_limited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visitor_with_no_room_for_a_budget_is_admitted_on_the_backstop() {
+    let anchor = anchor().await;
+    let mut cfg = config(PSK);
+    cfg.offers_per_credential_per_minute = 1;
+    cfg.offers_per_ip_per_minute = 1_000;
+    let router = bootstrap_router(Arc::clone(&anchor), &cfg);
+    let extra = 4;
+    let visitors: Vec<_> = (0..VISITOR_BUDGETS_PER_SOURCE + extra)
+        .map(|_| credential_for(PSK, Duration::from_secs(600)))
+        .collect();
+    for (i, visitor) in visitors.iter().enumerate() {
+        let (status, body) = post_offer(&router, visitor, 0x800 + i as u64, "v=0").await;
+        assert!(
+            status == StatusCode::OK || refusal_of(&body) != "rate_limited",
+            "visitor {i} was refused for want of a budget: {status}"
+        );
+    }
+    assert_eq!(
+        anchor.rtc_stats().bootstrap_visitor_budget_degraded(),
+        extra as u64,
+        "the visitors past the cap were admitted on the backstop"
+    );
+    let (status, body) = post_offer(&router, &visitors[0], 0x900, "v=0").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        message_of(&body).contains("for this credential"),
+        "a visitor holding a budget is still held to it"
     );
 }
 

@@ -117,6 +117,22 @@ const RATE_MAX_BUCKETS: usize = 65_536;
 /// without reclaiming anything sooner than this.
 const RATE_FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Most per-visitor offer budgets — live (source bucket, credential
+/// nonce) entries — one source bucket may hold at once.
+///
+/// The per-visitor table shares the 65,536-entry bound with the per-IP
+/// one, but one source can create an entry per credential it presents,
+/// up to its whole per-IP backstop (120 a minute by default) instead of
+/// one. Uncapped, a few hundred IPv6 /64s and an open game's credential
+/// issuance filled the table, and a full table refused every new
+/// visitor anchor-wide. Capped, filling it takes 2,048 distinct source
+/// buckets, one source can never crowd the others out of their
+/// budgets, and a full table no longer refuses anyone. A visitor past the cap — or arriving at a full
+/// table — is admitted on the per-source backstop
+/// ([`DEFAULT_OFFERS_PER_IP_PER_MINUTE`]) alone, never refused for
+/// want of room.
+pub const VISITOR_BUDGETS_PER_SOURCE: usize = 32;
+
 /// Cap on the offer body. An SDP is a few kilobytes; the credential
 /// is bounded by its own format.
 const MAX_OFFER_BODY_BYTES: usize = 64 * 1024;
@@ -904,7 +920,10 @@ struct Issuance {
 /// - at [`RATE_MAX_BUCKETS`] live buckets a **new** source is refused
 ///   ([`RateVerdict::TableFull`]). An existing restriction is never
 ///   evicted to make room: eviction is exactly how a flood would
-///   erase a limit.
+///   erase a limit. The per-visitor table also caps the entries one
+///   source may hold ([`VISITOR_BUDGETS_PER_SOURCE`]), and degrades a
+///   visitor it has no room for to the per-source backstop instead of
+///   refusing it ([`RateLimiter::admit_visitor`]).
 ///
 /// What /64 does not buy: a client controlling many prefixes still
 /// gets a bucket per prefix. The per-game ceiling (`--game ID:N`)
@@ -917,12 +936,18 @@ struct Issuance {
 struct RateLimiter<K = IpAddr> {
     per_minute: u32,
     max_buckets: usize,
+    /// Most live buckets one source bucket ([`RateKey::source`]) may
+    /// hold. `usize::MAX` (no cap) for a table keyed by source alone.
+    max_per_source: usize,
     table: Mutex<RateTable<K>>,
 }
 
 #[derive(Debug)]
 struct RateTable<K> {
     windows: HashMap<K, (Instant, u32)>,
+    /// Live buckets per source bucket, for keys that name one. Kept in
+    /// step with `windows` on every insert and sweep.
+    per_source: HashMap<IpAddr, usize>,
     last_sweep: Option<Instant>,
 }
 
@@ -930,8 +955,29 @@ impl<K> Default for RateTable<K> {
     fn default() -> Self {
         Self {
             windows: HashMap::new(),
+            per_source: HashMap::new(),
             last_sweep: None,
         }
+    }
+}
+
+/// A rate limiter's key.
+trait RateKey: std::hash::Hash + Eq + Copy {
+    /// The source bucket a per-source cap counts this key against, if
+    /// the table has one.
+    fn source(&self) -> Option<IpAddr>;
+}
+
+impl RateKey for IpAddr {
+    /// Keyed by source alone: one bucket per source, nothing to cap.
+    fn source(&self) -> Option<IpAddr> {
+        None
+    }
+}
+
+impl RateKey for (IpAddr, [u8; 16]) {
+    fn source(&self) -> Option<IpAddr> {
+        Some(self.0)
     }
 }
 
@@ -947,6 +993,10 @@ enum RateVerdict {
     /// says the anchor is under a many-source load, not that one
     /// client is too eager.
     TableFull,
+    /// Its key is new and its source bucket already holds its bound of
+    /// live buckets ([`VISITOR_BUDGETS_PER_SOURCE`]). Only a table
+    /// whose keys name a source can say this.
+    SourceFull,
 }
 
 /// The bucket a source address is charged to.
@@ -969,7 +1019,7 @@ fn rate_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-impl<K: std::hash::Hash + Eq + Copy> RateLimiter<K> {
+impl<K: RateKey> RateLimiter<K> {
     fn new(per_minute: u32) -> Self {
         Self::with_max_buckets(per_minute, RATE_MAX_BUCKETS)
     }
@@ -978,8 +1028,15 @@ impl<K: std::hash::Hash + Eq + Copy> RateLimiter<K> {
         Self {
             per_minute,
             max_buckets,
+            max_per_source: usize::MAX,
             table: Mutex::new(RateTable::default()),
         }
+    }
+
+    /// Cap the live buckets one source bucket may hold.
+    fn with_max_per_source(mut self, max_per_source: usize) -> Self {
+        self.max_per_source = max_per_source;
+        self
     }
 
     /// Check one request charged to `key` at `now`, charging it when
@@ -994,13 +1051,38 @@ impl<K: std::hash::Hash + Eq + Copy> RateLimiter<K> {
             Some(gap) => gap >= RATE_WINDOW || (full && is_new && gap >= RATE_FULL_SWEEP_INTERVAL),
         };
         if sweep_due {
-            table
-                .windows
-                .retain(|_, (start, _)| now.saturating_duration_since(*start) < RATE_WINDOW);
+            let RateTable {
+                windows,
+                per_source,
+                ..
+            } = &mut *table;
+            windows.retain(|key, (start, _)| {
+                let live = now.saturating_duration_since(*start) < RATE_WINDOW;
+                if !live {
+                    if let Some(source) = key.source() {
+                        if let Some(count) = per_source.get_mut(&source) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                per_source.remove(&source);
+                            }
+                        }
+                    }
+                }
+                live
+            });
             table.last_sweep = Some(now);
         }
-        if is_new && table.windows.len() >= self.max_buckets {
-            return RateVerdict::TableFull;
+        if is_new {
+            if table.windows.len() >= self.max_buckets {
+                return RateVerdict::TableFull;
+            }
+            if let Some(source) = key.source() {
+                let held = table.per_source.entry(source).or_insert(0);
+                if *held >= self.max_per_source {
+                    return RateVerdict::SourceFull;
+                }
+                *held += 1;
+            }
         }
         let entry = table.windows.entry(key).or_insert((now, 0));
         if now.saturating_duration_since(entry.0) >= RATE_WINDOW {
@@ -1023,7 +1105,9 @@ impl<K: std::hash::Hash + Eq + Copy> RateLimiter<K> {
                 node.rtc_stats().note_bootstrap_rate_limited();
                 false
             }
-            RateVerdict::TableFull => {
+            // `SourceFull` cannot come from a table keyed by source
+            // alone; refused like `TableFull` if it ever did.
+            RateVerdict::TableFull | RateVerdict::SourceFull => {
                 node.rtc_stats().note_bootstrap_rate_table_full();
                 tracing::warn!(
                     source = %source,
@@ -1053,6 +1137,53 @@ impl RateLimiter<IpAddr> {
     /// [`Self::check`], counting refusals. `true` when it may proceed.
     fn admit(&self, ip: IpAddr, now: Instant, node: &MeshNode) -> bool {
         self.admit_key(rate_key(ip), ip, now, node)
+    }
+}
+
+impl RateLimiter<(IpAddr, [u8; 16])> {
+    /// The per-visitor offer budget for `visitor` — (source bucket,
+    /// credential nonce) — at `now`. `true` when the offer may proceed.
+    ///
+    /// A visitor over its own budget is refused. A visitor that cannot
+    /// GET a budget — the table is full of live entries, or its source
+    /// already holds [`VISITOR_BUDGETS_PER_SOURCE`] of them — is
+    /// **admitted on the per-source backstop alone**, counted on
+    /// `bootstrap_visitor_budget_degraded` and logged.
+    ///
+    /// The trade-off, which is security-relevant: refusing there (what
+    /// this did before) let anyone who could fill the table — a few
+    /// hundred IPv6 /64s with an open game's credentials — refuse every
+    /// new visitor anchor-wide, a denial of service bought cheaply.
+    /// Admitting gives up only the per-VISITOR isolation for that
+    /// request: it is still bounded by the per-source ceiling, which
+    /// [`AppState::rate`] has already charged (and which refuses when
+    /// ITS table is full), by the issuer signature checked before this,
+    /// and by the provisional/RTC session bounds checked after. No
+    /// existing restriction is evicted: a visitor already over its
+    /// budget still holds its entry and is still refused.
+    fn admit_visitor(
+        &self,
+        visitor: (IpAddr, [u8; 16]),
+        source: IpAddr,
+        now: Instant,
+        stats: &net::adapter::net::rtc::RtcStats,
+    ) -> bool {
+        match self.check_key(visitor, now) {
+            RateVerdict::Allowed => true,
+            RateVerdict::Limited => {
+                stats.note_bootstrap_rate_limited();
+                false
+            }
+            verdict @ (RateVerdict::TableFull | RateVerdict::SourceFull) => {
+                stats.note_bootstrap_visitor_budget_degraded();
+                tracing::warn!(
+                    source = %source,
+                    cause = ?verdict,
+                    "no per-visitor offer budget available; admitting on the per-source backstop"
+                );
+                true
+            }
+        }
     }
 }
 
@@ -1091,7 +1222,10 @@ pub fn bootstrap_router(node: Arc<MeshNode>, config: &BootstrapConfig) -> Router
         allowed_origins: Arc::new(config.allowed_origins.clone()),
         any_origin: config.any_origin,
         rate: Arc::new(RateLimiter::new(config.offers_per_ip_per_minute)),
-        credential_rate: Arc::new(RateLimiter::new(config.offers_per_credential_per_minute)),
+        credential_rate: Arc::new(
+            RateLimiter::new(config.offers_per_credential_per_minute)
+                .with_max_per_source(VISITOR_BUDGETS_PER_SOURCE),
+        ),
         acme: config.acme.clone(),
         dialogs: Arc::new(AtomicU64::new(1)),
         attempts: Arc::new(Attempts::default()),
@@ -1985,11 +2119,16 @@ async fn post_offer(
     // verified: by (source bucket, invite nonce), so visitors sharing an
     // address each have their own, and a credential shared by many
     // visitors is still bounded per address.
+    // A visitor that cannot get a budget of its own (the table is full)
+    // is admitted on the per-address backstop just charged above, not
+    // refused: see `RateLimiter::admit_visitor`.
     let visitor = (rate_key(remote.ip()), credential.invite.nonce);
-    if !state
-        .credential_rate
-        .admit_key(visitor, remote.ip(), Instant::now(), &state.node)
-    {
+    if !state.credential_rate.admit_visitor(
+        visitor,
+        remote.ip(),
+        Instant::now(),
+        state.node.rtc_stats(),
+    ) {
         return refuse(
             BootstrapRefusal::RateLimited,
             "too many bootstrap offers for this credential from this address",
@@ -2654,6 +2793,87 @@ mod tests {
         );
     }
 
+    fn visitor(source: &str, nonce: u8) -> (IpAddr, [u8; 16]) {
+        (rate_key(ip(source)), [nonce; 16])
+    }
+
+    /// Review ANCHOR-1: one source bucket may hold at most its cap of
+    /// per-visitor entries, so it cannot crowd other sources out of the
+    /// shared table. Its existing restrictions still hold at the cap,
+    /// and the count follows the sweep, so the cap frees up once the
+    /// entries expire.
+    ///
+    /// Inverse: drop the per-source check from `check_key` — the
+    /// fourth visitor from one source is `Allowed`.
+    #[test]
+    fn the_visitor_table_caps_the_entries_one_source_may_hold() {
+        let limiter = RateLimiter::new(1).with_max_per_source(3);
+        let t0 = Instant::now();
+        for nonce in 0..3 {
+            assert_eq!(
+                limiter.check_key(visitor("2001:db8::1", nonce), t0),
+                RateVerdict::Allowed
+            );
+        }
+        assert_eq!(
+            limiter.check_key(visitor("2001:db8::2", 3), t0),
+            RateVerdict::SourceFull,
+            "the same /64, a fourth visitor"
+        );
+        assert_eq!(
+            limiter.check_key(visitor("2001:db8::1", 0), t0),
+            RateVerdict::Limited,
+            "an existing restriction holds at the cap"
+        );
+        assert_eq!(
+            limiter.check_key(visitor("2001:db8:1::1", 0), t0),
+            RateVerdict::Allowed,
+            "another source is not crowded out"
+        );
+        assert_eq!(limiter.buckets(), 4);
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        for nonce in 10..13 {
+            assert_eq!(
+                limiter.check_key(visitor("2001:db8::1", nonce), later),
+                RateVerdict::Allowed,
+                "the expired entries no longer count against the source"
+            );
+        }
+        assert_eq!(limiter.table.lock().per_source.len(), 1);
+    }
+
+    /// Review ANCHOR-1: a visitor that cannot get a budget of its own —
+    /// the table is full, or its source holds its cap — is ADMITTED on
+    /// the per-source backstop (and counted), not refused. Before, a
+    /// full table refused every new visitor anchor-wide. A visitor over
+    /// its own budget is still refused.
+    ///
+    /// Inverse: return `false` for `TableFull`/`SourceFull` in
+    /// `admit_visitor` — the third visitor is refused.
+    #[test]
+    fn a_visitor_with_no_room_for_a_budget_is_admitted_on_the_backstop() {
+        let stats = net::adapter::net::rtc::RtcStats::default();
+        let limiter = RateLimiter::with_max_buckets(1, 2).with_max_per_source(32);
+        let t0 = Instant::now();
+        let source = ip("198.51.100.1");
+        assert!(limiter.admit_visitor(visitor("198.51.100.1", 1), source, t0, &stats));
+        assert!(limiter.admit_visitor(visitor("198.51.100.2", 2), source, t0, &stats));
+        // The table is full: a new visitor gets no entry, and is admitted.
+        assert!(limiter.admit_visitor(visitor("198.51.100.3", 3), source, t0, &stats));
+        assert!(limiter.admit_visitor(visitor("198.51.100.3", 3), source, t0, &stats));
+        assert_eq!(stats.bootstrap_visitor_budget_degraded(), 2);
+        assert_eq!(limiter.buckets(), 2, "no entry was evicted for it");
+        // An existing visitor over its budget is still refused.
+        assert!(!limiter.admit_visitor(visitor("198.51.100.1", 1), source, t0, &stats));
+        assert_eq!(stats.bootstrap_rate_limited(), 1);
+
+        // The per-source cap degrades the same way.
+        let capped = RateLimiter::new(1).with_max_per_source(1);
+        assert!(capped.admit_visitor(visitor("203.0.113.1", 1), source, t0, &stats));
+        assert!(capped.admit_visitor(visitor("203.0.113.1", 2), source, t0, &stats));
+        assert_eq!(stats.bootstrap_visitor_budget_degraded(), 3);
+    }
+
     #[test]
     fn a_node_id_may_be_decimal_or_hex_and_nothing_else() {
         assert_eq!(parse_node_id("42"), Some(42));
@@ -2966,6 +3186,12 @@ pub struct AnchorIceStats {
     /// not one eager one. `None` from an anchor that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_rate_table_full: Option<u64>,
+    /// Bootstrap offers admitted on the per-source backstop alone,
+    /// because no per-visitor budget was available (the per-visitor
+    /// table was full, or the source held its bound of them). Admitted,
+    /// not refused. `None` from an anchor that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_visitor_budget_degraded: Option<u64>,
 }
 
 /// Serve the anchor's own ICE attempt ledger on `mesh`.
@@ -2996,6 +3222,9 @@ pub fn serve_anchor_ice_stats(mesh: &crate::Mesh) -> Result<crate::mesh_rpc::Ser
                 direct_ratio: ledger.as_ref().and_then(|s| s.direct_ratio()),
                 bootstrap_rate_limited: Some(node.rtc_stats().bootstrap_rate_limited()),
                 bootstrap_rate_table_full: Some(node.rtc_stats().bootstrap_rate_table_full()),
+                bootstrap_visitor_budget_degraded: Some(
+                    node.rtc_stats().bootstrap_visitor_budget_degraded(),
+                ),
             };
             serde_json::to_vec(&reply).map_err(|e| e.to_string())
         }

@@ -2052,6 +2052,17 @@ impl std::fmt::Debug for NetSession {
     }
 }
 
+/// A fire-and-forget stream's loss checkpoint: the sent watermark at
+/// a monotonic instant. See
+/// [`StreamState::reclaim_lost_fire_and_forget_credit`].
+#[derive(Debug, Clone, Copy)]
+struct ReclaimCheckpoint {
+    /// `tx_bytes_sent` when the checkpoint was taken.
+    sent: u64,
+    /// When it was taken.
+    at: Instant,
+}
+
 /// Per-stream state for multiplexing.
 pub struct StreamState {
     /// Next sequence number to send
@@ -2168,14 +2179,19 @@ pub struct StreamState {
     /// relayed player's lossy netcode stream wedged after ~64 KiB).
     /// Written-off bytes are added to every later grant's
     /// `total_consumed`, because the receiver's count now trails this
-    /// sender's by exactly them.
+    /// sender's by exactly them. A grant whose corrected total
+    /// overshoots the sent watermark proves some written-off bytes
+    /// arrived after all, and gives that much back (see
+    /// [`StreamState::apply_authoritative_grant`]).
     tx_written_off: AtomicU64,
-    /// When this stream's send credit last made progress, as
-    /// [`current_timestamp`] nanoseconds: a grant that advanced
-    /// `max_consumed_seen`, a send that found nothing outstanding, or
-    /// a write-off. The reclaim horizon is measured from here, so a
-    /// sender that has just filled its window is never written off.
-    tx_progress_ns: AtomicU64,
+    /// The loss checkpoint the write-off is measured against: the sent
+    /// watermark at a monotonic instant. See
+    /// [`StreamState::reclaim_lost_fire_and_forget_credit`] for the
+    /// invariant. Behind a lock rather than two atomics so the pair is
+    /// read and rolled as one, by one winner; it is only touched on a
+    /// grant or a refused send of a fire-and-forget stream, never on
+    /// the admitted-send hot path.
+    tx_reclaim_checkpoint: parking_lot::Mutex<ReclaimCheckpoint>,
     /// Number of `send_on_stream` calls that returned
     /// `StreamError::Backpressure` since this stream opened.
     backpressure_events: AtomicU64,
@@ -2497,7 +2513,10 @@ impl StreamState {
             max_consumed_seen: AtomicU64::new(0),
             overdraft: AtomicU64::new(0),
             tx_written_off: AtomicU64::new(0),
-            tx_progress_ns: AtomicU64::new(current_timestamp()),
+            tx_reclaim_checkpoint: parking_lot::Mutex::new(ReclaimCheckpoint {
+                sent: 0,
+                at: SystemClock::now(),
+            }),
             backpressure_events: AtomicU64::new(0),
             credit_grants_received: AtomicU64::new(0),
             credit_grants_sent: AtomicU64::new(0),
@@ -2858,22 +2877,16 @@ impl StreamState {
         if self.tx_window == 0 {
             return true;
         }
-        // A send that finds nothing outstanding starts the clock the
-        // reclaim horizon is measured against.
-        if self.tx_bytes_sent.load(Ordering::Acquire)
-            == self.max_consumed_seen.load(Ordering::Acquire)
-        {
-            self.tx_progress_ns
-                .store(current_timestamp(), Ordering::Release);
-        }
         loop {
             let cur = self.tx_credit_remaining.load(Ordering::Acquire);
             if cur < bytes {
-                // A fire-and-forget stream stalled past the horizon has
-                // lost those bytes for good: write them off and retry.
-                // At most once per horizon — the write-off restamps
-                // the progress clock.
-                if self.reclaim_lost_fire_and_forget_credit(current_timestamp()) > 0 {
+                // A fire-and-forget stream whose loss checkpoint has
+                // matured writes its lost bytes off and retries. This
+                // is the full-stall path (no grant arrives to run the
+                // check); under steady loss the grant handler has
+                // already done it. At most once per horizon — the
+                // write-off rolls the checkpoint.
+                if self.reclaim_lost_fire_and_forget_credit(SystemClock::now()) > 0 {
                     continue;
                 }
                 self.backpressure_events.fetch_add(1, Ordering::Relaxed);
@@ -3108,13 +3121,38 @@ impl StreamState {
         // The receiver never counts bytes this sender wrote off as
         // lost, so its total trails ours by exactly them.
         let written_off = self.tx_written_off.load(Ordering::Acquire);
-        self.apply_consumed_total(total_consumed.saturating_add(written_off));
+        let corrected = total_consumed.saturating_add(written_off);
+        // Under honest accounting the receiver's raw total never
+        // exceeds what was sent, so a corrected total past the sent
+        // watermark means the receiver consumed bytes this sender had
+        // written off — they arrived late, or the grants covering them
+        // were lost on the reverse path for a horizon. Give back the
+        // overshoot (never more than was written off) so a wrong
+        // write-off does not stay in every later grant and add up
+        // with the next one.
+        let sent = self.tx_bytes_sent.load(Ordering::Acquire);
+        if written_off > 0 && corrected > sent {
+            let overshoot = (corrected - sent).min(written_off);
+            self.tx_written_off
+                .update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                    w.saturating_sub(overshoot)
+                });
+        }
+        self.apply_consumed_total(corrected);
+        // Steady loss is reclaimed here, while grants still flow, so a
+        // lossy stream never drains its window just from loss. Only a
+        // fire-and-forget stream ever reads the clock.
+        if !self.reliable_mode() {
+            self.reclaim_lost_fire_and_forget_credit(SystemClock::now());
+        }
     }
 
     /// The ledger half of [`Self::apply_authoritative_grant`]: advance
     /// `max_consumed_seen` to `total_consumed` (clamped to what was
-    /// sent) and reopen credit for the delta, debt first.
-    fn apply_consumed_total(&self, total_consumed: u64) {
+    /// sent) and reopen credit for the delta, debt first. Returns the
+    /// delta it advanced `max_consumed_seen` by (0 for a stale or
+    /// duplicate total).
+    fn apply_consumed_total(&self, total_consumed: u64) -> u64 {
         // Clamp `total_consumed` to the sender-side `tx_bytes_sent`
         // watermark before the CAS. Without this, a malformed or
         // hostile grant carrying `total_consumed = u64::MAX` advanced
@@ -3131,7 +3169,7 @@ impl StreamState {
         let mut prev = self.max_consumed_seen.load(Ordering::Acquire);
         let delta = loop {
             if total_consumed <= prev {
-                return; // stale / duplicate grant — ignore
+                return 0; // stale / duplicate grant — ignore
             }
             match self.max_consumed_seen.compare_exchange_weak(
                 prev,
@@ -3143,8 +3181,6 @@ impl StreamState {
                 Err(current) => prev = current,
             }
         };
-        self.tx_progress_ns
-            .store(current_timestamp(), Ordering::Release);
         // Order matters, and so does width. `overdraft` and the
         // consumed watermarks are `u64`; only the application-credit
         // *representation* (`tx_credit_remaining`) is `u32`. So the
@@ -3177,13 +3213,14 @@ impl StreamState {
         let paid = self.retire_overdraft(delta);
         let credit_add = (delta - paid).min(u32::MAX as u64) as u32;
         if credit_add == 0 {
-            return;
+            return delta;
         }
         let window = self.tx_window;
         self.tx_credit_remaining
             .update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 v.saturating_add(credit_add).min(window)
             });
+        delta
     }
 
     /// Cumulative bytes committed to the wire on this stream.
@@ -3220,36 +3257,76 @@ impl StreamState {
         self.tx_written_off.load(Ordering::Acquire)
     }
 
-    /// Write off a fire-and-forget stream's outstanding bytes as lost,
-    /// when its credit has made no progress for
-    /// [`FIRE_AND_FORGET_RECLAIM_AFTER`]. Returns the bytes written off
-    /// (0: not fire-and-forget, nothing outstanding, or not yet stale).
+    /// Write off a fire-and-forget stream's lost bytes against its loss
+    /// checkpoint. Returns the bytes written off (0: not
+    /// fire-and-forget, checkpoint not yet mature, nothing lost, or
+    /// another caller is evaluating it right now).
+    ///
+    /// **Invariant.** The checkpoint is `(S, t)`: `S` is the sent
+    /// watermark at monotonic instant `t`. Once
+    /// `now - t >= FIRE_AND_FORGET_RECLAIM_AFTER`, every byte sent by
+    /// `t` has had the whole horizon to arrive and be granted, so
+    /// whatever of the first `S` bytes the ledger still counts as
+    /// outstanding — `S - max_consumed_seen`, where
+    /// `max_consumed_seen` already includes earlier write-offs — is
+    /// presumed lost and written off. The checkpoint then rolls to
+    /// `(sent now, now)`. Bytes sent after `t` are never written off by
+    /// this checkpoint, so a sender that has just filled its window is
+    /// refused, not written off. Because it compares against a
+    /// watermark, not against "time since the last grant", steady loss
+    /// is reclaimed while traffic flows: it runs on every grant (see
+    /// [`Self::apply_authoritative_grant`]), and a lost byte is written
+    /// off within two horizons of being sent. A full stall (no grants
+    /// at all) reaches it from the refused send instead, recovering
+    /// within two horizons of the stall.
+    ///
+    /// **Single winner.** The checkpoint is taken with `try_lock`, its
+    /// maturity rechecked under the lock, and the amount written off is
+    /// exactly the delta [`Self::apply_consumed_total`]'s CAS advanced
+    /// `max_consumed_seen` by — so two concurrent callers, or a caller
+    /// racing a grant, never count the same bytes twice.
+    ///
+    /// **Clock.** Monotonic ([`Instant`], `web_time` on wasm32), not
+    /// the wall clock: a wall step backward would hold the write-off
+    /// off for the size of the step, and one forward would write off
+    /// bytes still in flight.
+    ///
+    /// **Bound on a wrong write-off.** A write-off is wrong when the
+    /// grants covering bytes that did arrive were lost on the reverse
+    /// path for a whole horizon, or a byte arrived later than that.
+    /// The sender then holds credit for those bytes early — at most one
+    /// checkpoint's worth, so never more than the window plus control
+    /// overdraft — and it does not accumulate: `max_consumed_seen` is
+    /// inflated by exactly those bytes, so the next checkpoint writes
+    /// off that much less, and a grant whose corrected total overshoots
+    /// the sent watermark hands the overshoot back out of
+    /// `tx_written_off`.
     ///
     /// Never on a reliable stream: retransmission delivers its bytes,
-    /// so they are never lost for good. On a fire-and-forget stream
-    /// nothing retransmits, and bytes unconsumed after the horizon are
-    /// presumed lost. If one arrives late anyway, the receiver's total
-    /// overshoots by it; [`Self::apply_consumed_total`] clamps that to
-    /// the sent watermark, so the window is at worst one write-off
-    /// ahead of the wire — bounded, and only on a lossy stream.
-    fn reclaim_lost_fire_and_forget_credit(&self, now_ns: u64) -> u64 {
+    /// so they are never lost for good.
+    fn reclaim_lost_fire_and_forget_credit(&self, now: Instant) -> u64 {
         if self.tx_window == 0 || self.reliable_mode() {
             return 0;
         }
-        let since = self.tx_progress_ns.load(Ordering::Acquire);
-        if now_ns.saturating_sub(since) < FIRE_AND_FORGET_RECLAIM_AFTER.as_nanos() as u64 {
+        let Some(mut checkpoint) = self.tx_reclaim_checkpoint.try_lock() else {
+            // Another caller holds the checkpoint: it is the winner.
+            return 0;
+        };
+        if now.saturating_duration_since(checkpoint.at) < FIRE_AND_FORGET_RECLAIM_AFTER {
             return 0;
         }
-        let sent = self.tx_bytes_sent.load(Ordering::Acquire);
-        let consumed = self.max_consumed_seen.load(Ordering::Acquire);
-        let outstanding = sent.saturating_sub(consumed);
-        if outstanding == 0 {
-            return 0;
+        let sent_now = self.tx_bytes_sent.load(Ordering::Acquire);
+        // A refund after `t` can pull the watermark below `S`; those
+        // bytes never reached the wire, so they are not lost.
+        let lost = self.apply_consumed_total(checkpoint.sent.min(sent_now));
+        if lost > 0 {
+            self.tx_written_off.fetch_add(lost, Ordering::AcqRel);
         }
-        self.tx_written_off.fetch_add(outstanding, Ordering::AcqRel);
-        self.apply_consumed_total(sent);
-        self.tx_progress_ns.store(now_ns, Ordering::Release);
-        outstanding
+        *checkpoint = ReclaimCheckpoint {
+            sent: sent_now,
+            at: now,
+        };
+        lost
     }
 
     /// Record that the receiver side has accepted `bytes` off the
@@ -4147,12 +4224,27 @@ mod tests {
         );
     }
 
-    /// Age a stream's credit-progress clock past the reclaim horizon,
-    /// as if it had made no progress for that long.
+    /// An instant one reclaim horizon (plus a margin) in the past.
+    fn a_horizon_ago() -> Instant {
+        SystemClock::now()
+            .checked_sub(FIRE_AND_FORGET_RECLAIM_AFTER + Duration::from_millis(1))
+            .expect("the monotonic clock is older than one horizon")
+    }
+
+    /// Mature a loss checkpoint over everything sent so far: as if a
+    /// checkpoint taken after these sends had aged past the horizon
+    /// with no progress since.
     fn stall_past_reclaim_horizon(st: &StreamState) {
-        let back = FIRE_AND_FORGET_RECLAIM_AFTER.as_nanos() as u64 + 1_000_000;
-        st.tx_progress_ns
-            .store(current_timestamp().saturating_sub(back), Ordering::Release);
+        *st.tx_reclaim_checkpoint.lock() = ReclaimCheckpoint {
+            sent: st.tx_bytes_sent(),
+            at: a_horizon_ago(),
+        };
+    }
+
+    /// Let one horizon pass for the current checkpoint, keeping the
+    /// watermark it recorded.
+    fn let_a_horizon_pass(st: &StreamState) {
+        st.tx_reclaim_checkpoint.lock().at = a_horizon_ago();
     }
 
     /// Sharded-match S0b: a relayed player's lossy netcode stream
@@ -4256,9 +4348,173 @@ mod tests {
         st.apply_authoritative_grant(110);
         assert!(st.tx_credit_remaining() <= 100);
         assert!(st.max_consumed_seen() <= st.tx_bytes_sent());
+        assert_eq!(st.tx_written_off(), 0, "the late bytes were not lost");
     }
 
-    /// One write-off per horizon: it restamps the progress clock, so a
+    /// Review WIRE-1: steady loss on a stream whose grants keep
+    /// flowing is written off while it flows. Before, every grant
+    /// restamped the progress clock, so the write-off only fired after a
+    /// full stall: the lossy stream drained its whole window, froze for
+    /// a horizon, recovered, and repeated.
+    ///
+    /// A low-rate stream (20 B per horizon on a 100 B window) loses one
+    /// 10 B frame every other horizon — 150 B over the run, more than
+    /// the window. The window never drains: credit after every grant
+    /// stays above the loss of the last few horizons.
+    ///
+    /// Inverse: drop the reclaim call from `apply_authoritative_grant`
+    /// — the lost bytes stay outstanding until the window is short, and
+    /// the credit floor assertion fails.
+    #[test]
+    fn steady_loss_is_written_off_while_grants_flow() {
+        let st = StreamState::new_full(false, 1, 100);
+        let mut received = 0u64;
+        let mut lost = 0u64;
+        for round in 0..30u64 {
+            assert!(st.try_acquire_tx_credit(10), "round {round} frame 1");
+            assert!(st.try_acquire_tx_credit(10), "round {round} frame 2");
+            if round % 2 == 1 {
+                received += 10;
+                lost += 10;
+            } else {
+                received += 20;
+            }
+            st.apply_authoritative_grant(received);
+            assert!(
+                st.tx_credit_remaining() >= 60,
+                "round {round}: credit {} drained by loss (written off {})",
+                st.tx_credit_remaining(),
+                st.tx_written_off(),
+            );
+            let_a_horizon_pass(&st);
+        }
+        assert_eq!(st.backpressure_events(), 0, "never refused");
+        assert!(st.tx_written_off() <= lost, "never more than was lost");
+        assert!(
+            st.tx_written_off() + 30 >= lost,
+            "all but the last horizons' loss written off: {} of {lost}",
+            st.tx_written_off()
+        );
+        assert!(st.max_consumed_seen() <= st.tx_bytes_sent());
+    }
+
+    /// Bytes sent after the checkpoint are not written off by it, even
+    /// once it matures: they have not had the horizon to arrive.
+    #[test]
+    fn bytes_sent_after_the_checkpoint_are_not_written_off() {
+        let st = StreamState::new_full(false, 1, 100);
+        for _ in 0..4 {
+            assert!(st.try_acquire_tx_credit(10));
+        }
+        // Checkpoint over the first 40 B, then 60 B more in flight.
+        stall_past_reclaim_horizon(&st);
+        for _ in 0..6 {
+            assert!(st.try_acquire_tx_credit(10));
+        }
+        // The receiver has the first 30 B so far: 10 B of the
+        // checkpointed 40 are lost; the later 60 are still in flight.
+        st.apply_authoritative_grant(30);
+        assert_eq!(st.tx_written_off(), 10);
+        assert_eq!(st.max_consumed_seen(), 40);
+        assert_eq!(st.tx_credit_remaining(), 40);
+    }
+
+    /// Review WIRE-2: a write-off that turns out wrong — the bytes did
+    /// arrive, but the grants covering them were lost on the reverse
+    /// path for a horizon — is handed back by the first grant that
+    /// overshoots the sent watermark, so wrong write-offs never add up.
+    /// Before, `tx_written_off` only grew: every later grant was
+    /// overstated by it, and each such episode added to it.
+    ///
+    /// Inverse: drop the overshoot give-back from
+    /// `apply_authoritative_grant` — `tx_written_off` ends at 200, not
+    /// 0.
+    #[test]
+    fn a_grant_overshooting_the_sent_watermark_gives_the_write_off_back() {
+        let st = StreamState::new_full(false, 1, 100);
+        let mut received = 0u64;
+        for episode in 0..2 {
+            // A window's worth arrives; every grant for it is lost.
+            for _ in 0..10 {
+                assert!(st.try_acquire_tx_credit(10));
+            }
+            received += 100;
+            stall_past_reclaim_horizon(&st);
+            assert!(st.try_acquire_tx_credit(10), "episode {episode}");
+            received += 10;
+            assert_eq!(st.tx_written_off(), 100, "episode {episode}: written off");
+            // The reverse path heals: the grant reports everything.
+            st.apply_authoritative_grant(received);
+            assert_eq!(
+                st.tx_written_off(),
+                0,
+                "episode {episode}: the overshoot was given back"
+            );
+            assert_eq!(st.max_consumed_seen(), st.tx_bytes_sent());
+            assert_eq!(st.tx_credit_remaining(), 100);
+        }
+        // An honest later grant is not overstated.
+        assert!(st.try_acquire_tx_credit(10));
+        st.apply_authoritative_grant(received + 10);
+        assert_eq!(st.tx_credit_remaining(), 100);
+        assert_eq!(st.tx_written_off(), 0);
+    }
+
+    /// Review WIRE-3: a write-off is single-winner. While one caller
+    /// holds the checkpoint, another writes nothing off; and when
+    /// several race a matured checkpoint, the lost bytes are counted
+    /// once in total.
+    ///
+    /// Inverse: read the checkpoint, drop the lock, then write off —
+    /// concurrent callers each count the same outstanding bytes.
+    #[test]
+    fn a_write_off_is_counted_once_across_concurrent_callers() {
+        // Deterministic half: a held checkpoint is someone else's win.
+        let st = StreamState::new_full(false, 1, 100);
+        for _ in 0..10 {
+            assert!(st.try_acquire_tx_credit(10));
+        }
+        stall_past_reclaim_horizon(&st);
+        {
+            let _held = st.tx_reclaim_checkpoint.lock();
+            assert_eq!(
+                st.reclaim_lost_fire_and_forget_credit(SystemClock::now()),
+                0
+            );
+        }
+        let now = SystemClock::now();
+        assert_eq!(st.reclaim_lost_fire_and_forget_credit(now), 100);
+        assert_eq!(st.reclaim_lost_fire_and_forget_credit(now), 0, "duplicate");
+        assert_eq!(st.tx_written_off(), 100);
+
+        // Racing half.
+        for _ in 0..200 {
+            let st = Arc::new(StreamState::new_full(false, 1, 100));
+            for _ in 0..10 {
+                assert!(st.try_acquire_tx_credit(10));
+            }
+            st.apply_authoritative_grant(40);
+            stall_past_reclaim_horizon(&st);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let now = SystemClock::now();
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let st = st.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        st.reclaim_lost_fire_and_forget_credit(now)
+                    })
+                })
+                .collect();
+            let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(total, 60, "the 60 lost bytes are written off once");
+            assert_eq!(st.tx_written_off(), 60);
+            assert_eq!(st.tx_credit_remaining(), 100);
+        }
+    }
+
+    /// One write-off per horizon: it rolls the checkpoint, so a
     /// path that stays dead costs one window per horizon, not a spin.
     #[test]
     fn a_dead_path_is_written_off_once_per_horizon() {
