@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_09db2b9c870978::t_e3ac7295b0a6ca 40384-40392,40394-40395
+  s_09db2b9c870978::t_6542d3516ae7bb 42348
+  s_09db2b9c870978::t_a42f63c303aecc 42249-42252
+  s_09db2b9c870978::t_483f138f65d6b6 42253-42254
+  s_09db2b9c870978::t_583fb4fe400b88 10791-10805
+  s_09db2b9c870978::t_c07459acaa24e2 2848,13254,42314,42330
+  s_09db2b9c870978::t_e1b6f70309d2c5 42335-42337,42339-42341,42344,42349,42357
+  s_09db2b9c870978::t_de0785963b742a 41943,41949-41950,41956,41959-41960,41964
+  s_09db2b9c870978::t_acd46e2760286c 40393
+  s_09db2b9c870978::t_daee42d3fc70b3 41948
+  s_09db2b9c870978::t_efd05ec8be69dc 41944-41947,41951-41955
+net/crates/net/cli/CHANGELOG.md
+  s_09db2b9c870978::t_626d906b595725 23-28
+net/crates/net/src/adapter/net/rtc/mod.rs
+  s_09db2b9c870978::t_483f138f65d6b6 42-46
+  s_09db2b9c870978::t_9a32ba81859846 41
+net/crates/net/src/adapter/net/mesh_tenant_tests.rs
+  s_09db2b9c870978::t_5cd895dd4c0a82 58-81,137,238-345
+  s_09db2b9c870978::t_93766b396e4aa2 346-357,360,362-366,368-369,371-374
+  s_09db2b9c870978::t_293af30c7009ab 358-359,361,367,370
+net/crates/net/src/adapter/net/rtc/admission.rs
+  s_09db2b9c870978::t_35ea7e50b4bbc6 94-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "76cb814a346da794441a2ed6ec6b6734cf29b7a9",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
