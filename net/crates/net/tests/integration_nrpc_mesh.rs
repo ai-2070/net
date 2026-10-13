@@ -516,6 +516,16 @@ async fn rpc_deadline_actually_emits_cancel_to_server_handler() {
 /// observes its `ctx.cancellation` token. Pins the cancel-on-
 /// drop semantics that `hedge` and other "race + take winner"
 /// callers depend on.
+///
+/// The drop waits for the handler to have ENTERED rather than for a
+/// timer. The first call to a target subscribes to its reply channel
+/// and awaits the membership ack before it publishes the REQUEST;
+/// when a datagram of that exchange is lost on a loaded runner the
+/// subscribe retransmits for up to the whole ack timeout. A timer
+/// that fired inside that window dropped a future that had sent
+/// nothing, so there was no handler to observe anything and the
+/// assertion failed for a reason unrelated to the property it pins
+/// (the same race took down the SDK's hedge-loser witness).
 #[tokio::test]
 async fn rpc_dropped_call_future_fires_cancel_to_server() {
     let server = build_node().await;
@@ -523,12 +533,15 @@ async fn rpc_dropped_call_future_fires_cancel_to_server() {
     handshake_pair(&caller, &server).await;
 
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     struct CancelObservingSlow {
         cancelled: Arc<std::sync::atomic::AtomicBool>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
     }
     #[async_trait::async_trait]
     impl RpcHandler for CancelObservingSlow {
         async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.entered.store(true, Ordering::SeqCst);
             tokio::select! {
                 _ = ctx.cancellation.cancelled() => {
                     self.cancelled.store(true, Ordering::SeqCst);
@@ -549,23 +562,31 @@ async fn rpc_dropped_call_future_fires_cancel_to_server() {
             "slow_observe",
             Arc::new(CancelObservingSlow {
                 cancelled: cancelled.clone(),
+                entered: entered.clone(),
             }),
         )
         .expect("serve_rpc");
 
-    // Issue the call inside a `select!` that races against a
-    // short timer; the timer wins, the call future is dropped,
-    // and the guard's Drop fires CANCEL to the server.
+    // Issue the call inside a `select!` against "the handler is
+    // running": once it is, the REQUEST is provably on the far side,
+    // the call future is dropped, and the guard's Drop fires CANCEL.
     let server_id = server.node_id();
     let caller_clone = caller.clone();
+    let handler_running = async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
     tokio::select! {
         _ = caller_clone.call(
             server_id,
             "slow_observe",
             Bytes::from_static(b"go"),
             CallOptions::default(),
-        ) => panic!("call should not complete in this window"),
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        ) => panic!("call should not complete while the handler sleeps"),
+        r = tokio::time::timeout(Duration::from_secs(10), handler_running) => {
+            r.expect("the handler must enter: the first call's reply subscribe never completed");
+        }
     }
 
     // Wait for the CANCEL to traverse the network and the
@@ -577,6 +598,131 @@ async fn rpc_dropped_call_future_fires_cancel_to_server() {
     assert!(
         cancelled.load(Ordering::SeqCst),
         "server handler must observe ctx.cancellation after caller drops the call future",
+    );
+}
+
+/// The first call to a target subscribes to its reply channel and
+/// waits for the membership ack BEFORE it publishes the REQUEST. A
+/// call future dropped inside that wait — an nRPC hedge loser whose
+/// backup answered first, a `select!` loser, an aborted task — has
+/// sent nothing, so there is no handler to cancel and no reply to
+/// retire. What it must still do is leave the node as it found it:
+///
+/// - the caller-side `in_flight` gauge back at zero, with no outcome
+///   recorded for a call that never resolved;
+/// - no membership request left waiting for an ack that will never
+///   come (the slot used to be removed on the return paths only, so
+///   a drop mid-wait kept it, dead sender and all, for the node's
+///   lifetime);
+/// - the next call to the same target behaving as a plain first call.
+///
+/// The ack is withheld by partitioning the server at the caller: the
+/// caller's own outbound Subscribe is discarded, so the call is parked
+/// in the subscribe for the whole `membership_ack_timeout` and the
+/// drop lands inside it by construction, not by timing.
+#[tokio::test]
+async fn call_dropped_inside_reply_subscribe_leaves_no_trace() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct EnteredHandler {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl RpcHandler for EnteredHandler {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.entered.store(true, Ordering::SeqCst);
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: Bytes::from_static(b"served"),
+            })
+        }
+    }
+    let _serve = server
+        .serve_rpc(
+            "cold",
+            Arc::new(EnteredHandler {
+                entered: entered.clone(),
+            }),
+        )
+        .expect("serve_rpc");
+    assert_eq!(
+        caller.pending_membership_acks_for_test(),
+        0,
+        "precondition: no membership request in flight before the call"
+    );
+
+    let server_id = server.node_id();
+    let server_addr = server.local_addr();
+    caller.block_peer(server_addr);
+    let caller_clone = caller.clone();
+    tokio::select! {
+        r = caller_clone.call(
+            server_id,
+            "cold",
+            Bytes::from_static(b"go"),
+            CallOptions::default(),
+        ) => panic!("the call cannot resolve while its Subscribe is being discarded: {r:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    caller.unblock_peer(&server_addr);
+
+    // Nothing was published, so nothing can arrive: a REQUEST that
+    // reached the handler here would mean the drop did not land
+    // inside the subscribe and the rest of this test proves nothing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !entered.load(Ordering::SeqCst),
+        "a call dropped before its REQUEST was published must not reach the handler"
+    );
+    assert_eq!(
+        caller.pending_membership_acks_for_test(),
+        0,
+        "a subscribe abandoned mid-wait must take its ack slot with it"
+    );
+    let cold = |caller: &Arc<MeshNode>| {
+        caller
+            .rpc_metrics_snapshot()
+            .services
+            .into_iter()
+            .find(|s| s.service == "cold")
+            .expect("the metrics guard registers the service before the subscribe")
+    };
+    let after_drop = cold(&caller);
+    assert_eq!(
+        after_drop.in_flight, 0,
+        "the dropped call must leave in_flight"
+    );
+    assert_eq!(
+        after_drop.calls_total, 0,
+        "a call that never resolved records no outcome"
+    );
+
+    // The next call to the same target is an ordinary first call:
+    // a fresh subscribe, the REQUEST, the reply.
+    let reply = caller
+        .call(
+            server_id,
+            "cold",
+            Bytes::from_static(b"again"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("the call after an abandoned subscribe must succeed");
+    assert_eq!(reply.body.as_ref(), b"served");
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "the follow-up call must reach the handler"
+    );
+    assert_eq!(caller.pending_membership_acks_for_test(), 0);
+    let after_reply = cold(&caller);
+    assert_eq!(after_reply.in_flight, 0);
+    assert_eq!(
+        after_reply.calls_total, 1,
+        "exactly the resolved call is counted"
     );
 }
 

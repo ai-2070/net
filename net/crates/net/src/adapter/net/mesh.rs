@@ -24298,6 +24298,15 @@ impl MeshNode {
         self.partition_filter.contains(&PeerAddr::Udp(*addr))
     }
 
+    /// Test seam: membership Subscribe/Unsubscribe requests still waiting
+    /// for their `Ack`. Zero whenever no such request is in flight — a
+    /// request abandoned mid-wait (its future dropped) must not be
+    /// counted, which is the property the integration witness pins.
+    #[doc(hidden)]
+    pub fn pending_membership_acks_for_test(&self) -> usize {
+        self.pending_membership_acks.len()
+    }
+
     /// Get the proximity graph.
     pub fn proximity_graph(&self) -> &Arc<ProximityGraph> {
         &self.proximity_graph
@@ -36061,6 +36070,30 @@ impl MeshNode {
         self.pending_membership_acks
             .insert(nonce, (publisher_node_id, tx));
 
+        // The slot leaves with this future, however the future leaves.
+        // Removing it on each `return` below used to be enough for the
+        // paths that return; it did nothing for a future DROPPED while
+        // waiting — an nRPC hedge loser or `select!` loser abandoned
+        // inside its first-call reply subscribe. Such a drop stops the
+        // retransmits, so the ack the slot waits for never comes, and
+        // with no sweep over this map the slot stayed for the node's
+        // lifetime: one dead `oneshot::Sender` per abandoned subscribe.
+        // On the happy path the ack handler has already taken the slot
+        // (`remove_if` on the publisher's node id) and this is a no-op.
+        struct PendingAckSlot<'a> {
+            acks: &'a DashMap<u64, (u64, oneshot::Sender<MembershipAck>)>,
+            nonce: u64,
+        }
+        impl Drop for PendingAckSlot<'_> {
+            fn drop(&mut self) {
+                self.acks.remove(&self.nonce);
+            }
+        }
+        let _slot = PendingAckSlot {
+            acks: &self.pending_membership_acks,
+            nonce,
+        };
+
         // This subprotocol is fire-and-forget UDP (`send_subprotocol_to_node`
         // builds a frame and hands it straight to `send_datagram` — no NACKs,
         // no retransmit window). One dropped datagram in either direction
@@ -36084,8 +36117,6 @@ impl MeshNode {
 
         let mut ack = None;
         for attempt in 0..attempts {
-            // Scoped send; if it fails, drop the pending entry so memory
-            // doesn't accumulate.
             // Node-keyed: the membership request is addressed to a peer we
             // already identified. Round-tripping that id through an address
             // could not reach a peer we hold only a routed session with —
@@ -36094,7 +36125,6 @@ impl MeshNode {
                 .send_subprotocol_to_node(publisher_node_id, SUBPROTOCOL_CHANNEL_MEMBERSHIP, &bytes)
                 .await
             {
-                self.pending_membership_acks.remove(&nonce);
                 return Err(MembershipFailure::Transport(e));
             }
 
@@ -36108,7 +36138,6 @@ impl MeshNode {
                     break;
                 }
                 Ok(Err(_)) => {
-                    self.pending_membership_acks.remove(&nonce);
                     return Err(MembershipFailure::Transport(AdapterError::Connection(
                         "membership ack channel closed".into(),
                     )));
@@ -36129,7 +36158,6 @@ impl MeshNode {
         }
 
         let Some(ack) = ack else {
-            self.pending_membership_acks.remove(&nonce);
             return Err(MembershipFailure::Transport(AdapterError::Connection(
                 format!(
                     "membership ack timeout ({:?}, {} attempts) for channel {}",
