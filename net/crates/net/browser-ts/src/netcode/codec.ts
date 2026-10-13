@@ -26,6 +26,27 @@
  * an index it has no name for does not draw that entity and asks again
  * (`u` frame) — the lossy carrier's repair, with no acknowledgements.
  *
+ * Every binary snapshot also carries the host's **instance**, a random
+ * 32-bit number drawn when `hostNetcode` starts. A host re-created under
+ * the same label starts its indexes over; a player that sees a new instance
+ * drops every name (and every snapshot) it learnt from the old one, so the
+ * new host's indexes are never read through the old host's names.
+ *
+ * Names are also forgotten: an id no player has been shown for
+ * `NAME_FORGET_MS` (10 s) loses its index, and comes back, if it does,
+ * under a fresh one, named again. Transient ids (projectiles) do not grow
+ * the tables for the whole match.
+ *
+ * **Versions.** The fingerprint covers the binary wire's version as well as
+ * the schema. Frames carrying an instance are version 2; a peer from before
+ * it has another fingerprint for the same schema, so the pair falls back
+ * to JSON instead of refusing each other's frames.
+ *
+ * **Interpolation.** `entityCodec` also supplies an `interpolate` blend
+ * that knows its fields: an `angle()` turns the short way round across
+ * 0 / 2π. `joinNetcode` uses it when it has a codec and no `interpolate`
+ * of its own.
+ *
  * **What the schema promises.** An entity is a flat object of the schema's
  * fields and nothing else. Writing an entity with a field the schema does
  * not have, or a value that is not a finite number (or boolean, for
@@ -45,6 +66,12 @@ export interface FieldCodec {
   readonly quantum: number;
   /** Two values this field cannot tell apart once quantized (within two quantization steps). */
   near(a: unknown, b: unknown): boolean;
+  /**
+   * Blend two values of this field for interpolation (`alpha` in `[0, 1]`,
+   * above 1 when extrapolating). Omitted: linear. `angle()` turns the short
+   * way round.
+   */
+  blend?(from: number, to: number, alpha: number): number;
 }
 
 /** A whole-entity codec: fixed size, and a fingerprint both ends compare. */
@@ -61,7 +88,16 @@ export interface EntityCodec<E> {
    * correction.
    */
   near(a: E, b: E): boolean;
+  /**
+   * Blend two states of an entity for interpolation, field by field:
+   * linear, except where a field blends its own way (an `angle()` turns the
+   * short way). `joinNetcode` uses it when given this codec and no
+   * `interpolate`. Optional: a hand-written codec may leave it out.
+   */
+  readonly interpolate?: Interpolator<E>;
 }
+
+import { type Interpolator, lerpAngle, lerpNumbers } from './interpolate.js';
 
 const finite = (value: unknown, field: string): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -137,6 +173,7 @@ export function angle(bits: 8 | 16 = 8): FieldCodec {
       const d = Math.abs((((a - b) % turn) + turn) % turn);
       return Math.min(d, turn - d) <= (2 * turn) / steps + 1e-9;
     },
+    blend: lerpAngle,
   };
 }
 
@@ -183,7 +220,7 @@ export function int(bits: Bits = 16): FieldCodec {
   };
 }
 
-/** A 32-bit float: ~7 significant digits, no range to choose. */
+/** A 32-bit float: ~7 significant digits, no range to choose. A NaN or an infinity read off the wire refuses the frame. */
 export function float32(): FieldCodec {
   return {
     size: 4,
@@ -193,7 +230,10 @@ export function float32(): FieldCodec {
       view.setFloat32(at, finite(value, this.spec));
     },
     read(view, at) {
-      return view.getFloat32(at);
+      const value = view.getFloat32(at);
+      // The writer refuses these, so only a hostile or broken host sends them.
+      if (!Number.isFinite(value)) throw new RangeError(`field f32: ${String(value)} is not finite`);
+      return value;
     },
     near(a, b) {
       if (typeof a !== 'number' || typeof b !== 'number') return a === b;
@@ -227,8 +267,16 @@ function fnv(text: string): string {
 }
 
 /**
+ * The binary wire's version, part of every fingerprint. 2: snapshots carry
+ * the host's instance. A peer at another version has another fingerprint
+ * for the same schema, so the pair falls back to JSON.
+ */
+const BINARY_WIRE_VERSION = 2;
+
+/**
  * An entity codec from a schema: one field codec per property, written in
- * the schema's key order. The fingerprint covers names, order and specs.
+ * the schema's key order. The fingerprint covers names, order and specs,
+ * and the binary wire's version.
  */
 export function entityCodec<E extends object>(fields: { readonly [K in keyof E]: FieldCodec }): EntityCodec<E> {
   const entries = Object.entries(fields) as [string, FieldCodec][];
@@ -240,7 +288,8 @@ export function entityCodec<E extends object>(fields: { readonly [K in keyof E]:
     offsets.push(size);
     size += field.size;
   }
-  const fingerprint = fnv(entries.map(([name, field]) => `${name}:${field.spec}`).join(';'));
+  const fingerprint = fnv(`v${BINARY_WIRE_VERSION};${entries.map(([name, field]) => `${name}:${field.spec}`).join(';')}`);
+  const blended = entries.filter(([, field]) => field.blend !== undefined);
   return {
     size,
     fingerprint,
@@ -271,6 +320,19 @@ export function entityCodec<E extends object>(fields: { readonly [K in keyof E]:
       const right = b as Record<string, unknown>;
       return entries.every(([name, field]) => field.near(left[name], right[name]));
     },
+    interpolate(from, to, alpha) {
+      const out = lerpNumbers(from, to, alpha);
+      if (blended.length === 0 || out === null || typeof out !== 'object') return out;
+      const left = from as Record<string, unknown>;
+      const right = to as Record<string, unknown>;
+      const result = out as Record<string, unknown>;
+      for (const [name, field] of blended) {
+        const a = left[name];
+        const b = right[name];
+        if (typeof a === 'number' && typeof b === 'number') result[name] = field.blend!(a, b, alpha);
+      }
+      return out;
+    },
   };
 }
 
@@ -286,6 +348,12 @@ const KIND_SNAPSHOT = 1;
  * the frame rather than reading the epoch as the time.
  */
 const KIND_SNAPSHOT_EPOCH = 2;
+/**
+ * Kind bytes: the same two, with the host's instance (a 32-bit number,
+ * four bytes) right after the kind byte. Wire version 2.
+ */
+const KIND_SNAPSHOT_INSTANCE = 3;
+const KIND_SNAPSHOT_EPOCH_INSTANCE = 4;
 
 /** The label's 32-bit FNV-1a: a binary frame's stand-in for the JSON `n`. */
 export function labelHash(label: string): number {
@@ -304,6 +372,8 @@ export interface BinarySnapshot<E> {
   readonly of?: number;
   /** The assignment epoch the host sent it under, if it stamps one. */
   readonly ep?: number;
+  /** The sending host's instance (wire version 2), if the frame carries one. */
+  readonly instance?: number;
   /** Index → id, for the indexes this frame names. */
   readonly names: ReadonlyMap<number, string>;
   /** Index → entity. */
@@ -345,12 +415,21 @@ function getVarint(bytes: Uint8Array, at: number): [number, number] | null {
 
 /** The binary size of one snapshot frame, without building it. */
 export function binarySnapshotSize(
-  frame: { readonly tick: number; readonly ack: number; readonly iv?: number; readonly c?: number; readonly of?: number; readonly ep?: number },
+  frame: {
+    readonly tick: number;
+    readonly ack: number;
+    readonly iv?: number;
+    readonly c?: number;
+    readonly of?: number;
+    readonly ep?: number;
+    readonly instance?: number;
+  },
   names: Iterable<readonly [number, Uint8Array]>,
   indexes: Iterable<number>,
   entitySize: number,
 ): number {
   let size = 1 + 4 + 1 + varintSize(frame.tick) + 8 + varintSize(frame.ack) + varintSize(frame.iv ?? 0);
+  if (frame.instance !== undefined) size += 4;
   if (frame.ep !== undefined) size += varintSize(frame.ep);
   size += varintSize(frame.of ?? 0) + varintSize(frame.c ?? 0);
   let count = 0;
@@ -381,18 +460,31 @@ export function encodeBinarySnapshot<E>(
     readonly c?: number;
     readonly of?: number;
     readonly ep?: number;
+    /** The host's instance, a 32-bit unsigned integer: written as wire version 2. */
+    readonly instance?: number;
   },
   names: ReadonlyMap<number, Uint8Array>,
   entities: ReadonlyMap<number, E>,
   codec: EntityCodec<E>,
 ): Uint8Array {
+  const instance = frame.instance;
+  if (instance !== undefined && !(Number.isInteger(instance) && instance >= 0 && instance <= 0xffffffff)) {
+    throw new RangeError(`binary snapshot: instance ${String(instance)} is not a 32-bit unsigned integer`);
+  }
   const size = binarySnapshotSize(frame, names, entities.keys(), codec.size);
   const bytes = new Uint8Array(size);
   const view = new DataView(bytes.buffer);
   bytes[0] = BINARY_FRAME_MAGIC;
   view.setUint32(1, labelHash(label));
-  bytes[5] = frame.ep === undefined ? KIND_SNAPSHOT : KIND_SNAPSHOT_EPOCH;
-  let at = putVarint(bytes, 6, frame.tick);
+  let at = 6;
+  if (instance === undefined) {
+    bytes[5] = frame.ep === undefined ? KIND_SNAPSHOT : KIND_SNAPSHOT_EPOCH;
+  } else {
+    bytes[5] = frame.ep === undefined ? KIND_SNAPSHOT_INSTANCE : KIND_SNAPSHOT_EPOCH_INSTANCE;
+    view.setUint32(6, instance);
+    at = 10;
+  }
+  at = putVarint(bytes, at, frame.tick);
   if (frame.ep !== undefined) at = putVarint(bytes, at, frame.ep);
   view.setFloat64(at, frame.t);
   at += 8;
@@ -425,20 +517,31 @@ export function isBinaryFrame(payload: Uint8Array | undefined): payload is Uint8
 /**
  * Read a binary snapshot for `label`, or `null` for another label, another
  * kind, or anything malformed (truncated, trailing bytes, bad chunk fields,
- * a duplicate index, a name that is not UTF-8).
+ * a duplicate index, a name that is not UTF-8, an entity the codec will not
+ * read, such as a NaN `float32()`).
  */
 export function decodeBinarySnapshot<E>(payload: Uint8Array, label: string, codec: EntityCodec<E>): BinarySnapshot<E> | null {
   if (!isBinaryFrame(payload) || payload.length < 6) return null;
   const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
   const kind = payload[5];
-  if (view.getUint32(1) !== labelHash(label) || (kind !== KIND_SNAPSHOT && kind !== KIND_SNAPSHOT_EPOCH)) return null;
+  if (view.getUint32(1) !== labelHash(label)) return null;
+  if (kind !== KIND_SNAPSHOT && kind !== KIND_SNAPSHOT_EPOCH && kind !== KIND_SNAPSHOT_INSTANCE && kind !== KIND_SNAPSHOT_EPOCH_INSTANCE) {
+    return null;
+  }
+  let instance: number | undefined;
+  let start = 6;
+  if (kind === KIND_SNAPSHOT_INSTANCE || kind === KIND_SNAPSHOT_EPOCH_INSTANCE) {
+    if (payload.length < 10) return null;
+    instance = view.getUint32(6);
+    start = 10;
+  }
   const varint = (at: number) => getVarint(payload, at);
-  let read = varint(6);
+  let read = varint(start);
   if (read === null) return null;
   const [tick] = read;
   let at = read[1];
   let ep: number | undefined;
-  if (kind === KIND_SNAPSHOT_EPOCH) {
+  if (kind === KIND_SNAPSHOT_EPOCH || kind === KIND_SNAPSHOT_EPOCH_INSTANCE) {
     read = varint(at);
     if (read === null) return null;
     [ep, at] = read;
@@ -485,7 +588,11 @@ export function decodeBinarySnapshot<E>(payload: Uint8Array, label: string, code
   for (; count > 0; count -= 1) {
     const index = varint(at);
     if (index === null || index[1] + codec.size > payload.length || entities.has(index[0])) return null;
-    entities.set(index[0], codec.read(view, index[1]));
+    try {
+      entities.set(index[0], codec.read(view, index[1]));
+    } catch {
+      return null;
+    }
     at = index[1] + codec.size;
   }
   if (at !== payload.length) return null;
@@ -496,6 +603,7 @@ export function decodeBinarySnapshot<E>(payload: Uint8Array, label: string, code
     ...(iv > 0 ? { iv } : {}),
     ...(of > 0 ? { c, of } : {}),
     ...(ep === undefined ? {} : { ep }),
+    ...(instance === undefined ? {} : { instance }),
     names,
     entities,
   };

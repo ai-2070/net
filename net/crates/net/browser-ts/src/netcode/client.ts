@@ -26,6 +26,7 @@ import {
   MAX_NETCODE_INTEREST_KEYS,
   MAX_NETCODE_INTEREST_KEY_LENGTH,
   MAX_NAME_REQUESTS,
+  NAME_FORGET_MS,
   chunkOf,
   defaultNow,
   decodeFrame,
@@ -96,7 +97,11 @@ export interface JoinNetcodeOptions<E, I> {
    * — at least two snapshot intervals, so one lost snapshot does not
    * stall them. */
   readonly interpolationDelayMs?: number;
-  /** Blend two states of an entity. Default {@link lerpNumbers}. */
+  /**
+   * Blend two states of an entity. Default: the codec's `interpolate` when
+   * a `codec` is given (its `angle()` fields turn the short way), otherwise
+   * {@link lerpNumbers}. Also blends a correction in.
+   */
   readonly interpolate?: Interpolator<E>;
   /**
    * When the newest snapshot is older than the render time (a late or lost
@@ -141,9 +146,10 @@ export interface JoinNetcodeOptions<E, I> {
   readonly joinTimeoutMs?: number;
   /**
    * After an attempt to go direct ended with the pair relayed
-   * (`iceTimeout`, `udpBlocked`, …), the least time before another, ms.
-   * Default 30 000. Until then a reopened stream rides the relayed
-   * session, which is a supported outcome, not a failure.
+   * (`iceTimeout`, `udpBlocked`, …), or after `connectPeer` rejected, the
+   * least time before another, ms. Default 30 000. Until then a reopened
+   * stream rides the session there is, which is a supported outcome, not a
+   * failure.
    */
   readonly directRetryMs?: number;
   /**
@@ -238,7 +244,8 @@ export interface NetcodeClient<E, I> {
    * client holds, and the gap between the two that bracket it — or `null`
    * when no two do (too old, or newer than the newest). History, not a
    * render: never extrapolated, never predicted, and an entity in only one
-   * of the two snapshots is left out.
+   * of the two snapshots is left out (at a snapshot's exact time, that snapshot is
+   * used whole).
    *
    * What a shard host checks a hit claim against: where another host's
    * entity was at that host's time (sharded-match plan, "Clocks and hit
@@ -262,15 +269,22 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   if (host === null) throw new TypeError(`host is not a node id: ${JSON.stringify(options.host)}`);
   const label = options.label;
   const delay = options.interpolationDelayMs ?? 100;
-  const blend = options.interpolate ?? (lerpNumbers as Interpolator<E>);
+  const blend = options.interpolate ?? options.codec?.interpolate ?? (lerpNumbers as Interpolator<E>);
   const redundancy = Math.max(1, options.inputRedundancy ?? 8);
   const clock = new ClockEstimator();
-  const snapshots = new SnapshotBuffer<E>();
+  // Replaced, not cleared, when a binary snapshot shows a re-created host.
+  let snapshots = new SnapshotBuffer<E>();
   let stream: NetcodeStream | null = null;
   let closed = false;
   // Shared with the other shards' clients when `sequencer` is given, so the
   // sequence and the unacknowledged inputs survive a change of owner.
   const inputs: InputSequencer<I> = options.sequencer ?? createInputSequencer<I>();
+  // Whether this client speaks for the inputs: sends them, and trims them
+  // on its host's acks. With a shared sequencer (`joinShards`) only the
+  // client predicting the local entity does; the other shards' clients hold
+  // the same list and must neither send it to their hosts nor trim it on
+  // acks for inputs those hosts never received.
+  const speaks = options.sequencer === undefined || options.local !== undefined;
   let predicted: E | null = null;
   // A correction being blended in: the stale prediction (still advanced
   // by every input, so it keeps pace with the controls) and when it began.
@@ -356,13 +370,17 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   // reopen the stream on it, and try direct again only after
   // `directRetryMs`. `noAnnouncement` is retried at once (it is cheap and
   // discovery needs it); a direct pair's call is the idempotent check.
+  //
+  // A `connectPeer` that rejects (the peer answered `Reject`, say) is
+  // throttled the same way: it leaves no outcome, and without this every
+  // reopen would offer again.
   const directRetryMs = Math.max(0, options.directRetryMs ?? 30_000);
   let lastOfferAt = -Infinity;
+  let offerRejected = false;
   const shouldOffer = (): boolean =>
-    connectOutcome === null ||
-    connectOutcome === 'noAnnouncement' ||
-    connectOutcome === 'direct' ||
-    now() - lastOfferAt >= directRetryMs;
+    now() - lastOfferAt >= directRetryMs ||
+    (!offerRejected &&
+      (connectOutcome === null || connectOutcome === 'noAnnouncement' || connectOutcome === 'direct'));
   let opening: Promise<void> | null = null;
   const open = (): Promise<void> => {
     opening ??= (async () => {
@@ -370,8 +388,10 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
         lastOfferAt = now();
         try {
           const outcome = (await options.transport.connectPeer(host)) as { readonly type?: unknown } | undefined;
+          offerRejected = false;
           if (outcome !== null && typeof outcome === 'object' && typeof outcome.type === 'string') connectOutcome = outcome.type;
         } catch (error) {
+          offerRejected = true;
           lastError = message(error);
         }
       }
@@ -508,33 +528,77 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     if (assembly.parts.size === assembly.of) finish(frame.tick, assembly);
   }
 
-  // Binary snapshots: index → id, learnt from the frames that name them.
-  // The host never reuses an index, so a name, once known, stays right.
-  const idOf = new Map<number, string>();
+  // Binary snapshots: index → id, learnt from the frames that name them,
+  // and when a frame last carried the index. One host instance never
+  // reuses an index, so a name, once known, stays right for that instance.
+  const idOf = new Map<number, { readonly id: string; seen: number }>();
   let binaryFrames = 0;
   let unnamedEntities = 0;
+  // The host instance the names belong to, and instances replaced since
+  // (a late frame from one is not a new host).
+  let hostInstance: number | null = null;
+  const retiredInstances = new Set<number>();
+  /**
+   * A new host instance: the host was re-created under this label. Its
+   * indexes start over, and so do its ticks — drop every name, assembly
+   * and snapshot the old one left, rather than read the new one through
+   * them.
+   */
+  const newHostInstance = (instance: number) => {
+    if (hostInstance !== null) {
+      retiredInstances.add(hostInstance);
+      if (retiredInstances.size > 8) retiredInstances.delete(retiredInstances.values().next().value!);
+      idOf.clear();
+      assemblies.clear();
+      newestTick = null;
+      snapshots = new SnapshotBuffer<E>();
+      snapshotEpoch = null;
+      epochTick = -1;
+    }
+    hostInstance = instance;
+  };
+  // Names not carried by a frame for three times the host's forget time
+  // are forgotten (see NAME_FORGET_MS), checked about once a second.
+  let lastForget = now();
+  const forgetNames = (at: number) => {
+    if (at - lastForget < 1000) return;
+    lastForget = at;
+    for (const [index, known] of idOf) if (at - known.seen > 3 * NAME_FORGET_MS) idOf.delete(index);
+  };
   function onBinary(payload: Uint8Array): void {
     const codec = options.codec;
     if (codec === undefined) return;
     const decoded = decodeBinarySnapshot(payload, label, codec);
     if (decoded === null) return;
+    if (decoded.instance !== undefined && decoded.instance !== hostInstance) {
+      if (retiredInstances.has(decoded.instance)) return;
+      newHostInstance(decoded.instance);
+    }
+    const at = now();
     for (const [index, id] of decoded.names) {
       const known = idOf.get(index);
-      // A different name for a known index is not this host's protocol.
-      if (known !== undefined && known !== id) return;
+      if (known !== undefined && known.id !== id) {
+        // A different name for a known index is another host's numbering
+        // (one from before instances were stamped): start over from this
+        // frame's names, and ask for the rest below.
+        idOf.clear();
+        break;
+      }
     }
-    for (const [index, id] of decoded.names) idOf.set(index, id);
+    for (const [index, id] of decoded.names) idOf.set(index, { id, seen: at });
     binaryFrames += 1;
     const entities: Record<string, E> = {};
     const unknown: number[] = [];
     for (const [index, entity] of decoded.entities) {
-      const id = idOf.get(index);
-      if (id === undefined) {
+      const known = idOf.get(index);
+      if (known === undefined) {
         unknown.push(index);
         continue;
       }
-      Object.defineProperty(entities, id, { value: entity, enumerable: true, writable: true, configurable: true });
+      known.seen = at;
+      Object.defineProperty(entities, known.id, { value: entity, enumerable: true, writable: true, configurable: true });
     }
+    forgetNames(at);
     if (unknown.length > 0) {
       unnamedEntities += unknown.length;
       send({ n: label, k: 'u', u: unknown.slice(0, MAX_NAME_REQUESTS) });
@@ -588,10 +652,13 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     const newest = snapshots.latest();
     snapshots.add({ time, tick, entities });
     if (newestTick === null || tick > newestTick) newestTick = tick;
+    // Acknowledged inputs are done with, predicting or not: a client that
+    // never trimmed would send its whole backlog in every input frame. An
+    // ack only grows, so an older snapshot's trims nothing.
+    if (speaks) inputs.pending = inputs.pending.filter(input => input.seq > ack);
     // Reconcile only on a snapshot newer than any seen: an older one
     // (reordered by the carrier) must not roll the local entity back.
     if (options.local && (newest === null || tick > newest.tick)) {
-      inputs.pending = inputs.pending.filter(input => input.seq > ack);
       const authoritative = Object.prototype.hasOwnProperty.call(sent, options.local.id)
         ? sent[options.local.id]
         : undefined;
@@ -626,9 +693,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     // Unacknowledged inputs are repeated even with nothing new to send, so
     // a lost input frame is repaired without waiting for the next input.
     // With a shared sequencer, only the client predicting the local entity
-    // speaks for the inputs: under `joinShards` the other shards' clients
-    // hold the same pending list and must not send it to their hosts.
-    const speaks = options.sequencer === undefined || options.local !== undefined;
+    // speaks for the inputs (`speaks`, above).
     if (speaks && inputs.pending.length > 0) {
       sendInputs();
     }

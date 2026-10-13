@@ -60,7 +60,11 @@ export type Frame<E, I> =
   | { readonly n: string; readonly k: 'i'; readonly i: readonly WireInput<I>[]; readonly ep?: number }
   /** Player → host: clock ping, repeating the codec fingerprint (a lost join must not pin a player to JSON). */
   | { readonly n: string; readonly k: 'p'; readonly t0: number; readonly f?: string }
-  /** Player → host: binary-snapshot indexes it has no name for; the host names them again. */
+  /**
+   * Player → host: binary-snapshot indexes it has no name for; the host
+   * names them again (only indexes it showed that player, and an index at
+   * most once per 100 ms).
+   */
   | { readonly n: string; readonly k: 'u'; readonly u: readonly number[] }
   /**
    * Player → host: the interest keys it wants, version `v` (repeated until a
@@ -97,6 +101,16 @@ export const MAX_NETCODE_INTEREST_KEY_LENGTH = 64;
 
 /** Indexes one `u` frame may ask to have named. */
 export const MAX_NAME_REQUESTS = 256;
+
+/**
+ * A binary-snapshot name not used for this long, ms, is forgotten: by the
+ * host for an id no player has been shown (it gets a fresh index if it
+ * comes back, named again), and by the host for one player once that
+ * player has not been shown it. A player keeps a name three times as long
+ * from the last frame that carried the index, so it never forgets one the
+ * host still counts as known to it; forgetting early would only cost a `u`.
+ */
+export const NAME_FORGET_MS = 10_000;
 
 /** Chunks a snapshot may be split into, at most. */
 export const MAX_SNAPSHOT_CHUNKS = 256;

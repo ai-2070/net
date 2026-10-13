@@ -32,7 +32,7 @@ export type { LeaseWatch, LeaseWatchOptions, MatchAssignment, ShardRecord, Squad
 export type { JoinShardsOptions, ShardAssignment, ShardStats, ShardedMatch, ShardedMatchStats } from './shards.js';
 export { ClockEstimator, CLOCK_WINDOW } from './clock.js';
 export type { ClockEstimate, Millis } from './clock.js';
-export { SnapshotBuffer, lerpNumbers, SNAPSHOT_BUFFER } from './interpolate.js';
+export { SnapshotBuffer, lerpAngle, lerpNumbers, SNAPSHOT_BUFFER } from './interpolate.js';
 export type { Interpolator, TimedSnapshot } from './interpolate.js';
 export type { NetcodeStream, NetcodeTransport } from './wire.js';
 export { angle, bool, entityCodec, float32, int, quantized, uint } from './codec.js';
