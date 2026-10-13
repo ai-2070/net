@@ -388,7 +388,8 @@ globalThis.__peer = async id => {
 // delivers.
 const nonZeroCounters = () => {
   try {
-    return Object.fromEntries(Object.entries(node.counters()).filter(([, v]) => v !== '0'));
+    const link = Object.entries(node.rtcStats().counters ?? {}).map(([k, v]) => [`link.${k}`, String(v)]);
+    return Object.fromEntries([...Object.entries(node.counters()), ...link].filter(([, v]) => v !== '0'));
   } catch (error) {
     return { error: String(error?.message ?? error) };
   }

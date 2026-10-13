@@ -193,6 +193,12 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
     }
   }, 1000);
 
+  // Leaf counters of the first host and the first player, read when the
+  // window opens and again when it closes: per-second rates of what each
+  // end put on the wire and where its inbound packets died.
+  const sampled = [pages.find(entry => entry.role === 'host'), pages.find(entry => entry.role === 'player')].filter(Boolean);
+  const readCounters = () => Promise.all(sampled.map(entry => entry.page.evaluate(() => globalThis.__counters?.() ?? null).catch(() => null)));
+  let windowOpened = null;
   let profiled = false;
   for (;;) {
     await sleep(2000);
@@ -204,11 +210,27 @@ async function runBrowsers({ base, pin, hosts, players, chrome, headed, staggerM
       continue;
     }
     if (state.phase === 'done') break;
+    if (state.phase === 'measuring' && windowOpened === null) windowOpened = { at: Date.now(), counters: await readCounters() };
     const first = pages.find(entry => entry.cdp !== null);
     if (profileMs > 0 && !profiled && state.phase === 'measuring' && first) {
       profiled = true;
       profileHost(first.cdp, profileMs).catch(error => log(`profile: ${error.message}`));
     }
+  }
+  if (windowOpened !== null) {
+    const closed = await readCounters();
+    const secs = (Date.now() - windowOpened.at) / 1000;
+    sampled.forEach((entry, i) => {
+      const before = windowOpened.counters[i] ?? {};
+      const after = closed[i] ?? {};
+      const rates = Object.fromEntries(
+        Object.keys(after)
+          .map(key => [key, (Number(after[key]) - Number(before[key] ?? 0)) / secs])
+          .filter(([, rate]) => Number.isFinite(rate) && rate !== 0)
+          .map(([key, rate]) => [key, Math.round(rate * 10) / 10]),
+      );
+      log(`[${entry.role} 0] leaf counters per second over ${secs.toFixed(0)} s: ${JSON.stringify(rates)}`);
+    });
   }
   clearInterval(sampler);
   let anyFailedPlayer = false;
