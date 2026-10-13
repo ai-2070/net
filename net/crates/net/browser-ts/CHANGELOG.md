@@ -14,7 +14,7 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
-## Unreleased
+## 0.44.0 — sharded matches, compact snapshots
 
 - **`joinShards` merges a match split across several hosts** (topology A:
   every player joins every host). It runs one `joinNetcode` per shard host
