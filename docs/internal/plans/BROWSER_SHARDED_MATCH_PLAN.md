@@ -844,6 +844,33 @@ What S1 doesn't do yet:
 that each player's merged view matches the union of the hosts'
 authoritative states within one tick plus the interpolation delay.
 
+**Result: S2 built (2026-10-13).** `browser-ts/demo/sharded-arena/`:
+- `shard.js` is the recipe, with types in `shard.d.ts`. It takes the
+  library as a parameter, as `demo/game.js` does, so the page and the
+  test run the same code.
+- `index.html` + `main.js` run 4 hosts and 32 bot players on the local
+  mesh, drawing player 0's merged view coloured by owning shard.
+
+Two rules are made concrete beyond the list above:
+- **Apply and send only what you own.** `step` applies inputs only to
+  owned entities, `snapshot` sends only those, and every snapshot carries
+  the epoch.
+- **Fog uses the player's position on whichever host owns it**, which is
+  what the spectators are for. Hosts see everything.
+
+`test/netcode/sharded-arena.test.ts` (3 tests):
+- 4 hosts × 32 players (+ 4 drifting NPCs per host). Every player's merged
+  view has exactly the union's entities. Remote ones trail the host by at
+  most one tick plus the interpolation delay; your own runs ahead only by
+  the inputs in flight.
+- Fog follows the player across hosts.
+- A host applies nothing sideways and admits no one outside the roster.
+
+Mutation checks each fail a test: no fog, sending unowned entities,
+admitting everyone, and a view lagging past the bound. The skill section
+D3 mentions waits for S3, which gives the recipe its first real reason to
+spectate.
+
 #### S3 — Cross-host hits (combat scope of §2)
 
 - Fire input: `{ fire: { target, seenB } }`, with `seenA` from
