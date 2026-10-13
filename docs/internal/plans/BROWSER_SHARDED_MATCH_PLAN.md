@@ -797,6 +797,38 @@ match.setAssignment(next);     // install a newer epoch (§2 rules)
     newer-epoch snapshot is held, not drawn, until the assignment arrives;
   - a silent host shows in `stats()`.
 
+**Result: S1 built (2026-10-13).** `src/netcode/shards.ts`, with the
+wire's `ep` on `s` and `i` frames:
+- `hostNetcode({ epoch })` stamps snapshots and drops input frames from
+  another epoch (`stale-epoch`).
+- `joinNetcode({ epoch })` stamps inputs and reports the newest snapshot's
+  epoch and `lastSnapshotAt`.
+- Binary snapshots with an epoch use kind byte 2, so an older decoder
+  refuses them instead of reading `ep` as the time.
+
+`test/netcode/shards.test.ts` (8 tests) proves every item in the list
+above, on the simulated lossy network. Each fence has a mutation check
+that fails a test:
+- the owner check;
+- inputs to the owner only;
+- the epoch freeze;
+- the host's input epoch check.
+
+**One change from the text above.** A shard at an *older* epoch is
+**frozen** at its last drawn state, minus any entity it no longer owns,
+rather than having all its entries dropped. Under the original rule, a
+player that installed epoch N+1 before its hosts did saw every host's
+entities vanish until each host caught up, which would happen at every
+epoch change. Freezing keeps the safety property: nothing a shard sends
+under another epoch is drawn, and nothing is drawn from a non-owner. An
+older shard's refused entries still count, in `droppedStaleEpoch`. Owner
+changes linger for `lingerMs` (default 1 s).
+
+What S1 doesn't do yet:
+- the host's half: simulate only what you own, and leases (S2/S4);
+- moving the prediction between shards keeps no interpolation history,
+  because the old and new owners are rejoined.
+
 #### S2 — The shard host recipe (demo)
 
 `browser-ts/demo/sharded-arena/` wires:

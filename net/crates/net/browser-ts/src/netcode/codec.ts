@@ -280,6 +280,12 @@ export function entityCodec<E extends object>(fields: { readonly [K in keyof E]:
 export const BINARY_FRAME_MAGIC = 0xb1;
 /** Kind byte: a snapshot. */
 const KIND_SNAPSHOT = 1;
+/**
+ * Kind byte: a snapshot stamped with an assignment epoch (a varint after
+ * the tick). A kind of its own, so a decoder that predates epochs refuses
+ * the frame rather than reading the epoch as the time.
+ */
+const KIND_SNAPSHOT_EPOCH = 2;
 
 /** The label's 32-bit FNV-1a: a binary frame's stand-in for the JSON `n`. */
 export function labelHash(label: string): number {
@@ -296,6 +302,8 @@ export interface BinarySnapshot<E> {
   readonly iv?: number;
   readonly c?: number;
   readonly of?: number;
+  /** The assignment epoch the host sent it under, if it stamps one. */
+  readonly ep?: number;
   /** Index → id, for the indexes this frame names. */
   readonly names: ReadonlyMap<number, string>;
   /** Index → entity. */
@@ -337,12 +345,13 @@ function getVarint(bytes: Uint8Array, at: number): [number, number] | null {
 
 /** The binary size of one snapshot frame, without building it. */
 export function binarySnapshotSize(
-  frame: { readonly tick: number; readonly ack: number; readonly iv?: number; readonly c?: number; readonly of?: number },
+  frame: { readonly tick: number; readonly ack: number; readonly iv?: number; readonly c?: number; readonly of?: number; readonly ep?: number },
   names: Iterable<readonly [number, Uint8Array]>,
   indexes: Iterable<number>,
   entitySize: number,
 ): number {
   let size = 1 + 4 + 1 + varintSize(frame.tick) + 8 + varintSize(frame.ack) + varintSize(frame.iv ?? 0);
+  if (frame.ep !== undefined) size += varintSize(frame.ep);
   size += varintSize(frame.of ?? 0) + varintSize(frame.c ?? 0);
   let count = 0;
   let nameCount = 0;
@@ -364,7 +373,15 @@ export function binarySnapshotSize(
  */
 export function encodeBinarySnapshot<E>(
   label: string,
-  frame: { readonly tick: number; readonly t: number; readonly ack: number; readonly iv?: number; readonly c?: number; readonly of?: number },
+  frame: {
+    readonly tick: number;
+    readonly t: number;
+    readonly ack: number;
+    readonly iv?: number;
+    readonly c?: number;
+    readonly of?: number;
+    readonly ep?: number;
+  },
   names: ReadonlyMap<number, Uint8Array>,
   entities: ReadonlyMap<number, E>,
   codec: EntityCodec<E>,
@@ -374,8 +391,9 @@ export function encodeBinarySnapshot<E>(
   const view = new DataView(bytes.buffer);
   bytes[0] = BINARY_FRAME_MAGIC;
   view.setUint32(1, labelHash(label));
-  bytes[5] = KIND_SNAPSHOT;
+  bytes[5] = frame.ep === undefined ? KIND_SNAPSHOT : KIND_SNAPSHOT_EPOCH;
   let at = putVarint(bytes, 6, frame.tick);
+  if (frame.ep !== undefined) at = putVarint(bytes, at, frame.ep);
   view.setFloat64(at, frame.t);
   at += 8;
   at = putVarint(bytes, at, frame.ack);
@@ -412,12 +430,19 @@ export function isBinaryFrame(payload: Uint8Array | undefined): payload is Uint8
 export function decodeBinarySnapshot<E>(payload: Uint8Array, label: string, codec: EntityCodec<E>): BinarySnapshot<E> | null {
   if (!isBinaryFrame(payload) || payload.length < 6) return null;
   const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-  if (view.getUint32(1) !== labelHash(label) || payload[5] !== KIND_SNAPSHOT) return null;
+  const kind = payload[5];
+  if (view.getUint32(1) !== labelHash(label) || (kind !== KIND_SNAPSHOT && kind !== KIND_SNAPSHOT_EPOCH)) return null;
   const varint = (at: number) => getVarint(payload, at);
   let read = varint(6);
   if (read === null) return null;
   const [tick] = read;
   let at = read[1];
+  let ep: number | undefined;
+  if (kind === KIND_SNAPSHOT_EPOCH) {
+    read = varint(at);
+    if (read === null) return null;
+    [ep, at] = read;
+  }
   if (at + 8 > payload.length) return null;
   const t = view.getFloat64(at);
   if (!Number.isFinite(t)) return null;
@@ -470,6 +495,7 @@ export function decodeBinarySnapshot<E>(payload: Uint8Array, label: string, code
     ack,
     ...(iv > 0 ? { iv } : {}),
     ...(of > 0 ? { c, of } : {}),
+    ...(ep === undefined ? {} : { ep }),
     names,
     entities,
   };

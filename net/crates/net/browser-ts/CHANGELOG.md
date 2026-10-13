@@ -16,6 +16,24 @@ the README on why it is a sibling package rather than a sub-path.
 
 ## Unreleased
 
+- **`joinShards` merges a match split across several hosts** (topology A:
+  every player joins every host). It runs one `joinNetcode` per shard host
+  and draws each entity only from the shard that owns it in the installed
+  `ShardAssignment` (`{ epoch, hosts, owner }`, or an `ownerOf` resolver).
+  Inputs go only to the shard that owns you. A shard sending snapshots
+  from another epoch is frozen at its last drawn state, minus anything it
+  no longer owns, until it catches up or `setAssignment` installs its
+  epoch. When ownership changes, the old owner's copy lingers for
+  `lingerMs`. `stats()` reports each shard (with `silentMs`) and counts
+  what the fencing dropped.
+- **An optional epoch on the netcode wire.** `hostNetcode({ epoch })`
+  stamps `ep` on every snapshot and drops input frames stamped with
+  another epoch (`dropped['stale-epoch']`). `joinNetcode({ epoch })` stamps
+  inputs, and `stats()` gains `epoch` (from the newest snapshot) and
+  `lastSnapshotAt`. Binary snapshots with an epoch use a new kind byte, so
+  an older decoder refuses them rather than misreading them. Frames
+  without `ep` are unchanged.
+
 - **Compact netcode snapshots.** `hostNetcode` and `joinNetcode` take an
   optional `codec` built with `entityCodec({ x: quantized(0, 512), yaw:
   angle(), hp: uint(8), ... })`. When both ends have the same codec,

@@ -109,6 +109,14 @@ export interface HostNetcodeOptions<E, I> {
    * (`dropped['codec-write-failed']`).
    */
   readonly codec?: EntityCodec<E>;
+  /**
+   * Sharded matches (`joinShards`): the assignment epoch this host is at,
+   * read every tick. Each snapshot carries it (`ep`), so a player draws
+   * this host's entities only at the epoch it has installed; an input
+   * frame stamped with another epoch is dropped (`dropped['stale-epoch']`).
+   * An input frame with no epoch is applied, as from any plain player.
+   */
+  epoch?(): number;
   readonly now?: Now;
 }
 
@@ -169,10 +177,14 @@ export function snapshotFrames<E>(
   entities: Readonly<Record<string, E>>,
   maxBytes: number,
   interestVersion = 0,
+  epoch?: number,
 ): Frame<E, never>[] {
   // The interest version the view was filtered by, echoed so the player
-  // stops repeating its `w` frame.
-  const iv = interestVersion > 0 ? { iv: interestVersion } : {};
+  // stops repeating its `w` frame; and the epoch, when the host has one.
+  const iv = {
+    ...(interestVersion > 0 ? { iv: interestVersion } : {}),
+    ...(epoch === undefined ? {} : { ep: epoch }),
+  };
   const whole: Frame<E, never> = { n: label, k: 's', tick, t: time, ack, e: entities, ...iv };
   const size = encodeFrame(whole).length;
   if (size <= maxBytes) return [whole];
@@ -310,8 +322,15 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     tick: number,
     time: number,
     view: Readonly<Record<string, E>>,
+    epoch: number | undefined,
   ): Uint8Array[] => {
-    const header = { tick, t: time, ack: player.lastApplied, ...(player.interestVersion > 0 ? { iv: player.interestVersion } : {}) };
+    const header = {
+      tick,
+      t: time,
+      ack: player.lastApplied,
+      ...(player.interestVersion > 0 ? { iv: player.interestVersion } : {}),
+      ...(epoch === undefined ? {} : { ep: epoch }),
+    };
     const ids = Object.keys(view);
     const named = (index: number) => player.named.has(index) && !player.requested.has(index);
     const build = (of: number): Uint8Array[] => {
@@ -377,6 +396,10 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
         }
         return;
       case 'i':
+        if (options.epoch !== undefined && frame.ep !== undefined && frame.ep !== options.epoch()) {
+          drop('stale-epoch');
+          return;
+        }
         for (const input of frame.i) {
           if (!Number.isInteger(input.seq) || input.seq <= player.lastApplied) continue;
           if (!player.pending.has(input.seq)) {
@@ -412,6 +435,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
     }
     options.step({ tick, time, dtMs, inputs });
     const entities = options.snapshot(tick);
+    const epoch = options.epoch?.();
     history.push({ tick, time, entities });
     if (history.length > keep) history.shift();
     for (const [peer, player] of players) {
@@ -437,7 +461,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
       if (codec !== undefined && player.binary) {
         let binary: Uint8Array[] | null = null;
         try {
-          binary = binaryFrames(player, tick, time, view);
+          binary = binaryFrames(player, tick, time, view, epoch);
         } catch (error) {
           // The codec refused an entity: this player gets JSON this tick,
           // not a snapshot missing a field.
@@ -457,6 +481,7 @@ export function hostNetcode<E, I>(options: HostNetcodeOptions<E, I>): HostNetcod
         view,
         maxFrameBytes,
         player.interestVersion,
+        epoch,
       );
       for (const frame of frames) send(peer, player, frame);
     }

@@ -144,6 +144,12 @@ export interface JoinNetcodeOptions<E, I> {
    * which this client still reads.
    */
   readonly codec?: EntityCodec<E>;
+  /**
+   * Sharded matches: the assignment epoch this player has installed, read
+   * at each send. Input frames carry it (`ep`), and a host at another
+   * epoch drops them. `joinShards` supplies it.
+   */
+  epoch?(): number;
   readonly now?: Now;
 }
 
@@ -171,6 +177,13 @@ export interface NetcodeStats {
   readonly connectOutcome: string | null;
   /** The last error opening the stream to the host, or `null`. */
   readonly lastError: string | null;
+  /**
+   * The assignment epoch the newest snapshot was sent under, or `null`
+   * before one arrives or from a host that stamps none.
+   */
+  readonly epoch: number | null;
+  /** When (this client's `now`) the last snapshot frame arrived, or `null` before one. */
+  readonly lastSnapshotAt: number | null;
 }
 
 /** The running client. */
@@ -266,6 +279,11 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   let partialSnapshots = 0;
   let corrections = 0;
   let joined = false;
+  // The epoch of the newest-tick snapshot that carried one.
+  let snapshotEpoch: number | null = null;
+  let epochTick = -1;
+  let lastSnapshotAt: number | null = null;
+  const inputEpoch = () => (options.epoch === undefined ? {} : { ep: options.epoch() });
 
   const offset = () => clock.estimate()?.offsetMs ?? null;
   const hostNow = () => {
@@ -406,7 +424,13 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     readonly c?: number;
     readonly of?: number;
     readonly iv?: number;
+    readonly ep?: number;
   }): void {
+    lastSnapshotAt = now();
+    if (frame.ep !== undefined && frame.tick >= epochTick) {
+      snapshotEpoch = frame.ep;
+      epochTick = frame.tick;
+    }
     if (!joined) {
       joined = true;
       settleReady(null);
@@ -470,6 +494,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       ack: decoded.ack,
       e: entities,
       ...(decoded.iv === undefined ? {} : { iv: decoded.iv }),
+      ...(decoded.ep === undefined ? {} : { ep: decoded.ep }),
       ...(decoded.of === undefined ? {} : { c: decoded.c!, of: decoded.of }),
     });
   }
@@ -549,7 +574,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     sendInterest();
     // Unacknowledged inputs are repeated even with nothing new to send, so
     // a lost input frame is repaired without waiting for the next input.
-    if (pending.length > 0) send({ n: label, k: 'i', i: pending.slice(-redundancy) });
+    if (pending.length > 0) send({ n: label, k: 'i', i: pending.slice(-redundancy), ...inputEpoch() });
   }, pingEvery);
   void open().then(() => {
     send({ n: label, k: 'h', ...fingerprint });
@@ -567,7 +592,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
         predicted = options.local.predict(predicted, data);
         if (correcting !== null) correcting = { ...correcting, from: options.local.predict(correcting.from, data) };
       }
-      send({ n: label, k: 'i', i: pending.slice(-redundancy) });
+      send({ n: label, k: 'i', i: pending.slice(-redundancy), ...inputEpoch() });
     },
     view() {
       const at = hostNow();
@@ -609,6 +634,8 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       unnamedEntities,
       connectOutcome,
       lastError,
+      epoch: snapshotEpoch,
+      lastSnapshotAt,
     }),
     close() {
       if (closed) return;

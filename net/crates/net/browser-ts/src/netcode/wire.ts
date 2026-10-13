@@ -52,8 +52,12 @@ export type Frame<E, I> =
    * snapshots only when it matches its own (`codec.ts`).
    */
   | { readonly n: string; readonly k: 'h'; readonly f?: string }
-  /** Player → host: the newest inputs, the unacknowledged ones repeated. */
-  | { readonly n: string; readonly k: 'i'; readonly i: readonly WireInput<I>[] }
+  /**
+   * Player → host: the newest inputs, the unacknowledged ones repeated.
+   * `ep`: the assignment epoch the player sent them under (sharded
+   * matches); a host at another epoch drops them.
+   */
+  | { readonly n: string; readonly k: 'i'; readonly i: readonly WireInput<I>[]; readonly ep?: number }
   /** Player → host: clock ping, repeating the codec fingerprint (a lost join must not pin a player to JSON). */
   | { readonly n: string; readonly k: 'p'; readonly t0: number; readonly f?: string }
   /** Player → host: binary-snapshot indexes it has no name for; the host names them again. */
@@ -83,6 +87,8 @@ export type Frame<E, I> =
       readonly of?: number;
       /** The interest version this snapshot was filtered by, if any. */
       readonly iv?: number;
+      /** The assignment epoch the host sent it under (sharded matches). */
+      readonly ep?: number;
     };
 
 /** Interest keys a player may name, and the longest key, in UTF-16 units. */
@@ -106,6 +112,11 @@ export function chunkOf(id: string, of: number): number {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0) % of;
+}
+
+/** An `ep` field: absent, or a non-negative safe integer. */
+function epochField(ep: unknown): boolean {
+  return ep === undefined || (Number.isSafeInteger(ep) && (ep as number) >= 0);
 }
 
 const encoder = new TextEncoder();
@@ -140,7 +151,9 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
         : null;
     }
     case 'i':
-      return Array.isArray((frame as { i?: unknown }).i) ? (frame as Frame<E, I>) : null;
+      return Array.isArray((frame as { i?: unknown }).i) && epochField((frame as { ep?: unknown }).ep)
+        ? (frame as Frame<E, I>)
+        : null;
     case 'p':
       return typeof (frame as { t0?: unknown }).t0 === 'number' ? (frame as Frame<E, I>) : null;
     case 'w': {
@@ -168,9 +181,11 @@ export function decodeFrame<E, I>(payload: Uint8Array | undefined, label: string
         c?: unknown;
         of?: unknown;
         iv?: unknown;
+        ep?: unknown;
       };
       if (
         (s.iv !== undefined && !Number.isSafeInteger(s.iv)) ||
+        !epochField(s.ep) ||
         typeof s.tick !== 'number' ||
         typeof s.t !== 'number' ||
         typeof s.ack !== 'number' ||
