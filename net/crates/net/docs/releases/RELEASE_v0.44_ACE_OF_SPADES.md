@@ -122,7 +122,7 @@ Bump to 0.44.0 and rebuild.
 
 ---
 
-Released 2026-10-14.
+Released 2026-10-13.
 
 ## License
 
