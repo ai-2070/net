@@ -84,7 +84,7 @@ pub fn derive_child_identity(parent: &Identity, label: &str) -> Identity {
 /// One registry is shared by a gateway and all its subagents (Arc-backed,
 /// clone is a handle to the same store), so a revoke is observed by every
 /// chain that verifies against it.
-#[pyclass(name = "RevocationRegistry", skip_from_py_object)]
+#[pyclass(name = "RevocationRegistry")]
 #[derive(Clone)]
 pub struct PyRevocationRegistry {
     pub(crate) inner: Arc<RevocationRegistry>,
@@ -162,7 +162,7 @@ pub fn default_revocation_store_path() -> Option<String> {
 /// [`Self::extend_to_subagent`]. Verify it against a
 /// [`PyRevocationRegistry`] with [`Self::verify`]; serialize with
 /// [`Self::to_bytes`] to carry it.
-#[pyclass(name = "DelegationChain", skip_from_py_object)]
+#[pyclass(name = "DelegationChain")]
 #[derive(Clone)]
 pub struct PyDelegationChain {
     inner: DelegationChain,

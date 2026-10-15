@@ -72,7 +72,7 @@ fn map_dir_err(e: InnerDirError) -> PyErr {
 
 /// Transfer control frame (requester → holder): "send me the chunk
 /// addressed by `hash`".
-#[pyclass(name = "TransferControl", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "TransferControl", frozen, eq)]
 #[derive(Clone, PartialEq)]
 pub struct PyTransferControl {
     inner: TransferControl,
@@ -121,7 +121,7 @@ impl PyTransferControl {
 /// Transfer header (holder → requester): the first data-plane frame,
 /// declaring the total length (`Found`) or that the holder lacks the
 /// chunk (`NotFound`).
-#[pyclass(name = "TransferHeader", frozen, eq, skip_from_py_object)]
+#[pyclass(name = "TransferHeader", frozen, eq)]
 #[derive(Clone, PartialEq)]
 pub struct PyTransferHeader {
     inner: TransferHeader,

@@ -217,11 +217,7 @@ pub(crate) fn mesh_publish_tools(
 /// `NetMesh.publish_tools`). Hold it to keep the tools announced + served;
 /// [`withdraw`](Self::withdraw) reverses it (re-announcing the remainder), and
 /// dropping it (or [`stop`](Self::stop)) unregisters the services.
-#[pyclass(
-    name = "LocalPublicationHandle",
-    module = "net._net",
-    skip_from_py_object
-)]
+#[pyclass(name = "LocalPublicationHandle", module = "net._net")]
 pub struct PyLocalPublicationHandle {
     // A lock, not `&mut self`: `withdraw` released the GIL while holding the
     // mutable borrow, so any concurrent read raised "Already borrowed" (SDK

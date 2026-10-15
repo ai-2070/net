@@ -360,7 +360,7 @@ fn flow_err(e: A2aFlowError) -> PyErr {
 /// Keeps the served A2A services alive (returned by `NetMesh.serve_a2a` or
 /// `PaymentProvider.serve_a2a_configured`).
 /// Dropping it or calling [`stop`](Self::stop) unregisters them.
-#[pyclass(name = "A2aServeHandle", module = "net._net", skip_from_py_object)]
+#[pyclass(name = "A2aServeHandle", module = "net._net")]
 pub struct PyA2aServeHandle {
     // The `Mesh` holds the channel registry the services registered against,
     // and the registrations themselves are whatever the serving path returned.
