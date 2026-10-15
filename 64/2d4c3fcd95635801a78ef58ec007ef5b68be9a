@@ -1,0 +1,23 @@
+net/crates/net/cli/tests/org_join.rs
+  s_71c4b8f421dceb::t_fff2e84c7010b9 476
+  s_71c4b8f421dceb::t_1ff0fb41bbbf09 342-346
+  s_71c4b8f421dceb::t_3ba550ee17eb01 671-673
+  s_71c4b8f421dceb::t_c31333873de6d6 100-119
+  s_71c4b8f421dceb::t_aa81fe6af07c34 227,291,321,459,470,640,643,664
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "642d4c3fcd95635801a78ef58ec007ef5b68be9a",
+  "prompts": {},
+  "sessions": {
+    "s_71c4b8f421dceb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37348b9b-ae8e-4d5e-93ef-54467c462c18",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

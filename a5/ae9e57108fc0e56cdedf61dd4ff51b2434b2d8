@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_b1acdb693663bb::t_37839a70a60e26 4354,4363-4369
+net/crates/net/sdk/tests/mesh_rpc_hedge.rs
+  s_b1acdb693663bb::t_5f09b7355ec915 212-217,221,226-227,263,269,292-297,310
+  s_b1acdb693663bb::t_020c457df7e4f0 309
+net/crates/net/sdk/Cargo.toml
+  s_b1acdb693663bb::t_020c457df7e4f0 172
+  s_b1acdb693663bb::t_5f09b7355ec915 173
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_b1acdb693663bb::t_37839a70a60e26 2109-2111,2310-2315
+net/crates/net/src/adapter/net/mesh.rs
+  s_b1acdb693663bb::t_e2fa3d3909eb35 32564-32569
+net/crates/net/Cargo.lock
+  s_b1acdb693663bb::t_8329483fba9907 3382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a5ae9e57108fc0e56cdedf61dd4ff51b2434b2d8",
+  "prompts": {},
+  "sessions": {
+    "s_b1acdb693663bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "17df3b8f-0ce0-4d2f-8b07-ecbf9099f1cd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

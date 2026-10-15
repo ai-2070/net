@@ -1,0 +1,25 @@
+net/crates/net/browser-ts/demo/sharded-arena/shard.js
+  s_d71d2b607c2060::t_06afdcb332b93b 76
+net/crates/net/browser-ts/demo/sharded-arena/shard.d.ts
+  s_d71d2b607c2060::t_06afdcb332b93b 95
+.claude/skills/net-browser/netcode.md
+  s_d71d2b607c2060::t_ca4c871a92b576 241-247
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_d71d2b607c2060::t_36338d66d1f509 245,944-956
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b0324548d2289cbfc7371ee3daff4bb74cd08498",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

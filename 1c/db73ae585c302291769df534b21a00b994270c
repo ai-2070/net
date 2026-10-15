@@ -1,0 +1,26 @@
+net/crates/net/tests/natsim/browser/src/main.rs
+  s_d71d2b607c2060::t_77c74f1981a648 1365
+  s_d71d2b607c2060::t_24ee680ca7acab 1363-1364
+net/crates/net/tests/rtc_browser/runner/src/main.rs
+  s_d71d2b607c2060::t_24ee680ca7acab 2141-2142
+  s_d71d2b607c2060::t_77c74f1981a648 2143
+net/crates/net/examples/browser-demo/host/src/main.rs
+  s_d71d2b607c2060::t_24ee680ca7acab 1314-1315
+  s_d71d2b607c2060::t_77c74f1981a648 1316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1cdb73ae585c302291769df534b21a00b994270c",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

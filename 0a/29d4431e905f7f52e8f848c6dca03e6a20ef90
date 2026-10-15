@@ -1,0 +1,19 @@
+docs/internal/misc/CODE_REVIEW_2026_10_13_SHARDED_MATCH.md
+  s_09db2b9c870978::t_c42134df995a23 1-345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0a29d4431e905f7f52e8f848c6dca03e6a20ef90",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

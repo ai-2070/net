@@ -1,0 +1,29 @@
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_09db2b9c870978::t_55803244db1f61 6,12,15,124-156
+  s_09db2b9c870978::t_484ba8283ae3be 157-158
+net/crates/net/browser-ts/src/lobby.ts
+  s_09db2b9c870978::t_f5b6d4d6380252 135-149,343-347,518-526
+  s_09db2b9c870978::t_6e8c241f3f759c 555
+net/crates/net/browser-ts/CHANGELOG.md
+  s_09db2b9c870978::t_0f97b1d114a657 132-135
+.claude/skills/net-browser/store.md
+  s_09db2b9c870978::t_0f97b1d114a657 345-347,365
+web/src/content/docs/sdk/browser/store.md
+  s_09db2b9c870978::t_0f97b1d114a657 403-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e21150f0bfe124ceabd6ab361afe12b578e15157",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

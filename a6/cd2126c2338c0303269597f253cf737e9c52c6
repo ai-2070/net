@@ -1,0 +1,19 @@
+web/src/content/docs/sdk/browser/netcode.md
+  s_d71d2b607c2060::t_67c21f055d81ad 169-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a6cd2126c2338c0303269597f253cf737e9c52c6",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

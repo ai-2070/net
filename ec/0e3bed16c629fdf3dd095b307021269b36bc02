@@ -1,0 +1,25 @@
+net/crates/net/tests/integration_nrpc_mesh.rs
+  s_b1acdb693663bb::t_6b4277302ebd2d 696-699,716-719,723-726
+  s_b1acdb693663bb::t_328e16a06060a7 519-528,536,539,544
+  s_b1acdb693663bb::t_4023ae2a395bde 604-695,700-715,720-722,727-728
+  s_b1acdb693663bb::t_1647379c081470 565,570-572,575-579,586-589
+net/crates/net/src/adapter/net/mesh.rs
+  s_b1acdb693663bb::t_07486c277cea1b 36073-36096
+  s_b1acdb693663bb::t_b2967e5cb90153 24301-24309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ec0e3bed16c629fdf3dd095b307021269b36bc02",
+  "prompts": {},
+  "sessions": {
+    "s_b1acdb693663bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "17df3b8f-0ce0-4d2f-8b07-ecbf9099f1cd",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

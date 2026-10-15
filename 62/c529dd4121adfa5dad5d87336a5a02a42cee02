@@ -1,0 +1,23 @@
+net/crates/net/examples/shard-topology/run.mjs
+  s_d71d2b607c2060::t_ca1d5a9491616b 164-174
+net/crates/net/examples/shard-topology/page/match.mjs
+  s_d71d2b607c2060::t_39da12a98fb62a 365-376
+  s_d71d2b607c2060::t_a2a1e6465ed6a2 101,105-110
+  s_d71d2b607c2060::t_b2e13e8ab5a110 315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "62c529dd4121adfa5dad5d87336a5a02a42cee02",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

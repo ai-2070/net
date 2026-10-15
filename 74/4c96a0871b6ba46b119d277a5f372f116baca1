@@ -1,0 +1,37 @@
+web/src/app/globals.css
+  s_26f3293fd94965::t_ab5edc5f3ceee6 842-843
+web/src/components/games/GamesHero.tsx
+  s_26f3293fd94965::t_c42448f84683c7 407-408,412-413
+  s_26f3293fd94965::t_c423b255604a53 4
+  s_26f3293fd94965::t_2540bd6245cc14 6-11
+  s_26f3293fd94965::t_21bfb950834edf 328-334,337-344,346-349,358-377
+  s_26f3293fd94965::t_0e5456ba3139e5 299,301-306,317
+  s_26f3293fd94965::t_e539c6e6e3b131 300
+  s_26f3293fd94965::t_a3aa4ce3ca8d33 434
+web/src/app/games/page.tsx
+  s_26f3293fd94965::t_c42448f84683c7 23
+web/src/components/games/GamesSections.tsx
+  s_26f3293fd94965::t_c42448f84683c7 24,27,29,33,36,51-54,98,105,237-238,550,570
+  s_26f3293fd94965::t_e539c6e6e3b131 30
+web/src/components/games/GamesDemo.tsx
+  s_26f3293fd94965::t_c42448f84683c7 32-35
+  s_26f3293fd94965::t_fb9b448af57af2 31
+  s_26f3293fd94965::t_1dbdc93914b4ad 103-106
+  s_26f3293fd94965::t_29883be71ceeb2 65-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "744c96a0871b6ba46b119d277a5f372f116baca1",
+  "prompts": {},
+  "sessions": {
+    "s_26f3293fd94965": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b33308e-19da-4129-b80d-f034c7ae4ae5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

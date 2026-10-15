@@ -1,0 +1,41 @@
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  s_09db2b9c870978::t_ff7724e43e833c 127-130
+  s_09db2b9c870978::t_17b1f73e15fbe7 123,131-133
+  s_09db2b9c870978::t_bdb28e4853cf53 120-122,124-126,134-135,923-926,939-941,948-950,958,964-983,996-999,1022,1031,1036-1041,1054-1072,1075-1085,1108-1110,1143-1189,1225-1228,2122-2124,2126-2131
+  s_09db2b9c870978::t_78ecf1a1dc6594 2796-2875
+  s_09db2b9c870978::t_8bf193faa1a571 2876,3189-3194,3225-3227
+net/crates/net/wire/src/session.rs
+  s_09db2b9c870978::t_4d58a6d1075683 4227-4236,4238-4247,4351-4479,4484-4514,4517
+  s_09db2b9c870978::t_a2deeb6675784c 2055-2065,2182-2185,2187-2194,2516-2519,2883-2889,3124-3144,3152-3155,3172,3216,3223,3260-3303,3306-3307,3311-3312,3314-3315,3318-3329
+  s_09db2b9c870978::t_3545326eac4164 3145-3147
+  s_09db2b9c870978::t_161fe49893b768 4480-4483
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_09db2b9c870978::t_78ecf1a1dc6594 429-467
+  s_09db2b9c870978::t_9698833c4ba86a 30
+  s_09db2b9c870978::t_2b3bc6296bcdf6 468-469
+net/crates/net/src/adapter/net/rtc/stats.rs
+  s_09db2b9c870978::t_989b02d9eb78a7 158,373-376
+  s_09db2b9c870978::t_668526c3b72606 377
+web/src/content/docs/reference/cli.md
+  s_09db2b9c870978::t_e803e7f5399529 261
+.github/workflows/ci.yml
+  s_09db2b9c870978::t_ce7ad309252068 3206
+net/crates/net/cli/src/commands/anchor.rs
+  s_09db2b9c870978::t_2c64e9ec9a22ec 335-339,607
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "53125390a162769f1441fa0d02ecac5ad9fb1842",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

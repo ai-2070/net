@@ -1,0 +1,26 @@
+net/crates/net/browser-ts/src/lobby.ts
+  s_09db2b9c870978::t_89ab414f88e670 332,503,532
+  s_09db2b9c870978::t_f50596d034a1af 128-131
+.claude/skills/net-browser/store.md
+  s_09db2b9c870978::t_89ab414f88e670 345,363
+net/crates/net/browser-ts/test/lobby.test.ts
+  s_09db2b9c870978::t_89ab414f88e670 6
+web/src/content/docs/sdk/browser/store.md
+  s_09db2b9c870978::t_89ab414f88e670 403
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "78c2e3850612343193df7b51694c7fe26428356d",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

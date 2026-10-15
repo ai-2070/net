@@ -1,0 +1,33 @@
+net/crates/net/examples/shard-topology/run.mjs
+  s_d71d2b607c2060::t_29a8163401a226 430-433
+net/crates/net/cli/src/commands/anchor.rs
+  s_d71d2b607c2060::t_422938447f4353 982,1003-1004,1007-1012,1525-1526
+  s_d71d2b607c2060::t_2535159950aa6e 1527
+.github/workflows/ci.yml
+  s_d71d2b607c2060::t_20433fa72eac6d 3203-3205
+net/crates/net/sdk/src/rtc_bootstrap.rs
+  s_d71d2b607c2060::t_422938447f4353 1048
+  s_d71d2b607c2060::t_8d45572046436f 74-75,80-101,325-326,328-331,399,417-423,876-877,912-915,917,920,923-925,929-937,972,985-987,1016,1018-1020,1029,1045-1047,1049-1058,1094,1984-1997
+net/crates/net/sdk/tests/rtc_bootstrap_listener.rs
+  s_d71d2b607c2060::t_23fdc4e50d5be9 368-369,387-389
+  s_d71d2b607c2060::t_63e874b771813b 122-131,143,306-367,370-386,390-427
+  s_d71d2b607c2060::t_31e9d578712921 121,428
+net/crates/net/cli/CHANGELOG.md
+  s_d71d2b607c2060::t_29a8163401a226 23-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c47c2e28d2f20653122eaa9f4672e6acbe108d52",
+  "prompts": {},
+  "sessions": {
+    "s_d71d2b607c2060": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1498db4-5e79-4e41-9b11-eae7bd37af17",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

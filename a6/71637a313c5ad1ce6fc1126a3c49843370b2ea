@@ -1,0 +1,24 @@
+web/src/content/docs/sdk/browser/netcode.md
+  s_09db2b9c870978::t_a669d80aecc3af 196-200
+.claude/skills/net-browser/netcode.md
+  s_09db2b9c870978::t_279e0a250a2584 329
+  s_09db2b9c870978::t_a669d80aecc3af 330-337,375-376
+docs/internal/misc/CODE_REVIEW_2026_10_13_SHARDED_MATCH.md
+  s_09db2b9c870978::t_b7eeef487999e0 346-363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a671637a313c5ad1ce6fc1126a3c49843370b2ea",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

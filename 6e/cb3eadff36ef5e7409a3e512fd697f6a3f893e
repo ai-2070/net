@@ -1,0 +1,89 @@
+web/src/content/docs/sdk/browser/world.md
+  s_09db2b9c870978::t_186ccb025f94fb 24-25,133-137
+net/crates/net/browser-ts/test/netcode/cross-host-hits.test.ts
+  s_09db2b9c870978::t_b1d302309830fd 42-44,57,70,110-125
+  s_09db2b9c870978::t_310397c0224cf6 126-128
+net/crates/net/browser-ts/demo/sharded-arena/README.md
+  s_09db2b9c870978::t_b1c2ca2062fc46 25-44
+.claude/skills/net-browser/world.md
+  s_09db2b9c870978::t_186ccb025f94fb 77-81
+  s_09db2b9c870978::t_347878415d5cb1 21-22
+net/crates/net/browser-ts/demo/sharded-arena/shard.d.ts
+  s_09db2b9c870978::t_43ec04af7e5962 69,71-77,87-92,128-133,135,147-148,152-157,161
+  s_09db2b9c870978::t_b1434665dce317 43
+net/crates/net/browser-ts/test/netcode/npc.test.ts
+  s_09db2b9c870978::t_e1688f4a5d5e8c 44-46,72,83,101-102
+net/crates/net/browser-ts/src/world/link.ts
+  s_09db2b9c870978::t_7b537604a67717 295,297-304,435-438
+net/crates/net/browser-ts/src/netcode/shards.ts
+  s_09db2b9c870978::t_0d1589862d9dec 38-42,141-146,156-159,201,212,227-238,312-313,320,323,327-342
+  s_09db2b9c870978::t_7f971057b30561 343
+docs/internal/plans/BROWSER_SHARDED_MATCH_PLAN.md
+  s_09db2b9c870978::t_cb8f6c12772ae1 175-182,184-185,1014-1015
+  s_09db2b9c870978::t_d819dd9472ed85 1314
+web/src/content/docs/sdk/browser/netcode.md
+  s_09db2b9c870978::t_5c599903475543 121,129-130,136-137,166-170,174-180,211-214,232-235
+net/crates/net/browser-ts/test/netcode/host-crash.test.ts
+  s_09db2b9c870978::t_87394b2186310a 253-257
+  s_09db2b9c870978::t_bce4e1fbcbd078 21-22,95,186
+  s_09db2b9c870978::t_dbcf464e643131 199-252,258-262
+.claude/skills/net-browser/netcode.md
+  s_09db2b9c870978::t_cb8f6c12772ae1 275,280-283,286-289,316-328
+  s_09db2b9c870978::t_6bffa163e0f99f 95-102,175-176,180-188,295-298,342-345,364-366
+net/crates/net/browser-ts/src/netcode/assignment.ts
+  s_09db2b9c870978::t_ef4bbeec5aa47b 104-107
+  s_09db2b9c870978::t_6b0da5cebb37a1 59-64,68-71,81-93,95-101,103,109,117-129,131-133,139-144,146-151,158-160,168-171,225-236,238-245,261,266-279,284,288-289,294
+  s_09db2b9c870978::t_70f7b183e507f9 290-292
+net/crates/net/browser-ts/test/netcode/npc-paths.test.ts
+  s_09db2b9c870978::t_8fb2c4748930b9 42,79-81,197-212
+  s_09db2b9c870978::t_08b1b8718634dc 393-397,416
+  s_09db2b9c870978::t_bce4e1fbcbd078 258-299,496
+  s_09db2b9c870978::t_a4b871fde06d5d 421,462-479
+  s_09db2b9c870978::t_787922e7eb3b6a 8,12,19,43-44,88,95-96,108-109,132-140,186,213-215,334-392,398-415,417-420,422-461,480-495
+  s_09db2b9c870978::t_1895bf83d0c013 257
+web/src/content/docs/sdk/browser/store.md
+  s_09db2b9c870978::t_bce4e1fbcbd078 215-217
+net/crates/net/browser-ts/test/netcode/planned-move.test.ts
+  s_09db2b9c870978::t_23793e40428645 8,32-40,67,145-159
+  s_09db2b9c870978::t_22a79347c3f908 160-162
+net/crates/net/browser-ts/test/netcode/assignment.test.ts
+  s_09db2b9c870978::t_daf87f2b8a6e69 113-116,118,120,122,124,129-142,146-147,149-163,305-306
+  s_09db2b9c870978::t_c6d0a232b4684f 85-103
+  s_09db2b9c870978::t_3c5de069164a5c 143-145,148
+net/crates/net/browser-ts/src/netcode/paths.ts
+  s_09db2b9c870978::t_d9051d0704ebc4 262
+  s_09db2b9c870978::t_bce4e1fbcbd078 328
+  s_09db2b9c870978::t_620237aeef6618 14-18,111,113-115,120,150-157,170-175,207-218,221-224,241-256,260-261,263-272,324-327,331
+  s_09db2b9c870978::t_ad4e34331ed4e4 239
+net/crates/net/browser-ts/test/netcode/shards.test.ts
+  s_09db2b9c870978::t_e4fea4da167872 215-216
+  s_09db2b9c870978::t_1186d8918d05cc 209-214,217-269
+  s_09db2b9c870978::t_7c28c73d862013 208
+.claude/skills/net-browser/store.md
+  s_09db2b9c870978::t_347878415d5cb1 344-347
+net/crates/net/browser-ts/demo/sharded-arena/shard.js
+  s_09db2b9c870978::t_955594d10f0f47 479
+  s_09db2b9c870978::t_c4e043518474d0 143
+  s_09db2b9c870978::t_4824a2f963f8b7 412-413,415
+  s_09db2b9c870978::t_334d84c0a66f13 42-44,49-62,75-77,91-93,95,97-99,104-106,120-121,123-124,132-135,138-142,144-151,250,284,316-318,326-336,344-347,354,384-388,391-411,414,416-428
+  s_09db2b9c870978::t_c3894e9037aeb0 136-137
+  s_09db2b9c870978::t_989b02d9eb78a7 438-439,446,457-463,466-471,474-475,477,481-488,494-495,498-500,502-503,505,508-509,512-519,524,529-534,542,544-554
+  s_09db2b9c870978::t_bce4e1fbcbd078 480
+  s_09db2b9c870978::t_7f0ba8c0cc3318 429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6ecb3eadff36ef5e7409a3e512fd697f6a3f893e",
+  "prompts": {},
+  "sessions": {
+    "s_09db2b9c870978": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4baf24ac-96d6-4084-b09f-b3c2beb6717c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
