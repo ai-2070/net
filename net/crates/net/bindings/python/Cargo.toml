@@ -294,7 +294,7 @@ tempfile = "3"
 async-trait = "0.1"
 
 [build-dependencies]
-pyo3-build-config = "0.29.0"
+pyo3-build-config = "0.30.0"
 
 # `[profile.release]` intentionally omitted — cargo ignores non-root
 # profiles ("profiles for the non root package will be ignored"). The
