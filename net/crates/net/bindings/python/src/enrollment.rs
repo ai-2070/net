@@ -68,7 +68,7 @@ pub fn fingerprint(entity: &[u8]) -> PyResult<String> {
 
 /// A pre-authorization to *ask* to join a mesh — not a key. Carries the mesh
 /// `root`, a `rendezvous` locator, a single-use nonce, and a short TTL.
-#[pyclass(name = "InviteToken", skip_from_py_object)]
+#[pyclass(name = "InviteToken")]
 #[derive(Clone)]
 pub struct PyInviteToken {
     pub(crate) inner: InviteToken,
@@ -142,7 +142,7 @@ impl PyInviteToken {
 }
 
 /// A device's request to join, signed by the device's own key.
-#[pyclass(name = "JoinRequest", skip_from_py_object)]
+#[pyclass(name = "JoinRequest")]
 #[derive(Clone)]
 pub struct PyJoinRequest {
     pub(crate) inner: JoinRequest,
@@ -206,7 +206,7 @@ impl PyJoinRequest {
 
 /// The operator's response to a join request — the payload the enrollment RPC
 /// returns to the device.
-#[pyclass(name = "JoinOutcome", skip_from_py_object)]
+#[pyclass(name = "JoinOutcome")]
 #[derive(Clone)]
 pub struct PyJoinOutcome {
     inner: JoinOutcome,
@@ -284,7 +284,7 @@ impl PyJoinOutcome {
 }
 
 /// One enrolled device in the operator's inventory.
-#[pyclass(name = "DeviceRecord", skip_from_py_object)]
+#[pyclass(name = "DeviceRecord")]
 #[derive(Clone)]
 pub struct PyDeviceRecord {
     inner: DeviceRecord,
@@ -337,7 +337,7 @@ impl PyDeviceRecord {
 /// The operator side: mint invites, approve join requests into `root → device`
 /// delegations, and manage the device inventory — composing the enrollment
 /// authority + device registry + revocation store for one mesh root.
-#[pyclass(name = "OperatorEnrollment", skip_from_py_object)]
+#[pyclass(name = "OperatorEnrollment")]
 pub struct PyOperatorEnrollment {
     inner: Arc<OperatorEnrollment>,
 }
@@ -476,7 +476,7 @@ impl PyOperatorEnrollment {
 /// A device's **persisted** enrollment — its own key + the `root → device`
 /// grant it received — so it survives restarts without re-pairing. The device
 /// seed stays in Rust (H8); [`Self::device`] hands back an opaque `Identity`.
-#[pyclass(name = "DeviceEnrollment", skip_from_py_object)]
+#[pyclass(name = "DeviceEnrollment")]
 #[derive(Clone)]
 pub struct PyDeviceEnrollment {
     inner: DeviceEnrollment,
@@ -757,7 +757,7 @@ async fn ask_py_approver(approver: Arc<Py<PyAny>>, request: JoinRequest) -> bool
 
 /// Keeps the served enrollment services alive. Dropping it (or calling
 /// [`Self::stop`]) unregisters them.
-#[pyclass(name = "EnrollmentServeHandle", skip_from_py_object)]
+#[pyclass(name = "EnrollmentServeHandle")]
 pub struct PyEnrollmentServeHandle {
     // The `Mesh` holds the channel registry the services registered against and
     // each `ServeHandle` holds one dispatcher registration (enroll + renew) —
