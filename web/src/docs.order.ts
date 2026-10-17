@@ -174,6 +174,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.44.1_ACE_OF_SPADES",
       "RELEASE_v0.44_ACE_OF_SPADES",
       "RELEASE_v0.43_IRON_MAN",
       "RELEASE_v0.42_BACK_IN_BLACK",
