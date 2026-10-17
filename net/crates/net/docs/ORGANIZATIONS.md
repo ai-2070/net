@@ -181,9 +181,17 @@ when the set changed or five minutes have passed since it last went to that
 provider). The header is inside the signed request digest, and the provider
 strips it before the handler runs.
 
-The provider verifies each relayed bundle and merges it **before** admitting
-the call, so a revocation relayed by one A member applies to the very next
-admission. It takes material only from orgs it has a reason to: its own, any
+The provider verifies each relayed bundle and merges it in the background,
+off the service's request path, so one caller relaying many bundles does not
+hold up every other caller of the service. A revocation relayed by one A
+member therefore applies to admissions shortly after the call that carried it,
+not necessarily to that call. The exception is material the call's own
+admission needs: when the provider requires fresh material from the caller's
+org (below) and what it holds is stale, up to two of the relayed bundles from
+that org are applied before the call is admitted. A bundle already handled is
+skipped; one refused for a reason that can change (the provider had not yet
+granted to that org, a cap was full) is tried again when it is next relayed.
+It takes material only from orgs it has a reason to: its own, any
 org it has granted a capability to, and any org named in its freshness policy.
 A foreign org is capped at 4,096 floors and 4,096 grant revocations, and grant
 expiries are clamped to the grant TTL ceiling, so a grantee cannot grow the
