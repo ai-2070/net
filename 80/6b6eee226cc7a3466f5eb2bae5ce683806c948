@@ -1,0 +1,27 @@
+docs/data/tiers.yaml
+  s_d8b00bedd146e9::t_561321b2af9474 24,94
+net/crates/net/docs/releases/RELEASE_v0.44.1_ACE_OF_SPADES.md
+  s_d8b00bedd146e9::t_6e0b61e18195f1 1-72
+web/scripts/sync-releases.mjs
+  s_d8b00bedd146e9::t_ea42492ec57ac0 120
+web/src/content/docs/releases/RELEASE_v0.44.1_ACE_OF_SPADES.md
+  s_d8b00bedd146e9::t_7671fc7958b5fb 1-76
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_0bb1378920c3ad 177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "806b6eee226cc7a3466f5eb2bae5ce683806c948",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
