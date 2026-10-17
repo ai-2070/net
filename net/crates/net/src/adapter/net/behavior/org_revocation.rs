@@ -897,7 +897,10 @@ impl StoreCore {
         if grants_regressed > 0 {
             tracing::error!(
                 entries = grants_regressed,
-                "org revocation: the persisted state is BEHIND the enforced view                  for {grants_regressed} grant revocation(s); the live view is                  preserved, but a restart would re-admit those grants. Restore                  the state file or re-apply the bundles that revoked them.",
+                "org revocation: the persisted state is BEHIND the enforced view \
+                 for {grants_regressed} grant revocation(s); the live view is \
+                 preserved, but a restart would re-admit those grants. Restore \
+                 the state file or re-apply the bundles that revoked them.",
             );
         }
         let newly_revoked: Vec<RevokedGrantKey> = next
