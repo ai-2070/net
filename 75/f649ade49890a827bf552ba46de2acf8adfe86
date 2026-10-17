@@ -1,0 +1,96 @@
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_68458b432a1e7f::t_044319c91784b0 76,80,151-157,162-163,183-188,193,196,198,202,760-763,1529,2286-2291,2316-2330,2334-2375,2570-2597
+  s_68458b432a1e7f::t_7260c3d02e531b 158-161,2331-2333
+  s_68458b432a1e7f::t_7651f67571b444 2598
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_68458b432a1e7f::t_bd49e98a3c7cc6 1518-1540,1543-1550,3398,3654-3656
+  s_68458b432a1e7f::t_7260c3d02e531b 1541-1542
+  s_68458b432a1e7f::t_8c1da9a0885bd3 2351-2353,2382,2384-2391
+docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md
+  s_68458b432a1e7f::t_eecb8b23ce43ff 123-131
+net/crates/net/src/adapter/net/behavior/org_call.rs
+  s_68458b432a1e7f::t_52a349fbaf086a 132-140
+net/crates/net/cli/src/commands/org.rs
+  s_68458b432a1e7f::t_1772c189094a57 113-119,198-222,674,721,753-759,826-951
+  s_68458b432a1e7f::t_9a389718594c68 952
+net/crates/net/docs/ORGANIZATIONS.md
+  s_68458b432a1e7f::t_27f31bcd2a3a03 161-220
+web/src/content/docs/reference/cli.md
+  s_68458b432a1e7f::t_fae8513661ddb7 112-118
+  s_68458b432a1e7f::t_ef963a2bb6521a 521-528
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_68458b432a1e7f::t_044319c91784b0 68
+net/crates/net/sdk/src/org/floors.rs
+  s_68458b432a1e7f::t_7260c3d02e531b 30,436
+  s_68458b432a1e7f::t_51e21d7705c409 323-339,354-372,413-424,427-434,437-449,492-499
+  s_68458b432a1e7f::t_accf0d01691bdd 322
+net/crates/net/sdk/src/org/types.rs
+  s_68458b432a1e7f::t_dab0b4109d1544 64-70
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_68458b432a1e7f::t_6a6fb13372c139 1427
+  s_68458b432a1e7f::t_7260c3d02e531b 1170,1497,8856-8864,8934-8973
+  s_68458b432a1e7f::t_c96c4df6e7d224 1156-1169,1171-1203,1428-1440,1442,1488-1496,1498-1500,1675-1678,1995,8851-8855,8974-8976
+net/crates/net/sdk/src/org/provision.rs
+  s_68458b432a1e7f::t_7260c3d02e531b 162-164
+  s_68458b432a1e7f::t_634ca2c1442d91 136-161,165-171
+.claude/skills/net-event-bus/cli.md
+  s_68458b432a1e7f::t_023dfe7d569328 191,327
+net/crates/net/bindings/node/src/org.rs
+  s_68458b432a1e7f::t_9efc30b43aee5d 427-458,462-464
+  s_68458b432a1e7f::t_7260c3d02e531b 459-461
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_68458b432a1e7f::t_9efc30b43aee5d 5666-5678
+net/crates/net/cli/tests/org_grant.rs
+  s_68458b432a1e7f::t_ffdd8bc72b7274 865-888,890-902
+  s_68458b432a1e7f::t_7260c3d02e531b 889
+net/crates/net/bindings/python/src/org_serve.rs
+  s_68458b432a1e7f::t_9efc30b43aee5d 268-301,305-306
+  s_68458b432a1e7f::t_7260c3d02e531b 302-304
+.claude/skills/net-event-bus/org.md
+  s_68458b432a1e7f::t_023dfe7d569328 139-145
+net/crates/net/sdk/src/org/grant_revocation.rs
+  s_68458b432a1e7f::t_51e21d7705c409 334-345,360-379
+  s_68458b432a1e7f::t_7260c3d02e531b 359
+  s_68458b432a1e7f::t_988fee05fab7af 333
+net/crates/net/bindings/python/src/lib.rs
+  s_68458b432a1e7f::t_9efc30b43aee5d 4352-4359
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_68458b432a1e7f::t_52a349fbaf086a 2034,6794,7975,8846
+net/crates/net/sdk/src/org/tests_live.rs
+  s_68458b432a1e7f::t_737c801673be1b 1326-1327,1338-1438,1462-1482,1487-1511
+  s_68458b432a1e7f::t_7260c3d02e531b 1328-1337,1483-1486
+  s_68458b432a1e7f::t_31cff45a415a4f 1439-1461
+net/crates/net/src/adapter/net/behavior/org_revocation_relay.rs
+  s_68458b432a1e7f::t_7260c3d02e531b 547-548,639-642
+  s_68458b432a1e7f::t_46b2ab8a89b07b 307
+  s_68458b432a1e7f::t_e6caaaec9828ca 340-353
+  s_68458b432a1e7f::t_5e77cf8e562460 1-284,286-288,295,297-306,308-339,354-415,604-638,645-731
+  s_68458b432a1e7f::t_07ce6a56c9dd28 285,429-431,443
+  s_68458b432a1e7f::t_873cdf45c12774 643-644
+  s_68458b432a1e7f::t_2c70a0bbce080e 416-428,432-442,444-546,549-603
+  s_68458b432a1e7f::t_c738ee8ec95bbc 289-294,296
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  s_68458b432a1e7f::t_6a6fb13372c139 197-202,349,423-427,430-432,434-439,475,704-713,1096,1144,1162
+net/crates/net/bindings/node/org.ts
+  s_68458b432a1e7f::t_9efc30b43aee5d 47-48,69-76
+net/crates/net/bindings/python/python/net/__init__.py
+  s_68458b432a1e7f::t_9efc30b43aee5d 985,988,1009,1012
+net/crates/net/src/adapter/net/mesh.rs
+  s_68458b432a1e7f::t_4ad0aba0c85132 13834-13837,15276,22236-22353
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "75f649ade49890a827bf552ba46de2acf8adfe86",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
