@@ -1,0 +1,207 @@
+net/crates/net/sdk/tests/enrollment_join.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 120,175
+net/crates/net/sdk/tests/mesh_rpc_retry.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 50-51
+net/crates/net/cli/tests/node_lifecycle.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 295
+net/crates/net/sdk/tests/stream_inbound.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 51-52
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 67-68,481-483
+net/crates/net/sdk/tests/rpc_observer.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 69-70
+net/crates/net/bindings/python/src/capability_gateway.rs
+  s_68458b432a1e7f::t_ddeeb0602ae081 1837-1838
+net/crates/net/sdk/src/org/tests_live.rs
+  s_68458b432a1e7f::t_ddeeb0602ae081 70,72,135-136
+net/crates/net/sdk/benches/nrpc_churn.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 88-89
+net/crates/net/src/ffi/mesh.rs
+  s_68458b432a1e7f::t_0239336b29b0d2 104-106,1074-1081
+  s_68458b432a1e7f::t_02ed56e32b0ec3 4882-4904
+net/crates/net/payments/tests/payment_channel_deadline.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 88-89
+net/crates/net/cli/src/context.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 336-337
+net/crates/net/deck/src/runtime.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 116-117
+net/crates/net/sdk/src/error.rs
+  s_68458b432a1e7f::t_e2c4f02019bce6 154-159
+  s_68458b432a1e7f::t_6f26294c352971 96-102
+  s_68458b432a1e7f::t_13d5f7ae267253 153
+net/crates/net/sdk/tests/mesh_recv_shards.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 45-46
+net/crates/net/sdk/tests/mesh_rpc_bidi_typed.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 56-57
+net/crates/net/cli/src/commands/enrollment.rs
+  s_68458b432a1e7f::t_ddeeb0602ae081 1868
+net/crates/net/sdk/tests/mesh_rpc_streaming_typed.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 45-46
+net/crates/net/sdk/tests/aggregator_registry_client_round_trip.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 54-55
+net/crates/net/sdk/tests/mesh_rpc_where.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 71-72
+net/crates/net/sdk/src/mesh.rs
+  s_68458b432a1e7f::t_4a75396034062c 863-872,876-877
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 175-176
+go/mesh.go
+  s_68458b432a1e7f::t_1646a3cfd0eb75 75-80,126-127,159-162,696-699
+net/crates/net/cli/tests/automation_contract.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 217,323
+net/crates/net/sdk/src/testing/cluster.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 355-356
+net/crates/net/sdk-ts/src/mesh.ts
+  s_68458b432a1e7f::t_cdccc1d23ce4af 640-646
+net/crates/net/sdk/tests/a2a_call_bounds.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 78,80
+net/crates/net/sdk/tests/mesh_rpc_metrics.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 42-43
+net/crates/net/sdk/tests/sensing_consumer.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 320,322
+net/crates/net/cli/tests/typegen_live_metadata.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 132,259,337,389,433
+net/crates/net/deck/src/app.rs
+  s_68458b432a1e7f::t_ddeeb0602ae081 4159
+net/crates/net/cli/tests/transfer_cli_dir.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 88
+net/crates/net/sdk/tests/review_a2a_wire.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 63-64
+net/crates/net/sdk/tests/a2a_admission_identity.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 382-383,1612-1613
+net/crates/net/sdk/tests/tool_macro.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 102-103
+net/crates/net/sdk/tests/compute_channel_rebind.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 137-138,211-213,307-309,463-464
+net/crates/net/sdk/tests/enrollment_org.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 556-557,678,826
+net/crates/net/cli/src/commands/joined.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 121-122
+net/crates/net/cli/tests/rpc_deadline.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 55
+net/crates/net/cli/tests/transfer_cli_admin.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 50
+net/crates/net/bindings/python/src/lib.rs
+  s_68458b432a1e7f::t_4fbb043c26fdae 1896-1901,3823-3827
+net/crates/net/src/adapter/net/mod.rs
+  s_68458b432a1e7f::t_b09a4116ea2f64 241-242
+net/crates/net/sdk/src/mesh_enroll.rs
+  s_68458b432a1e7f::t_ddeeb0602ae081 332,363,398,425,452,486
+net/crates/net/adapters/mcp/tests/wrap_end_to_end.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 62-63
+go/start_refused_test.go
+  s_68458b432a1e7f::t_091d5ad28f2cb4 1-36
+net/crates/net/payments/tests/mesh_payments_e2e.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 47-48
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_68458b432a1e7f::t_ce5e3d167bfb84 958-963
+net/crates/net/cli/tests/remote_inspection.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 445
+go/net.h
+  s_68458b432a1e7f::t_0239336b29b0d2 103-107,372-374
+net/crates/net/sdk/examples/tool_calling.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 139-140
+net/crates/net/sdk/tests/org_streaming.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 198-199,224
+net/crates/net/cli/src/commands/wrap.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 274-275
+net/crates/net/bindings/node/src/lib.rs
+  s_68458b432a1e7f::t_4fbb043c26fdae 2031-2035
+net/crates/net/sdk/tests/review_repair_provider.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 382-383,1549-1550
+net/crates/net/cli/tests/wrap_startup.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 52
+net/crates/net/sdk/tests/mesh_rpc_breaker.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 59-60
+net/crates/net/sdk/tests/a2a_task_ownership.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 51,53
+net/crates/net/payments/tests/mesh_paid_capability_e2e.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 91-92
+net/crates/net/sdk/tests/mesh_rpc_hedge.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 43-44
+net/crates/net/sdk/tests/enrollment_over_rtc.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 70-71,162-163
+net/crates/net/sdk/examples/nrpc_echo.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 90-91
+net/crates/net/sdk/tests/org_exact_sensing.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 223,225
+net/crates/net/cli/tests/native_contract_workflow.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 131,207
+net/crates/net/sdk/tests/tool_serve_paid.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 131-132
+net/crates/net/sdk/src/mesh_a2a.rs
+  s_68458b432a1e7f::t_ddeeb0602ae081 3033
+net/crates/net/sdk/tests/nrpc_tool_watch.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 81-82
+net/crates/net/cli/tests/protected_native_workflow.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 145-146
+net/crates/net/sdk/tests/channel_delegated.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 70-71,239
+net/crates/net/sdk/tests/mesh_port_mapping.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 67
+net/crates/net/sdk/tests/mesh_rpc_typed.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 46-47
+net/crates/net/cli/tests/enrollment_lifecycle.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 218
+net/crates/net/sdk/tests/review_a2a_provider.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 405,407
+net/crates/net/include/net.go.h
+  s_68458b432a1e7f::t_0239336b29b0d2 103-107,376-378
+net/crates/net/sdk/tests/mesh_channels.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 43-44
+net/crates/net/adapters/mcp/tests/publish_tools_end_to_end.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 152-153
+net/crates/net/sdk/tests/mesh_nat_traversal.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 91-92,107,138-140,255-258
+net/crates/net/payments/tests/a2a_paid_end_to_end.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 618-619
+net/crates/net/sdk/tests/tool_serve_round_trip.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 76-77
+net/crates/net/cli/tests/transfer_cli_blob.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 49,180,504
+net/crates/net/cli/src/commands/anchor.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 1508-1509
+net/crates/net/sdk/tests/review_round3_provider.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 382-383,1612-1613
+net/crates/net/sdk/tests/compute_migration.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 165-166,238,317-318,380-381,439-440,516-517,587-588,643-644,711-712,773-774,843-844,931-932,1055-1056,1132,1229-1230,1308-1309,1377-1378,1536,1586,1653
+net/crates/net/payments/tests/mcp_wrap_paid_e2e.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 127-128
+net/crates/net/src/adapter/net/mesh.rs
+  s_68458b432a1e7f::t_897cfaac28382a 9537-9574
+  s_68458b432a1e7f::t_f38da552f15fc8 25831
+  s_68458b432a1e7f::t_ebe931789c0c6b 66048-66050
+  s_68458b432a1e7f::t_94efb2d6f9d408 25626-25632,25634-25644,25656,25662,25665-25668,25675-25678,25681,66072
+  s_68458b432a1e7f::t_46c33e46254ae3 25700
+  s_68458b432a1e7f::t_be3722637b49fa 25731-25732
+  s_68458b432a1e7f::t_3f857bf89cbe0b 66022,66024,66028-66030
+  s_68458b432a1e7f::t_a1e65383da46f1 66069-66071
+  s_68458b432a1e7f::t_54e7edb27a5640 66073-66075
+  s_68458b432a1e7f::t_b2d68707467930 66060,66062,66067-66068,66076-66095
+net/crates/net/sdk/tests/a2a_paid_admission.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 405,407
+net/crates/net/payments/benches/mesh_paid_invoke.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 94-95
+net/crates/net/sdk/tests/mesh_stream_backpressure.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 58-59,131-132
+net/crates/net/sdk/tests/sensing_provider.rs
+  s_68458b432a1e7f::t_74f4bb214f65eb 236
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_68458b432a1e7f::t_29ace1c9a49774 3517-3518
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "22905e4c2b99d2730c90d42fa16989b6becbcc22",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
