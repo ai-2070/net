@@ -1,0 +1,26 @@
+net/crates/net/sdk/src/org/grant_revocation.rs
+  s_68458b432a1e7f::t_b0f74e1e4f5c51 371,379-381
+  s_68458b432a1e7f::t_176a3657500276 401-405
+net/crates/net/tests/org_ownership.rs
+  s_68458b432a1e7f::t_03cf24f5f0841b 2138-2139
+  s_68458b432a1e7f::t_fcad140956bff7 2231-2233
+  s_68458b432a1e7f::t_5f1882c10fbeab 2128-2134,2137
+net/crates/net/sdk/src/org/floors.rs
+  s_68458b432a1e7f::t_b0f74e1e4f5c51 329-332,360-377,451-456
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "65433a365f0fea07bfba603a6369cf56211cbb42",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
