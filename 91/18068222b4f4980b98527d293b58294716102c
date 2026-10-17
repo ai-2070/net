@@ -1,0 +1,25 @@
+net/crates/net/cli/tests/cross_org_protected_workflow.rs
+  s_68458b432a1e7f::t_2c01a58c21d946 1-136,138-204,209-355,361-369
+  s_68458b432a1e7f::t_7260c3d02e531b 137,205-208,356-360
+.github/workflows/ci.yml
+  s_68458b432a1e7f::t_973f048db9d22c 6484-6486
+  s_68458b432a1e7f::t_f0d8c612206220 6178-6179
+docs/internal/plans/NET_CLI_PLAN_V2.md
+  s_68458b432a1e7f::t_a6626f3f2b7333 508
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9118068222b4f4980b98527d293b58294716102c",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
