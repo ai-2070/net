@@ -142,7 +142,7 @@ Bump to 0.45.0 and rebuild.
 
 ---
 
-Released 2026-10-18.
+Released 2026-10-17.
 
 ## License
 
