@@ -1,0 +1,25 @@
+net/crates/net/tests/rtc_repairs.rs
+  s_d8b00bedd146e9::t_46f18e391e3ada 3326-3387
+  s_d8b00bedd146e9::t_28b0039b23e02d 3388-3469
+net/crates/net/src/adapter/net/mesh.rs
+  s_d8b00bedd146e9::t_551ace7e5e965b 25279-25295
+  s_d8b00bedd146e9::t_5c81d59240db76 33995-33997,34008
+  s_d8b00bedd146e9::t_6aad92d97bbabc 33211-33214
+  s_d8b00bedd146e9::t_48995da222fe43 34080,34084-34086,34089,34094-34116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5df790368903f603615211fcf35349d0a33b148a",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
