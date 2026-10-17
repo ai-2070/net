@@ -229,6 +229,12 @@ pub enum OrgError {
     /// non-canonical bundle is rejected before its signature is
     /// examined.
     NonCanonicalFloors,
+    /// A grant-revocation bundle carries more than
+    /// `MAX_GRANT_REVOCATIONS_PER_BUNDLE` entries.
+    TooManyGrantRevocations,
+    /// Grant-revocation entries are not strictly ascending by
+    /// `(kind, grant_id)`.
+    NonCanonicalGrantRevocations,
     /// A capability grant carries the all-zero `grant_id`. Zero is
     /// RESERVED — the owner-audience envelope sentinel — so issuance
     /// and decode both reject it.
@@ -280,6 +286,14 @@ impl core::fmt::Display for OrgError {
             Self::NonCanonicalFloors => {
                 write!(f, "revocation bundle floors are not in canonical order")
             }
+            Self::TooManyGrantRevocations => write!(
+                f,
+                "grant revocation bundle exceeds MAX_GRANT_REVOCATIONS_PER_BUNDLE"
+            ),
+            Self::NonCanonicalGrantRevocations => write!(
+                f,
+                "grant revocation entries are not in canonical (kind, grant_id) order"
+            ),
             Self::ReservedGrantId => {
                 write!(f, "grant_id zero is reserved (owner-audience sentinel)")
             }

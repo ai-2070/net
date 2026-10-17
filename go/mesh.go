@@ -72,6 +72,12 @@ var (
 	// attribution out-params), the bare sentinel is returned.
 	ErrEventTooLarge = errors.New("stream event too large")
 
+	// ErrStartRefused: Start started nothing (NET_ERR_MESH_START_REFUSED,
+	// -129) because an Accept was still mid-handshake. The node stays
+	// stopped: it would send but never receive. Retry Start once the
+	// Accept returns.
+	ErrStartRefused = errors.New("mesh start refused: an accept is in flight")
+
 	// NAT traversal errors. One sentinel per `TraversalError`
 	// variant so callers can `errors.Is(err, net.ErrTraversalPunchFailed)`.
 	// Framing (plan §5): every one of these represents a missed
@@ -117,6 +123,8 @@ func meshErrorFromCode(code C.int) error {
 		return ErrSessionSuperseded
 	case netErrMeshEventTooLarge:
 		return ErrEventTooLarge
+	case netErrMeshStartRefused:
+		return ErrStartRefused
 	case -130:
 		return ErrTraversalReflexTimeout
 	case -131:
@@ -147,6 +155,10 @@ func meshErrorFromCode(code C.int) error {
 // the gap this const closes went unnoticed.
 // `TestEventTooLargeHeaderParity` pins its value.
 const netErrMeshEventTooLarge = C.NET_ERR_MESH_EVENT_TOO_LARGE
+
+// netErrMeshStartRefused is NET_ERR_MESH_START_REFUSED, bound to the
+// header for the same reason as netErrMeshEventTooLarge.
+const netErrMeshStartRefused = C.NET_ERR_MESH_START_REFUSED
 
 // MaxEventSize reports the largest single event ONE Net packet can
 // carry, in bytes — `MAX_PAYLOAD_SIZE` minus the event frame's
@@ -681,7 +693,10 @@ func (m *MeshNode) Accept(peerNodeID uint64) (string, error) {
 	return copyCString(unsafe.Pointer(out), uint64(outLen))
 }
 
-// Start the receive loop, heartbeats, and router.
+// Start the receive loop, heartbeats, and router. Idempotent: nil when
+// the node is running afterwards. ErrStartRefused when nothing was
+// started because an Accept is still mid-handshake; retry once it
+// returns.
 func (m *MeshNode) Start() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

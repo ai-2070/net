@@ -142,8 +142,8 @@ async fn two_node_protected_native_denial_then_authorized_typed_call() {
         .org(OrgCredentials::new(caller_cert.unwrap(), dispatcher, vec![], vec![]).unwrap())
         .unwrap();
 
-    provider.start();
-    caller.start();
+    provider.start().expect("mesh start");
+    caller.start().expect("mesh start");
     tokio::time::timeout(
         Duration::from_secs(10),
         caller.connect_via(

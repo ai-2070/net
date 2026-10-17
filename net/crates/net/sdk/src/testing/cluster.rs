@@ -352,7 +352,8 @@ impl ClusterHarness {
         //     the receive loop is needed for post-handshake
         //     message traffic + the future daemon RPC paths.
         for m in &meshes {
-            m.start();
+            m.start()
+                .map_err(|e| ClusterError::MeshBuild(format!("start() on a cluster node: {e}")))?;
         }
 
         // (4a) Each node announces a baseline (empty) capability

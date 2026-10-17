@@ -292,7 +292,7 @@ fn attach(ready: &Value, psk: [u8; 32]) -> Result<(), String> {
             .build()
             .await
             .map_err(|e| e.to_string())?;
-        mesh.start();
+        mesh.start().expect("mesh start");
         let key: [u8; 32] = hex::decode(ready["public_key"].as_str().unwrap())
             .unwrap()
             .try_into()

@@ -85,8 +85,8 @@ async fn connect(provider: &Mesh, caller: &Mesh) {
     });
     accepted.expect("accept");
     connected.expect("connect");
-    caller.start();
-    provider.start();
+    caller.start().expect("mesh start");
+    provider.start().expect("mesh start");
 }
 
 /// A `pay` whose reply never comes returns a **retryable** channel error

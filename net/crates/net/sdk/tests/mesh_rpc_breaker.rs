@@ -56,8 +56,8 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: std::net::SocketAddr) {
     });
     r1.expect("accept");
     r2.expect("connect");
-    a.start();
-    b.start();
+    a.start().expect("mesh start");
+    b.start().expect("mesh start");
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

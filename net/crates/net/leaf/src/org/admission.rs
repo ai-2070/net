@@ -142,6 +142,11 @@ pub enum AdmissionDenied {
     /// The capability grant failed its
     /// signature/structural/window validation.
     CapabilityGrantInvalid,
+    /// The capability grant is valid but its issuer revoked it early.
+    CapabilityGrantRevoked,
+    /// The dispatcher grant is valid but its issuing org revoked it
+    /// early.
+    DispatcherGrantRevoked,
     /// The proof is expired, or claims an expiry beyond
     /// `now + MAX_ORG_PROOF_TTL_SECS` — both surface here (the TTL
     /// ceiling refusing a standing credential is a merits denial).
@@ -268,6 +273,8 @@ impl AdmissionDenied {
             | D::MembershipInvalid
             | D::MembershipRevoked
             | D::CapabilityGrantInvalid
+            | D::CapabilityGrantRevoked
+            | D::DispatcherGrantRevoked
             | D::ProofExpired
             | D::BindingInvalid
             | D::Replay
@@ -576,6 +583,24 @@ pub fn verify_org_admission(
         grant
             .is_valid_at_with_skew(now_secs, ctx.skew_secs)
             .map_err(|_| AdmissionDenied::CapabilityGrantInvalid)?;
+    }
+    // Grant revocation (mirrors core): each grant is looked up under its
+    // own issuer, so only that org's bundles can revoke it.
+    if ctx.floors.is_grant_revoked(
+        &dispatcher.org_id,
+        crate::org::grant_revocation::RevokedGrantKind::Dispatcher,
+        &crate::org::grant_revocation::dispatcher_revocation_id(dispatcher),
+    ) {
+        return Err(AdmissionDenied::DispatcherGrantRevoked);
+    }
+    if let Some(grant) = &cap_grant {
+        if ctx.floors.is_grant_revoked(
+            &grant.issuer_org,
+            crate::org::grant_revocation::RevokedGrantKind::Capability,
+            &grant.grant_id,
+        ) {
+            return Err(AdmissionDenied::CapabilityGrantRevoked);
+        }
     }
     match &proof {
         DecodedProof::Unary(p) => p.check_expiry_at(now_unix_ns, ctx.skew_secs),

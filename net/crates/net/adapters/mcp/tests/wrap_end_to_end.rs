@@ -59,8 +59,8 @@ async fn handshake(a: &Mesh, b: &Mesh) {
     });
     r1.expect("accept");
     r2.expect("connect");
-    a.start();
-    b.start();
+    a.start().expect("mesh start");
+    b.start().expect("mesh start");
 }
 
 /// Poll `cond` until true or `timeout` elapses.

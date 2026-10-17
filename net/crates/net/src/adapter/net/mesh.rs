@@ -9534,6 +9534,44 @@ impl std::error::Error for SensingLeaseReleaseRefused {
     }
 }
 
+/// Why [`MeshNode::try_start`] started nothing.
+///
+/// Every variant is retryable: the node is left stopped, exactly as
+/// before the call, and a later `try_start` proceeds normally once the
+/// condition clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartRefused {
+    /// An `accept()` was mid-handshake. Starting the receive loop now
+    /// would race the responder for the peer's first handshake message,
+    /// so the start was rolled back. Retry after the `accept()` returns.
+    AcceptInFlight,
+}
+
+impl std::fmt::Display for StartRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AcceptInFlight => f.write_str(
+                "start refused: an accept() is in flight; nothing was started \
+                 (retry once accept() returns)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartRefused {}
+
+/// What one `start_inner` call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTransition {
+    /// This call moved the node from stopped to started.
+    Started,
+    /// The node was already running.
+    AlreadyStarted,
+    /// Rolled back: an `accept()` is in flight.
+    RefusedAcceptInFlight,
+}
+
 /// Everything Phase 1 decided that Phase 2 must still put on the wire.
 ///
 /// Phase 1 mutates local state under the sensing guards and produces this;
@@ -13793,6 +13831,10 @@ pub struct MeshNode {
     /// exit, and `start()` refuses while any `accept()` is in
     /// flight.
     accept_in_flight: std::sync::atomic::AtomicUsize,
+    /// Cross-org revocation relay: the freshness policy this node enforces
+    /// as a provider, relayed-bundle de-duplication, and when it last
+    /// relayed its own org's material to each provider.
+    org_relay: super::behavior::org_revocation_relay::NodeRelayState,
 }
 
 /// Verify an announcement's owner cert against `floors`, apply the
@@ -15231,6 +15273,7 @@ impl MeshNode {
             started: AtomicBool::new(false),
             self_weak: Arc::new(std::sync::OnceLock::new()),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            org_relay: Default::default(),
         };
 
         // OA-1 (review-8 §2): install the authority loaded above as
@@ -22190,6 +22233,137 @@ impl MeshNode {
         removed
     }
 
+    /// Require recent revocation material from `org` before admitting its
+    /// callers (`Some(max_age)`), or stop requiring it (`None`).
+    ///
+    /// A provider checks a caller against the acting org's membership floors
+    /// and dispatcher-grant revocations, but only those that have reached it.
+    /// With a requirement set, a caller from `org` is refused
+    /// ([`AdmissionDenied::RevocationsStale`]) unless this node holds signed
+    /// revocation material from `org` issued within `max_age`. That material
+    /// arrives relayed by `org`'s own callers or pushed by its operator; an
+    /// org with nothing new to revoke proves itself current by issuing an
+    /// empty bundle (`net-mesh org heartbeat`). Naming an org here also makes
+    /// this node accept that org's material from the network.
+    ///
+    /// [`AdmissionDenied::RevocationsStale`]:
+    ///     super::behavior::org_admission::AdmissionDenied::RevocationsStale
+    pub fn require_fresh_org_revocations(
+        &self,
+        org: super::behavior::org::OrgId,
+        max_age: Option<std::time::Duration>,
+    ) {
+        self.org_relay
+            .set_freshness(org, max_age.map(|d| d.as_secs().max(1)));
+    }
+
+    /// The freshness requirements set with
+    /// [`Self::require_fresh_org_revocations`].
+    pub fn org_revocation_freshness(
+        &self,
+    ) -> std::collections::BTreeMap<super::behavior::org::OrgId, std::time::Duration> {
+        self.org_relay
+            .freshness()
+            .into_iter()
+            .map(|(org, secs)| (org, std::time::Duration::from_secs(secs)))
+            .collect()
+    }
+
+    /// The relay bookkeeping (crate-internal).
+    pub(crate) fn org_relay(&self) -> &super::behavior::org_revocation_relay::NodeRelayState {
+        &self.org_relay
+    }
+
+    /// Whether this node takes revocation material signed by `org` from the
+    /// network: its own org, an org it has granted a capability to (a
+    /// grantee of an installed provider grant), or an org named in its
+    /// freshness policy. Anything else is refused, so a stranger cannot grow
+    /// this node's persisted state under a throwaway org.
+    pub fn accepts_org_revocations_from(&self, org: &super::behavior::org::OrgId) -> bool {
+        if self
+            .node_authority()
+            .is_some_and(|authority| authority.owner_org() == *org)
+        {
+            return true;
+        }
+        if self.org_relay.has_freshness_policy(org) {
+            return true;
+        }
+        self.provider_grant_audiences
+            .load()
+            .records()
+            .any(|record| record.grant().grantee_org == *org)
+    }
+
+    /// Verify and apply one signed revocation bundle that arrived from the
+    /// network (relayed on a call, or pushed by an operator), if this node
+    /// takes material from its org ([`Self::accepts_org_revocations_from`]).
+    /// A foreign org is capped at
+    /// [`MAX_FOREIGN_ORG_ENTRIES`](super::behavior::org_revocation_relay::MAX_FOREIGN_ORG_ENTRIES)
+    /// entries. Blocking: the apply persists before it publishes.
+    pub fn apply_org_revocation_material(
+        &self,
+        material: &super::behavior::org_revocation_relay::RevocationMaterial,
+    ) -> Result<
+        super::behavior::org_revocation_relay::VerifiedMaterial,
+        super::behavior::org_revocation_relay::MaterialRefusal,
+    > {
+        use super::behavior::org::OrgError;
+        use super::behavior::org_revocation_relay::{MaterialRefusal, MAX_FOREIGN_ORG_ENTRIES};
+        // The cheap refusals come before the signature check: a stranger's
+        // bundle costs a decode, not an ed25519 verify.
+        let claimed = material
+            .claimed_org()
+            .ok_or(MaterialRefusal::Invalid(OrgError::InvalidFormat))?;
+        let authority = self.node_authority().ok_or(MaterialRefusal::NoAuthority)?;
+        let store = self
+            .org_revocation_store()
+            .ok_or(MaterialRefusal::NoAuthority)?;
+        if !self.accepts_org_revocations_from(&claimed) {
+            return Err(MaterialRefusal::NotAccepted(claimed));
+        }
+        let verified = material.verify().map_err(MaterialRefusal::Invalid)?;
+        let org = verified.org_id();
+        // A foreign org is capped. The store counts under its apply lock,
+        // and only entries the bundle would add, so re-issuing a cumulative
+        // bundle that raises existing floors is never refused for size.
+        let cap = (org != authority.owner_org()).then_some(MAX_FOREIGN_ORG_ENTRIES);
+        match store.apply_verified_material(&verified, cap) {
+            Ok(true) => Ok(verified),
+            Ok(false) => Err(MaterialRefusal::OverCap(org)),
+            Err(e) => Err(MaterialRefusal::Store(e.to_string())),
+        }
+    }
+
+    /// Whether this node holds revocation material from `org` recent enough
+    /// for its freshness policy, at `now_secs`. `true` when the policy does
+    /// not name `org`.
+    pub(crate) fn org_revocations_fresh(
+        &self,
+        org: &super::behavior::org::OrgId,
+        now_secs: u64,
+    ) -> bool {
+        match self.org_relay.freshness_for(org) {
+            None => true,
+            Some(max_age) => self
+                .org_revocation_store()
+                .and_then(|store| store.latest_issued_at(org, now_secs))
+                .is_some_and(|issued| now_secs <= issued.saturating_add(max_age)),
+        }
+    }
+
+    /// Cross-org admissions made while this node held no revocation material
+    /// at all from the caller's org and no freshness requirement applied.
+    /// Each such org is also logged once.
+    pub fn foreign_revocation_unverified_admissions(&self) -> u64 {
+        self.org_relay.unverified_admissions()
+    }
+
+    /// Relayed or pushed revocation bundles this node refused.
+    pub fn refused_org_revocation_material(&self) -> u64 {
+        self.org_relay.refused()
+    }
+
     /// OA3-4b2: install a CONSUMER grant-audience record — a grant whose
     /// `grantee_org` is this node's own org, plus its out-of-band secret. Same
     /// invariants as the provider install except the role check is
@@ -25585,7 +25759,25 @@ impl MeshNode {
     /// of documenting it.
     ///
     /// Idempotent.
+    ///
+    /// **A refusal is silent here.** If an `accept()` is in flight this
+    /// returns having started nothing, and the only trace is a `warn!`
+    /// log line. A node in that state sends normally but processes no
+    /// inbound packet, which looks like a discovery or routing fault
+    /// rather than a lifecycle one. Use [`Self::try_start`] wherever
+    /// the caller can act on the refusal; every language binding does.
     pub fn start(self: &Arc<Self>) {
+        let _ = self.try_start();
+    }
+
+    /// [`Self::start`], reporting whether the node is running afterwards.
+    ///
+    /// `Ok(())` means the receive loop is running: either this call
+    /// started it or an earlier one did (starting is idempotent).
+    /// [`StartRefused::AcceptInFlight`] means nothing was started
+    /// because an `accept()` is mid-handshake. The refusal is
+    /// retryable: call again once that `accept()` returns.
+    pub fn try_start(self: &Arc<Self>) -> Result<(), StartRefused> {
         // Store the weak BEFORE the loops below are spawned — the
         // re-announce and change-announcer tasks read this holder each
         // iteration. `set` only fails if already set (a re-start); the
@@ -25597,30 +25789,32 @@ impl MeshNode {
         // spawning unconditionally meant each repeated or refused call
         // added another detached scan loop, multiplying upgrade probes
         // on a node that never started once.
-        let transitioned = self.start_inner();
+        let transition = self.start_inner();
         // Background direct-path upgrade scan loop (Stage 3). The loop
         // itself no-ops unless `auto_direct_upgrade` is set, so spawning
         // on a real transition is cheap. Detached like the other
         // lifecycle loops — it exits on `shutdown_notify`.
         #[cfg(feature = "nat-traversal")]
-        if transitioned {
+        if transition == StartTransition::Started {
             let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
         }
-        #[cfg(not(feature = "nat-traversal"))]
-        let _ = transitioned;
+        match transition {
+            StartTransition::Started | StartTransition::AlreadyStarted => Ok(()),
+            StartTransition::RefusedAcceptInFlight => Err(StartRefused::AcceptInFlight),
+        }
     }
 
     /// Everything `start` does that needs only `&self`. Split out so
     /// the `Arc` wiring above happens exactly once, before any loop
     /// that reads it is spawned.
     ///
-    /// Returns whether this call is the one that moved the node from
-    /// stopped to started — `false` for an idempotent re-start and for
-    /// a refusal against an in-flight `accept()`.
-    fn start_inner(&self) -> bool {
+    /// Reports whether this call moved the node from stopped to
+    /// started, found it already started, or refused against an
+    /// in-flight `accept()`.
+    fn start_inner(&self) -> StartTransition {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
-            return false; // already started
+            return StartTransition::AlreadyStarted;
         }
         // After flipping `started`, observe `accept_in_flight`.
         // If any accept is mid-handshake, roll back and refuse.
@@ -25639,7 +25833,7 @@ impl MeshNode {
                  refusing to start the dispatch loop to avoid racing the \
                  responder handshake. Retry start() after accept() returns."
             );
-            return false;
+            return StartTransition::RefusedAcceptInFlight;
         }
 
         let recv_handle = self.spawn_receive_loop();
@@ -25670,8 +25864,8 @@ impl MeshNode {
                      This usually indicates start() was invoked twice."
                 );
                 // The router was already running, so this call did not
-                // complete a transition either.
-                return false;
+                // complete a transition either — but the node IS running.
+                return StartTransition::AlreadyStarted;
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
@@ -25770,7 +25964,7 @@ impl MeshNode {
                 tasks.push(h);
             }
         }
-        true
+        StartTransition::Started
     }
 
     /// The ONE production path that constructs a [`RoutingSupervisor`] and
@@ -65961,13 +66155,15 @@ mod lifecycle_regression_tests {
     #[tokio::test]
     async fn only_the_first_start_reports_a_transition() {
         let node = node().await;
-        assert!(
+        assert_eq!(
             node.start_inner(),
+            StartTransition::Started,
             "the first start moves the node from stopped to started"
         );
         for _ in 0..3 {
-            assert!(
-                !node.start_inner(),
+            assert_eq!(
+                node.start_inner(),
+                StartTransition::AlreadyStarted,
                 "an idempotent re-start must not report a transition — the \
                  upgrade scanner is spawned on this answer"
             );
@@ -65985,8 +66181,9 @@ mod lifecycle_regression_tests {
         // Stand in for an accept that is mid-handshake.
         node.accept_in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            !node.start_inner(),
+        assert_eq!(
+            node.start_inner(),
+            StartTransition::RefusedAcceptInFlight,
             "a refused start must not report a transition"
         );
         assert!(
@@ -65996,9 +66193,39 @@ mod lifecycle_regression_tests {
 
         node.accept_in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(
+        assert_eq!(
             node.start_inner(),
+            StartTransition::Started,
             "once the accept completes, start transitions normally"
+        );
+    }
+
+    /// `start()` swallows the in-flight-accept refusal (its only trace is
+    /// a log line), and a node in that state processes no inbound packet
+    /// while its sends work, which reads as a discovery fault. Every
+    /// binding therefore starts through `try_start`, so the refusal must
+    /// come back as a typed error, leave the node stopped, and clear on
+    /// retry. An already-running node is `Ok`, not an error: start is
+    /// idempotent.
+    #[tokio::test]
+    async fn try_start_reports_the_inflight_accept_refusal_and_recovers() {
+        let node = node().await;
+        node.accept_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(node.try_start(), Err(StartRefused::AcceptInFlight));
+        assert!(
+            !node.started.load(Ordering::SeqCst),
+            "a refused try_start leaves the node stopped"
+        );
+
+        node.accept_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(node.try_start(), Ok(()), "the retry starts the node");
+        assert!(node.started.load(Ordering::SeqCst));
+        assert_eq!(
+            node.try_start(),
+            Ok(()),
+            "a running node reports Ok — starting is idempotent"
         );
     }
 

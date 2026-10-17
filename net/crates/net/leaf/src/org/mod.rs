@@ -59,6 +59,7 @@ pub mod cert;
 pub mod digest;
 pub mod entity;
 pub mod grant;
+pub mod grant_revocation;
 pub mod proof;
 pub mod replay;
 pub mod revocation;
@@ -79,6 +80,10 @@ pub use grant::{
     GrantedDiscoveryBinding, OrgAudienceSecret, OrgCapabilityGrant, OrgDispatcherGrant,
     AUDIENCE_COMMIT_CONTEXT, CAPABILITY_AUTHORITY_CONTEXT, MAX_ORG_GRANT_TTL_SECS,
     ORG_AUDIENCE_SECRET_VERSION, ORG_CAPABILITY_GRANT_SIG_DOMAIN, ORG_DISPATCHER_GRANT_SIG_DOMAIN,
+};
+pub use grant_revocation::{
+    dispatcher_revocation_id, OrgGrantRevocationBundle, RevokedGrant, RevokedGrantKind,
+    DISPATCHER_GRANT_ID_CONTEXT, MAX_GRANT_REVOCATIONS_PER_BUNDLE, ORG_GRANT_REVOCATION_SIG_DOMAIN,
 };
 pub use proof::{
     check_proof_expiry_at, CallBinding, OrgCallProof, OrgStreamCallProof, RpcCallShape,

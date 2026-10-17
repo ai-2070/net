@@ -4813,6 +4813,18 @@ async fn service_control_plane(inner: &Rc<RefCell<Inner>>) -> Result<(), LeafErr
                 console_error(&format!("net-mesh-leaf: revocation bundle refused: {e}"));
             }
         }
+        // The grant half of the feed, under the same rules.
+        let now_secs = clock::now_unix_secs();
+        for bundle in guard.control.take_grant_revocation_bundles() {
+            if let Err(e) = guard
+                .node
+                .ingest_org_grant_revocation_bundle(&bundle.0, now_secs)
+            {
+                console_error(&format!(
+                    "net-mesh-leaf: grant revocation bundle refused: {e}"
+                ));
+            }
+        }
     }
 
     match ended {
@@ -7313,6 +7325,27 @@ impl LeafNode {
                 .map_err(js)?;
             guard.pump();
             Ok::<_, JsError>(u32::try_from(raised).unwrap_or(u32::MAX))
+        })
+    }
+
+    /// Apply one signed grant-revocation bundle, and say how many grants
+    /// it newly revoked.
+    ///
+    /// The grant twin of [`Self::apply_org_revocation_bundle`]: the
+    /// bundle is verified in-leaf before anything moves, an org can
+    /// revoke only grants it issued, and every live served call that
+    /// rode on a revoked grant retires with the `Revoked` terminal.
+    pub fn apply_org_grant_revocation_bundle(&self, bundle_hex: &str) -> Result<u32, JsError> {
+        let bytes = crate::identity::unhex(bundle_hex)
+            .map_err(|e| JsError::new(&format!("the bundle is not hex: {e}")))?;
+        with_node(&self.inner, |guard| {
+            guard.admit()?;
+            let revoked = guard
+                .node
+                .ingest_org_grant_revocation_bundle(&bytes, clock::now_unix_secs())
+                .map_err(js)?;
+            guard.pump();
+            Ok::<_, JsError>(u32::try_from(revoked).unwrap_or(u32::MAX))
         })
     }
 }

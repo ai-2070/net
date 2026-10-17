@@ -955,7 +955,12 @@ class NetMesh:
         peer's wire address."""
         ...
     def start(self) -> None:
-        """Start the receive loop, heartbeats, and router."""
+        """Start the receive loop, heartbeats, and router.
+
+        Idempotent: starting a running node returns normally. Raises
+        ``RuntimeError`` when nothing was started because an ``accept()``
+        is still mid-handshake; the node stays stopped (it would send but
+        never receive), so retry once that ``accept()`` returns."""
         ...
 
     def rendezvous_string(self) -> str:
@@ -5656,6 +5661,19 @@ def install_provider_grant_audience(
 ) -> None:
     """Install a provider grant audience (grant wire bytes + secret file PATH)
     so a ``"granted"`` service can seal envelopes."""
+    ...
+
+def require_fresh_org_revocations(
+    mesh: Any, org: bytes, max_age_secs: Optional[int]
+) -> None:
+    """As a provider, refuse callers acting for ``org`` (32 raw bytes) unless
+    this node holds signed revocation material from that org issued within
+    ``max_age_secs``; ``None`` lifts the requirement."""
+    ...
+
+def foreign_revocation_unverified_admissions(mesh: Any) -> int:
+    """Cross-org admissions made with no revocation material at all from the
+    caller's org."""
     ...
 
 # ---------------------------------------------------------------------------

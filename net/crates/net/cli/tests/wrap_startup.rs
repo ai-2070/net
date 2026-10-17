@@ -49,7 +49,7 @@ async fn exercise(stall: bool, listen: bool) {
         .build()
         .await
         .unwrap();
-    mesh.start();
+    mesh.start().expect("mesh start");
     let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cmd = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("net-mesh"));
     cmd.env_remove("NET_MESH_CONFIG")

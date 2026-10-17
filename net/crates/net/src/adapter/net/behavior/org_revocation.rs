@@ -72,13 +72,32 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
-use super::org::{OrgError, OrgId, OrgRevocationBundle};
+use super::org::{current_timestamp, OrgError, OrgId, OrgRevocationBundle};
+use super::org_grant::MAX_ORG_GRANT_TTL_SECS;
+use super::org_grant_revocation::{
+    revocation_entry_expired, OrgGrantRevocationBundle, RevokedGrantKind,
+};
+use super::org_revocation_relay::{RetainedMaterial, RevocationMaterial, VerifiedMaterial};
 use crate::adapter::net::identity::EntityId;
 
 /// Format version of `revocation-state.json`. Bump requires an
 /// explicit migration; an unknown version is a loud startup
 /// failure, never a silent re-init.
+///
+/// A state holding no grant revocations is still written as this
+/// version, byte-for-byte as before, so a node that never revokes a
+/// grant stays readable by older builds.
 pub const ORG_REVOCATION_STATE_VERSION: u32 = 1;
+
+/// Format version written once the state holds grant revocations. An
+/// older build refuses it as an unsupported version, which is the
+/// fail-closed outcome: it cannot enforce entries it does not
+/// understand.
+pub const ORG_REVOCATION_STATE_VERSION_WITH_GRANTS: u32 = 2;
+
+/// A revoked grant as the store keys it: the org that issued (and
+/// revoked) the grant, the grant family, and its revocation id.
+pub type RevokedGrantKey = (OrgId, RevokedGrantKind, [u8; 32]);
 
 /// Merged revocation-floor maxima: for each `(org, member)`, the
 /// highest `minimum_generation` any verified bundle has ever
@@ -86,6 +105,11 @@ pub const ORG_REVOCATION_STATE_VERSION: u32 = 1;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrgRevocationState {
     floors: BTreeMap<(OrgId, EntityId), u32>,
+    /// Grants revoked by their issuing org, each with the revoked
+    /// grant's `not_after`. Entries leave only once that has passed
+    /// (plus the skew ceiling), when the grant could no longer verify
+    /// anyway.
+    revoked_grants: BTreeMap<RevokedGrantKey, u64>,
 }
 
 impl OrgRevocationState {
@@ -99,7 +123,140 @@ impl OrgRevocationState {
     /// a supported downstream constructor for synthetic authority state.
     #[cfg(test)]
     pub(crate) fn from_floors_for_test(floors: BTreeMap<(OrgId, EntityId), u32>) -> Self {
-        Self { floors }
+        Self {
+            floors,
+            revoked_grants: BTreeMap::new(),
+        }
+    }
+
+    /// `true` iff `issuer` has revoked the grant of `kind` named
+    /// `grant_id`. Look a capability grant up under its `issuer_org` and
+    /// a dispatcher grant under its `org_id`: only the issuer's own
+    /// bundles can revoke its grants.
+    pub fn is_grant_revoked(
+        &self,
+        issuer: &OrgId,
+        kind: RevokedGrantKind,
+        grant_id: &[u8; 32],
+    ) -> bool {
+        self.revoked_grants
+            .contains_key(&(*issuer, kind, *grant_id))
+    }
+
+    /// Number of tracked grant revocations.
+    pub fn revoked_grant_count(&self) -> usize {
+        self.revoked_grants.len()
+    }
+
+    /// Number of floors tracked for `org`.
+    pub fn floor_count_for(&self, org: &OrgId) -> usize {
+        self.floors.keys().filter(|(o, _)| o == org).count()
+    }
+
+    /// Number of grant revocations tracked for `org`.
+    pub fn revoked_grant_count_for(&self, org: &OrgId) -> usize {
+        self.revoked_grants
+            .keys()
+            .filter(|(o, _, _)| o == org)
+            .count()
+    }
+
+    /// How many of `bundle`'s nonzero floors name a member this state
+    /// does not track yet: the entries a merge would ADD (raising an
+    /// existing floor adds none).
+    pub fn new_floor_count(&self, bundle: &OrgRevocationBundle) -> usize {
+        bundle
+            .floors()
+            .iter()
+            .filter(|(member, floor)| {
+                *floor > 0 && !self.floors.contains_key(&(bundle.org_id, member.clone()))
+            })
+            .count()
+    }
+
+    /// How many grant revocations this state tracks for `org` that have
+    /// not expired at `now_secs`.
+    pub fn live_revoked_grant_count_for(&self, org: &OrgId, now_secs: u64) -> usize {
+        self.revoked_grants
+            .iter()
+            .filter(|((o, _, _), not_after)| {
+                o == org && !revocation_entry_expired(**not_after, now_secs)
+            })
+            .count()
+    }
+
+    /// How many of `bundle`'s unexpired entries this state does not track
+    /// yet: the entries a merge at `now_secs` would ADD.
+    pub fn new_grant_revocation_count(
+        &self,
+        bundle: &OrgGrantRevocationBundle,
+        now_secs: u64,
+    ) -> usize {
+        bundle
+            .entries()
+            .iter()
+            .filter(|e| {
+                !revocation_entry_expired(e.not_after, now_secs)
+                    && !self
+                        .revoked_grants
+                        .contains_key(&(bundle.org_id, e.kind, e.grant_id))
+            })
+            .count()
+    }
+
+    /// Iterate grant revocations in canonical order, each with the
+    /// revoked grant's `not_after`.
+    pub fn iter_revoked_grants(&self) -> impl Iterator<Item = (&RevokedGrantKey, &u64)> {
+        self.revoked_grants.iter()
+    }
+
+    /// Merge a VERIFIED grant-revocation bundle: add every entry not
+    /// already expired at `now_secs` (keeping the later `not_after` if
+    /// one is already present), then drop entries that have expired.
+    /// Returns how many entries were added or pruned, so a caller
+    /// knows whether the state changed.
+    ///
+    /// Does NOT verify the bundle; the store verifies first.
+    pub fn merge_grant_revocations(
+        &mut self,
+        bundle: &OrgGrantRevocationBundle,
+        now_secs: u64,
+    ) -> usize {
+        let mut changed = 0;
+        // No genuine grant can be valid past now + the grant TTL ceiling
+        // (plus skew), so an entry claiming a later `not_after` is clamped:
+        // it revokes exactly as much, but cannot pin state indefinitely.
+        let horizon = now_secs
+            .saturating_add(MAX_ORG_GRANT_TTL_SECS)
+            .saturating_add(crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS);
+        for entry in bundle.entries() {
+            if revocation_entry_expired(entry.not_after, now_secs) {
+                continue;
+            }
+            let entry_not_after = entry.not_after.min(horizon);
+            let key = (bundle.org_id, entry.kind, entry.grant_id);
+            match self.revoked_grants.get_mut(&key) {
+                Some(not_after) if *not_after >= entry_not_after => {}
+                Some(not_after) => {
+                    *not_after = entry_not_after;
+                    changed += 1;
+                }
+                None => {
+                    self.revoked_grants.insert(key, entry_not_after);
+                    changed += 1;
+                }
+            }
+        }
+        changed + self.prune_expired_grants(now_secs)
+    }
+
+    /// Drop grant revocations whose grants can no longer verify.
+    /// Returns how many were dropped.
+    pub fn prune_expired_grants(&mut self, now_secs: u64) -> usize {
+        let before = self.revoked_grants.len();
+        self.revoked_grants
+            .retain(|_, not_after| !revocation_entry_expired(*not_after, now_secs));
+        before - self.revoked_grants.len()
     }
 
     /// The current floor for `(org, member)`. Absent keys floor at
@@ -170,8 +327,24 @@ impl OrgRevocationState {
     /// Serialize to the versioned on-disk JSON form (sorted by the
     /// map's canonical order, so the file is deterministic).
     fn to_file_bytes(&self) -> Result<Vec<u8>, OrgRevocationError> {
+        let revoked_grants: Vec<PersistedRevokedGrant> = self
+            .revoked_grants
+            .iter()
+            .map(|((org, kind, grant_id), not_after)| PersistedRevokedGrant {
+                org: *org,
+                kind: kind.as_str().to_string(),
+                grant_id: hex::encode(grant_id),
+                not_after: *not_after,
+            })
+            .collect();
         let file = PersistedStateFile {
-            version: ORG_REVOCATION_STATE_VERSION,
+            // Version 1 stays byte-identical for a state with no grant
+            // revocations (the field is skipped when empty).
+            version: if revoked_grants.is_empty() {
+                ORG_REVOCATION_STATE_VERSION
+            } else {
+                ORG_REVOCATION_STATE_VERSION_WITH_GRANTS
+            },
             floors: self
                 .floors
                 .iter()
@@ -181,6 +354,7 @@ impl OrgRevocationState {
                     floor: *floor,
                 })
                 .collect(),
+            revoked_grants,
         };
         serde_json::to_vec_pretty(&file).map_err(|e| OrgRevocationError::Io {
             path: String::new(),
@@ -214,12 +388,47 @@ impl OrgRevocationState {
                 path: path.display().to_string(),
                 detail: e.to_string(),
             })?;
-        if file.version != ORG_REVOCATION_STATE_VERSION {
+        if file.version != ORG_REVOCATION_STATE_VERSION
+            && file.version != ORG_REVOCATION_STATE_VERSION_WITH_GRANTS
+        {
             return Err(OrgRevocationError::UnsupportedVersion {
                 path: path.display().to_string(),
                 found: file.version,
             });
         }
+        if file.version == ORG_REVOCATION_STATE_VERSION && !file.revoked_grants.is_empty() {
+            return Err(OrgRevocationError::CorruptState {
+                path: path.display().to_string(),
+                detail: "a version-1 state file carries grant revocations".to_string(),
+            });
+        }
+        let corrupt = |detail: String| OrgRevocationError::CorruptState {
+            path: path.display().to_string(),
+            detail,
+        };
+        let now_secs = current_timestamp();
+        let mut revoked_grants = BTreeMap::new();
+        for entry in file.revoked_grants {
+            let kind = match entry.kind.as_str() {
+                "capability" => RevokedGrantKind::Capability,
+                "dispatcher" => RevokedGrantKind::Dispatcher,
+                other => return Err(corrupt(format!("unknown revoked grant kind `{other}`"))),
+            };
+            let grant_id: [u8; 32] = hex::decode(&entry.grant_id)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| corrupt("revoked grant id is not 32 hex bytes".to_string()))?;
+            if revoked_grants
+                .insert((entry.org, kind, grant_id), entry.not_after)
+                .is_some()
+            {
+                return Err(corrupt("duplicate revoked grant entry".to_string()));
+            }
+        }
+        // An expired entry says nothing (its grant cannot verify), so it
+        // is dropped here exactly like a zero floor below; the next write
+        // persists the pruned set.
+        revoked_grants.retain(|_, not_after| !revocation_entry_expired(*not_after, now_secs));
         let mut floors = BTreeMap::new();
         for entry in file.floors {
             // §20 — the §14 zero-floor rule is enforced HERE too, not just in
@@ -277,7 +486,10 @@ impl OrgRevocationState {
                  the org certificate generation so historical floors can be retired.",
             );
         }
-        Ok(Self { floors })
+        Ok(Self {
+            floors,
+            revoked_grants,
+        })
     }
 }
 
@@ -298,6 +510,22 @@ const FLOOR_COUNT_ADVISORY: usize = 4_096;
 struct PersistedStateFile {
     version: u32,
     floors: Vec<PersistedFloor>,
+    /// Version 2 only; skipped when empty so version 1 is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_grants: Vec<PersistedRevokedGrant>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRevokedGrant {
+    /// The issuing (and revoking) org.
+    org: OrgId,
+    /// `"capability"` or `"dispatcher"`.
+    kind: String,
+    /// The grant's revocation id, lowercase hex.
+    grant_id: String,
+    /// The revoked grant's `not_after` (unix seconds).
+    not_after: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -456,6 +684,26 @@ pub type RaisedFloor = (OrgId, EntityId, u32);
 /// previously enforced view.
 type FloorsRaisedCallback = Arc<dyn Fn(&[RaisedFloor]) + Send + Sync>;
 
+/// Callback invoked after a publication adds grant revocations the
+/// previously enforced view did not have.
+type GrantsRevokedCallback = Arc<dyn Fn(&[RevokedGrantKey]) + Send + Sync>;
+
+/// One registered observer: either of floor raises (and authority
+/// changes, as the empty slice) or of newly revoked grants.
+#[derive(Clone)]
+enum Subscriber {
+    Floors(FloorsRaisedCallback),
+    Grants(GrantsRevokedCallback),
+}
+
+/// What one publication changed relative to the previously enforced
+/// view.
+#[derive(Debug, Default)]
+struct Published {
+    floors: Vec<RaisedFloor>,
+    grants: Vec<RevokedGrantKey>,
+}
+
 /// The process-wide state shared by every [`OrgRevocationStore`]
 /// handle backed by one normalized path (review-9 addendum): ONE
 /// live view, ONE reload/publish transaction lock, ONE publish
@@ -551,7 +799,11 @@ struct StoreCore {
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
     /// notifications.
-    subscribers: RwLock<Vec<(u64, FloorsRaisedCallback)>>,
+    subscribers: RwLock<Vec<(u64, Subscriber)>>,
+    /// The signed bundles kept for relay to other orgs' providers, and the
+    /// source of each org's freshness. Not security state (losing it only
+    /// means relaying less); persisted best-effort beside the state file.
+    relay: Mutex<RetainedMaterial>,
     /// Token source for [`Self::subscribers`].
     next_subscriber: AtomicU64,
     /// Test-only pause fired ONCE, from inside [`Self::publish`],
@@ -592,7 +844,7 @@ impl StoreCore {
     /// always a monotone superset under the locked reload order;
     /// the per-key max with the outgoing view makes "an installed
     /// floor never lowers" structural rather than assumed.
-    fn publish(&self, mut next: OrgRevocationState) -> Vec<RaisedFloor> {
+    fn publish(&self, mut next: OrgRevocationState) -> Published {
         // The acknowledgement fires ONLY after a `try_write` has actually
         // failed, never merely before attempting the write.
         //
@@ -666,6 +918,40 @@ impl StoreCore {
             .filter(|((org, member), floor)| **floor > live.floor_for(org, member))
             .map(|((org, member), floor)| (*org, member.clone(), *floor))
             .collect();
+        // Grant revocations get the same never-lower treatment as floors:
+        // an entry the live view enforces survives a weaker incoming state
+        // unless it has expired (its grant can no longer verify, so
+        // dropping it changes nothing). A surviving entry that `next`
+        // lacked is the same disk-behind-memory condition as above.
+        let now_secs = current_timestamp();
+        let mut grants_regressed = 0usize;
+        for (key, not_after) in live.revoked_grants.iter() {
+            if revocation_entry_expired(*not_after, now_secs) {
+                continue;
+            }
+            let entry = next.revoked_grants.entry(*key).or_insert_with(|| {
+                grants_regressed += 1;
+                *not_after
+            });
+            if *not_after > *entry {
+                *entry = *not_after;
+            }
+        }
+        if grants_regressed > 0 {
+            tracing::error!(
+                entries = grants_regressed,
+                "org revocation: the persisted state is BEHIND the enforced view \
+                 for {grants_regressed} grant revocation(s); the live view is \
+                 preserved, but a restart would re-admit those grants. Restore \
+                 the state file or re-apply the bundles that revoked them.",
+            );
+        }
+        let newly_revoked: Vec<RevokedGrantKey> = next
+            .revoked_grants
+            .keys()
+            .filter(|key| !live.revoked_grants.contains_key(key))
+            .copied()
+            .collect();
         *live = Arc::new(next);
         // Occupy the "new view installed, old generation still present"
         // window while `live` (the write guard) is held, so a witness
@@ -689,7 +975,10 @@ impl StoreCore {
                 }
             }
         }
-        raised
+        Published {
+            floors: raised,
+            grants: newly_revoked,
+        }
     }
 
     /// Fire the one-shot publish pause hook if a test installed one.
@@ -709,15 +998,48 @@ impl StoreCore {
         if raised.is_empty() {
             return;
         }
-        let subscribers: Vec<FloorsRaisedCallback> = self
+        for callback in self.floor_subscribers() {
+            callback(raised);
+        }
+    }
+
+    /// Notify every grant subscriber of newly revoked grants. Same
+    /// calling discipline as [`Self::notify`].
+    fn notify_grants(&self, revoked: &[RevokedGrantKey]) {
+        if revoked.is_empty() {
+            return;
+        }
+        let subscribers: Vec<GrantsRevokedCallback> = self
             .subscribers
             .read()
             .iter()
-            .map(|(_, callback)| callback.clone())
+            .filter_map(|(_, s)| match s {
+                Subscriber::Grants(callback) => Some(callback.clone()),
+                Subscriber::Floors(_) => None,
+            })
             .collect();
         for callback in subscribers {
-            callback(raised);
+            callback(revoked);
         }
+    }
+
+    /// Everything one publication owes its observers: floor raises,
+    /// then grant revocations.
+    fn notify_published(&self, published: &Published) {
+        self.notify(&published.floors);
+        self.notify_grants(&published.grants);
+    }
+
+    /// The floor subscribers, cloned outside the registry lock.
+    fn floor_subscribers(&self) -> Vec<FloorsRaisedCallback> {
+        self.subscribers
+            .read()
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Subscriber::Floors(callback) => Some(callback.clone()),
+                Subscriber::Grants(_) => None,
+            })
+            .collect()
     }
 
     /// Wake every subscriber for an authority change that raised NO floor.
@@ -734,13 +1056,7 @@ impl StoreCore {
     /// or `live` guard held — a subscriber takes the routing authority gate, and
     /// a routing settlement holding that gate takes `poison_gate` + `live.read`.
     fn notify_authority_changed(&self) {
-        let subscribers: Vec<FloorsRaisedCallback> = self
-            .subscribers
-            .read()
-            .iter()
-            .map(|(_, callback)| callback.clone())
-            .collect();
-        for callback in subscribers {
+        for callback in self.floor_subscribers() {
             callback(&[]);
         }
     }
@@ -974,6 +1290,23 @@ impl SubscriptionLease {
     }
 }
 
+/// R2-3: admit `body` under `lease`, run it OUTSIDE the lease lock
+/// (re-entrant applies and long retractions must not self-deadlock),
+/// then leave, even on panic, via the drop guard.
+fn run_leased(lease: &Arc<SubscriptionLease>, body: impl FnOnce()) {
+    if !lease.enter() {
+        return;
+    }
+    struct LeaveOnDrop<'a>(&'a Arc<SubscriptionLease>);
+    impl Drop for LeaveOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.leave();
+        }
+    }
+    let _leave = LeaveOnDrop(lease);
+    body();
+}
+
 /// An externally-owned RAII handle to one raise subscription (R2-2 +
 /// R2-3). Dropping it:
 /// 1. marks the exclusion lease dead and drains any in-flight callback
@@ -1182,7 +1515,7 @@ fn join_or_create_core(
     backing_id: BackingId,
     path: &Path,
     disk: OrgRevocationState,
-) -> Result<(Arc<StoreCore>, Vec<RaisedFloor>), OrgRevocationError> {
+) -> Result<(Arc<StoreCore>, Published), OrgRevocationError> {
     let mut guard = core_registry().lock();
     // Reborrow as `&mut CoreRegistry` so disjoint field borrows (immutable
     // `cores`, mutable `bindings`) are allowed — a `MutexGuard`'s Deref
@@ -1239,12 +1572,13 @@ fn join_or_create_core(
         #[cfg(test)]
         poison_contended_hook: Mutex::new(None),
         subscribers: RwLock::new(Vec::new()),
+        relay: Mutex::new(load_relay_sidecar(path)),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
         publish_pause: parking_lot::Mutex::new(None),
     });
     reg.cores.insert(backing_id, Arc::downgrade(&core));
-    Ok((core, Vec::new()))
+    Ok((core, Published::default()))
 }
 
 /// Exclusive guard over one or two stores' publish transactions.
@@ -1566,7 +1900,7 @@ impl OrgRevocationStore {
         }
         drop(lock);
         let store = Self { core };
-        store.core.notify(&raised);
+        store.core.notify_published(&raised);
         if was_poisoned {
             // Recovery raises no floor, so `notify` alone is silent — yet the
             // authority just moved from "unusable" back to usable.
@@ -1624,7 +1958,7 @@ impl OrgRevocationStore {
         }
         drop(lock);
         let store = Self { core };
-        store.core.notify(&raised);
+        store.core.notify_published(&raised);
         if was_poisoned {
             store.core.notify_authority_changed();
         }
@@ -1883,12 +2217,7 @@ impl OrgRevocationStore {
     /// the owner-liveness token makes such a late callback inert.
     #[doc(hidden)]
     pub fn snapshot_subscribers_for_test(&self) -> Vec<FloorsRaisedCallback> {
-        self.core
-            .subscribers
-            .read()
-            .iter()
-            .map(|(_, callback)| callback.clone())
-            .collect()
+        self.core.floor_subscribers()
     }
 
     /// Register `callback` as ONE subscriber in the core's raise
@@ -1920,24 +2249,35 @@ impl OrgRevocationStore {
         let lease = SubscriptionLease::new();
         let lease_cb = Arc::clone(&lease);
         let wrapped: FloorsRaisedCallback = Arc::new(move |raised: &[RaisedFloor]| {
-            // R2-3: admit under the lease, run the user callback OUTSIDE
-            // the lease lock (re-entrant `apply_bundle` and long
-            // retractions must not self-deadlock), then leave — even on
-            // panic, via the drop guard.
-            if !lease_cb.enter() {
-                return;
-            }
-            struct LeaveOnDrop<'a>(&'a Arc<SubscriptionLease>);
-            impl Drop for LeaveOnDrop<'_> {
-                fn drop(&mut self) {
-                    self.0.leave();
-                }
-            }
-            let _leave = LeaveOnDrop(&lease_cb);
-            callback(raised);
+            run_leased(&lease_cb, || callback(raised));
         });
+        self.register(Subscriber::Floors(wrapped), lease)
+    }
+
+    /// Register `callback` for grant revocations: it runs after a
+    /// publication adds revocations the previously enforced view lacked
+    /// (including ones learned from another writer via the under-lock
+    /// reread), with the newly revoked keys. Never called with an empty
+    /// slice; authority changes reach only floor subscribers.
+    ///
+    /// Same lifecycle as [`Self::subscribe_floors_raised`]: dropping the
+    /// returned guard drains any in-flight callback and unsubscribes.
+    #[must_use = "dropping the returned guard immediately unsubscribes the callback"]
+    pub fn subscribe_grants_revoked(
+        &self,
+        callback: impl Fn(&[RevokedGrantKey]) + Send + Sync + 'static,
+    ) -> RaiseSubscription {
+        let lease = SubscriptionLease::new();
+        let lease_cb = Arc::clone(&lease);
+        let wrapped: GrantsRevokedCallback = Arc::new(move |revoked: &[RevokedGrantKey]| {
+            run_leased(&lease_cb, || callback(revoked));
+        });
+        self.register(Subscriber::Grants(wrapped), lease)
+    }
+
+    fn register(&self, subscriber: Subscriber, lease: Arc<SubscriptionLease>) -> RaiseSubscription {
         let token = self.core.next_subscriber.fetch_add(1, Ordering::Relaxed);
-        self.core.subscribers.write().push((token, wrapped));
+        self.core.subscribers.write().push((token, subscriber));
         RaiseSubscription {
             core: Arc::downgrade(&self.core),
             token,
@@ -1978,22 +2318,6 @@ impl OrgRevocationStore {
         &self,
         bundle: &OrgRevocationBundle,
     ) -> Result<Vec<RaisedFloor>, OrgRevocationError> {
-        let path = &self.core.path;
-
-        // The locked phase returns its outcome so raise observers
-        // run AFTER both the file lock and the core's reload guard
-        // have dropped — a callback that re-enters `apply_bundle`
-        // on the same store must not deadlock (review-9).
-        enum LockedOutcome {
-            /// Raised floors, plus whether this apply RECOVERED the path from
-            /// poison — which owes an authority wake even when nothing rose.
-            Applied(Vec<RaisedFloor>, bool),
-            /// Raised floors, the reason, and whether the mark was the
-            /// false→true TRANSITION — which owes the same wake the recovery
-            /// does when nothing rose (E3c blockers §1).
-            DurabilityUncertain(Vec<RaisedFloor>, String, bool),
-        }
-
         // 1. Verify the incoming bundle's signature + canonical
         //    structure BEFORE taking any lock — a corrupt bundle
         //    keeps last-good, loudly, and touches nothing.
@@ -2004,6 +2328,243 @@ impl OrgRevocationStore {
                 "rejecting revocation bundle, keeping last-good persisted floors: {err}"
             );
             return Err(err);
+        }
+        Ok(self
+            .apply_verified_bundle(bundle, None)?
+            .unwrap_or_default())
+    }
+
+    /// [`Self::apply_bundle`] for a bundle the caller has ALREADY
+    /// verified. With `cap`, the apply is refused (`Ok(None)`, nothing
+    /// merged, nothing retained) when it would leave the bundle's org with
+    /// more than `cap` floors. The check runs on the state reread under
+    /// the apply lock and counts only floors the merge would add, so a
+    /// bundle raising floors that are already tracked never trips it, and
+    /// two concurrent applies cannot both pass against one stale view.
+    fn apply_verified_bundle(
+        &self,
+        bundle: &OrgRevocationBundle,
+        cap: Option<usize>,
+    ) -> Result<Option<Vec<RaisedFloor>>, OrgRevocationError> {
+        let over_cap = std::cell::Cell::new(false);
+        let published = self.apply_locked(|merged| {
+            if let Some(cap) = cap {
+                let after = merged
+                    .floor_count_for(&bundle.org_id)
+                    .saturating_add(merged.new_floor_count(bundle));
+                if after > cap {
+                    over_cap.set(true);
+                    return false;
+                }
+            }
+            merged.merge_bundle(bundle) > 0
+        })?;
+        if over_cap.get() {
+            return Ok(None);
+        }
+        self.retain_for_relay(
+            &RevocationMaterial::floors(bundle),
+            &VerifiedMaterial::Floors(bundle.clone()),
+        );
+        Ok(Some(published.floors))
+    }
+
+    /// Apply a grant-revocation bundle under the same locked order as
+    /// [`Self::apply_bundle`]: verify, lock, reread disk, merge, persist
+    /// iff changed, publish, notify. Returns the grants newly revoked
+    /// relative to the previously enforced view.
+    ///
+    /// Grant subscribers ([`Self::subscribe_grants_revoked`]) run after
+    /// the publish, outside every lock. The publish also advances the
+    /// generation, so an admission in flight against the old view fails
+    /// its stability recheck rather than admitting a revoked grant.
+    pub fn apply_grant_revocations(
+        &self,
+        bundle: &OrgGrantRevocationBundle,
+    ) -> Result<Vec<RevokedGrantKey>, OrgRevocationError> {
+        if let Err(e) = bundle.verify() {
+            let err = OrgRevocationError::InvalidBundle(e);
+            tracing::error!(
+                org = %bundle.org_id,
+                "rejecting grant revocation bundle, keeping last-good persisted state: {err}"
+            );
+            return Err(err);
+        }
+        Ok(self
+            .apply_verified_grant_revocations(bundle, None)?
+            .unwrap_or_default())
+    }
+
+    /// [`Self::apply_grant_revocations`] for a bundle the caller has
+    /// ALREADY verified, with the same optional cap as
+    /// [`Self::apply_verified_bundle`]: counted on the locked reread, over
+    /// the org's unexpired entries plus only the entries the merge would
+    /// add.
+    fn apply_verified_grant_revocations(
+        &self,
+        bundle: &OrgGrantRevocationBundle,
+        cap: Option<usize>,
+    ) -> Result<Option<Vec<RevokedGrantKey>>, OrgRevocationError> {
+        let now_secs = current_timestamp();
+        let over_cap = std::cell::Cell::new(false);
+        let published = self.apply_locked(|merged| {
+            if let Some(cap) = cap {
+                let after = merged
+                    .live_revoked_grant_count_for(&bundle.org_id, now_secs)
+                    .saturating_add(merged.new_grant_revocation_count(bundle, now_secs));
+                if after > cap {
+                    over_cap.set(true);
+                    return false;
+                }
+            }
+            merged.merge_grant_revocations(bundle, now_secs) > 0
+        })?;
+        if over_cap.get() {
+            return Ok(None);
+        }
+        self.retain_for_relay(
+            &RevocationMaterial::grants(bundle),
+            &VerifiedMaterial::Grants(bundle.clone()),
+        );
+        Ok(Some(published.grants))
+    }
+
+    /// Apply one signed bundle of either kind. Verifies first; returns
+    /// what was verified so the caller can attribute it.
+    pub fn apply_material(
+        &self,
+        material: &RevocationMaterial,
+    ) -> Result<VerifiedMaterial, OrgRevocationError> {
+        let verified = material
+            .verify()
+            .map_err(OrgRevocationError::InvalidBundle)?;
+        self.apply_verified_material(&verified, None)?;
+        Ok(verified)
+    }
+
+    /// Apply a bundle the caller has ALREADY verified, so a bundle costs
+    /// one signature check rather than one per layer. With `cap`, refuse
+    /// (`Ok(false)`, nothing merged or retained) an apply that would leave
+    /// the signing org with more than `cap` entries of the bundle's kind;
+    /// the count is taken under the apply lock and covers only entries the
+    /// merge would add. Without a cap this is always `Ok(true)` on success.
+    pub(crate) fn apply_verified_material(
+        &self,
+        verified: &VerifiedMaterial,
+        cap: Option<usize>,
+    ) -> Result<bool, OrgRevocationError> {
+        Ok(match verified {
+            VerifiedMaterial::Floors(b) => self.apply_verified_bundle(b, cap)?.is_some(),
+            VerifiedMaterial::Grants(b) => self.apply_verified_grant_revocations(b, cap)?.is_some(),
+        })
+    }
+
+    /// Keep a just-applied bundle for relay, then persist the relay cache
+    /// best-effort. Runs after the apply transaction, outside its locks.
+    fn retain_for_relay(&self, material: &RevocationMaterial, verified: &VerifiedMaterial) {
+        let view = self.snapshot();
+        let now = current_timestamp();
+        if !self
+            .core
+            .relay
+            .lock()
+            .retain(material, verified, &view, now)
+        {
+            return;
+        }
+        let sidecar = relay_sidecar_path(&self.core.path);
+        if let Err(e) = self.persist_relay_cache(&sidecar, &view, now) {
+            tracing::warn!(
+                path = %sidecar.display(),
+                "org revocation relay: could not persist the relay cache ({e}); \
+                 enforcement is unaffected, relay restarts from what arrives next",
+            );
+        }
+    }
+
+    /// Write the relay cache to its sidecar. Every writer, in this process
+    /// or another sharing the state path, holds the state file's
+    /// interprocess lock across read, merge and replace, so writes land in
+    /// order and the fixed temp path is never written by two at once.
+    /// Bundles another process retained (and this one never saw) are read
+    /// back from the sidecar and kept, so neither process's write drops the
+    /// other's material. The bytes are taken under that lock from the cache
+    /// as it is then, so a later write carries at least what an earlier
+    /// one did.
+    fn persist_relay_cache(
+        &self,
+        sidecar: &Path,
+        view: &OrgRevocationState,
+        now: u64,
+    ) -> Result<(), String> {
+        let _lock = lock_state_file(&self.core.path).map_err(|e| e.to_string())?;
+        if let Ok(disk) = std::fs::read(sidecar) {
+            let items = RetainedMaterial::parse_file_items(&disk);
+            let unknown: Vec<RevocationMaterial> = {
+                let relay = self.core.relay.lock();
+                items
+                    .into_iter()
+                    .filter(|m| !relay.contains(&m.digest()))
+                    .collect()
+            };
+            // Signature checks run outside the cache's mutex, which the
+            // send path takes on cross-org calls.
+            let verified: Vec<(RevocationMaterial, VerifiedMaterial)> = unknown
+                .into_iter()
+                .filter_map(|m| m.verify().ok().map(|v| (m, v)))
+                .collect();
+            if !verified.is_empty() {
+                let mut relay = self.core.relay.lock();
+                for (material, v) in &verified {
+                    relay.retain(material, v, view, now);
+                }
+            }
+        }
+        let bytes = self.core.relay.lock().to_file_bytes();
+        write_relay_sidecar(sidecar, &bytes).map_err(|e| e.to_string())
+    }
+
+    /// The signed bundles to relay for `org`, newest first.
+    pub fn relay_material(&self, org: &OrgId) -> Vec<RevocationMaterial> {
+        self.core.relay.lock().for_org(org)
+    }
+
+    /// The identity of [`Self::relay_material`]`(org)` as a relay set,
+    /// without copying it: `None` when nothing is retained for `org`.
+    pub fn relay_set_digest(&self, org: &OrgId) -> Option<[u8; 32]> {
+        self.core.relay.lock().set_digest_for(org)
+    }
+
+    /// The newest signed `issued_at` this node holds from `org`, ignoring
+    /// any dated beyond `now_secs` plus the skew ceiling. `None` when the
+    /// node has never applied material from `org`.
+    pub fn latest_issued_at(&self, org: &OrgId, now_secs: u64) -> Option<u64> {
+        self.core.relay.lock().latest_issued_at(org, now_secs)
+    }
+
+    /// The locked merge, persist, publish, notify transaction shared by
+    /// every apply. `merge` mutates the freshly reread disk state and
+    /// returns whether it changed anything (a change is persisted before
+    /// it is published). The caller has already verified its input.
+    fn apply_locked(
+        &self,
+        merge: impl FnOnce(&mut OrgRevocationState) -> bool,
+    ) -> Result<Published, OrgRevocationError> {
+        let path = &self.core.path;
+
+        // The locked phase returns its outcome so raise observers
+        // run AFTER both the file lock and the core's reload guard
+        // have dropped — a callback that re-enters `apply_bundle`
+        // on the same store must not deadlock (review-9).
+        enum LockedOutcome {
+            /// What the publication changed, plus whether this apply
+            /// RECOVERED the path from poison — which owes an authority
+            /// wake even when nothing rose.
+            Applied(Published, bool),
+            /// What the publication changed, the reason, and whether the
+            /// mark was the false→true TRANSITION — which owes the same
+            /// wake the recovery does when nothing rose (E3c blockers §1).
+            DurabilityUncertain(Published, String, bool),
         }
 
         let outcome = {
@@ -2059,12 +2620,12 @@ impl OrgRevocationStore {
 
             // 4. Monotone merge against the reread disk state.
             let mut merged = disk.clone();
-            let raised_on_disk = merged.merge_bundle(bundle);
+            let changed_on_disk = merge(&mut merged);
 
             // 5. Persist iff the disk state changed; the write must
             //    complete before anything is published.
             let mut durability_uncertain: Option<(String, bool)> = None;
-            if raised_on_disk > 0 {
+            if changed_on_disk {
                 // Test seam: report a post-rename durability failure while
                 // leaving the file at its PRIOR bytes — the exact uncertainty
                 // PostRename names (the entry may resolve to the old state).
@@ -2115,7 +2676,7 @@ impl OrgRevocationStore {
             //    this lands (review-9 addendum) — then clear any
             //    recovered poison and release the lock;
             //    notification happens outside.
-            let raised = self.core.publish(merged);
+            let published = self.core.publish(merged);
             let recovered = was_poisoned && durability_uncertain.is_none();
             if recovered {
                 // Through the CORE: the clear is exactly as load-bearing as the
@@ -2125,28 +2686,30 @@ impl OrgRevocationStore {
             }
             drop(lock);
             match durability_uncertain {
-                None => LockedOutcome::Applied(raised, recovered),
-                Some((reason, newly)) => LockedOutcome::DurabilityUncertain(raised, reason, newly),
+                None => LockedOutcome::Applied(published, recovered),
+                Some((reason, newly)) => {
+                    LockedOutcome::DurabilityUncertain(published, reason, newly)
+                }
             }
         };
 
         match outcome {
-            LockedOutcome::Applied(raised, recovered) => {
-                self.core.notify(&raised);
+            LockedOutcome::Applied(published, recovered) => {
+                self.core.notify_published(&published);
                 if recovered {
                     // A recovery that raised nothing still moved authority.
                     self.core.notify_authority_changed();
                 }
-                Ok(raised)
+                Ok(published)
             }
-            LockedOutcome::DurabilityUncertain(raised, reason, newly_poisoned) => {
+            LockedOutcome::DurabilityUncertain(published, reason, newly_poisoned) => {
                 let err = OrgRevocationError::DurabilityUncertain {
                     path: path.display().to_string(),
                     reason,
                 };
                 tracing::error!("{err}");
-                self.core.notify(&raised);
-                if newly_poisoned && raised.is_empty() {
+                self.core.notify_published(&published);
+                if newly_poisoned && published.floors.is_empty() {
                     // The MARK owes the same wake the CLEAR does (E3c blockers
                     // §1): what this node may serve just went from the real
                     // material to NOTHING, yet `notify` is silent on an empty
@@ -2169,6 +2732,37 @@ impl OrgRevocationStore {
             }
         }
     }
+}
+
+/// The relay cache's sidecar: `revocation-state.json` →
+/// `revocation-state.relay.json`.
+fn relay_sidecar_path(state: &Path) -> PathBuf {
+    state.with_extension("relay.json")
+}
+
+/// Load the relay cache beside `state`, re-verifying every bundle. A missing
+/// or unreadable sidecar is an empty cache, never an error.
+fn load_relay_sidecar(state: &Path) -> RetainedMaterial {
+    let sidecar = relay_sidecar_path(state);
+    let Ok(bytes) = std::fs::read(&sidecar) else {
+        return RetainedMaterial::default();
+    };
+    // Re-run the covering rule against the persisted state when it parses;
+    // otherwise keep only what re-verifies.
+    let view = std::fs::read(state)
+        .ok()
+        .and_then(|b| OrgRevocationState::from_file_bytes(&b, state).ok())
+        .unwrap_or_default();
+    RetainedMaterial::from_file_bytes(&bytes, &view, current_timestamp())
+}
+
+/// Best-effort atomic replace (temp + rename); no durability promise. The
+/// caller holds the state file's lock, which is what makes the fixed temp
+/// path safe.
+fn write_relay_sidecar(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("relay.json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 impl std::fmt::Debug for OrgRevocationStore {
@@ -4264,6 +4858,187 @@ mod tests {
 
     /// Review-8 §9 plumbing: the raise callback fires with exactly
     /// the raised floors, and never for a no-op (lower) bundle.
+    fn grant_revocation(
+        not_after: u64,
+    ) -> crate::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle {
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        OrgGrantRevocationBundle::try_issue(
+            &org(),
+            [RevokedGrant {
+                kind: RevokedGrantKind::Capability,
+                grant_id: [0x3cu8; 32],
+                not_after,
+            }],
+        )
+        .expect("grant revocation bundle")
+    }
+
+    /// A grant revocation persists, survives restart, and keeps the file
+    /// at version 1 until there is one to record (so a node that never
+    /// revokes a grant stays readable by older builds).
+    #[test]
+    fn grant_revocation_persists_across_restart_and_bumps_the_version() {
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
+        store.apply_bundle(&bundle_with_floor(2)).expect("floor");
+        let v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        assert_eq!(v1["version"], ORG_REVOCATION_STATE_VERSION);
+        assert!(
+            v1.get("revoked_grants").is_none(),
+            "v1 stays byte-shaped as before"
+        );
+
+        let generation_before = store.publish_generation();
+        let not_after = current_timestamp() + 3_600;
+        let revoked = store
+            .apply_grant_revocations(&grant_revocation(not_after))
+            .expect("apply");
+        let key = (org().org_id(), RevokedGrantKind::Capability, [0x3cu8; 32]);
+        assert_eq!(revoked, vec![key]);
+        assert!(
+            store.publish_generation() > generation_before,
+            "an in-flight admission's stability recheck must see the change"
+        );
+        let v2: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        assert_eq!(v2["version"], ORG_REVOCATION_STATE_VERSION_WITH_GRANTS);
+
+        // Re-applying is a no-op that leaves the file untouched.
+        let before = std::fs::read(&path).expect("read");
+        assert!(store
+            .apply_grant_revocations(&grant_revocation(not_after))
+            .expect("re-apply")
+            .is_empty());
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+
+        drop(store);
+        let reopened = OrgRevocationStore::open_existing(&path).expect("restart");
+        let view = reopened.snapshot();
+        assert!(view.is_grant_revoked(&key.0, key.1, &key.2));
+        assert_eq!(
+            reopened.floor_for(&org().org_id(), &member()),
+            2,
+            "floors kept"
+        );
+    }
+
+    /// An entry whose grant has expired is never stored, and one that
+    /// expires while stored is dropped at load: it can no longer matter.
+    #[test]
+    fn expired_grant_revocations_are_not_kept() {
+        let skew = crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let mut state = OrgRevocationState::empty();
+        let long_gone = current_timestamp().saturating_sub(skew + 10);
+        assert_eq!(
+            state.merge_grant_revocations(&grant_revocation(long_gone), current_timestamp()),
+            0
+        );
+        assert_eq!(state.revoked_grant_count(), 0);
+
+        state.merge_grant_revocations(&grant_revocation(1_000), 0);
+        assert_eq!(state.revoked_grant_count(), 1);
+        let bytes = state.to_file_bytes().expect("serialize");
+        let loaded =
+            OrgRevocationState::from_file_bytes(&bytes, Path::new("x")).expect("load drops it");
+        assert_eq!(loaded.revoked_grant_count(), 0);
+    }
+
+    /// A version-1 file cannot carry grant revocations, and an unknown kind
+    /// is corruption: both refuse loudly rather than load a weaker view.
+    #[test]
+    fn malformed_grant_revocation_state_is_refused() {
+        let org_hex = serde_json::to_value(org().org_id()).expect("org json");
+        let entry = serde_json::json!({
+            "org": org_hex,
+            "kind": "capability",
+            "grant_id": hex::encode([0x3cu8; 32]),
+            "not_after": u64::MAX,
+        });
+        let v1_with_grants = serde_json::json!({
+            "version": 1, "floors": [], "revoked_grants": [entry],
+        });
+        assert!(matches!(
+            OrgRevocationState::from_file_bytes(
+                &serde_json::to_vec(&v1_with_grants).expect("json"),
+                Path::new("x")
+            ),
+            Err(OrgRevocationError::CorruptState { .. })
+        ));
+        let mut bad_kind = entry.clone();
+        bad_kind["kind"] = serde_json::json!("membership");
+        let v2_bad_kind = serde_json::json!({
+            "version": 2, "floors": [], "revoked_grants": [bad_kind],
+        });
+        assert!(matches!(
+            OrgRevocationState::from_file_bytes(
+                &serde_json::to_vec(&v2_bad_kind).expect("json"),
+                Path::new("x")
+            ),
+            Err(OrgRevocationError::CorruptState { .. })
+        ));
+    }
+
+    /// Grant subscribers hear exactly the newly revoked keys; floor
+    /// subscribers do not hear grant revocations, and vice versa.
+    #[test]
+    fn grant_subscribers_hear_only_new_grant_revocations() {
+        let scratch = Scratch::new();
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
+        let grants: Arc<Mutex<Vec<RevokedGrantKey>>> = Arc::new(Mutex::new(Vec::new()));
+        let floors: Arc<Mutex<Vec<RaisedFloor>>> = Arc::new(Mutex::new(Vec::new()));
+        let (g, f) = (grants.clone(), floors.clone());
+        let _g = store.subscribe_grants_revoked(move |revoked| g.lock().extend_from_slice(revoked));
+        let _f = store.subscribe_floors_raised(move |raised| f.lock().extend_from_slice(raised));
+
+        let not_after = current_timestamp() + 3_600;
+        store
+            .apply_grant_revocations(&grant_revocation(not_after))
+            .expect("apply");
+        assert_eq!(grants.lock().len(), 1);
+        assert!(
+            floors.lock().is_empty(),
+            "a grant revocation raises no floor"
+        );
+
+        store.apply_bundle(&bundle_with_floor(4)).expect("floor");
+        assert_eq!(grants.lock().len(), 1, "a floor raise revokes no grant");
+        assert_eq!(floors.lock().len(), 1);
+
+        store
+            .apply_grant_revocations(&grant_revocation(not_after))
+            .expect("re-apply");
+        assert_eq!(grants.lock().len(), 1, "nothing new, nothing heard");
+    }
+
+    /// A forged grant-revocation bundle is refused before any lock and
+    /// changes nothing on disk.
+    #[test]
+    fn a_forged_grant_revocation_is_refused() {
+        use crate::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle;
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
+        let mut bytes = grant_revocation(current_timestamp() + 3_600).to_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let forged = OrgGrantRevocationBundle::from_bytes(&bytes).expect("decodes");
+        let before = std::fs::read(&path).expect("read");
+        assert!(matches!(
+            store.apply_grant_revocations(&forged),
+            Err(OrgRevocationError::InvalidBundle(_))
+        ));
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+        assert_eq!(store.snapshot().revoked_grant_count(), 0);
+    }
+
     #[test]
     fn raise_callback_fires_only_on_raises() {
         let scratch = Scratch::new();
@@ -4800,5 +5575,115 @@ mod tests {
         // Terminal: a further publication does not clear it.
         store.republish_for_test();
         assert_eq!(store.barriered_generation(), Err(GenerationExhausted));
+    }
+
+    fn floors_bundle(entries: &[(u8, u32)]) -> OrgRevocationBundle {
+        let floors: BTreeMap<EntityId, u32> = entries
+            .iter()
+            .map(|(id, floor)| (EntityId::from_bytes([*id; 32]), *floor))
+            .collect();
+        OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
+    }
+
+    /// CO-5: the foreign-org cap counts only floors the merge would add, on
+    /// the state reread under the apply lock. A cumulative bundle raising
+    /// floors the org already holds fits a cap the org is already at; one
+    /// that would add past it is refused whole and not kept for relay.
+    #[test]
+    fn a_capped_apply_counts_only_the_floors_it_would_add() {
+        use super::super::org_revocation_relay::{RevocationMaterial, VerifiedMaterial};
+        let scratch = Scratch::new();
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
+        let org_id = org().org_id();
+        let at = |floor: u32| floors_bundle(&[(1, floor), (2, floor), (3, floor)]);
+
+        assert!(store
+            .apply_verified_material(&VerifiedMaterial::Floors(at(1)), Some(3))
+            .expect("apply"));
+        assert!(
+            store
+                .apply_verified_material(&VerifiedMaterial::Floors(at(2)), Some(3))
+                .expect("apply"),
+            "raising three tracked floors adds none, so it fits a cap of three"
+        );
+        assert_eq!(store.floor_for(&org_id, &EntityId::from_bytes([1; 32])), 2);
+
+        let over = floors_bundle(&[(1, 7), (9, 5)]);
+        assert!(
+            !store
+                .apply_verified_material(&VerifiedMaterial::Floors(over.clone()), Some(3))
+                .expect("apply"),
+            "a fourth member is over the cap"
+        );
+        assert_eq!(
+            store.floor_for(&org_id, &EntityId::from_bytes([1; 32])),
+            2,
+            "an apply over the cap merges nothing, not even its raises"
+        );
+        assert_eq!(store.floor_for(&org_id, &EntityId::from_bytes([9; 32])), 0);
+        assert!(!store
+            .relay_material(&org_id)
+            .contains(&RevocationMaterial::floors(&over)));
+        // Uncapped (the node's own org), the same bundle applies.
+        assert!(store
+            .apply_verified_material(&VerifiedMaterial::Floors(over), None)
+            .expect("apply"));
+        assert_eq!(store.floor_for(&org_id, &EntityId::from_bytes([9; 32])), 5);
+    }
+
+    /// CO-6: the relay sidecar is rewritten under the state file's lock
+    /// after reading back what is already there, so a bundle another
+    /// process sharing the state path retained survives this process's
+    /// write instead of being overwritten.
+    #[test]
+    fn the_relay_sidecar_keeps_what_another_process_retained() {
+        use super::super::org_revocation_relay::{
+            RetainedMaterial, RevocationMaterial, VerifiedMaterial,
+        };
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
+        let theirs = floors_bundle(&[(1, 2)]);
+        let ours = floors_bundle(&[(2, 3)]);
+
+        // The other process applied `theirs`: its floor is on disk and its
+        // bundle is in the sidecar this process has never read.
+        let mut disk = OrgRevocationState::empty();
+        disk.merge_bundle(&theirs);
+        std::fs::write(&path, disk.to_file_bytes().expect("state bytes")).expect("state");
+        let mut their_cache = RetainedMaterial::default();
+        their_cache.retain(
+            &RevocationMaterial::floors(&theirs),
+            &VerifiedMaterial::Floors(theirs.clone()),
+            &disk,
+            current_timestamp(),
+        );
+        std::fs::write(relay_sidecar_path(&path), their_cache.to_file_bytes()).expect("sidecar");
+
+        store.apply_bundle(&ours).expect("apply");
+
+        let reloaded = RetainedMaterial::from_file_bytes(
+            &std::fs::read(relay_sidecar_path(&path)).expect("sidecar"),
+            &store.snapshot(),
+            current_timestamp(),
+        );
+        let kept = reloaded.for_org(&org().org_id());
+        assert!(
+            kept.contains(&RevocationMaterial::floors(&ours)),
+            "our bundle is written"
+        );
+        assert!(
+            kept.contains(&RevocationMaterial::floors(&theirs)),
+            "the other process's bundle survives our write"
+        );
+        assert!(
+            store
+                .relay_material(&org().org_id())
+                .contains(&RevocationMaterial::floors(&theirs)),
+            "and this process now relays it too"
+        );
     }
 }

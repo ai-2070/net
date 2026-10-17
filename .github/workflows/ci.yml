@@ -5216,6 +5216,97 @@ jobs:
           .github/scripts/run-skill-examples.sh --lang go
           .github/scripts/run-skill-examples.sh --lang c
 
+  # The cross-process, cross-language org matrix: every caller language
+  # against every provider language (Rust, Go, Python, Node), each pair as
+  # TWO OS processes over a real mesh, one cross-org Granted call per shape
+  # (unary, server-streaming). In-process binding suites (org_live.*,
+  # TestLiveGranted*) cannot catch what only appears across a process
+  # boundary: the serve-handle lifetime, teardown racing the caller's drain,
+  # and a refused `start()` that leaves one side deaf (the three harness
+  # defects of the org-streaming S4 round). The protocol every driver speaks
+  # is tests/cross_lang_org/matrix/PROTOCOL.md; run_matrix.py exits non-zero
+  # if any of the 32 cells fails or does not run.
+  org-matrix:
+    name: Org cross-process matrix (Rust/Go/Python/Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go/go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: org-matrix
+          workspaces: net/crates/net -> target
+
+      - name: Build libnet and the Rust driver
+        working-directory: net/crates/net
+        run: |
+          cargo build --release -p net-ffi --features net-ffi/test-helpers
+          cargo build -p net-mesh-sdk --features net,cortex,fixtures \
+            --example gen_org_scenario --example org_matrix_peer
+
+      - name: Build the Go driver
+        working-directory: go
+        env:
+          CGO_ENABLED: "1"
+        run: go build -o "$RUNNER_TEMP/org-matrix-peer" ./cmd/org-matrix-peer
+
+      - name: Build the Python wheel
+        working-directory: net/crates/net/bindings/python
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python -m pip install --upgrade maturin
+          maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator,tool,consent,mcp,delegation,publish,a2a,payments,payments-http,org,dataforts,extension-module
+
+      - name: Build the Node addon
+        working-directory: net/crates/net/bindings/node
+        run: |
+          npm i
+          npx napi build --platform --no-default-features --features net,nat-traversal,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,consent,mcp,publish,payments,payments-http,delegation,a2a,org,test-helpers
+          npm run build:ts
+
+      - name: Run the matrix
+        working-directory: net/crates/net
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+        run: |
+          python3 tests/cross_lang_org/matrix/run_matrix.py \
+            --gen "$PWD/target/debug/examples/gen_org_scenario" \
+            --driver "rust=$PWD/target/debug/examples/org_matrix_peer" \
+            --driver "go=$RUNNER_TEMP/org-matrix-peer" \
+            --driver "python=$RUNNER_TEMP/venv/bin/python $PWD/tests/cross_lang_org/matrix/driver.py" \
+            --driver "node=node $PWD/tests/cross_lang_org/matrix/driver.mjs" \
+            --report "$RUNNER_TEMP/org-matrix.json" \
+            --logs "$RUNNER_TEMP/org-matrix-logs"
+
+      - name: Upload the matrix logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: org-matrix-logs
+          path: |
+            ${{ runner.temp }}/org-matrix.json
+            ${{ runner.temp }}/org-matrix-logs
+
   c-consumers:
     # C SDK consumer verification, slice C0
     # (docs/internal/plans/C_SDK_CONSUMER_VERIFICATION_PLAN.md).
@@ -6175,7 +6266,8 @@ jobs:
           for t in two_node_mcp_consent_then_authorized_invocation \
                    two_node_mcp_pin_does_not_override_provider_owner_scope \
                    native_typed_call_and_generated_consumer_reuse_captured_contract_offline \
-                   two_node_protected_native_denial_then_authorized_typed_call; do
+                   two_node_protected_native_denial_then_authorized_typed_call \
+                   two_org_granted_native_denial_then_authorized_generated_call; do
             grep -q "test $t ... ok" /tmp/cli_default.log || {
               echo "::error::$t did not run"; exit 1; }
           done
@@ -6480,8 +6572,9 @@ jobs:
       # aliasing the lexical guard cannot catch).
       # This full-crate run includes the journey witnesses, and two of them
       # REQUIRE Python + Pydantic v2 on PATH rather than skipping when it is
-      # missing: `native_contract_workflow` and `protected_native_workflow`
-      # assert `import pydantic; major == 2` before doing anything. The ubuntu
+      # missing: `native_contract_workflow`, `protected_native_workflow` and
+      # `cross_org_protected_workflow` assert `import pydantic; major == 2`
+      # before doing anything. The ubuntu
       # `cli-tests` job installs both; windows-latest's preinstalled Python
       # does not carry pydantic, so without this step the Windows run is red.
       # mypy additionally stops `typegen_downstream_python` from silently
@@ -7339,14 +7432,14 @@ jobs:
           cargo test --features mock-control-plane 2>&1 | tee /tmp/leaf-native.log
           total=$(grep -c '^test .* \.\.\. ok$' /tmp/leaf-native.log || true)
           echo "leaf native tests: $total"
-          # FLOOR is the measured inventory of this exact command: 299 lib
-          # units + 186 across the fifteen native integration binaries (the four
+          # FLOOR is the measured inventory of this exact command: 301 lib
+          # units + 187 across the fifteen native integration binaries (the four
           # `wasm_*` binaries compile to 0 tests natively, by design, and
           # doctests are 0). No test in the leaf is `#[cfg(unix)]`/
           # `#[cfg(windows)]`, so the count is platform-independent.
           # Raise it in the SAME commit as the witnesses it counts.
-          if [ "$total" -lt 485 ]; then
-            echo "::error::the leaf's native surface ran $total tests, floor is 485 — \
+          if [ "$total" -lt 488 ]; then
+            echo "::error::the leaf's native surface ran $total tests, floor is 488 — \
           lower the floor deliberately or restore the witness"
             exit 1
           fi
@@ -7358,7 +7451,9 @@ jobs:
           # `response_credit_parks_the_sender_and_each_grant_releases_exactly_its_chunks`
           # replaced `…the_pump…` when the instrument moved to sender-parking
           # (strengthened — the property moved with it).
-          for spec in org_authority:22 nrpc_streaming_parity:21 org_streaming_lifecycle:29; do
+          # org_streaming_lifecycle +1: the grant-revocation retirement witness
+          # (`a_grant_revocation_retires_only_the_call_under_the_revoked_grant`).
+          for spec in org_authority:22 nrpc_streaming_parity:21 org_streaming_lifecycle:30; do
             name="${spec%%:*}"; floor="${spec##*:}"
             out=$(cargo test --features mock-control-plane --test "$name" 2>&1 | tee /dev/stderr)
             n=$(printf '%s\n' "$out" | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' | head -1)

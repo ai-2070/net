@@ -3030,7 +3030,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        mesh.start();
+        mesh.start().expect("mesh start");
         mesh
     }
 

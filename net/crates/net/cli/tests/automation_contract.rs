@@ -214,7 +214,7 @@ async fn live_typegen_discovery_budget_preserves_existing_output_on_expiry() {
         .build()
         .await
         .unwrap();
-    holder.start();
+    holder.start().expect("mesh start");
     let dir = fixture();
     let destination = dir.path().join("snapshot.json");
     std::fs::write(&destination, b"previous output").unwrap();
@@ -320,7 +320,7 @@ async fn mcp_startup_budget_does_not_limit_protocol_lifetime() {
         .build()
         .await
         .unwrap();
-    holder.start();
+    holder.start().expect("mesh start");
     let dir = fixture();
     let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("net-mesh"))
         .env_remove("NET_MESH_CONFIG")

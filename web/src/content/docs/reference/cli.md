@@ -109,6 +109,13 @@ pair `--subnet-issuer-grant <PATH>` / `--subnet-issuer-key <PATH>`.
 `--subnet-leaf-ttl` (default `24h`) and `--subnet-generation` tune the
 delegated subnet credentials.
 
+Repeatable `--require-fresh-revocations <ORG_HEX>=<DURATION>` makes the node,
+as a provider, refuse callers acting for that org unless it holds signed
+revocation material from the org issued within the duration (see `org
+heartbeat`). Without it, such callers are admitted even when none of their
+org's revocations have reached the node; that is counted and logged once per
+org.
+
 `net-mesh enrollment init --issuer-identity <PATH> [--ledger <DIR>]
 [--state-dir <DIR>]` prepares an enrollment ledger offline (the ledger
 directory must not exist yet), before the first `up --enroll` uses it.
@@ -501,6 +508,23 @@ net-mesh org members <ORG> --state-dir <DIR> \
 ```
 
 `remove` signs a floor here with the offline org root — every membership certificate of the member below `--minimum-generation` is revoked — and has each named verifier (`self`, or `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`) apply it. Each verifier's own signed attestation is reported, and `complete` holds only when every named verifier persisted the floor; unnamed nodes are never assumed. `members` reports what the node of `--state-dir` issued for the org and each member's standing against its own floors — explicitly not a global roster or a claim about activity.
+
+### `revoke-grant`
+
+```
+net-mesh org revoke-grant --org-key <PATH> [--grant <PATH> …] [--dispatcher-grant <PATH> …] \
+                          [--verifier <NODE> …] [--out <PATH>] [--state-dir <DIR>] [--dry-run]
+```
+
+Withdraws grants this org issued before they expire: capability grants (`--grant`, files from `grant-capability`) and dispatcher grants (`--dispatcher-grant`, files from `grant-dispatcher`). Every named grant must verify and must have been issued by the `--org-key` org; anything else is refused before signing. One grant-revocation bundle is signed here with the org root. `--out` writes it for nodes reached another way, and each `--verifier` applies it and answers with a signed attestation giving every grant's state there (`revoked`, `not_revoked`, or `expired`). A capability grant is enforced by the providers of the org that issued it, so name those providers. At a verifier, new calls under a revoked grant are refused, and a call or stream still running under it is retired immediately. `complete` holds only when every named verifier reports every grant revoked or already expired.
+
+### `heartbeat`
+
+```
+net-mesh org heartbeat --org-key <PATH> [--verifier <NODE> …] [--out <PATH>] [--state-dir <DIR>]
+```
+
+Proves the org's revocation state current: signs an empty floor bundle (it revokes nothing) and has each `--verifier` take it. A provider started with `up --require-fresh-revocations <ORG>=<AGE>` refuses that org's callers once the newest signed revocation material it holds from the org is older than `<AGE>`. Send a heartbeat to the org's own nodes, whose calls relay it to every provider they reach, or to the providers directly, inside that age.
 
 ### `leave`
 

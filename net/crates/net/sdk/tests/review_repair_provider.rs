@@ -379,8 +379,8 @@ async fn connect(provider: &Mesh, caller: &Mesh) {
     });
     accepted.expect("accept");
     connected.expect("connect");
-    caller.start();
-    provider.start();
+    caller.start().expect("mesh start");
+    provider.start().expect("mesh start");
 }
 
 /// What a witness wants of its provider before the first request lands.
@@ -1546,8 +1546,8 @@ async fn bring_up(caller: &Mesh, provider: &Mesh) {
         .await
         .expect("connect");
     accept.await.expect("accept task").expect("accept");
-    caller.start();
-    provider.start();
+    caller.start().expect("mesh start");
+    provider.start().expect("mesh start");
     for m in [caller, provider] {
         m.inner()
             .announce_capabilities(CapabilitySet::new())

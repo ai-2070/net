@@ -93,6 +93,13 @@ pub enum SdkError {
     #[error("stream's session has been replaced by a successor")]
     SessionSuperseded,
 
+    /// [`Mesh::start`](crate::Mesh::start) started nothing. The node
+    /// is left stopped and the refusal is retryable; see
+    /// [`net::adapter::net::StartRefused`] for each reason.
+    #[cfg(feature = "net")]
+    #[error("{0}")]
+    StartRefused(net::adapter::net::StartRefused),
+
     /// One event handed to a stream send is larger than a single Net
     /// packet can carry, so nothing was sent.
     ///
@@ -141,6 +148,13 @@ pub enum SdkError {
         /// that have no variable detail.
         message: String,
     },
+}
+
+#[cfg(feature = "net")]
+impl From<net::adapter::net::StartRefused> for SdkError {
+    fn from(e: net::adapter::net::StartRefused) -> Self {
+        SdkError::StartRefused(e)
+    }
 }
 
 #[cfg(feature = "net")]

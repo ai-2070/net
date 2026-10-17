@@ -479,6 +479,12 @@ required-features = ["net", "macros"]
 name = "gen_org_scenario"
 required-features = ["net", "fixtures"]
 
+# The Rust driver of the cross-language org matrix
+# (`tests/cross_lang_org/matrix/PROTOCOL.md`): one caller or provider process.
+[[example]]
+name = "org_matrix_peer"
+required-features = ["net", "cortex"]
+
 # OSDK-L X1 — regenerate the canonical `org:` error-vocabulary fixture
 # (`tests/cross_lang_org/error_vectors.json`) every language binding parses.
 # Explicitly declared (not auto-discovered) so a build WITHOUT `fixtures`

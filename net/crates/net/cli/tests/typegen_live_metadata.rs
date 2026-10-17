@@ -129,7 +129,7 @@ async fn hydrated_snapshot_regenerates_offline_after_provider_shutdown() {
             },
         )
         .unwrap();
-    mesh.start();
+    mesh.start().expect("mesh start");
     let dir = tempfile::tempdir().unwrap();
     let snapshot = dir.path().join("snapshot.json");
     let mut cmd = command(&mesh, dir.path(), "snapshot");
@@ -256,7 +256,7 @@ async fn metadata_failures_do_not_publish_or_retry() {
                 },
             )
             .unwrap();
-        mesh.start();
+        mesh.start().expect("mesh start");
         let dir = tempfile::tempdir().unwrap();
         for verb in ["snapshot", "generate"] {
             let output = dir.path().join(verb);
@@ -334,7 +334,7 @@ async fn metadata_fetches_share_remaining_budget_without_partial_publication() {
             },
         )
         .unwrap();
-    mesh.start();
+    mesh.start().expect("mesh start");
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("snapshot.json");
     std::fs::write(&output, b"old snapshot").unwrap();
@@ -386,7 +386,7 @@ fn caps(ids: &[&str]) -> CapabilitySet {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requested_tool_arriving_after_unrelated_is_captured() {
     let mesh = discovery_host().await;
-    mesh.start();
+    mesh.start().expect("mesh start");
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("snapshot.json");
     let mut cmd = command(&mesh, dir.path(), "snapshot");
@@ -430,7 +430,7 @@ async fn missing_requested_tool_preserves_snapshot_and_generated_destination() {
         .build()
         .await
         .unwrap();
-    mesh.start();
+    mesh.start().expect("mesh start");
     let dir = tempfile::tempdir().unwrap();
     for verb in ["snapshot", "generate"] {
         let output = dir.path().join(verb);

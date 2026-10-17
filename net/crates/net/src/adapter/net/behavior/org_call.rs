@@ -129,6 +129,15 @@ impl RpcCallShape {
 /// EXACTLY ONE or deny).
 pub const ORG_ADMISSION_HEADER: &str = "net-org-admission";
 
+/// `true` for the request headers that carry org credential material for
+/// the admission layer rather than for the application: the admission
+/// proof and relayed revocation material
+/// ([`ORG_REVOCATIONS_HEADER`](super::org_revocation_relay::ORG_REVOCATIONS_HEADER)).
+/// Both are stripped before a protected handler sees the request.
+pub fn is_org_credential_header(name: &str) -> bool {
+    name == ORG_ADMISSION_HEADER || name == super::org_revocation_relay::ORG_REVOCATIONS_HEADER
+}
+
 /// Ceiling on how far in the future a proof may claim to expire,
 /// measured from now at verify time (§2.3: "FINITE, always"). A
 /// proof that could FIRST be admitted arbitrarily far in the

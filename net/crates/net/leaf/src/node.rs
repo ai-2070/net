@@ -2925,6 +2925,35 @@ impl LeafNode {
         a + b
     }
 
+    /// The grant half of the revocation feed: decode and STRICTLY
+    /// verify a signed `OrgGrantRevocationBundle`, merge its entries
+    /// into the node's view (each keyed by the bundle's org, so an org
+    /// revokes only grants it issued; entries already expired at
+    /// `now_unix_secs` are skipped), and retire every live protected
+    /// call that rode on a revoked grant, with the same `Revoked`
+    /// terminal a floor raise produces. Returns the number of newly
+    /// revoked grants.
+    pub fn ingest_org_grant_revocation_bundle(
+        &mut self,
+        bundle_bytes: &[u8],
+        now_unix_secs: u64,
+    ) -> Result<usize> {
+        let bundle =
+            crate::org::grant_revocation::OrgGrantRevocationBundle::from_bytes(bundle_bytes)
+                .map_err(|e| LeafError::Wire(format!("grant revocation bundle: {e}")))?;
+        bundle
+            .verify()
+            .map_err(|e| LeafError::Wire(format!("grant revocation bundle: {e}")))?;
+        let added = self
+            .org_revocation
+            .merge_grant_revocations(&bundle, now_unix_secs);
+        if added > 0 {
+            self.org_serves.raise_floors(&self.org_revocation);
+            self.pump_org_frames();
+        }
+        Ok(added)
+    }
+
     /// The revocation feed: decode and STRICTLY verify a signed
     /// `OrgRevocationBundle` (org-root signature), merge its floors
     /// into the node's raise-only view (a lower floor never rolls back

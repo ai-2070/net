@@ -704,3 +704,199 @@ fn grant_capability_discover_warns_about_windows_dacl() {
         "--insecure-permissions must not silence the Windows DACL warning",
     );
 }
+
+// ---------------------------------------------------------------------------
+// `org revoke-grant`: the offline half (signing + `--out`). Delivery to
+// running nodes is exercised end to end in the SDK's live witnesses.
+// ---------------------------------------------------------------------------
+
+fn grant_capability_invoke(key: &Path, out: &Path) {
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-capability", "--org-key"])
+        .arg(key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .arg("--invoke")
+        .args(["--target-node", TARGET_NODE_HEX])
+        .args(["--out"])
+        .arg(out)
+        .assert()
+        .code(0);
+}
+
+fn grant_dispatcher(key: &Path, out: &Path) {
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "grant-dispatcher", "--org-key"])
+        .arg(key)
+        .args(["--dispatcher", DISPATCHER_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .args(["--out"])
+        .arg(out)
+        .assert()
+        .code(0);
+}
+
+/// The written bundle verifies under the issuing org and names exactly the
+/// grants given: the capability grant by its `grant_id`, the dispatcher
+/// grant by its derived revocation id.
+#[test]
+fn revoke_grant_writes_a_verifiable_bundle_naming_the_grants() {
+    use net_sdk::org::{OrgDispatcherGrant, OrgGrantRevocationBundle, RevokedGrantKind};
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let cap = dir.path().join("cap.grant.json");
+    let disp = dir.path().join("disp.grant.json");
+    grant_capability_invoke(&key, &cap);
+    grant_dispatcher(&key, &disp);
+    let bundle_path = dir.path().join("revoked.json");
+
+    let out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["--output", "json", "org", "revoke-grant", "--org-key"])
+        .arg(&key)
+        .arg("--grant")
+        .arg(&cap)
+        .arg("--dispatcher-grant")
+        .arg(&disp)
+        .arg("--out")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["org"], org_id_of(&key));
+    assert_eq!(summary["grants"].as_array().unwrap().len(), 2);
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    assert_eq!(envelope["version"], 1);
+    let bundle: OrgGrantRevocationBundle =
+        serde_json::from_value(envelope["bundle"].clone()).unwrap();
+    bundle.verify().expect("signed by the org root");
+    assert_eq!(hex::encode(bundle.org_id.as_bytes()), org_id_of(&key));
+
+    let cap_grant: OrgCapabilityGrant = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&cap).unwrap()).unwrap()
+            ["grant"]
+            .clone(),
+    )
+    .unwrap();
+    let disp_grant: OrgDispatcherGrant = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&disp).unwrap()).unwrap()
+            ["grant"]
+            .clone(),
+    )
+    .unwrap();
+    let named: Vec<_> = bundle
+        .entries()
+        .iter()
+        .map(|e| (e.kind, e.grant_id))
+        .collect();
+    assert!(named.contains(&(RevokedGrantKind::Capability, cap_grant.grant_id)));
+    assert!(named.contains(&(RevokedGrantKind::Dispatcher, disp_grant.revocation_id())));
+}
+
+/// Only the issuing org can revoke a grant. A grant from org A named with
+/// org B's key is refused before anything is signed or written.
+#[test]
+fn revoke_grant_refuses_a_grant_another_org_issued() {
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = keygen(dir.path(), "issuer.toml");
+    let other = keygen(dir.path(), "other.toml");
+    let cap = dir.path().join("cap.grant.json");
+    grant_capability_invoke(&issuer, &cap);
+    let bundle_path = dir.path().join("revoked.json");
+
+    let out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "revoke-grant", "--org-key"])
+        .arg(&other)
+        .arg("--grant")
+        .arg(&cap)
+        .arg("--out")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only the issuing org can revoke"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!bundle_path.exists(), "nothing was written");
+}
+
+/// Nothing to revoke, or nowhere to send it, is an argument error.
+#[test]
+fn revoke_grant_needs_a_grant_and_a_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let cap = dir.path().join("cap.grant.json");
+    grant_capability_invoke(&key, &cap);
+
+    let no_grant = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "revoke-grant", "--org-key"])
+        .arg(&key)
+        .args(["--out"])
+        .arg(dir.path().join("x.json"))
+        .output()
+        .unwrap();
+    assert!(!no_grant.status.success());
+    assert!(String::from_utf8_lossy(&no_grant.stderr).contains("at least one grant"));
+
+    let nowhere = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "revoke-grant", "--org-key"])
+        .arg(&key)
+        .arg("--grant")
+        .arg(&cap)
+        .output()
+        .unwrap();
+    assert!(!nowhere.status.success());
+    assert!(String::from_utf8_lossy(&nowhere.stderr).contains("nothing would receive"));
+}
+
+/// `org heartbeat --out` writes an empty, verifiable floor bundle: it revokes
+/// nothing and carries the org's signed `issued_at`.
+#[test]
+fn heartbeat_writes_an_empty_signed_floor_bundle() {
+    use net_sdk::org::OrgRevocationBundle;
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let out_path = dir.path().join("heartbeat.json");
+    let out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["--output", "json", "org", "heartbeat", "--org-key"])
+        .arg(&key)
+        .arg("--out")
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+    let bundle: OrgRevocationBundle = serde_json::from_value(envelope["bundle"].clone()).unwrap();
+    bundle.verify().expect("signed by the org root");
+    assert!(bundle.floors().is_empty(), "a heartbeat revokes nothing");
+    assert_eq!(hex::encode(bundle.org_id.as_bytes()), org_id_of(&key));
+
+    let nowhere = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "heartbeat", "--org-key"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(!nowhere.status.success());
+    assert!(String::from_utf8_lossy(&nowhere.stderr).contains("nothing would receive"));
+}

@@ -60,8 +60,8 @@ async fn check(description_len: usize) {
     });
     a.unwrap();
     c.unwrap();
-    caller.start();
-    host.start();
+    caller.start().expect("mesh start");
+    host.start().expect("mesh start");
     let result = tokio::time::timeout(Duration::from_secs(35), caller.describe_a2a(target)).await;
     assert!(
         result.is_ok(),

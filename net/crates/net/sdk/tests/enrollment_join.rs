@@ -117,7 +117,7 @@ impl Operator {
             .build()
             .await
             .unwrap();
-        mesh.start();
+        mesh.start().expect("mesh start");
         let contact = MeshContact {
             addr: Some(mesh.local_addr()),
             noise_pubkey: *mesh.public_key(),
@@ -172,7 +172,7 @@ async fn attach(identity: Identity, psk: &Psk, contact: &MeshContact) -> Result<
         .build()
         .await
         .map_err(|e| e.to_string())?;
-    mesh.start();
+    mesh.start().expect("mesh start");
     match tokio::time::timeout(
         Duration::from_secs(3),
         mesh.connect_via(

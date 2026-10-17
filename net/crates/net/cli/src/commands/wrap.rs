@@ -271,7 +271,8 @@ pub async fn run(
                 .build()
                 .await
                 .map_err(|e| connection_failure(format!("listener startup: {e}")))?;
-            mesh.start();
+            mesh.start()
+                .map_err(|e| connection_failure(format!("listener startup: {e}")))?;
             Ok((mesh, None))
         } else if let Some(remote) = remote.as_ref() {
             Ok((build_attached_mesh(Some(identity), remote).await?, None))

@@ -85,7 +85,7 @@ async fn boot_holder_with_dir(src: &Path) -> (Mesh, BlobRef) {
         .build()
         .await
         .expect("mesh build");
-    mesh.start();
+    mesh.start().expect("mesh start");
     let adapter = Arc::new(MeshBlobAdapter::new("holder", Arc::new(Redex::new())));
     transport::serve_blob_transfer(&mesh, adapter.clone());
     let manifest_ref = transport::store_dir(&adapter, src)

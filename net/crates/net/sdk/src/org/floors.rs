@@ -27,6 +27,7 @@
 use net::adapter::net::behavior::org::{OrgId, OrgRevocationBundle};
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_revocation::OrgRevocationError;
+use net::adapter::net::behavior::org_revocation_relay::RevocationMaterial;
 use net::adapter::net::identity::{EntityId, EntityKeypair};
 
 /// nRPC service every node serves floor application on.
@@ -43,24 +44,24 @@ const ATTESTATION_DOMAIN: &[u8] = b"net-mesh org floor attestation v1";
 const MAX_REQUEST_BUNDLE_BYTES: usize = 64 * 1024;
 const MAX_ATTESTED_FLOORS: usize = 1024;
 
-fn now_unix() -> u64 {
+pub(super) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(super) fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
 }
 
-struct Cursor<'a> {
-    buf: &'a [u8],
+pub(super) struct Cursor<'a> {
+    pub(super) buf: &'a [u8],
 }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(super) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if n > self.buf.len() {
             return None;
         }
@@ -68,16 +69,16 @@ impl<'a> Cursor<'a> {
         self.buf = tail;
         Some(head)
     }
-    fn arr<const N: usize>(&mut self) -> Option<[u8; N]> {
+    pub(super) fn arr<const N: usize>(&mut self) -> Option<[u8; N]> {
         self.take(N)?.try_into().ok()
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(super) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.arr()?))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(super) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.arr()?))
     }
-    fn lp(&mut self, max: usize) -> Option<&'a [u8]> {
+    pub(super) fn lp(&mut self, max: usize) -> Option<&'a [u8]> {
         let n = self.u32()? as usize;
         if n > max {
             return None;
@@ -319,6 +320,26 @@ pub fn answer_org_floor(
     authority: Option<&NodeAuthority>,
     now: u64,
 ) -> Result<OrgFloorAttestation, String> {
+    answer_org_floor_with(request_bytes, keypair, authority, now, None)
+}
+
+/// How a node applies revocation material signed by an org other than its
+/// own, when it takes any: an org it granted to, or one its freshness
+/// policy names (`MeshNode::apply_org_revocation_material`, which also
+/// enforces the foreign-org caps). `None` means this node takes no material
+/// from that org at all (answered `NotMember`); `Some(Err)` carries why an
+/// accepted org's bundle was refused.
+pub type ForeignApply<'a> = dyn Fn(&RevocationMaterial) -> Option<Result<(), String>> + 'a;
+
+/// [`answer_org_floor`], plus `foreign`: how to apply a bundle signed by an
+/// org other than this node's own. `None` answers such a bundle `NotMember`.
+pub fn answer_org_floor_with(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+    foreign: Option<&ForeignApply<'_>>,
+) -> Result<OrgFloorAttestation, String> {
     let request = OrgFloorRequest::from_bytes(request_bytes)?;
     if request.issued_at > now.saturating_add(ORG_FLOOR_FRESHNESS_SECS)
         || now > request.issued_at.saturating_add(ORG_FLOOR_FRESHNESS_SECS)
@@ -332,10 +353,29 @@ pub fn answer_org_floor(
     let members: Vec<EntityId> = bundle.floors().iter().map(|f| f.0.clone()).collect();
     let (outcome, floors) = match authority {
         None => (OrgFloorOutcome::NotMember, Vec::new()),
-        // Only the owner org's floors are applied from the network.
-        Some(authority) if bundle.org_id != authority.config.owner_org => {
-            (OrgFloorOutcome::NotMember, Vec::new())
-        }
+        // Another org's floors: applied only through `foreign` (an org this
+        // node granted to, or one its freshness policy names).
+        Some(authority) if bundle.org_id != authority.config.owner_org => match foreign {
+            None => (OrgFloorOutcome::NotMember, Vec::new()),
+            Some(apply) => match apply(&RevocationMaterial::floors(&bundle)) {
+                // Not an org this node takes material from.
+                None => (OrgFloorOutcome::NotMember, Vec::new()),
+                Some(applied) => {
+                    let outcome = match applied {
+                        Ok(()) => OrgFloorOutcome::Applied,
+                        Err(_) => OrgFloorOutcome::Refused,
+                    };
+                    let floors = members
+                        .into_iter()
+                        .map(|m| {
+                            let floor = authority.revocation.floor_for(&bundle.org_id, &m);
+                            (m, floor)
+                        })
+                        .collect();
+                    (outcome, floors)
+                }
+            },
+        },
         Some(authority) => {
             let outcome = match authority.revocation.apply_bundle(&bundle) {
                 Ok(_) => OrgFloorOutcome::Applied,
@@ -367,8 +407,59 @@ pub fn answer_org_floor(
     Ok(attestation)
 }
 
+/// Node side, for either request kind the floor service carries: a floor
+/// request ([`OrgFloorRequest`]) or a grant-revocation request
+/// ([`super::grant_revocation::OrgGrantRevocationRequest`]), told apart by
+/// their magic. Returns the signed attestation's wire bytes.
+pub fn answer_org_revocation_request(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+) -> Result<Vec<u8>, String> {
+    answer_org_revocation_request_with(request_bytes, keypair, authority, now, None)
+}
+
+/// [`answer_org_revocation_request`] with a [`ForeignApply`] hook for
+/// bundles signed by another org.
+pub fn answer_org_revocation_request_with(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+    foreign: Option<&ForeignApply<'_>>,
+) -> Result<Vec<u8>, String> {
+    if super::grant_revocation::is_grant_revocation_request(request_bytes) {
+        super::grant_revocation::answer_org_grant_revocation_with(
+            request_bytes,
+            keypair,
+            authority,
+            now,
+            foreign,
+        )
+        .map(|a| a.to_bytes())
+    } else {
+        answer_org_floor_with(request_bytes, keypair, authority, now, foreign).map(|a| a.to_bytes())
+    }
+}
+
+/// The [`ForeignApply`] hook backed by a node: its own acceptance rule and
+/// caps (`MeshNode::apply_org_revocation_material`).
+#[cfg(feature = "cortex")]
+pub fn node_foreign_apply(
+    node: &net::adapter::net::MeshNode,
+) -> impl Fn(&RevocationMaterial) -> Option<Result<(), String>> + '_ {
+    use net::adapter::net::behavior::org_revocation_relay::MaterialRefusal;
+    move |material| match node.apply_org_revocation_material(material) {
+        Ok(_) => Some(Ok(())),
+        Err(MaterialRefusal::NotAccepted(_) | MaterialRefusal::NoAuthority) => None,
+        Err(e) => Some(Err(e.to_string())),
+    }
+}
+
 /// Serve floor application on [`ORG_FLOOR_SERVICE`]. Drop the handle to
-/// stop serving.
+/// stop serving. The same service applies grant revocations
+/// ([`super::grant_revocation`]).
 #[cfg(feature = "cortex")]
 pub fn serve_org_floor(
     node: &std::sync::Arc<net::adapter::net::MeshNode>,
@@ -405,7 +496,14 @@ impl net::adapter::net::cortex::rpc::RpcHandler for FloorHandler {
                 let keypair = node.entity_keypair_arc();
                 // Floor application persists (fsync): off the async runtime.
                 tokio::task::spawn_blocking(move || {
-                    answer_org_floor(&body, &keypair, authority.as_deref(), now_unix())
+                    let foreign = node_foreign_apply(&node);
+                    answer_org_revocation_request_with(
+                        &body,
+                        &keypair,
+                        authority.as_deref(),
+                        now_unix(),
+                        Some(&foreign),
+                    )
                 })
                 .await
                 .unwrap_or_else(|_| Err("org floor task failed".to_string()))
@@ -415,7 +513,7 @@ impl net::adapter::net::cortex::rpc::RpcHandler for FloorHandler {
             Ok(attestation) => RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: Vec::new(),
-                body: bytes::Bytes::from(attestation.to_bytes()),
+                body: bytes::Bytes::from(attestation),
             },
             Err(e) => RpcResponsePayload {
                 status: RpcStatus::Unauthorized,

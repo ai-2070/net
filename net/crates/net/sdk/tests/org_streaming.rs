@@ -195,8 +195,8 @@ async fn bring_up(caller: &Mesh, provider: &Mesh) {
         .await
         .expect("connect");
     accept.await.expect("accept task").expect("accept");
-    caller.start();
-    provider.start();
+    caller.start().expect("mesh start");
+    provider.start().expect("mesh start");
 
     for m in [caller, provider] {
         m.node()
@@ -221,7 +221,7 @@ async fn attach_provider(caller: &Mesh, provider: &Mesh) {
         .await
         .expect("connect");
     accept.await.expect("accept task").expect("accept");
-    provider.start();
+    provider.start().expect("mesh start");
 
     for m in [caller, provider] {
         m.node()

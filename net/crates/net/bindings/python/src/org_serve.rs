@@ -265,6 +265,45 @@ pub fn install_provider_grant_audience(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
+/// As a provider, refuse callers acting for ``org`` (32 raw bytes) unless
+/// this node holds signed revocation material from that org issued within
+/// ``max_age_secs``; ``None`` lifts the requirement. Without it, a cross-org
+/// caller is admitted even when none of its org's revocations have reached
+/// this node (counted by :func:`foreign_revocation_unverified_admissions`).
+#[pyfunction]
+#[pyo3(signature = (mesh, org, max_age_secs))]
+pub fn require_fresh_org_revocations(
+    mesh: &crate::mesh_bindings::NetMesh,
+    org: &[u8],
+    max_age_secs: Option<u64>,
+) -> PyResult<()> {
+    let org: [u8; 32] = org
+        .try_into()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("org must be 32 bytes"))?;
+    if max_age_secs == Some(0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_age_secs must be positive (pass None to lift the requirement)",
+        ));
+    }
+    let node = mesh.node_arc_clone()?;
+    node.require_fresh_org_revocations(
+        net::adapter::net::behavior::org::OrgId::from_bytes(org),
+        max_age_secs.map(std::time::Duration::from_secs),
+    );
+    Ok(())
+}
+
+/// Cross-org admissions this node made with no revocation material at all
+/// from the caller's org.
+#[pyfunction]
+pub fn foreign_revocation_unverified_admissions(
+    mesh: &crate::mesh_bindings::NetMesh,
+) -> PyResult<u64> {
+    Ok(mesh
+        .node_arc_clone()?
+        .foreign_revocation_unverified_admissions())
+}
+
 // ===========================================================================
 // §4.4 — the streaming provider verbs: `serve_org_streaming` /
 // `serve_org_client_stream` / `serve_org_duplex`.

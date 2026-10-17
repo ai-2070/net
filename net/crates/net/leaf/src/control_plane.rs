@@ -120,6 +120,13 @@ pub struct SignedAnnouncement(pub Vec<u8>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevocationBundle(pub Vec<u8>);
 
+/// An organization's signed grant-revocation bundle, carried verbatim
+/// and as opaque as [`RevocationBundle`]: the leaf's org module
+/// verifies it and retires calls under the grants it names. See
+/// [`ControlPlane::take_grant_revocation_bundles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRevocationBundle(pub Vec<u8>);
+
 /// **The session-independent signalling envelope.**
 ///
 /// This is the design Kyra pinned and the plan requires Stage 5 to
@@ -302,6 +309,15 @@ pub trait ControlPlane {
     /// exactly. Implementations override only to deliver what their
     /// carrier actually sent, in arrival order.
     fn take_revocation_bundles(&mut self) -> Vec<RevocationBundle> {
+        vec![]
+    }
+
+    /// Hand over every grant-revocation bundle the carrier delivered
+    /// since the last call, verbatim and in arrival order. Same rules
+    /// as [`Self::take_revocation_bundles`]: opaque to the carrier,
+    /// verified by the leaf, and empty by default (no feed revokes
+    /// nothing).
+    fn take_grant_revocation_bundles(&mut self) -> Vec<GrantRevocationBundle> {
         vec![]
     }
 }

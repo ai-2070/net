@@ -110,6 +110,25 @@ is immediate"), but the unqualified invariant above read as a stronger
 guarantee than the cross-org path provides. The mechanism to close it
 exists — `grant_id` is in the proof the policy sees — and is not built.
 
+**Update (2026-10-17, branch `LZL0/cross-org`): built.** Grant revocation
+ships as `OrgGrantRevocationBundle` (`behavior/org_grant_revocation.rs`):
+the issuing org revokes its capability grants (by `grant_id`) or dispatcher
+grants (by a derived revocation id); entries merge into
+`revocation-state.json` (version 2 once any exist), admission step 8 denies
+`CapabilityGrantRevoked` / `DispatcherGrantRevoked`, and live protected
+streams under a revoked grant retire `Revoked` through a grant feed on the
+store. Delivery rides the floor service; `net org revoke-grant` is the
+operator verb. See `ORGANIZATIONS.md` §Grant revocation.
+
+The cross-org half of this limitation ("absent means zero": A's floors and
+dispatcher revocations never reaching B) is closed the same day by the
+revocation relay plus opt-in freshness (`behavior/org_revocation_relay.rs`):
+A's nodes carry A's retained signed bundles on their cross-org calls, B
+merges them before admission (from its own org, its grantees and its policy
+orgs only, capped per foreign org), and a provider may require recent
+material per org (`RevocationsStale`), fed by `net org heartbeat`. See
+`ORGANIZATIONS.md` §Cross-org revocations.
+
 ---
 
 ## Model

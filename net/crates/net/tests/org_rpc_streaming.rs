@@ -2164,6 +2164,10 @@ async fn raise_between_reserve_and_install_denies_with_zero_effects() {
                 acting_org: org_b.org_id(),
                 member: caller_kp.entity_id().clone(),
                 member_generation: 1,
+                grants: net::adapter::net::cortex::rpc::CallGrantKeys {
+                    dispatcher: (org_b.org_id(), [0xd1u8; 32]),
+                    capability: None,
+                },
                 deadline: None,
             },
             clock.wall_ns,

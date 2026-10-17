@@ -75,9 +75,9 @@ async fn connect_all(executor: &Mesh, callers: &[&Mesh]) {
         connected.expect("connect");
     }
     for caller in callers {
-        caller.start();
+        caller.start().expect("mesh start");
     }
-    executor.start();
+    executor.start().expect("mesh start");
 }
 
 /// Completes immediately, counting the briefs it was actually handed —

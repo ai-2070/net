@@ -1515,6 +1515,39 @@ pub struct UpArgs {
     /// minted from it. The channel root never sits on this node.
     #[arg(long = "channel-grant", value_name = "PATH", requires = "enroll")]
     pub channel_grants: Vec<PathBuf>,
+
+    /// As a provider, refuse callers acting for org `ORG_HEX` unless this
+    /// node holds signed revocation material from that org issued within
+    /// `DURATION` (e.g. `<org>=7d`). Repeat per org. The org proves itself
+    /// current with `org heartbeat`; its callers relay what their nodes hold.
+    /// Without this, such callers are admitted even when none of their org's
+    /// revocations have reached this node (counted and logged once).
+    #[arg(long = "require-fresh-revocations", value_name = "ORG_HEX=DURATION")]
+    pub require_fresh_revocations: Vec<String>,
+}
+
+/// Parse `--require-fresh-revocations ORG_HEX=DURATION` values.
+fn parse_fresh_revocations(
+    raw: &[String],
+) -> Result<Vec<(net::adapter::net::behavior::org::OrgId, Duration)>, CliError> {
+    raw.iter()
+        .map(|entry| {
+            let (org, age) = entry.split_once('=').ok_or_else(|| {
+                invalid_args(format!(
+                    "--require-fresh-revocations '{entry}' must be <org-hex>=<duration>"
+                ))
+            })?;
+            let org = super::enrollment::parse_org_id(org).map_err(invalid_args)?;
+            let age = crate::humantime::parse_duration(age)
+                .map_err(|e| invalid_args(format!("--require-fresh-revocations '{entry}': {e}")))?;
+            if age.is_zero() {
+                return Err(invalid_args(format!(
+                    "--require-fresh-revocations '{entry}': the age must be positive"
+                )));
+            }
+            Ok((org, age))
+        })
+        .collect()
 }
 
 /// `net-mesh down` arguments.
@@ -2315,10 +2348,22 @@ async fn forward_org_floor(
     node: &Arc<net::adapter::net::MeshNode>,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    use net_sdk::org::floors::{answer_org_floor, request_org_floor, OrgFloorRequest};
+    use net_sdk::org::floors::{
+        answer_org_revocation_request_with, node_foreign_apply, OrgFloorRequest, ORG_FLOOR_SERVICE,
+    };
+    use net_sdk::org::grant_revocation::{is_grant_revocation_request, OrgGrantRevocationRequest};
     let parsed = (|| {
         let bytes = hex::decode(request["request"].as_str()?).ok()?;
-        let floor = OrgFloorRequest::from_bytes(&bytes).ok()?;
+        // Either request kind the floor service answers: the verifier is
+        // all this node needs from it.
+        let verifier = if is_grant_revocation_request(&bytes) {
+            OrgGrantRevocationRequest::from_bytes(&bytes)
+                .ok()?
+                .verifier()
+                .clone()
+        } else {
+            OrgFloorRequest::from_bytes(&bytes).ok()?.verifier().clone()
+        };
         let addr: Option<std::net::SocketAddr> =
             request["addr"].as_str().and_then(|a| a.parse().ok());
         let key = request["noise_pubkey"]
@@ -2327,24 +2372,32 @@ async fn forward_org_floor(
             .and_then(|k| <[u8; 32]>::try_from(k).ok());
         let wait = Duration::from_millis(request["wait_ms"].as_u64().unwrap_or(10_000))
             .min(MAX_FLOOR_FORWARD_WAIT);
-        Some((bytes, floor, addr.zip(key), wait))
+        Some((bytes, verifier, addr.zip(key), wait))
     })();
-    let Some((bytes, floor, contact, wait)) = parsed else {
+    let Some((bytes, verifier, contact, wait)) = parsed else {
         return serde_json::json!({ "error": "malformed org floor request" });
     };
-    if floor.verifier() == node.entity_id() {
+    if &verifier == node.entity_id() {
         let (keypair, authority) = (node.entity_keypair_arc(), node.node_authority());
+        let node = Arc::clone(node);
         let answered = tokio::task::spawn_blocking(move || {
-            answer_org_floor(&bytes, &keypair, authority.as_deref(), now_unix())
+            let foreign = node_foreign_apply(&node);
+            answer_org_revocation_request_with(
+                &bytes,
+                &keypair,
+                authority.as_deref(),
+                now_unix(),
+                Some(&foreign),
+            )
         })
         .await
         .unwrap_or_else(|_| Err("org floor task failed".to_string()));
         return match answered {
-            Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+            Ok(a) => serde_json::json!({ "attestation": hex::encode(a) }),
             Err(e) => serde_json::json!({ "refused": e }),
         };
     }
-    let target = floor.verifier().node_id();
+    let target = verifier.node_id();
     let outcome = tokio::time::timeout(wait, async {
         if node.peer_session_id(target).is_none() {
             let (addr, key) =
@@ -2353,12 +2406,21 @@ async fn forward_org_floor(
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        request_org_floor(node, target, &floor, wait).await
+        // The bytes go as built: the CLI decodes and verifies the reply
+        // against its own request, so this node only carries them.
+        let opts = net::adapter::net::mesh_rpc::CallOptions {
+            deadline: Some(std::time::Instant::now() + wait),
+            ..Default::default()
+        };
+        node.call(target, ORG_FLOOR_SERVICE, bytes.into(), opts)
+            .await
+            .map(|reply| reply.body.to_vec())
+            .map_err(|e| e.to_string())
     })
     .await
     .unwrap_or_else(|_| Err("timed out".to_string()));
     match outcome {
-        Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+        Ok(a) => serde_json::json!({ "attestation": hex::encode(a) }),
         Err(e) => serde_json::json!({ "no_answer": e }),
     }
 }
@@ -3333,6 +3395,7 @@ pub async fn run_up(
 ) -> Result<(), CliError> {
     // Resolve and validate everything before any filesystem or network effect.
     let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+    let fresh_revocations = parse_fresh_revocations(&args.require_fresh_revocations)?;
     let state = state_dir(args.state_dir, profile_name)?;
     let source = PskSource::parse(args.psk_from.as_deref())?;
     let bind_raw = args
@@ -3514,7 +3577,14 @@ pub async fn run_up(
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
-    mesh.start();
+    // The freshness policy is in force before the node processes a single
+    // inbound packet: set after `start()`, a restart would admit the very
+    // callers the flag exists to refuse until the policy landed.
+    for (org, age) in &fresh_revocations {
+        mesh.node().require_fresh_org_revocations(*org, Some(*age));
+    }
+    mesh.start()
+        .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     // Channels served from this state directory (`channel serve`) are gated
     // again before anything is served; an unreadable record fails closed.
     for served in super::channel::read_served(&state).map_err(generic)? {

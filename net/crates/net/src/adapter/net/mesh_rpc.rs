@@ -1153,6 +1153,114 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
     })
 }
 
+/// Most relayed bundles one protected REQUEST may have verified (and
+/// persisted) on the service's bridge path, before its admission. Everything
+/// else a relay header carries is applied in the background.
+const MAX_INLINE_RELAY_APPLIES: usize = 2;
+
+/// Ingest revocation material a cross-org caller relayed in the
+/// `net-org-revocations` header of a protected REQUEST. Best-effort and
+/// never a reason to refuse the call: a malformed header is ignored, each
+/// bundle is verified and accepted or refused on its own
+/// ([`MeshNode::apply_org_revocation_material`]), and bundles already
+/// handled are skipped by digest.
+///
+/// The bridge serves one frame at a time, so this must not make every other
+/// caller of the service wait on signature checks and fsyncs. Only material
+/// THIS call's admission needs is applied before it returns: a bundle whose
+/// signer is in this node's freshness policy while the material held for
+/// that org is stale (without it the call would be refused
+/// `RevocationsStale`), at most [`MAX_INLINE_RELAY_APPLIES`] of them.
+/// Everything else is applied in the background, at most
+/// [`MAX_BACKGROUND_INGESTS`] ingests at a time; a relay that finds no free
+/// slot is dropped and forgotten, so a later relay of it is tried again.
+///
+/// [`MAX_BACKGROUND_INGESTS`]:
+///     crate::adapter::net::behavior::org_revocation_relay::MAX_BACKGROUND_INGESTS
+async fn ingest_relayed_org_revocations(mesh: &Arc<MeshNode>, inbound: &RpcInboundEvent) {
+    use crate::adapter::net::behavior::org_revocation_relay::{
+        decode_relay_header, ORG_REVOCATIONS_HEADER,
+    };
+    let needle = ORG_REVOCATIONS_HEADER.as_bytes();
+    if inbound.payload.len() < RPC_FRAME_BODY_OFFSET
+        || !inbound.payload.windows(needle.len()).any(|w| w == needle)
+    {
+        return;
+    }
+    let Ok(req) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..)) else {
+        return;
+    };
+    let fresh: Vec<_> = req
+        .headers
+        .iter()
+        .filter(|(name, _)| name == ORG_REVOCATIONS_HEADER)
+        .filter_map(|(_, value)| decode_relay_header(value))
+        .flatten()
+        .filter(|item| mesh.org_relay().first_sighting(item.digest()))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let now = crate::adapter::net::behavior::org::current_timestamp();
+    let (mut inline, mut background) = (Vec::new(), Vec::new());
+    for item in fresh {
+        let needed_now = inline.len() < MAX_INLINE_RELAY_APPLIES
+            && item.claimed_org().is_some_and(|org| {
+                mesh.org_relay().has_freshness_policy(&org)
+                    && !mesh.org_revocations_fresh(&org, now)
+            });
+        if needed_now {
+            inline.push(item);
+        } else {
+            background.push(item);
+        }
+    }
+    if !background.is_empty() {
+        if mesh.org_relay().begin_ingest() {
+            let node = Arc::clone(mesh);
+            tokio::spawn(async move {
+                let worker = Arc::clone(&node);
+                // The slot is released whether the apply finishes or panics.
+                let _ = tokio::task::spawn_blocking(move || {
+                    apply_relayed_org_revocations(&worker, background)
+                })
+                .await;
+                node.org_relay().end_ingest();
+            });
+        } else {
+            for item in &background {
+                mesh.org_relay().forget(&item.digest());
+            }
+        }
+    }
+    if !inline.is_empty() {
+        let node = Arc::clone(mesh);
+        let _ =
+            tokio::task::spawn_blocking(move || apply_relayed_org_revocations(&node, inline)).await;
+    }
+}
+
+/// Apply relayed bundles one by one (blocking: an apply persists). Only a
+/// bundle that is itself bad stays seen. Every other refusal depends on this
+/// node's state at that moment (its authority, its grants, its freshness
+/// policy, a foreign org's entry count, the store), so the same bundle
+/// relayed again later is tried again once that state has changed.
+fn apply_relayed_org_revocations(
+    node: &MeshNode,
+    items: Vec<crate::adapter::net::behavior::org_revocation_relay::RevocationMaterial>,
+) {
+    use crate::adapter::net::behavior::org_revocation_relay::MaterialRefusal;
+    for item in items {
+        if let Err(refusal) = node.apply_org_revocation_material(&item) {
+            if !matches!(refusal, MaterialRefusal::Invalid(_)) {
+                node.org_relay().forget(&item.digest());
+            }
+            node.org_relay().note_refused();
+            tracing::debug!(%refusal, "relayed org revocation material refused");
+        }
+    }
+}
+
 /// §2.4a v0.4 compatibility: a legacy fire-and-forget publish carries
 /// `flags: 0` — an OMITTED shape. The streaming folds' contract-4 check
 /// (`ss_request_flags_ok` and the CS/DX twins) refuses a flag-less REQUEST on
@@ -1376,7 +1484,14 @@ pub fn admit_protected_opening(
         session_binding,
         floors: facts.floors.as_ref(),
         skew_secs: facts.skew_secs,
+        revocation_freshness: None,
     };
+    // Revocation freshness (opt-in): an acting org named in this node's
+    // policy must have signed material here no older than its max age.
+    let freshness = |org: &crate::adapter::net::behavior::org::OrgId, now: u64| -> bool {
+        mesh.org_revocations_fresh(org, now)
+    };
+    let ctx = ctx.with_revocation_freshness(&freshness);
     let captured_stamp = facts.stamp;
 
     // Review-7 RED negative-control seam — registration-local,
@@ -1422,11 +1537,24 @@ pub fn admit_protected_opening(
         |proof| (reg.provider_policy())(proof),
     );
     let admitted = outcome?;
+    // Default-permissive is not silent: a cross-org call admitted while this
+    // node holds no revocation material at all from the acting org (and no
+    // freshness requirement applied) is counted and, once per org, logged.
+    if admitted.acting_org != admitted.provider_org
+        && !mesh.org_relay().has_freshness_policy(&admitted.acting_org)
+        && mesh
+            .org_revocation_store()
+            .and_then(|store| store.latest_issued_at(&admitted.acting_org, clock.wall_secs()))
+            .is_none()
+    {
+        mesh.org_relay()
+            .note_unverified_admission(&admitted.acting_org);
+    }
 
     // §3 step 4 — INSTALL under the registry lock with the §2.3
     // requalification. The member generation comes from the decoded
     // proof's membership certificate (the floor comparison term).
-    let (member_generation, mut deadline_inputs) = match registered_shape {
+    let (member_generation, mut deadline_inputs, grants) = match registered_shape {
         RpcCallShape::Unary => crate::adapter::net::behavior::org_call::OrgCallProof::decode(
             admission_headers.first().copied().unwrap_or(&[]),
         )
@@ -1438,6 +1566,7 @@ pub fn admit_protected_opening(
                     Some(proof.dispatcher_grant.not_after),
                     proof.capability_grant.as_ref().map(|g| g.not_after),
                 ],
+                fold::CallGrantKeys::of(&proof.dispatcher_grant, proof.capability_grant.as_ref()),
             )
         }),
         _ => crate::adapter::net::behavior::org_call::OrgStreamCallProof::decode(
@@ -1451,6 +1580,7 @@ pub fn admit_protected_opening(
                     Some(proof.dispatcher_grant.not_after),
                     proof.capability_grant.as_ref().map(|g| g.not_after),
                 ],
+                fold::CallGrantKeys::of(&proof.dispatcher_grant, proof.capability_grant.as_ref()),
             )
         }),
     }
@@ -1474,6 +1604,7 @@ pub fn admit_protected_opening(
             acting_org: admitted.acting_org,
             member: admitted.caller.clone(),
             member_generation,
+            grants,
             // The §2.1 deadline lives at the fold (`StreamCallLifetime`);
             // unary records carry none (enforcing §2.1 on unary would
             // change unary behavior).
@@ -1593,6 +1724,10 @@ async fn admit_and_dispatch_protected(
     // (the reservation guard; the Q4 policy-veto guard slot stays
     // consumed) → install under the registry lock (§2.3 requalification).
     // The fold seam then TRANSFERS the lease at its effect boundary.
+    //
+    // Relayed revocation material lands FIRST, so the snapshot this
+    // admission verifies against already holds it.
+    ingest_relayed_org_revocations(mesh, inbound).await;
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
     // WIRE-1: ONE atomic snapshot of the peer's live session (the streaming
     // twin's verbatim clause): the record's `(session_id, establishment)`
@@ -1909,6 +2044,7 @@ async fn admit_and_dispatch_protected_stream<F: ProtectedStreamFold>(
     // RECEIVING session's full Noise handshake hash — resolved here and
     // required to equal `proof.session_binding` at step 9b (a hand-built
     // session with `None` can never admit a protected stream).
+    ingest_relayed_org_revocations(mesh, inbound).await;
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
     // WIRE-1: ONE atomic snapshot of the peer's live session. The record's
     // `(session_id, establishment)` must BOTH come from the exact
@@ -2715,17 +2851,19 @@ impl ClientStreamCallRaw {
                     headers: self.initial_headers.clone(),
                     body: body.clone(),
                 };
-                if let Some(intent) = self.org_proof_intent.as_ref() {
-                    attach_signed_admission(
+                let relay = match self.org_proof_intent.as_ref() {
+                    Some(intent) => attach_signed_admission(
                         &self.mesh,
                         self.target_node_id,
                         self.call_id,
                         intent,
                         &mut req,
                         RpcCallShape::ClientStreaming,
-                    )?;
-                }
+                    )?,
+                    None => PendingRelay(None),
+                };
                 self.publish_initial_request(&req).await?;
+                relay.sent(&self.mesh);
                 self.initial_headers.clear();
                 self.state = ClientStreamState::Sending;
             }
@@ -2773,17 +2911,19 @@ impl ClientStreamCallRaw {
                     headers: std::mem::take(&mut self.initial_headers),
                     body: Bytes::new(),
                 };
-                if let Some(intent) = self.org_proof_intent.as_ref() {
-                    attach_signed_admission(
+                let relay = match self.org_proof_intent.as_ref() {
+                    Some(intent) => attach_signed_admission(
                         &self.mesh,
                         self.target_node_id,
                         self.call_id,
                         intent,
                         &mut req,
                         RpcCallShape::ClientStreaming,
-                    )?;
-                }
+                    )?,
+                    None => PendingRelay(None),
+                };
                 self.publish_initial_request(&req).await?;
+                relay.sent(&self.mesh);
             }
             ClientStreamState::Sending => {
                 let chunk = RpcRequestChunkPayload {
@@ -3080,17 +3220,19 @@ impl DuplexSink {
                     headers: self.initial_headers.clone(),
                     body: body.clone(),
                 };
-                if let Some(intent) = self.org_proof_intent.as_ref() {
-                    attach_signed_admission(
+                let relay = match self.org_proof_intent.as_ref() {
+                    Some(intent) => attach_signed_admission(
                         &self.inner.mesh,
                         self.inner.target_node_id,
                         self.inner.call_id,
                         intent,
                         &mut req,
                         RpcCallShape::Duplex,
-                    )?;
-                }
+                    )?,
+                    None => PendingRelay(None),
+                };
                 self.publish_initial_request(&req).await?;
+                relay.sent(&self.inner.mesh);
                 self.initial_headers.clear();
                 self.inner.initial_sent.store(true, Ordering::SeqCst);
                 self.state = ClientStreamState::Sending;
@@ -3133,17 +3275,19 @@ impl DuplexSink {
                     headers: std::mem::take(&mut self.initial_headers),
                     body: Bytes::new(),
                 };
-                if let Some(intent) = self.org_proof_intent.as_ref() {
-                    attach_signed_admission(
+                let relay = match self.org_proof_intent.as_ref() {
+                    Some(intent) => attach_signed_admission(
                         &self.inner.mesh,
                         self.inner.target_node_id,
                         self.inner.call_id,
                         intent,
                         &mut req,
                         RpcCallShape::Duplex,
-                    )?;
-                }
+                    )?,
+                    None => PendingRelay(None),
+                };
                 self.publish_initial_request(&req).await?;
+                relay.sent(&self.inner.mesh);
                 self.inner.initial_sent.store(true, Ordering::SeqCst);
             }
             ClientStreamState::Sending => {
@@ -7299,17 +7443,20 @@ impl MeshNode {
         // measurement) with the shape and the receiving session's Noise
         // handshake hash threaded through. A streaming mint without a binding
         // (a hand-built session) fails LOCAL, fail-closed.
-        if let Some(intent) = opts.org_proof_intent.as_ref() {
-            check_provider_binding(self, target_node_id, intent)?;
-            attach_signed_admission(
-                self,
-                target_node_id,
-                call_id,
-                intent,
-                &mut req,
-                RpcCallShape::ServerStreaming,
-            )?;
-        }
+        let relay = match opts.org_proof_intent.as_ref() {
+            Some(intent) => {
+                check_provider_binding(self, target_node_id, intent)?;
+                attach_signed_admission(
+                    self,
+                    target_node_id,
+                    call_id,
+                    intent,
+                    &mut req,
+                    RpcCallShape::ServerStreaming,
+                )?
+            }
+            None => PendingRelay(None),
+        };
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + RPC_ROUTE_V1_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
@@ -7333,6 +7480,7 @@ impl MeshNode {
             pending.cancel(call_id);
             return Err(e);
         }
+        relay.sent(self);
 
         let request_bytes_len = payload_bytes.len() as u32;
         // Cancel keep-alive lives on the returned RpcStream so the
@@ -7919,17 +8067,20 @@ impl MeshNode {
         // exactly-one-header discipline, the finalized wire bounds and the
         // one-packet measurement); the unary proof carries no session binding
         // (§1.3 is streaming-only).
-        if let Some(intent) = opts.org_proof_intent.as_ref() {
-            check_provider_binding(self, target_node_id, intent)?;
-            attach_signed_admission(
-                self,
-                target_node_id,
-                call_id,
-                intent,
-                &mut req,
-                RpcCallShape::Unary,
-            )?;
-        }
+        let relay = match opts.org_proof_intent.as_ref() {
+            Some(intent) => {
+                check_provider_binding(self, target_node_id, intent)?;
+                attach_signed_admission(
+                    self,
+                    target_node_id,
+                    call_id,
+                    intent,
+                    &mut req,
+                    RpcCallShape::Unary,
+                )?
+            }
+            None => PendingRelay(None),
+        };
 
         // Caller-side metrics guard, created ONLY after all fallible LOCAL
         // request construction (provider binding, proof signing, final wire
@@ -8068,6 +8219,7 @@ impl MeshNode {
             );
             return Err(err);
         }
+        relay.sent(self);
 
         // From here on, the REQUEST is in flight on the server. The
         // `UnaryCallGuard` installed right after `register_large` covers
@@ -8744,7 +8896,7 @@ fn attach_signed_admission(
     intent: &OrgProofIntent,
     req: &mut RpcRequestPayload,
     call_shape: RpcCallShape,
-) -> Result<(), RpcError> {
+) -> Result<PendingRelay, RpcError> {
     if req
         .headers
         .iter()
@@ -8764,6 +8916,48 @@ fn attach_signed_admission(
         RpcCallShape::Unary => None,
         _ => mesh.peer_session_binding(target_node_id),
     };
+    // The relay rides the same single packet as the request and its proof.
+    // If finalizing with it fails any bound (header count, field size, the
+    // packet), drop it and finalize again without it: the call matters more
+    // than the relay, which is not marked sent and so stays due.
+    if let Some(set_digest) = attach_relayed_org_revocations(mesh, intent, req) {
+        if finalize_signed_admission(intent, call_id, req, call_shape, session_binding).is_ok() {
+            return Ok(PendingRelay(Some((intent.provider.clone(), set_digest))));
+        }
+        req.headers.retain(|(name, _)| {
+            name != ORG_ADMISSION_HEADER
+                && name
+                    != crate::adapter::net::behavior::org_revocation_relay::ORG_REVOCATIONS_HEADER
+        });
+    }
+    finalize_signed_admission(intent, call_id, req, call_shape, session_binding)?;
+    Ok(PendingRelay(None))
+}
+
+/// The relay a protected request carries, recorded as sent (see
+/// `NodeRelayState::mark_relayed`) only once the request is published.
+/// Dropped unsent, it records nothing and the relay stays due.
+#[must_use = "call `sent` once the request is published"]
+struct PendingRelay(Option<(crate::adapter::net::identity::EntityId, [u8; 32])>);
+
+impl PendingRelay {
+    /// The request was published: the provider has this set.
+    fn sent(self, mesh: &MeshNode) {
+        if let Some((provider, set_digest)) = self.0 {
+            mesh.org_relay().mark_relayed(&provider, set_digest);
+        }
+    }
+}
+
+/// Sign the admission proof over the finalized `req`, append it, and check
+/// the final wire: the field bounds and the one-packet budget.
+fn finalize_signed_admission(
+    intent: &OrgProofIntent,
+    call_id: u64,
+    req: &mut RpcRequestPayload,
+    call_shape: RpcCallShape,
+    session_binding: Option<[u8; 32]>,
+) -> Result<(), RpcError> {
     let header = sign_admission_proof(intent, call_id, req, call_shape, session_binding)?;
     req.headers.push(header);
     req.validate_wire_bounds().map_err(|e| RpcError::Codec {
@@ -8791,6 +8985,46 @@ fn attach_signed_admission(
         });
     }
     Ok(())
+}
+
+/// Caller side of the cross-org revocation relay: on a cross-org protected
+/// call, attach this node's retained revocation material for the acting org
+/// (newest first, within the relay budget) unless the same set went to this
+/// provider recently. Returns the attached set's digest, for the caller to
+/// record once the request is sent. A caller-set relay header is left
+/// alone, and so is a request with no header slot left for the relay AND
+/// the admission proof that follows it.
+///
+/// The due check runs first, from the cached set digest: in steady state
+/// the set is not due, and nothing is copied or encoded.
+fn attach_relayed_org_revocations(
+    mesh: &MeshNode,
+    intent: &OrgProofIntent,
+    req: &mut RpcRequestPayload,
+) -> Option<[u8; 32]> {
+    use crate::adapter::net::behavior::org_revocation_relay::{
+        encode_relay_header, MAX_RELAY_HEADER_BYTES, ORG_REVOCATIONS_HEADER,
+    };
+    if intent.acting_org == intent.provider_owner_org
+        || req.headers.len() + 2 > crate::adapter::net::cortex::MAX_RPC_HEADERS
+        || req.headers.iter().any(|(n, _)| n == ORG_REVOCATIONS_HEADER)
+    {
+        return None;
+    }
+    let store = mesh.org_revocation_store()?;
+    let set_digest = store.relay_set_digest(&intent.acting_org)?;
+    if !mesh.org_relay().relay_due(&intent.provider, set_digest) {
+        return None;
+    }
+    let material = store.relay_material(&intent.acting_org);
+    // Leave room for the proof (about a kilobyte) and the rest of the frame.
+    let room = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE
+        .saturating_sub(request_wire_size(req))
+        .saturating_sub(2048);
+    let value = encode_relay_header(&material, room.min(MAX_RELAY_HEADER_BYTES))?;
+    req.headers
+        .push((ORG_REVOCATIONS_HEADER.to_string(), value));
+    Some(set_digest)
 }
 
 /// Mint a random 64-bit call_id. Used as the correlation token
@@ -14005,6 +14239,218 @@ mod roster_fallback_tests {
         assert!(
             result.is_ok(),
             "a stale route hint must fall back to the roster, not error out: {result:?}",
+        );
+    }
+
+    // ---- Cross-org revocation relay: caller and provider sides ----
+
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgRevocationBundle};
+    use crate::adapter::net::behavior::org_revocation_relay::{
+        encode_relay_header, RevocationMaterial, MAX_BACKGROUND_INGESTS, MAX_RELAY_HEADER_BYTES,
+        ORG_REVOCATIONS_HEADER,
+    };
+
+    /// A cross-org intent: the caller acts in org B (the node's own org)
+    /// toward a provider owned by a different org.
+    fn cross_org_intent(org_b: &OrgKeypair) -> OrgProofIntent {
+        let provider = EntityKeypair::generate().entity_id().clone();
+        let mut intent = owner_delegated_intent(EntityKeypair::generate(), org_b, provider);
+        intent.provider_owner_org = OrgKeypair::from_bytes([0x43u8; 32]).org_id();
+        intent
+    }
+
+    fn svc_request(app_headers: usize) -> RpcRequestPayload {
+        RpcRequestPayload {
+            service: "svc".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: (0..app_headers)
+                .map(|i| (format!("x-app-{i}"), b"v".to_vec()))
+                .collect(),
+            body: Bytes::from_static(b"ping"),
+        }
+    }
+
+    fn carries_relay(req: &RpcRequestPayload) -> bool {
+        req.headers.iter().any(|(n, _)| n == ORG_REVOCATIONS_HEADER)
+    }
+
+    /// A provider node of org B whose store holds one heartbeat from B, so
+    /// it has B's material to relay.
+    async fn relaying_node(tag: &str) -> (Arc<MeshNode>, OrgKeypair, std::path::PathBuf) {
+        let (node, _entity, org_b, dir) = protected_provider(tag).await;
+        let heartbeat = OrgRevocationBundle::try_issue(&org_b, &std::collections::BTreeMap::new())
+            .expect("heartbeat");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&heartbeat)
+            .expect("apply");
+        (node, org_b, dir)
+    }
+
+    /// CO-3: attaching the relay records nothing. Only `sent` (after the
+    /// publish) marks the set, so a request that was finalized but never
+    /// went out leaves the relay due for the next call.
+    #[tokio::test]
+    async fn a_relay_is_marked_sent_only_once_its_request_is_out() {
+        let (node, org_b, _dir) = relaying_node("relay-mark").await;
+        let intent = cross_org_intent(&org_b);
+
+        let mut unsent = svc_request(0);
+        let pending =
+            attach_signed_admission(&node, 0, 1, &intent, &mut unsent, RpcCallShape::Unary)
+                .expect("finalize");
+        assert!(carries_relay(&unsent));
+        drop(pending);
+
+        let mut next = svc_request(0);
+        let pending = attach_signed_admission(&node, 0, 2, &intent, &mut next, RpcCallShape::Unary)
+            .expect("finalize");
+        assert!(
+            carries_relay(&next),
+            "a relay that never went out stays due"
+        );
+        pending.sent(&node);
+
+        let mut after = svc_request(0);
+        let pending =
+            attach_signed_admission(&node, 0, 3, &intent, &mut after, RpcCallShape::Unary)
+                .expect("finalize");
+        assert!(
+            !carries_relay(&after),
+            "a set that went out is not resent inside the resend interval"
+        );
+        pending.sent(&node);
+    }
+
+    /// CO-4: the relay never takes the header slot the admission proof
+    /// needs. A cross-org call with one slot left finalizes without it (as
+    /// it did before the relay existed), and the relay stays due.
+    #[tokio::test]
+    async fn a_relay_never_takes_the_last_header_slot() {
+        use crate::adapter::net::cortex::MAX_RPC_HEADERS;
+        let (node, org_b, _dir) = relaying_node("relay-slots").await;
+        let intent = cross_org_intent(&org_b);
+
+        let mut full = svc_request(MAX_RPC_HEADERS - 1);
+        let pending = attach_signed_admission(&node, 0, 1, &intent, &mut full, RpcCallShape::Unary)
+            .expect("a request that fits without the relay still finalizes");
+        assert!(!carries_relay(&full));
+        assert_eq!(full.headers.len(), MAX_RPC_HEADERS);
+        pending.sent(&node);
+
+        let mut roomy = svc_request(0);
+        let pending =
+            attach_signed_admission(&node, 0, 2, &intent, &mut roomy, RpcCallShape::Unary)
+                .expect("finalize");
+        assert!(carries_relay(&roomy), "the skipped relay is still due");
+        drop(pending);
+    }
+
+    /// A protected REQUEST frame carrying `items` in a relay header.
+    fn relay_frame(items: &[RevocationMaterial]) -> RpcInboundEvent {
+        let mut req = svc_request(0);
+        req.headers.push((
+            ORG_REVOCATIONS_HEADER.to_string(),
+            encode_relay_header(items, MAX_RELAY_HEADER_BYTES).expect("fits"),
+        ));
+        let mut f = EventMeta::new(DISPATCH_RPC_REQUEST, 0, 0x1, 1, 0)
+            .to_bytes()
+            .to_vec();
+        encode_rpc_route(&mut f, 0);
+        f.extend_from_slice(&req.encode());
+        RpcInboundEvent {
+            session_id: 0,
+            channel_hash: 0,
+            origin_hash: 0x1,
+            from_node: 0x9b,
+            payload: Bytes::from(f),
+        }
+    }
+
+    /// CO-2 (and CO-1's inline path): a relayed bundle refused because of
+    /// this node's state at the time (here: it takes nothing from org A
+    /// yet) is not remembered as seen. Once the node requires fresh
+    /// material from A, the SAME relay is applied, and because the call's
+    /// admission depends on it, it is applied before ingest returns.
+    #[tokio::test]
+    async fn a_bundle_refused_for_this_nodes_state_is_tried_again() {
+        let (node, _entity, _org_b, _dir) = protected_provider("relay-retry").await;
+        let org_a = OrgKeypair::from_bytes([0x41u8; 32]);
+        let heartbeat = OrgRevocationBundle::try_issue(&org_a, &std::collections::BTreeMap::new())
+            .expect("heartbeat");
+        let frame = relay_frame(&[RevocationMaterial::floors(&heartbeat)]);
+        let store = node.org_revocation_store().expect("store");
+        let now = crate::adapter::net::behavior::org::current_timestamp;
+
+        ingest_relayed_org_revocations(&node, &frame).await;
+        assert!(
+            wait_until_at_least(|| node.refused_org_revocation_material(), 1).await,
+            "B takes nothing from A yet: refused"
+        );
+        assert!(store.latest_issued_at(&org_a.org_id(), now()).is_none());
+
+        node.require_fresh_org_revocations(org_a.org_id(), Some(Duration::from_secs(3600)));
+        ingest_relayed_org_revocations(&node, &frame).await;
+        assert!(
+            store.latest_issued_at(&org_a.org_id(), now()).is_some(),
+            "the same relay is applied now, before ingest returns"
+        );
+    }
+
+    /// CO-1 / CO-2: material the call does not need is applied in the
+    /// background, within a bounded number of ingests. With every slot
+    /// taken a relay is dropped and forgotten (so a later relay retries
+    /// it); a bundle that does not verify stays seen.
+    #[tokio::test]
+    async fn background_ingest_is_bounded_and_a_bad_bundle_stays_seen() {
+        let (node, _entity, org_b, _dir) = protected_provider("relay-bg").await;
+        let relay = node.org_relay();
+        let good = OrgRevocationBundle::try_issue(&org_b, &std::collections::BTreeMap::new())
+            .expect("heartbeat");
+        let mut bad = RevocationMaterial::floors(&good);
+        let last = bad.bytes.len() - 1;
+        bad.bytes[last] ^= 0xff; // the signature's last byte
+
+        ingest_relayed_org_revocations(&node, &relay_frame(std::slice::from_ref(&bad))).await;
+        assert!(wait_until_at_least(|| node.refused_org_revocation_material(), 1).await);
+        assert!(
+            !relay.first_sighting(bad.digest()),
+            "a bundle that does not verify stays seen"
+        );
+
+        // The background ingest above may still be releasing its slot.
+        for _ in 0..MAX_BACKGROUND_INGESTS {
+            assert!(wait_until_at_least(|| u64::from(relay.begin_ingest()), 1).await);
+        }
+        assert!(!relay.begin_ingest(), "the slots are bounded");
+        let material = RevocationMaterial::floors(&good);
+        ingest_relayed_org_revocations(&node, &relay_frame(std::slice::from_ref(&material))).await;
+        assert!(
+            relay.first_sighting(material.digest()),
+            "with no free slot the relay is dropped and forgotten"
+        );
+        relay.forget(&material.digest());
+        for _ in 0..MAX_BACKGROUND_INGESTS {
+            relay.end_ingest();
+        }
+
+        ingest_relayed_org_revocations(&node, &relay_frame(&[material])).await;
+        let store = node.org_revocation_store().expect("store");
+        assert!(
+            wait_until_at_least(
+                || u64::from(
+                    store
+                        .latest_issued_at(
+                            &org_b.org_id(),
+                            crate::adapter::net::behavior::org::current_timestamp()
+                        )
+                        .is_some()
+                ),
+                1
+            )
+            .await,
+            "with a slot free the relay lands in the background"
         );
     }
 }

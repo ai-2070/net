@@ -333,7 +333,8 @@ pub(crate) async fn build_attached_mesh(
     // `connect_via` registers a pending-initiator entry then
     // awaits msg2 from the dispatch loop, so start() must run
     // before the call — otherwise no consumer picks up msg2.
-    mesh.start();
+    mesh.start()
+        .map_err(|e| connection_failure(format!("mesh start failed: {e}")))?;
     mesh.connect_via(&remote.addr.to_string(), &remote.public_key, remote.node_id)
         .await
         .map_err(|e| {

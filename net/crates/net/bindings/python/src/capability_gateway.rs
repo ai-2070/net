@@ -1834,8 +1834,8 @@ mod paid_invoke_e2e {
         });
         accept.expect("accept");
         connect.expect("connect");
-        server.start();
-        caller.start();
+        server.start().expect("mesh start");
+        caller.start().expect("mesh start");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -553,8 +553,8 @@ mod live {
             .await
             .unwrap();
         accept.await.unwrap().unwrap();
-        device.start();
-        provider.start();
+        device.start().expect("mesh start");
+        provider.start().expect("mesh start");
         for m in [&device, &provider] {
             m.node()
                 .announce_capabilities(CapabilitySet::new())
@@ -675,7 +675,7 @@ mod live {
         node.install_node_authority(Arc::new(authority)).unwrap();
         node.set_owner_cert_emission(true).unwrap();
         let mesh = Mesh::from_node_arc(node, configs, Some(identity.clone()));
-        mesh.start();
+        mesh.start().expect("mesh start");
         mesh
     }
 
@@ -823,7 +823,7 @@ mod live {
         let (node, configs) = node_for(&p_id).await;
         let restarted = Mesh::from_node_arc(node, configs, Some(p_id.clone()));
         restarted.install_org_authority(&p_node_dir).unwrap();
-        restarted.start();
+        restarted.start().expect("mesh start");
         assert_eq!(
             restarted
                 .node()

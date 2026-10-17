@@ -220,9 +220,9 @@ async fn bring_up(consumer: &Member, providers: &[&Member]) {
             .expect("connect");
         accept.await.expect("accept task").expect("accept");
     }
-    consumer.mesh.start();
+    consumer.mesh.start().expect("mesh start");
     for provider in providers {
-        provider.mesh.start();
+        provider.mesh.start().expect("mesh start");
     }
     for member in providers.iter().copied().chain([consumer]) {
         member

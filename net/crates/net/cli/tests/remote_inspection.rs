@@ -442,7 +442,7 @@ async fn live_typegen_consumes_the_inspected_non_loopback_bind() {
     let channels = Arc::new(ChannelConfigRegistry::new());
     node.set_channel_configs(channels.clone());
     let host = Arc::new(net_sdk::Mesh::from_node_arc(Arc::new(node), channels, None));
-    host.start();
+    host.start().expect("mesh start");
     let descriptor: net_sdk::tool::ToolDescriptor = serde_json::from_value(serde_json::json!({
         "tool_id": "bind_probe", "name": "Bind Probe", "version": "1.0.0",
         "description": "Non-loopback acquisition witness",
