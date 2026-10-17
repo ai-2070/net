@@ -52,7 +52,7 @@ async fn remote_effect_occurs_once_despite_timeout_and_late_response() {
     let handler = Arc::new(EffectHandler::default());
     handler.delay.store(true, Ordering::SeqCst);
     let _serve = mesh.serve_rpc(TRANSFER_SERVICE, handler.clone()).unwrap();
-    mesh.start();
+    mesh.start().expect("mesh start");
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "").unwrap();

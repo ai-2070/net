@@ -67,9 +67,9 @@ async fn bring_up_all(callers: &[&Mesh], provider: &Mesh) {
             .await;
         settle_handshake(connected, accept).await;
     }
-    provider.start();
+    provider.start().expect("mesh start");
     for caller in callers {
-        caller.start();
+        caller.start().expect("mesh start");
     }
     for m in callers.iter().copied().chain([provider]) {
         m.node()
@@ -132,8 +132,8 @@ async fn bring_up(caller: &Mesh, provider: &Mesh) {
         )
         .await;
     settle_handshake(connected, accept).await;
-    caller.start();
-    provider.start();
+    caller.start().expect("mesh start");
+    provider.start().expect("mesh start");
 
     for m in [caller, provider] {
         m.node()

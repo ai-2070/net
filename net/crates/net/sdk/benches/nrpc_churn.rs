@@ -85,8 +85,8 @@ fn main() {
             });
             accept_res.expect("accept");
             connect_res.expect("connect");
-            server.start();
-            caller.start();
+            server.start().expect("mesh start");
+            caller.start().expect("mesh start");
             // Subtract the 50ms breather so the recorded
             // handshake reflects actual handshake work, not the
             // artificial gap.

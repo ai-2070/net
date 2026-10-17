@@ -46,7 +46,7 @@ async fn boot_holder_with_blob(bytes: &[u8]) -> (Mesh, BlobRef) {
         .build()
         .await
         .expect("mesh build");
-    mesh.start();
+    mesh.start().expect("mesh start");
 
     let adapter = Arc::new(MeshBlobAdapter::new("holder", Arc::new(Redex::new())));
     transport::serve_blob_transfer(&mesh, adapter.clone());
@@ -177,7 +177,7 @@ async fn recv_blob_deadline_preserves_destination_after_attachment() {
         .build()
         .await
         .unwrap();
-    holder.start();
+    holder.start().expect("mesh start");
     let home = TempDir::new().unwrap();
     let out_dir = TempDir::new().unwrap();
     let destination = out_dir.path().join("received.bin");
@@ -501,7 +501,7 @@ async fn send_blob_store_then_recv_round_trip() {
         .build()
         .await
         .expect("mesh build");
-    mesh.start();
+    mesh.start().expect("mesh start");
     let redex = Arc::new(Redex::new().with_persistent_dir(store_dir.path()));
     let adapter = Arc::new(MeshBlobAdapter::new("send-blob", redex).with_persistent(true));
     transport::serve_blob_transfer(&mesh, adapter);

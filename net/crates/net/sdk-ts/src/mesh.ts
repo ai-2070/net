@@ -637,7 +637,13 @@ export class MeshNode {
     return await this.native.accept(peerNodeId);
   }
 
-  /** Start the receive loop / heartbeats / router. */
+  /**
+   * Start the receive loop / heartbeats / router. Idempotent.
+   *
+   * Rejects when nothing was started because an `accept()` is still
+   * mid-handshake. The node stays stopped (it would send but never
+   * receive); retry once that `accept()` resolves.
+   */
   async start(): Promise<void> {
     await this.native.start();
   }

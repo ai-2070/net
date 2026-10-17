@@ -91,8 +91,8 @@ async fn handshaken_pair() -> (Mesh, Mesh) {
     });
     accept.expect("accept");
     connect.expect("connect");
-    server.start();
-    caller.start();
+    server.start().expect("mesh start");
+    caller.start().expect("mesh start");
     (server, caller)
 }
 

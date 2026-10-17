@@ -128,7 +128,7 @@ async fn native_typed_call_and_generated_consumer_reuse_captured_contract_offlin
     let records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let observed = records.clone();
     let full = descriptor();
-    host.start();
+    host.start().expect("mesh start");
     // Publish only after attachment is observed. This avoids racing the
     // default announcement coalescer against CLI's five-second discovery
     // window; no production timers are shortened for this fixture.
@@ -204,7 +204,7 @@ async fn native_typed_call_and_generated_consumer_reuse_captured_contract_offlin
         .await
         .unwrap();
     assert_ne!(caller.node_id(), provider);
-    caller.start();
+    caller.start().expect("mesh start");
     tokio::time::timeout(
         Duration::from_secs(10),
         caller.connect_via(&host.local_addr().to_string(), host.public_key(), provider),

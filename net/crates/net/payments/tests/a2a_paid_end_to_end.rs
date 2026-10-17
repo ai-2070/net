@@ -615,8 +615,8 @@ async fn handshake(server: &Mesh, caller: &Mesh) {
     });
     accept.expect("accept");
     connect.expect("connect");
-    server.start();
-    caller.start();
+    server.start().expect("mesh start");
+    caller.start().expect("mesh start");
 }
 
 fn bounds() -> A2aBounds {

@@ -47,7 +47,7 @@ async fn boot_holder_with(
     let adapter = Arc::new(MeshBlobAdapter::new("holder", Arc::new(Redex::new())));
     let serve = transport::serve_blob_transfer_rpc_with_policy(&mesh, adapter, policy)
         .expect("serve transfers rpc");
-    mesh.start();
+    mesh.start().expect("mesh start");
     (mesh, serve)
 }
 

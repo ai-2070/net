@@ -136,8 +136,8 @@ async fn build_pair() -> (Mesh, Mesh) {
     );
     r1.unwrap();
     r2.unwrap();
-    host.start();
-    agent.start();
+    host.start().expect("mesh start");
+    agent.start().expect("mesh start");
     (host, agent)
 }
 

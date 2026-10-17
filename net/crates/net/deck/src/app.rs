@@ -4156,7 +4156,7 @@ mod anchor_cell_tests {
             .build()
             .await
             .expect("the anchor node");
-        anchor.start();
+        anchor.start().expect("mesh start");
         // The deck's node is already dispatching (`spawn` starts
         // it), so the anchor joins over the routed handshake — the
         // same path any peer takes against a running node.

@@ -48,8 +48,8 @@ async fn connected_pair() -> (Mesh, Mesh) {
     });
     accepted.expect("accept");
     connected.expect("connect");
-    host.start();
-    alice.start();
+    host.start().expect("mesh start");
+    alice.start().expect("mesh start");
     (host, alice)
 }
 

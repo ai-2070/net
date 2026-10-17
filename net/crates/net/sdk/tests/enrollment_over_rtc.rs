@@ -67,8 +67,8 @@ async fn a_real_sdk_enrollment_promotes_the_exact_session() {
         .build()
         .await
         .expect("client");
-    anchor.start();
-    client.start();
+    anchor.start().expect("mesh start");
+    client.start().expect("mesh start");
 
     let (_id_client, endpoint) = connect_rtc_loopback(client.node(), anchor.node())
         .await
@@ -159,8 +159,8 @@ async fn a_rejected_sdk_enrollment_leaves_the_session_provisional() {
         .build()
         .await
         .expect("client");
-    anchor.start();
-    client.start();
+    anchor.start().expect("mesh start");
+    client.start().expect("mesh start");
     connect_rtc_loopback(client.node(), anchor.node())
         .await
         .expect("DataChannel + Noise");

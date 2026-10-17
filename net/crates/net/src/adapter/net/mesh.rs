@@ -9534,6 +9534,44 @@ impl std::error::Error for SensingLeaseReleaseRefused {
     }
 }
 
+/// Why [`MeshNode::try_start`] started nothing.
+///
+/// Every variant is retryable: the node is left stopped, exactly as
+/// before the call, and a later `try_start` proceeds normally once the
+/// condition clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartRefused {
+    /// An `accept()` was mid-handshake. Starting the receive loop now
+    /// would race the responder for the peer's first handshake message,
+    /// so the start was rolled back. Retry after the `accept()` returns.
+    AcceptInFlight,
+}
+
+impl std::fmt::Display for StartRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AcceptInFlight => f.write_str(
+                "start refused: an accept() is in flight; nothing was started \
+                 (retry once accept() returns)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartRefused {}
+
+/// What one `start_inner` call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTransition {
+    /// This call moved the node from stopped to started.
+    Started,
+    /// The node was already running.
+    AlreadyStarted,
+    /// Rolled back: an `accept()` is in flight.
+    RefusedAcceptInFlight,
+}
+
 /// Everything Phase 1 decided that Phase 2 must still put on the wire.
 ///
 /// Phase 1 mutates local state under the sensing guards and produces this;
@@ -25585,7 +25623,25 @@ impl MeshNode {
     /// of documenting it.
     ///
     /// Idempotent.
+    ///
+    /// **A refusal is silent here.** If an `accept()` is in flight this
+    /// returns having started nothing, and the only trace is a `warn!`
+    /// log line. A node in that state sends normally but processes no
+    /// inbound packet, which looks like a discovery or routing fault
+    /// rather than a lifecycle one. Use [`Self::try_start`] wherever
+    /// the caller can act on the refusal; every language binding does.
     pub fn start(self: &Arc<Self>) {
+        let _ = self.try_start();
+    }
+
+    /// [`Self::start`], reporting whether the node is running afterwards.
+    ///
+    /// `Ok(())` means the receive loop is running: either this call
+    /// started it or an earlier one did (starting is idempotent).
+    /// [`StartRefused::AcceptInFlight`] means nothing was started
+    /// because an `accept()` is mid-handshake. The refusal is
+    /// retryable: call again once that `accept()` returns.
+    pub fn try_start(self: &Arc<Self>) -> Result<(), StartRefused> {
         // Store the weak BEFORE the loops below are spawned — the
         // re-announce and change-announcer tasks read this holder each
         // iteration. `set` only fails if already set (a re-start); the
@@ -25597,30 +25653,32 @@ impl MeshNode {
         // spawning unconditionally meant each repeated or refused call
         // added another detached scan loop, multiplying upgrade probes
         // on a node that never started once.
-        let transitioned = self.start_inner();
+        let transition = self.start_inner();
         // Background direct-path upgrade scan loop (Stage 3). The loop
         // itself no-ops unless `auto_direct_upgrade` is set, so spawning
         // on a real transition is cheap. Detached like the other
         // lifecycle loops — it exits on `shutdown_notify`.
         #[cfg(feature = "nat-traversal")]
-        if transitioned {
+        if transition == StartTransition::Started {
             let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
         }
-        #[cfg(not(feature = "nat-traversal"))]
-        let _ = transitioned;
+        match transition {
+            StartTransition::Started | StartTransition::AlreadyStarted => Ok(()),
+            StartTransition::RefusedAcceptInFlight => Err(StartRefused::AcceptInFlight),
+        }
     }
 
     /// Everything `start` does that needs only `&self`. Split out so
     /// the `Arc` wiring above happens exactly once, before any loop
     /// that reads it is spawned.
     ///
-    /// Returns whether this call is the one that moved the node from
-    /// stopped to started — `false` for an idempotent re-start and for
-    /// a refusal against an in-flight `accept()`.
-    fn start_inner(&self) -> bool {
+    /// Reports whether this call moved the node from stopped to
+    /// started, found it already started, or refused against an
+    /// in-flight `accept()`.
+    fn start_inner(&self) -> StartTransition {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
-            return false; // already started
+            return StartTransition::AlreadyStarted;
         }
         // After flipping `started`, observe `accept_in_flight`.
         // If any accept is mid-handshake, roll back and refuse.
@@ -25639,7 +25697,7 @@ impl MeshNode {
                  refusing to start the dispatch loop to avoid racing the \
                  responder handshake. Retry start() after accept() returns."
             );
-            return false;
+            return StartTransition::RefusedAcceptInFlight;
         }
 
         let recv_handle = self.spawn_receive_loop();
@@ -25670,8 +25728,8 @@ impl MeshNode {
                      This usually indicates start() was invoked twice."
                 );
                 // The router was already running, so this call did not
-                // complete a transition either.
-                return false;
+                // complete a transition either — but the node IS running.
+                return StartTransition::AlreadyStarted;
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
@@ -25770,7 +25828,7 @@ impl MeshNode {
                 tasks.push(h);
             }
         }
-        true
+        StartTransition::Started
     }
 
     /// The ONE production path that constructs a [`RoutingSupervisor`] and
@@ -65961,13 +66019,15 @@ mod lifecycle_regression_tests {
     #[tokio::test]
     async fn only_the_first_start_reports_a_transition() {
         let node = node().await;
-        assert!(
+        assert_eq!(
             node.start_inner(),
+            StartTransition::Started,
             "the first start moves the node from stopped to started"
         );
         for _ in 0..3 {
-            assert!(
-                !node.start_inner(),
+            assert_eq!(
+                node.start_inner(),
+                StartTransition::AlreadyStarted,
                 "an idempotent re-start must not report a transition — the \
                  upgrade scanner is spawned on this answer"
             );
@@ -65985,8 +66045,9 @@ mod lifecycle_regression_tests {
         // Stand in for an accept that is mid-handshake.
         node.accept_in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            !node.start_inner(),
+        assert_eq!(
+            node.start_inner(),
+            StartTransition::RefusedAcceptInFlight,
             "a refused start must not report a transition"
         );
         assert!(
@@ -65996,9 +66057,39 @@ mod lifecycle_regression_tests {
 
         node.accept_in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(
+        assert_eq!(
             node.start_inner(),
+            StartTransition::Started,
             "once the accept completes, start transitions normally"
+        );
+    }
+
+    /// `start()` swallows the in-flight-accept refusal (its only trace is
+    /// a log line), and a node in that state processes no inbound packet
+    /// while its sends work, which reads as a discovery fault. Every
+    /// binding therefore starts through `try_start`, so the refusal must
+    /// come back as a typed error, leave the node stopped, and clear on
+    /// retry. An already-running node is `Ok`, not an error: start is
+    /// idempotent.
+    #[tokio::test]
+    async fn try_start_reports_the_inflight_accept_refusal_and_recovers() {
+        let node = node().await;
+        node.accept_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(node.try_start(), Err(StartRefused::AcceptInFlight));
+        assert!(
+            !node.started.load(Ordering::SeqCst),
+            "a refused try_start leaves the node stopped"
+        );
+
+        node.accept_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(node.try_start(), Ok(()), "the retry starts the node");
+        assert!(node.started.load(Ordering::SeqCst));
+        assert_eq!(
+            node.try_start(),
+            Ok(()),
+            "a running node reports Ok — starting is idempotent"
         );
     }
 

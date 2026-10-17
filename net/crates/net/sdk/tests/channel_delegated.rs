@@ -67,8 +67,8 @@ async fn link(a: &Mesh, b: &Mesh) {
         .await
         .unwrap();
     accept.await.unwrap().unwrap();
-    a.start();
-    b.start();
+    a.start().expect("mesh start");
+    b.start().expect("mesh start");
 }
 
 #[test]
@@ -236,7 +236,7 @@ async fn publish_needs_the_managed_chain_and_exact_removal_spares_a_successor() 
     let device = Identity::generate();
     let local = mesh(&device).await;
     local.register_channel(gated(&root));
-    local.start();
+    local.start().expect("mesh start");
     let ch = channel();
     let publish = || local.publish(&ch, Bytes::from_static(b"reading"), Default::default());
 

@@ -1893,8 +1893,12 @@ mod mesh_bindings {
             // it must run inside a tokio runtime context. Enter
             // our owned runtime for the duration of the call.
             let _guard = self.runtime.enter();
-            node.start();
-            Ok(())
+            // `try_start`, not `start`: a start refused against an
+            // in-flight `accept()` used to return `Ok(())` here while
+            // starting nothing, leaving a node that sends but never
+            // receives.
+            node.try_start()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         }
 
         /// The invite `rendezvous` locator for this node (address + Noise
@@ -3816,8 +3820,11 @@ mod mesh_bindings {
             let handle = crate::async_bridge::runtime()
                 .ok_or_else(|| PyRuntimeError::new_err("async bridge not initialized"))?;
             let _guard = handle.enter();
-            self.node.start();
-            Ok(())
+            // `try_start`: surface a refused start instead of returning
+            // `Ok(())` with nothing started (matches `NetMesh.start`).
+            self.node
+                .try_start()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         }
 
         /// Initiate a handshake to `peer_addr`. Returns an

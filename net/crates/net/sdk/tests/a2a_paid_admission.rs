@@ -402,9 +402,9 @@ async fn connect_all(provider: &Mesh, callers: &[&Mesh]) {
         connected.expect("connect");
     }
     for caller in callers {
-        caller.start();
+        caller.start().expect("mesh start");
     }
-    provider.start();
+    provider.start().expect("mesh start");
 }
 
 /// A server refusal, both renderings: the wire status + human message,

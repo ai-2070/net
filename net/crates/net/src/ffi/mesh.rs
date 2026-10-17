@@ -101,6 +101,9 @@ pub(crate) const NET_ERR_MESH_SESSION_SUPERSEDED: c_int = -117;
 /// attempted, the payload itself is the fault, and retrying cannot
 /// help — the caller must split it.
 pub(crate) const NET_ERR_MESH_EVENT_TOO_LARGE: c_int = -118;
+/// `net_mesh_start` started nothing (an `accept()` was mid-handshake).
+/// The node is left stopped; retrying once the `accept()` returns starts it.
+pub(crate) const NET_ERR_MESH_START_REFUSED: c_int = -129;
 
 // Identity + token error codes. Block -120..-129 mirrors the
 // `"identity: ..."` / `"token: <kind>"` prefix convention used by
@@ -1068,8 +1071,14 @@ pub unsafe extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
     // `start` spawns internal tasks via tokio::spawn; run under the
     // shared runtime. `start` also enables the periodic capability
     // re-announce (keeps the node discoverable past one TTL).
-    block_on(async move { node.start() });
-    0
+    //
+    // `try_start`, not `start`: a refusal against an in-flight
+    // `accept()` used to return 0 with nothing started, leaving a node
+    // that sends but never receives.
+    match block_on(async move { node.try_start() }) {
+        Ok(()) => 0,
+        Err(_) => NET_ERR_MESH_START_REFUSED,
+    }
 }
 
 /// Shut down the node. Must be called before `net_mesh_free` to
@@ -4869,6 +4878,29 @@ fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `net_mesh_start` returns `NET_ERR_MESH_START_REFUSED` for a start
+    /// that started nothing (it used to return 0). Both header copies must
+    /// declare the number this module returns; a constant restated only in
+    /// Rust would agree with itself.
+    #[test]
+    fn headers_declare_the_start_refused_code() {
+        for (name, header) in [
+            ("include/net.go.h", include_str!("../../include/net.go.h")),
+            ("go/net.h", include_str!("../../../../../go/net.h")),
+        ] {
+            let line = header
+                .lines()
+                .find(|l| l.trim_start().starts_with("NET_ERR_MESH_START_REFUSED ="))
+                .unwrap_or_else(|| panic!("{name} must declare NET_ERR_MESH_START_REFUSED"));
+            let declared: c_int = line
+                .split('=')
+                .nth(1)
+                .and_then(|v| v.trim().trim_end_matches(',').parse().ok())
+                .unwrap_or_else(|| panic!("{name}: unparseable `{line}`"));
+            assert_eq!(declared, NET_ERR_MESH_START_REFUSED, "{name}");
+        }
+    }
 
     /// D-C5-1 (C SDK plan, C5): after `net_mesh_shutdown` + `net_mesh_free`
     /// the node must be reclaimed. LeakSanitizer found two in-process nodes

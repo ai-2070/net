@@ -134,8 +134,8 @@ async fn subscribe_through_runtime_records_in_ledger() {
         .register_factory("echo-counter", echo_factory())
         .unwrap();
     source_rt.start().await.unwrap();
-    source_rt.mesh().start();
-    publisher.start();
+    source_rt.mesh().start().expect("mesh start");
+    publisher.start().expect("mesh start");
     sleep(Duration::from_millis(100)).await;
 
     // Publisher registers an open channel.
@@ -208,9 +208,9 @@ async fn ledger_rides_snapshot_through_migration() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().start();
-    target_rt.mesh().start();
-    publisher.start();
+    source_rt.mesh().start().expect("mesh start");
+    target_rt.mesh().start().expect("mesh start");
+    publisher.start().expect("mesh start");
     sleep(Duration::from_millis(100)).await;
 
     let channel = ChannelName::new("sensors/lidar").unwrap();
@@ -304,9 +304,9 @@ async fn auto_replay_rebinds_subscriptions_on_target_after_migration() {
         .unwrap();
     source_rt.start().await.unwrap();
     target_rt.start().await.unwrap();
-    source_rt.mesh().start();
-    target_rt.mesh().start();
-    publisher.start();
+    source_rt.mesh().start().expect("mesh start");
+    target_rt.mesh().start().expect("mesh start");
+    publisher.start().expect("mesh start");
     sleep(Duration::from_millis(100)).await;
 
     let channel = ChannelName::new("lab/streams").unwrap();
@@ -460,8 +460,8 @@ async fn one_daemons_unsubscribe_keeps_a_colocated_subscriber_on_the_roster() {
         .register_factory("echo-counter", echo_factory())
         .unwrap();
     source_rt.start().await.unwrap();
-    source_rt.mesh().start();
-    publisher.start();
+    source_rt.mesh().start().expect("mesh start");
+    publisher.start().expect("mesh start");
     sleep(Duration::from_millis(100)).await;
 
     let channel = ChannelName::new("sensors/shared").unwrap();

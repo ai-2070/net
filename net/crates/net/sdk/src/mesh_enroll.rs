@@ -329,7 +329,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        operator_mesh.start();
+        operator_mesh.start().expect("mesh start");
 
         let dir = tempfile::tempdir().unwrap();
         let op = Arc::new(OperatorEnrollment::new(
@@ -360,7 +360,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        device_mesh.start();
+        device_mesh.start().expect("mesh start");
 
         let chain = device_mesh
             .join(&invite_str, "pc", vec!["region:office".into()])
@@ -395,7 +395,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        operator_mesh.start();
+        operator_mesh.start().expect("mesh start");
 
         let dir = tempfile::tempdir().unwrap();
         let op = Arc::new(OperatorEnrollment::new(
@@ -422,7 +422,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        device_mesh.start();
+        device_mesh.start().expect("mesh start");
 
         let err = device_mesh
             .join(&invite_str, "pc", vec![])
@@ -449,7 +449,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        operator_mesh.start();
+        operator_mesh.start().expect("mesh start");
 
         let dir = tempfile::tempdir().unwrap();
         let op = Arc::new(OperatorEnrollment::new(
@@ -483,7 +483,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        device_mesh.start();
+        device_mesh.start().expect("mesh start");
 
         // Join, then renew over the wire → a fresh grant, still anchored + bound.
         let chain = device_mesh

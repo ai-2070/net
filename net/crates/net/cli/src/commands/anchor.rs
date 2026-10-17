@@ -1505,7 +1505,8 @@ async fn run_serve(
         .build()
         .await
         .map_err(|e| generic(format!("starting the anchor: {e}")))?;
-    mesh.start();
+    mesh.start()
+        .map_err(|e| generic(format!("starting the anchor: {e}")))?;
 
     let sdk_psk = Psk::new(psk);
     let mut listener_config = BootstrapConfig::new(

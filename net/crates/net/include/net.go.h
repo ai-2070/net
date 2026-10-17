@@ -100,6 +100,11 @@ typedef enum {
     /* Capability announce / find_nodes errors. Wraps core
      * `AdapterError` when announcement dispatch fails. */
     NET_ERR_CAPABILITY = -128,
+    /* net_mesh_start started nothing: an accept() was mid-handshake,
+     * and starting the receive loop then would race the responder.
+     * The node is left stopped (it would send but never receive).
+     * Retryable: call net_mesh_start again once the accept() returns. */
+    NET_ERR_MESH_START_REFUSED = -129,
     /* NAT-traversal surface (compiled when the Rust cdylib has
      * the `nat-traversal` feature on). Codes mirror core
      * `TraversalError` variants — one integer per `kind` so Go
@@ -368,6 +373,9 @@ int      net_mesh_connect(net_meshnode_t* handle,
 int      net_mesh_accept(net_meshnode_t* handle,
                          uint64_t peer_node_id,
                          char** out_addr, size_t* out_len);
+/* Idempotent: 0 when the node is running afterwards (this call or an
+ * earlier one started it). NET_ERR_MESH_START_REFUSED when nothing was
+ * started; see that code. */
 int      net_mesh_start(net_meshnode_t* handle);
 
 /* ---- Gang-claim resource-island scheduler ----

@@ -238,8 +238,8 @@ pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, PartitionFilter,
     PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
-    SensingRegistrationError, SessionPath, StreamInboundEvent, StreamInboundSink, StreamInbox,
-    SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    SensingRegistrationError, SessionPath, StartRefused, StreamInboundEvent, StreamInboundSink,
+    StreamInbox, SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
 };
 /// Exported only so the fixtures-gated ordered-egress accessors have nameable
 /// types in integration tests; each is `#[doc(hidden)]` at its definition and

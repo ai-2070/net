@@ -1865,7 +1865,7 @@ pub(crate) async fn attach_mesh(
         .build()
         .await
         .map_err(|e| e.to_string())?;
-    mesh.start();
+    mesh.start().map_err(|e| e.to_string())?;
     match attach_contact(mesh.node(), contact, wait).await {
         Ok(path) => Ok((mesh, path)),
         Err(e) => {

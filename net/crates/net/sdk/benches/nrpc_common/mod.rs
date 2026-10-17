@@ -172,8 +172,8 @@ async fn handshake_and_start(server: &Mesh, caller: &Mesh) {
     });
     accept_res.expect("accept");
     connect_res.expect("connect");
-    server.start();
-    caller.start();
+    server.start().expect("mesh start");
+    caller.start().expect("mesh start");
 }
 
 /// Per-caller admission-replay ceiling for the protected provider.

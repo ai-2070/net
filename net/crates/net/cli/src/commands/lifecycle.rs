@@ -3514,7 +3514,8 @@ pub async fn run_up(
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
-    mesh.start();
+    mesh.start()
+        .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     // Channels served from this state directory (`channel serve`) are gated
     // again before anything is served; an unreadable record fails closed.
     for served in super::channel::read_served(&state).map_err(generic)? {

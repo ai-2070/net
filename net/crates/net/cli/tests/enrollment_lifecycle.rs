@@ -215,7 +215,7 @@ fn attach(join: &DeviceJoin) -> Result<(), String> {
             .build()
             .await
             .map_err(|e| e.to_string())?;
-        mesh.start();
+        mesh.start().expect("mesh start");
         let c = bundle.contact();
         let result = tokio::time::timeout(
             Duration::from_secs(3),

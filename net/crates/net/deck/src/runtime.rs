@@ -113,7 +113,8 @@ pub async fn spawn_with_psk(psk: &[u8; 32]) -> color_eyre::Result<Harness> {
         .map_err(|e| color_eyre::eyre::eyre!("the deck's mesh node failed to start: {e}"))?;
     // Dispatch loop + periodic re-announce. Without it nothing is
     // ever received, so nothing is ever ingested.
-    mesh.start();
+    mesh.start()
+        .map_err(|e| color_eyre::eyre::eyre!("the deck's mesh node failed to start: {e}"))?;
     let this_node = mesh.node_id();
 
     // Faster tick than the production default so the UI's

@@ -860,12 +860,21 @@ impl Mesh {
     /// Start the receive loop, heartbeat sender, and router.
     ///
     /// Call this after connecting to peers. Events won't be received
-    /// until `start()` is called.
-    pub fn start(&self) {
+    /// until `start()` is called. Idempotent: starting a running node
+    /// is `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::StartRefused`] when nothing was started, for example
+    /// because an `accept()` is still mid-handshake. The node stays
+    /// stopped (its sends would work, but it would process no inbound
+    /// packet); retry once the condition clears.
+    pub fn start(&self) -> Result<()> {
         // One start: it takes the node's `Arc`, which is what the
         // periodic capability re-announce and the trailing-edge
         // announce flush both need.
-        self.node.start();
+        self.node.try_start()?;
+        Ok(())
     }
 
     /// Number of connected peers.

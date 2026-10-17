@@ -2028,8 +2028,11 @@ mod mesh_bindings {
         pub async fn start(&self) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            node.start();
-            Ok(())
+            // `try_start`, not `start`: a start refused against an
+            // in-flight `accept()` used to resolve while starting
+            // nothing, leaving a node that sends but never receives.
+            node.try_start()
+                .map_err(|e| Error::from_reason(e.to_string()))
         }
 
         /// Send raw bytes to a direct peer.

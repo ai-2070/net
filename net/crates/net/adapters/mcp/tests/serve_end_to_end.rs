@@ -64,8 +64,8 @@ async fn handshake(a: &Mesh, b: &Mesh) {
     });
     r1.expect("accept");
     r2.expect("connect");
-    a.start();
-    b.start();
+    a.start().expect("mesh start");
+    b.start().expect("mesh start");
 }
 
 /// Poll `cond` until true or `timeout` elapses.
@@ -478,9 +478,9 @@ async fn invoke_fails_over_when_the_primary_provider_goes_down() {
     // Caller connects to both providers (hub), then everyone starts.
     connect(&caller, &host_a).await;
     connect(&caller, &host_b).await;
-    caller.start();
-    host_a.start();
-    host_b.start();
+    caller.start().expect("mesh start");
+    host_a.start().expect("mesh start");
+    host_b.start().expect("mesh start");
 
     let id_a = host_a.inner().node_id();
     let id_b = host_b.inner().node_id();

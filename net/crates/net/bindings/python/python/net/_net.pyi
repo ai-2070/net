@@ -955,7 +955,12 @@ class NetMesh:
         peer's wire address."""
         ...
     def start(self) -> None:
-        """Start the receive loop, heartbeats, and router."""
+        """Start the receive loop, heartbeats, and router.
+
+        Idempotent: starting a running node returns normally. Raises
+        ``RuntimeError`` when nothing was started because an ``accept()``
+        is still mid-handshake; the node stays stopped (it would send but
+        never receive), so retry once that ``accept()`` returns."""
         ...
 
     def rendezvous_string(self) -> str:

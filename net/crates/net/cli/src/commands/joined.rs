@@ -118,7 +118,8 @@ pub(crate) async fn attach(
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
-    mesh.start();
+    mesh.start()
+        .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     let contact = peer.unwrap_or_else(|| bundle.contact().clone());
     let path = super::enrollment::attach_contact(mesh.node(), &contact, ATTACH_WAIT)
         .await
