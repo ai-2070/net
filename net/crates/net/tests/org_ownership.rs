@@ -2125,16 +2125,18 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     let node = build_node().await;
     node.install_org_revocation_store(store.clone())
         .expect("install");
-    // Rewritten 2026-09-22 (named, plan §2.3): installation registers
-    // exactly TWO subscribers — the node's own raise callback and the
-    // protected-call registry's second `subscribe_floors_raised` feed.
-    // The teardown property below is unchanged and now guards strictly
-    // more: BOTH subscriptions must be gone after the drop.
+    // Rewritten 2026-09-22 (named, plan §2.3), extended 2026-10-17 for
+    // grant revocation: installation registers exactly THREE subscribers —
+    // the node's own raise callback, the protected-call registry's second
+    // `subscribe_floors_raised` feed, and the registry's
+    // `subscribe_grants_revoked` feed. The teardown property below is
+    // unchanged and guards strictly more: ALL of them must be gone after
+    // the drop.
     assert_eq!(
         store.subscriber_count(),
-        2,
-        "installation registers exactly two subscribers (plan §2.3): the \
-         node's own raise callback and the protected-call registry's"
+        3,
+        "installation registers exactly three subscribers: the node's own \
+         raise callback and the protected-call registry's floor and grant feeds"
     );
 
     // Drop the node (the test holds the only strong Arc, and an
@@ -2226,8 +2228,9 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
     // over every snapshotted callback, not just one.
     assert_eq!(
         store.subscriber_count(),
-        2,
-        "§2.3: the node's callback plus the protected-call registry's"
+        3,
+        "§2.3: the node's callback plus the protected-call registry's floor \
+         and grant feeds"
     );
 
     // Project ownership under the installed store (cert generation 4).

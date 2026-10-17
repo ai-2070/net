@@ -326,8 +326,10 @@ pub fn answer_org_floor(
 /// How a node applies revocation material signed by an org other than its
 /// own, when it takes any: an org it granted to, or one its freshness
 /// policy names (`MeshNode::apply_org_revocation_material`, which also
-/// enforces the foreign-org caps). `Err` carries why it was refused.
-pub type ForeignApply<'a> = dyn Fn(&RevocationMaterial) -> Result<(), String> + 'a;
+/// enforces the foreign-org caps). `None` means this node takes no material
+/// from that org at all (answered `NotMember`); `Some(Err)` carries why an
+/// accepted org's bundle was refused.
+pub type ForeignApply<'a> = dyn Fn(&RevocationMaterial) -> Option<Result<(), String>> + 'a;
 
 /// [`answer_org_floor`], plus `foreign`: how to apply a bundle signed by an
 /// org other than this node's own. `None` answers such a bundle `NotMember`.
@@ -355,20 +357,24 @@ pub fn answer_org_floor_with(
         // node granted to, or one its freshness policy names).
         Some(authority) if bundle.org_id != authority.config.owner_org => match foreign {
             None => (OrgFloorOutcome::NotMember, Vec::new()),
-            Some(apply) => {
-                let outcome = match apply(&RevocationMaterial::floors(&bundle)) {
-                    Ok(()) => OrgFloorOutcome::Applied,
-                    Err(_) => OrgFloorOutcome::Refused,
-                };
-                let floors = members
-                    .into_iter()
-                    .map(|m| {
-                        let floor = authority.revocation.floor_for(&bundle.org_id, &m);
-                        (m, floor)
-                    })
-                    .collect();
-                (outcome, floors)
-            }
+            Some(apply) => match apply(&RevocationMaterial::floors(&bundle)) {
+                // Not an org this node takes material from.
+                None => (OrgFloorOutcome::NotMember, Vec::new()),
+                Some(applied) => {
+                    let outcome = match applied {
+                        Ok(()) => OrgFloorOutcome::Applied,
+                        Err(_) => OrgFloorOutcome::Refused,
+                    };
+                    let floors = members
+                        .into_iter()
+                        .map(|m| {
+                            let floor = authority.revocation.floor_for(&bundle.org_id, &m);
+                            (m, floor)
+                        })
+                        .collect();
+                    (outcome, floors)
+                }
+            },
         },
         Some(authority) => {
             let outcome = match authority.revocation.apply_bundle(&bundle) {
@@ -442,11 +448,12 @@ pub fn answer_org_revocation_request_with(
 #[cfg(feature = "cortex")]
 pub fn node_foreign_apply(
     node: &net::adapter::net::MeshNode,
-) -> impl Fn(&RevocationMaterial) -> Result<(), String> + '_ {
-    move |material| {
-        node.apply_org_revocation_material(material)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+) -> impl Fn(&RevocationMaterial) -> Option<Result<(), String>> + '_ {
+    use net::adapter::net::behavior::org_revocation_relay::MaterialRefusal;
+    move |material| match node.apply_org_revocation_material(material) {
+        Ok(_) => Some(Ok(())),
+        Err(MaterialRefusal::NotAccepted(_) | MaterialRefusal::NoAuthority) => None,
+        Err(e) => Some(Err(e.to_string())),
     }
 }
 

@@ -368,7 +368,7 @@ pub fn answer_org_grant_revocation_with(
             } else {
                 // Another org's revocations (its dispatcher grants, when it
                 // is a grantee here): only through the node's own rule.
-                match foreign.map(|apply| {
+                match foreign.and_then(|apply| {
                     apply(
                         &net::adapter::net::behavior::org_revocation_relay::RevocationMaterial::grants(
                             &bundle,
@@ -376,7 +376,9 @@ pub fn answer_org_grant_revocation_with(
                     )
                 }) {
                     Some(Ok(())) => OrgGrantRevocationOutcome::Applied,
-                    _ => OrgGrantRevocationOutcome::Refused,
+                    Some(Err(_)) => OrgGrantRevocationOutcome::Refused,
+                    // Not an org this node takes material from.
+                    None => OrgGrantRevocationOutcome::NotMember,
                 }
             };
             let view = authority.revocation.snapshot();
@@ -396,7 +398,11 @@ pub fn answer_org_grant_revocation_with(
                     (e.kind, e.grant_id, state)
                 })
                 .collect();
-            (outcome, attested)
+            if outcome == OrgGrantRevocationOutcome::NotMember {
+                (outcome, Vec::new())
+            } else {
+                (outcome, attested)
+            }
         }
         // No authority, or another org's: this node enforces none of the
         // bundle org's grants.
