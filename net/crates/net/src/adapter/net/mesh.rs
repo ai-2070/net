@@ -22308,35 +22308,31 @@ impl MeshNode {
         super::behavior::org_revocation_relay::VerifiedMaterial,
         super::behavior::org_revocation_relay::MaterialRefusal,
     > {
-        use super::behavior::org_revocation_relay::{
-            MaterialRefusal, VerifiedMaterial, MAX_FOREIGN_ORG_ENTRIES,
-        };
-        let verified = material.verify().map_err(MaterialRefusal::Invalid)?;
-        let org = verified.org_id();
+        use super::behavior::org::OrgError;
+        use super::behavior::org_revocation_relay::{MaterialRefusal, MAX_FOREIGN_ORG_ENTRIES};
+        // The cheap refusals come before the signature check: a stranger's
+        // bundle costs a decode, not an ed25519 verify.
+        let claimed = material
+            .claimed_org()
+            .ok_or(MaterialRefusal::Invalid(OrgError::InvalidFormat))?;
         let authority = self.node_authority().ok_or(MaterialRefusal::NoAuthority)?;
         let store = self
             .org_revocation_store()
             .ok_or(MaterialRefusal::NoAuthority)?;
-        if !self.accepts_org_revocations_from(&org) {
-            return Err(MaterialRefusal::NotAccepted(org));
+        if !self.accepts_org_revocations_from(&claimed) {
+            return Err(MaterialRefusal::NotAccepted(claimed));
         }
-        if org != authority.owner_org() {
-            let view = store.snapshot();
-            let over = match &verified {
-                VerifiedMaterial::Floors(b) => {
-                    view.floor_count_for(&org) + b.floors().len() > MAX_FOREIGN_ORG_ENTRIES
-                }
-                VerifiedMaterial::Grants(b) => {
-                    view.revoked_grant_count_for(&org) + b.entries().len() > MAX_FOREIGN_ORG_ENTRIES
-                }
-            };
-            if over {
-                return Err(MaterialRefusal::OverCap(org));
-            }
+        let verified = material.verify().map_err(MaterialRefusal::Invalid)?;
+        let org = verified.org_id();
+        // A foreign org is capped. The store counts under its apply lock,
+        // and only entries the bundle would add, so re-issuing a cumulative
+        // bundle that raises existing floors is never refused for size.
+        let cap = (org != authority.owner_org()).then_some(MAX_FOREIGN_ORG_ENTRIES);
+        match store.apply_verified_material(&verified, cap) {
+            Ok(true) => Ok(verified),
+            Ok(false) => Err(MaterialRefusal::OverCap(org)),
+            Err(e) => Err(MaterialRefusal::Store(e.to_string())),
         }
-        store
-            .apply_material(material)
-            .map_err(|e| MaterialRefusal::Store(e.to_string()))
     }
 
     /// Cross-org admissions made while this node held no revocation material

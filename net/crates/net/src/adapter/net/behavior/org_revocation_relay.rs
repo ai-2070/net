@@ -142,6 +142,21 @@ impl RevocationMaterial {
         *hasher.finalize().as_bytes()
     }
 
+    /// The org the bundle names as its signer, from a strict decode with
+    /// NO signature check: a cheap filter before the signature work (the
+    /// org id is signed, so [`Self::verify`] still decides). `None` when
+    /// the bytes do not decode.
+    pub fn claimed_org(&self) -> Option<OrgId> {
+        match self.kind {
+            RevocationMaterialKind::Floors => OrgRevocationBundle::from_bytes(&self.bytes)
+                .ok()
+                .map(|b| b.org_id),
+            RevocationMaterialKind::Grants => OrgGrantRevocationBundle::from_bytes(&self.bytes)
+                .ok()
+                .map(|b| b.org_id),
+        }
+    }
+
     /// Decode strictly and verify the org signature.
     pub fn verify(&self) -> Result<VerifiedMaterial, OrgError> {
         match self.kind {
@@ -212,6 +227,8 @@ pub fn decode_relay_header(value: &[u8]) -> Option<Vec<RevocationMaterial>> {
 #[derive(Clone)]
 struct Retained {
     material: RevocationMaterial,
+    /// `material.digest()`, computed once.
+    digest: [u8; 32],
     issued_at: u64,
     /// Insertion order, the tie-break between equal `issued_at`.
     seq: u64,
@@ -250,7 +267,7 @@ impl RetainedMaterial {
         let org = verified.org_id();
         let digest = material.digest();
         let entries = self.by_org.entry(org).or_default();
-        if entries.iter().any(|r| r.material.digest() == digest) {
+        if entries.iter().any(|r| r.digest == digest) {
             return false;
         }
         let (floors, grants) = match verified {
@@ -267,6 +284,7 @@ impl RetainedMaterial {
         self.next_seq += 1;
         entries.push(Retained {
             material: material.clone(),
+            digest,
             issued_at: verified.issued_at(),
             seq,
             floors,
@@ -337,6 +355,23 @@ impl RetainedMaterial {
             .unwrap_or_default()
     }
 
+    /// The relay set identity of `org`'s retained bundles: the same value
+    /// [`relay_set_digest`] gives over [`Self::for_org`], from the cached
+    /// per-bundle digests, without copying any bundle.
+    pub fn set_digest_for(&self, org: &OrgId) -> Option<[u8; 32]> {
+        let entries = self.by_org.get(org)?;
+        Some(set_digest_of(entries.iter().map(|r| &r.digest)))
+    }
+
+    /// Whether a bundle with this [`RevocationMaterial::digest`] is
+    /// retained.
+    pub fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.by_org
+            .values()
+            .flat_map(|v| v.iter())
+            .any(|r| r.digest == *digest)
+    }
+
     /// The newest signed `issued_at` retained for `org`, ignoring any
     /// bundle dated beyond `now_secs` plus the skew ceiling: a future-dated
     /// bundle must not read as fresh forever.
@@ -384,32 +419,40 @@ impl RetainedMaterial {
     /// a cache, and a bad entry must not stop the node.
     pub fn from_file_bytes(bytes: &[u8], view: &OrgRevocationState, now_secs: u64) -> Self {
         let mut out = Self::default();
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            return out;
-        };
-        let Some(items) = doc.get("bundles").and_then(|v| v.as_array()) else {
-            return out;
-        };
-        // Oldest first, so insertion order matches issue order.
-        for item in items.iter().rev() {
-            let kind = item
-                .get("kind")
-                .and_then(|v| v.as_u64())
-                .and_then(|k| u8::try_from(k).ok())
-                .and_then(RevocationMaterialKind::from_tag);
-            let bundle = item
-                .get("bundle")
-                .and_then(|v| v.as_str())
-                .and_then(|h| hex::decode(h).ok());
-            let (Some(kind), Some(bytes)) = (kind, bundle) else {
-                continue;
-            };
-            let material = RevocationMaterial { kind, bytes };
+        for material in Self::parse_file_items(bytes) {
             if let Ok(verified) = material.verify() {
                 out.retain(&material, &verified, view, now_secs);
             }
         }
         out
+    }
+
+    /// The bundles a sidecar holds, oldest first (so retaining them in
+    /// order matches issue order). Signatures are NOT checked; anything
+    /// unreadable is skipped.
+    pub fn parse_file_items(bytes: &[u8]) -> Vec<RevocationMaterial> {
+        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return Vec::new();
+        };
+        let Some(items) = doc.get("bundles").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .rev()
+            .filter_map(|item| {
+                let kind = item
+                    .get("kind")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|k| u8::try_from(k).ok())
+                    .and_then(RevocationMaterialKind::from_tag)?;
+                let bytes = item
+                    .get("bundle")
+                    .and_then(|v| v.as_str())
+                    .and_then(|h| hex::decode(h).ok())?;
+                Some(RevocationMaterial { kind, bytes })
+            })
+            .collect()
     }
 }
 
@@ -477,6 +520,12 @@ impl NodeRelayState {
     /// The current policy.
     pub fn freshness(&self) -> BTreeMap<OrgId, u64> {
         self.freshness.read().clone()
+    }
+
+    /// The most seconds `org`'s newest material may age, if the policy
+    /// names it.
+    pub fn freshness_for(&self, org: &OrgId) -> Option<u64> {
+        self.freshness.read().get(org).copied()
     }
 
     /// Whether `org` is named in the policy.
@@ -556,9 +605,14 @@ impl NodeRelayState {
 
 /// Identity of a relay set (the bundles' digests, in order).
 pub fn relay_set_digest(items: &[RevocationMaterial]) -> [u8; 32] {
+    let digests: Vec<[u8; 32]> = items.iter().map(RevocationMaterial::digest).collect();
+    set_digest_of(digests.iter())
+}
+
+fn set_digest_of<'a>(digests: impl Iterator<Item = &'a [u8; 32]>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(MATERIAL_DIGEST_CONTEXT);
-    for item in items {
-        hasher.update(&item.digest());
+    for digest in digests {
+        hasher.update(digest);
     }
     *hasher.finalize().as_bytes()
 }

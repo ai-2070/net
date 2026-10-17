@@ -161,6 +161,49 @@ impl OrgRevocationState {
             .count()
     }
 
+    /// How many of `bundle`'s nonzero floors name a member this state
+    /// does not track yet: the entries a merge would ADD (raising an
+    /// existing floor adds none).
+    pub fn new_floor_count(&self, bundle: &OrgRevocationBundle) -> usize {
+        bundle
+            .floors()
+            .iter()
+            .filter(|(member, floor)| {
+                *floor > 0 && !self.floors.contains_key(&(bundle.org_id, member.clone()))
+            })
+            .count()
+    }
+
+    /// How many grant revocations this state tracks for `org` that have
+    /// not expired at `now_secs`.
+    pub fn live_revoked_grant_count_for(&self, org: &OrgId, now_secs: u64) -> usize {
+        self.revoked_grants
+            .iter()
+            .filter(|((o, _, _), not_after)| {
+                o == org && !revocation_entry_expired(**not_after, now_secs)
+            })
+            .count()
+    }
+
+    /// How many of `bundle`'s unexpired entries this state does not track
+    /// yet: the entries a merge at `now_secs` would ADD.
+    pub fn new_grant_revocation_count(
+        &self,
+        bundle: &OrgGrantRevocationBundle,
+        now_secs: u64,
+    ) -> usize {
+        bundle
+            .entries()
+            .iter()
+            .filter(|e| {
+                !revocation_entry_expired(e.not_after, now_secs)
+                    && !self
+                        .revoked_grants
+                        .contains_key(&(bundle.org_id, e.kind, e.grant_id))
+            })
+            .count()
+    }
+
     /// Iterate grant revocations in canonical order, each with the
     /// revoked grant's `not_after`.
     pub fn iter_revoked_grants(&self) -> impl Iterator<Item = (&RevokedGrantKey, &u64)> {
@@ -2286,12 +2329,44 @@ impl OrgRevocationStore {
             );
             return Err(err);
         }
-        let published = self.apply_locked(|merged| merged.merge_bundle(bundle) > 0)?;
+        Ok(self
+            .apply_verified_bundle(bundle, None)?
+            .unwrap_or_default())
+    }
+
+    /// [`Self::apply_bundle`] for a bundle the caller has ALREADY
+    /// verified. With `cap`, the apply is refused (`Ok(None)`, nothing
+    /// merged, nothing retained) when it would leave the bundle's org with
+    /// more than `cap` floors. The check runs on the state reread under
+    /// the apply lock and counts only floors the merge would add, so a
+    /// bundle raising floors that are already tracked never trips it, and
+    /// two concurrent applies cannot both pass against one stale view.
+    fn apply_verified_bundle(
+        &self,
+        bundle: &OrgRevocationBundle,
+        cap: Option<usize>,
+    ) -> Result<Option<Vec<RaisedFloor>>, OrgRevocationError> {
+        let over_cap = std::cell::Cell::new(false);
+        let published = self.apply_locked(|merged| {
+            if let Some(cap) = cap {
+                let after = merged
+                    .floor_count_for(&bundle.org_id)
+                    .saturating_add(merged.new_floor_count(bundle));
+                if after > cap {
+                    over_cap.set(true);
+                    return false;
+                }
+            }
+            merged.merge_bundle(bundle) > 0
+        })?;
+        if over_cap.get() {
+            return Ok(None);
+        }
         self.retain_for_relay(
             &RevocationMaterial::floors(bundle),
             &VerifiedMaterial::Floors(bundle.clone()),
         );
-        Ok(published.floors)
+        Ok(Some(published.floors))
     }
 
     /// Apply a grant-revocation bundle under the same locked order as
@@ -2315,14 +2390,43 @@ impl OrgRevocationStore {
             );
             return Err(err);
         }
+        Ok(self
+            .apply_verified_grant_revocations(bundle, None)?
+            .unwrap_or_default())
+    }
+
+    /// [`Self::apply_grant_revocations`] for a bundle the caller has
+    /// ALREADY verified, with the same optional cap as
+    /// [`Self::apply_verified_bundle`]: counted on the locked reread, over
+    /// the org's unexpired entries plus only the entries the merge would
+    /// add.
+    fn apply_verified_grant_revocations(
+        &self,
+        bundle: &OrgGrantRevocationBundle,
+        cap: Option<usize>,
+    ) -> Result<Option<Vec<RevokedGrantKey>>, OrgRevocationError> {
         let now_secs = current_timestamp();
-        let published =
-            self.apply_locked(|merged| merged.merge_grant_revocations(bundle, now_secs) > 0)?;
+        let over_cap = std::cell::Cell::new(false);
+        let published = self.apply_locked(|merged| {
+            if let Some(cap) = cap {
+                let after = merged
+                    .live_revoked_grant_count_for(&bundle.org_id, now_secs)
+                    .saturating_add(merged.new_grant_revocation_count(bundle, now_secs));
+                if after > cap {
+                    over_cap.set(true);
+                    return false;
+                }
+            }
+            merged.merge_grant_revocations(bundle, now_secs) > 0
+        })?;
+        if over_cap.get() {
+            return Ok(None);
+        }
         self.retain_for_relay(
             &RevocationMaterial::grants(bundle),
             &VerifiedMaterial::Grants(bundle.clone()),
         );
-        Ok(published.grants)
+        Ok(Some(published.grants))
     }
 
     /// Apply one signed bundle of either kind. Verifies first; returns
@@ -2334,30 +2438,42 @@ impl OrgRevocationStore {
         let verified = material
             .verify()
             .map_err(OrgRevocationError::InvalidBundle)?;
-        match &verified {
-            VerifiedMaterial::Floors(b) => {
-                self.apply_bundle(b)?;
-            }
-            VerifiedMaterial::Grants(b) => {
-                self.apply_grant_revocations(b)?;
-            }
-        }
+        self.apply_verified_material(&verified, None)?;
         Ok(verified)
+    }
+
+    /// Apply a bundle the caller has ALREADY verified, so a bundle costs
+    /// one signature check rather than one per layer. With `cap`, refuse
+    /// (`Ok(false)`, nothing merged or retained) an apply that would leave
+    /// the signing org with more than `cap` entries of the bundle's kind;
+    /// the count is taken under the apply lock and covers only entries the
+    /// merge would add. Without a cap this is always `Ok(true)` on success.
+    pub(crate) fn apply_verified_material(
+        &self,
+        verified: &VerifiedMaterial,
+        cap: Option<usize>,
+    ) -> Result<bool, OrgRevocationError> {
+        Ok(match verified {
+            VerifiedMaterial::Floors(b) => self.apply_verified_bundle(b, cap)?.is_some(),
+            VerifiedMaterial::Grants(b) => self.apply_verified_grant_revocations(b, cap)?.is_some(),
+        })
     }
 
     /// Keep a just-applied bundle for relay, then persist the relay cache
     /// best-effort. Runs after the apply transaction, outside its locks.
     fn retain_for_relay(&self, material: &RevocationMaterial, verified: &VerifiedMaterial) {
         let view = self.snapshot();
-        let bytes = {
-            let mut relay = self.core.relay.lock();
-            if !relay.retain(material, verified, &view, current_timestamp()) {
-                return;
-            }
-            relay.to_file_bytes()
-        };
+        let now = current_timestamp();
+        if !self
+            .core
+            .relay
+            .lock()
+            .retain(material, verified, &view, now)
+        {
+            return;
+        }
         let sidecar = relay_sidecar_path(&self.core.path);
-        if let Err(e) = write_relay_sidecar(&sidecar, &bytes) {
+        if let Err(e) = self.persist_relay_cache(&sidecar, &view, now) {
             tracing::warn!(
                 path = %sidecar.display(),
                 "org revocation relay: could not persist the relay cache ({e}); \
@@ -2366,9 +2482,57 @@ impl OrgRevocationStore {
         }
     }
 
+    /// Write the relay cache to its sidecar. Every writer, in this process
+    /// or another sharing the state path, holds the state file's
+    /// interprocess lock across read, merge and replace, so writes land in
+    /// order and the fixed temp path is never written by two at once.
+    /// Bundles another process retained (and this one never saw) are read
+    /// back from the sidecar and kept, so neither process's write drops the
+    /// other's material. The bytes are taken under that lock from the cache
+    /// as it is then, so a later write carries at least what an earlier
+    /// one did.
+    fn persist_relay_cache(
+        &self,
+        sidecar: &Path,
+        view: &OrgRevocationState,
+        now: u64,
+    ) -> Result<(), String> {
+        let _lock = lock_state_file(&self.core.path).map_err(|e| e.to_string())?;
+        if let Ok(disk) = std::fs::read(sidecar) {
+            let items = RetainedMaterial::parse_file_items(&disk);
+            let unknown: Vec<RevocationMaterial> = {
+                let relay = self.core.relay.lock();
+                items
+                    .into_iter()
+                    .filter(|m| !relay.contains(&m.digest()))
+                    .collect()
+            };
+            // Signature checks run outside the cache's mutex, which the
+            // send path takes on cross-org calls.
+            let verified: Vec<(RevocationMaterial, VerifiedMaterial)> = unknown
+                .into_iter()
+                .filter_map(|m| m.verify().ok().map(|v| (m, v)))
+                .collect();
+            if !verified.is_empty() {
+                let mut relay = self.core.relay.lock();
+                for (material, v) in &verified {
+                    relay.retain(material, v, view, now);
+                }
+            }
+        }
+        let bytes = self.core.relay.lock().to_file_bytes();
+        write_relay_sidecar(sidecar, &bytes).map_err(|e| e.to_string())
+    }
+
     /// The signed bundles to relay for `org`, newest first.
     pub fn relay_material(&self, org: &OrgId) -> Vec<RevocationMaterial> {
         self.core.relay.lock().for_org(org)
+    }
+
+    /// The identity of [`Self::relay_material`]`(org)` as a relay set,
+    /// without copying it: `None` when nothing is retained for `org`.
+    pub fn relay_set_digest(&self, org: &OrgId) -> Option<[u8; 32]> {
+        self.core.relay.lock().set_digest_for(org)
     }
 
     /// The newest signed `issued_at` this node holds from `org`, ignoring
@@ -2592,7 +2756,9 @@ fn load_relay_sidecar(state: &Path) -> RetainedMaterial {
     RetainedMaterial::from_file_bytes(&bytes, &view, current_timestamp())
 }
 
-/// Best-effort atomic replace (temp + rename); no durability promise.
+/// Best-effort atomic replace (temp + rename); no durability promise. The
+/// caller holds the state file's lock, which is what makes the fixed temp
+/// path safe.
 fn write_relay_sidecar(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("relay.json.tmp");
     std::fs::write(&tmp, bytes)?;
@@ -5409,5 +5575,115 @@ mod tests {
         // Terminal: a further publication does not clear it.
         store.republish_for_test();
         assert_eq!(store.barriered_generation(), Err(GenerationExhausted));
+    }
+
+    fn floors_bundle(entries: &[(u8, u32)]) -> OrgRevocationBundle {
+        let floors: BTreeMap<EntityId, u32> = entries
+            .iter()
+            .map(|(id, floor)| (EntityId::from_bytes([*id; 32]), *floor))
+            .collect();
+        OrgRevocationBundle::try_issue(&org(), &floors).expect("issue")
+    }
+
+    /// CO-5: the foreign-org cap counts only floors the merge would add, on
+    /// the state reread under the apply lock. A cumulative bundle raising
+    /// floors the org already holds fits a cap the org is already at; one
+    /// that would add past it is refused whole and not kept for relay.
+    #[test]
+    fn a_capped_apply_counts_only_the_floors_it_would_add() {
+        use super::super::org_revocation_relay::{RevocationMaterial, VerifiedMaterial};
+        let scratch = Scratch::new();
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
+        let org_id = org().org_id();
+        let at = |floor: u32| floors_bundle(&[(1, floor), (2, floor), (3, floor)]);
+
+        assert!(store
+            .apply_verified_material(&VerifiedMaterial::Floors(at(1)), Some(3))
+            .expect("apply"));
+        assert!(
+            store
+                .apply_verified_material(&VerifiedMaterial::Floors(at(2)), Some(3))
+                .expect("apply"),
+            "raising three tracked floors adds none, so it fits a cap of three"
+        );
+        assert_eq!(store.floor_for(&org_id, &EntityId::from_bytes([1; 32])), 2);
+
+        let over = floors_bundle(&[(1, 7), (9, 5)]);
+        assert!(
+            !store
+                .apply_verified_material(&VerifiedMaterial::Floors(over.clone()), Some(3))
+                .expect("apply"),
+            "a fourth member is over the cap"
+        );
+        assert_eq!(
+            store.floor_for(&org_id, &EntityId::from_bytes([1; 32])),
+            2,
+            "an apply over the cap merges nothing, not even its raises"
+        );
+        assert_eq!(store.floor_for(&org_id, &EntityId::from_bytes([9; 32])), 0);
+        assert!(!store
+            .relay_material(&org_id)
+            .contains(&RevocationMaterial::floors(&over)));
+        // Uncapped (the node's own org), the same bundle applies.
+        assert!(store
+            .apply_verified_material(&VerifiedMaterial::Floors(over), None)
+            .expect("apply"));
+        assert_eq!(store.floor_for(&org_id, &EntityId::from_bytes([9; 32])), 5);
+    }
+
+    /// CO-6: the relay sidecar is rewritten under the state file's lock
+    /// after reading back what is already there, so a bundle another
+    /// process sharing the state path retained survives this process's
+    /// write instead of being overwritten.
+    #[test]
+    fn the_relay_sidecar_keeps_what_another_process_retained() {
+        use super::super::org_revocation_relay::{
+            RetainedMaterial, RevocationMaterial, VerifiedMaterial,
+        };
+        let scratch = Scratch::new();
+        let path = scratch.state_path();
+        let store =
+            OrgRevocationStore::init(&path, ProvisioningExpectation::MayBeFresh).expect("init");
+        let theirs = floors_bundle(&[(1, 2)]);
+        let ours = floors_bundle(&[(2, 3)]);
+
+        // The other process applied `theirs`: its floor is on disk and its
+        // bundle is in the sidecar this process has never read.
+        let mut disk = OrgRevocationState::empty();
+        disk.merge_bundle(&theirs);
+        std::fs::write(&path, disk.to_file_bytes().expect("state bytes")).expect("state");
+        let mut their_cache = RetainedMaterial::default();
+        their_cache.retain(
+            &RevocationMaterial::floors(&theirs),
+            &VerifiedMaterial::Floors(theirs.clone()),
+            &disk,
+            current_timestamp(),
+        );
+        std::fs::write(relay_sidecar_path(&path), their_cache.to_file_bytes()).expect("sidecar");
+
+        store.apply_bundle(&ours).expect("apply");
+
+        let reloaded = RetainedMaterial::from_file_bytes(
+            &std::fs::read(relay_sidecar_path(&path)).expect("sidecar"),
+            &store.snapshot(),
+            current_timestamp(),
+        );
+        let kept = reloaded.for_org(&org().org_id());
+        assert!(
+            kept.contains(&RevocationMaterial::floors(&ours)),
+            "our bundle is written"
+        );
+        assert!(
+            kept.contains(&RevocationMaterial::floors(&theirs)),
+            "the other process's bundle survives our write"
+        );
+        assert!(
+            store
+                .relay_material(&org().org_id())
+                .contains(&RevocationMaterial::floors(&theirs)),
+            "and this process now relays it too"
+        );
     }
 }
