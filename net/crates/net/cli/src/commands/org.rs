@@ -102,6 +102,14 @@ pub enum OrgCommand {
     /// named node attested the floor applied and persisted. Nodes not named
     /// are never assumed.
     Remove(OrgRemoveArgs),
+    /// Revoke grants this org issued, before they expire: capability grants
+    /// (`grant-capability`) and dispatcher grants (`grant-dispatcher`). Signs
+    /// one grant-revocation bundle with the org root, writes it with `--out`
+    /// and/or has each `--verifier` apply it, reported from that node's own
+    /// signed attestation. A capability grant is enforced by the providers
+    /// of the org that issued it, so name those providers; a call or stream
+    /// still running there under a revoked grant is retired at once.
+    RevokeGrant(OrgRevokeGrantArgs),
     /// Leave this device's org: record it durably, then stop the running
     /// node; its next `up` runs on the mesh without the org. Local only —
     /// the org still accepts this device's certificate until `org remove`.
@@ -164,6 +172,45 @@ pub struct OrgRemoveArgs {
     /// `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`. Repeat for each enforcement
     /// point.
     #[arg(long = "verifier", value_name = "NODE", required = true)]
+    pub verifiers: Vec<String>,
+    /// State directory of the operator's running node, which carries the
+    /// requests (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
+    /// Show what would be signed and asked, without signing or sending.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
+/// `org revoke-grant` arguments.
+#[derive(Args, Debug)]
+pub struct OrgRevokeGrantArgs {
+    /// The org root key file of the org that issued the grants; stays on
+    /// this machine.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// A capability grant file to revoke (as written by `grant-capability`).
+    /// Repeatable.
+    #[arg(long = "grant", value_name = "PATH")]
+    pub grants: Vec<PathBuf>,
+    /// A dispatcher grant file to revoke (as written by `grant-dispatcher`).
+    /// Repeatable.
+    #[arg(long = "dispatcher-grant", value_name = "PATH")]
+    pub dispatcher_grants: Vec<PathBuf>,
+    /// Also write the signed bundle here, for nodes reached another way.
+    /// Refuses an existing file.
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+    /// A node to apply the revocation at: `self` (the node of `--state-dir`)
+    /// or `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`. Repeat for each
+    /// enforcement point.
+    #[arg(long = "verifier", value_name = "NODE")]
     pub verifiers: Vec<String>,
     /// State directory of the operator's running node, which carries the
     /// requests (as given to `net-mesh up`).
@@ -591,6 +638,7 @@ pub async fn run(
         }
         OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
         OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
+        OrgCommand::RevokeGrant(args) => run_revoke_grant(args, output, profile_name).await,
         OrgCommand::Members(args) => {
             let org = super::enrollment::parse_org_id(&args.org).map_err(invalid_args)?;
             let remote = match (&args.org_key, args.verifiers.is_empty()) {
@@ -660,24 +708,7 @@ async fn run_remove(
         )
         .map_err(|e| generic(format!("write result: {e}")));
     }
-    // `self` is the operator's node: its entity from its authenticated status.
-    let mut targets = Vec::new();
-    for v in &args.verifiers {
-        if v == "self" {
-            let (_, status) =
-                super::lifecycle::control_call(&node_dir, serde_json::json!({ "op": "status" }))
-                    .await
-                    .map_err(|e| {
-                        crate::error::connection_failure(format!("operator node: {e:?}"))
-                    })?;
-            let entity =
-                parse_entity_hex(status["node"]["entity_id"].as_str().unwrap_or_default())?;
-            targets.push((entity, None));
-        } else {
-            let contact = super::subnet::parse_verifier(v)?;
-            targets.push((contact.entity.clone(), Some(contact)));
-        }
-    }
+    let targets = resolve_verifier_targets(&args.verifiers, &node_dir).await?;
     let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
     let mut floors = BTreeMap::new();
     floors.insert(member.clone(), args.minimum_generation);
@@ -757,6 +788,239 @@ async fn run_remove(
             "complete": applied == targets.len(),
             // What removal does not do, stated rather than implied.
             "scope": "membership only: the member's transport (the mesh PSK) and any independently granted access are unaffected; nodes not named here were not asked",
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// A verifier the operator's node should reach: its entity, and its contact
+/// unless it is the operator's own node (`self`).
+type VerifierTarget = (
+    net::adapter::net::identity::EntityId,
+    Option<super::subnet::VerifierContact>,
+);
+
+/// Resolve `--verifier` values: `self` is the operator's node, named by its
+/// entity from its authenticated status; anything else is a contact.
+async fn resolve_verifier_targets(
+    verifiers: &[String],
+    node_dir: &Path,
+) -> Result<Vec<VerifierTarget>, CliError> {
+    let mut targets = Vec::new();
+    for v in verifiers {
+        if v == "self" {
+            let (_, status) =
+                super::lifecycle::control_call(node_dir, serde_json::json!({ "op": "status" }))
+                    .await
+                    .map_err(|e| {
+                        crate::error::connection_failure(format!("operator node: {e:?}"))
+                    })?;
+            let entity =
+                parse_entity_hex(status["node"]["entity_id"].as_str().unwrap_or_default())?;
+            targets.push((entity, None));
+        } else {
+            let contact = super::subnet::parse_verifier(v)?;
+            targets.push((contact.entity.clone(), Some(contact)));
+        }
+    }
+    Ok(targets)
+}
+
+/// Read a grant envelope written by `grant-capability` / `grant-dispatcher`.
+async fn read_grant_file<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    what: &str,
+) -> Result<T, CliError> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| invalid_args(format!("read {what} {}: {e}", path.display())))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        invalid_args(format!(
+            "{what} {} is not a grant file: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// `org revoke-grant`: sign one grant-revocation bundle here with the org
+/// root, optionally write it, and carry it through the operator's node to
+/// each named node, reporting each node's verified attestation.
+async fn run_revoke_grant(
+    args: OrgRevokeGrantArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net::adapter::net::behavior::org_grant_revocation::{
+        OrgGrantRevocationBundle, RevokedGrant,
+    };
+    use net_sdk::org::grant_revocation::{
+        GrantEntryState, OrgGrantRevocationAttestation, OrgGrantRevocationOutcome,
+        OrgGrantRevocationRequest,
+    };
+    if args.grants.is_empty() && args.dispatcher_grants.is_empty() {
+        return Err(invalid_args(
+            "name at least one grant to revoke (--grant or --dispatcher-grant)",
+        ));
+    }
+    if args.out.is_none() && args.verifiers.is_empty() && !args.dry_run {
+        return Err(invalid_args(
+            "nothing would receive the revocation: pass --out, --verifier, or both",
+        ));
+    }
+
+    // Every entry names a grant this org issued, verified, so a typo'd path
+    // or another org's grant is refused rather than signed into a bundle
+    // that can never match anything.
+    let mut entries = Vec::new();
+    let mut issuers = Vec::new();
+    for path in &args.grants {
+        let file: OrgCapabilityGrantFile = read_grant_file(path, "capability grant").await?;
+        file.grant
+            .verify()
+            .map_err(|e| invalid_args(format!("capability grant {}: {e}", path.display())))?;
+        issuers.push((path, file.grant.issuer_org));
+        entries.push(RevokedGrant::capability(&file.grant));
+    }
+    for path in &args.dispatcher_grants {
+        let file: OrgDispatcherGrantFile = read_grant_file(path, "dispatcher grant").await?;
+        file.grant
+            .verify()
+            .map_err(|e| invalid_args(format!("dispatcher grant {}: {e}", path.display())))?;
+        issuers.push((path, file.grant.org_id));
+        entries.push(RevokedGrant::dispatcher(&file.grant));
+    }
+    let entry_rows: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "kind": e.kind.as_str(),
+                "grant_id": hex::encode(e.grant_id),
+                "not_after": e.not_after,
+            })
+        })
+        .collect();
+    let fmt = OutputFormat::resolve_oneshot(output);
+    if args.dry_run {
+        return emit_value(
+            fmt,
+            &serde_json::json!({
+                "dry_run": true,
+                "grants": entry_rows,
+                "verifiers": args.verifiers,
+                "out": args.out.as_ref().map(|p| p.display().to_string()),
+                "effect": "none: nothing was signed, written or sent",
+            }),
+        )
+        .map_err(|e| generic(format!("write result: {e}")));
+    }
+
+    let node_dir = super::lifecycle::state_dir(args.state_dir.clone(), profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let targets = resolve_verifier_targets(&args.verifiers, &node_dir).await?;
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    if let Some((path, issuer)) = issuers.iter().find(|(_, o)| *o != keypair.org_id()) {
+        return Err(invalid_args(format!(
+            "{} was issued by org {}, not by the --org-key org {}; only the issuing org can revoke a grant",
+            path.display(),
+            hex::encode(issuer.as_bytes()),
+            hex::encode(keypair.org_id().as_bytes()),
+        )));
+    }
+    let bundle = OrgGrantRevocationBundle::try_issue(&keypair, entries)
+        .map_err(|e| invalid_args(format!("grant revocation: {e}")))?;
+    let org = hex::encode(keypair.org_id().as_bytes());
+    drop(keypair);
+
+    if let Some(out) = &args.out {
+        refuse_aliased_paths(&[("--org-key", &args.org_key), ("--out", out)])?;
+        refuse_existing(out, false).await?;
+        let json = serialize_json(&OrgGrantRevocationFile {
+            version: ORG_FILE_VERSION,
+            bundle: bundle.clone(),
+        })?;
+        publish_json_artifact(out, &json, false).await?;
+    }
+
+    let mut rows = Vec::with_capacity(targets.len());
+    let mut applied = 0usize;
+    for (verifier, contact) in &targets {
+        let request = OrgGrantRevocationRequest::new(&bundle, verifier.clone()).map_err(generic)?;
+        let mut call = serde_json::json!({
+            "op": "org_floor_forward",
+            "request": hex::encode(request.to_bytes()),
+            "wait_ms": args.wait.as_millis() as u64,
+        });
+        if let Some(c) = contact {
+            call["addr"] = serde_json::json!(c.addr.to_string());
+            call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
+        }
+        let entity = hex::encode(verifier.as_bytes());
+        let row = match super::lifecycle::control_call_within(
+            &node_dir,
+            call,
+            args.wait + std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Err(e) => serde_json::json!({
+                "verifier": entity, "state": "no_answer", "detail": format!("operator node: {e:?}"),
+            }),
+            Ok((_, reply)) => match reply["attestation"].as_str() {
+                Some(hex_a) => match hex::decode(hex_a)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| OrgGrantRevocationAttestation::from_bytes(&b))
+                    .and_then(|a| a.verify_for(&request).map(|()| a))
+                {
+                    Ok(a) => {
+                        // Applied means every named grant is now enforced
+                        // as revoked there (or had already expired).
+                        let done = a.outcome == OrgGrantRevocationOutcome::Applied
+                            && bundle.entries().iter().all(|e| {
+                                matches!(
+                                    a.state_of(e.kind, &e.grant_id),
+                                    Some(GrantEntryState::Revoked | GrantEntryState::Expired)
+                                )
+                            });
+                        if done {
+                            applied += 1;
+                        }
+                        serde_json::json!({
+                            "verifier": entity,
+                            "state": if done { "applied" } else { a.outcome.as_str() },
+                            "grants": a.entries.iter().map(|(kind, id, state)| serde_json::json!({
+                                "kind": kind.as_str(),
+                                "grant_id": hex::encode(id),
+                                "state": state.as_str(),
+                            })).collect::<Vec<_>>(),
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "verifier": entity, "state": "bad_attestation", "detail": e,
+                    }),
+                },
+                None => serde_json::json!({
+                    "verifier": entity,
+                    "state": if reply["refused"].is_string() { "refused" } else { "no_answer" },
+                    "detail": reply["refused"]
+                        .as_str()
+                        .or_else(|| reply["no_answer"].as_str())
+                        .or_else(|| reply["error"].as_str()),
+                }),
+            },
+        };
+        rows.push(row);
+    }
+    emit_value(
+        fmt,
+        &serde_json::json!({
+            "org": org,
+            "grants": entry_rows,
+            "out": args.out.as_ref().map(|p| p.display().to_string()),
+            "verifiers": rows,
+            "applied": applied,
+            "pending": targets.len() - applied,
+            "complete": applied == targets.len(),
+            "scope": "nodes named here were asked; any other node enforcing these grants keeps honouring them until it receives the bundle or the grants expire",
         }),
     )
     .map_err(|e| generic(format!("write result: {e}")))
@@ -1442,6 +1706,14 @@ pub(crate) struct OrgCertFile {
 pub(crate) struct OrgFloorsFile {
     pub(crate) version: u32,
     pub(crate) bundle: OrgRevocationBundle,
+}
+
+/// Versioned JSON envelope for a grant-revocation bundle.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrgGrantRevocationFile {
+    pub(crate) version: u32,
+    pub(crate) bundle: net::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle,
 }
 
 /// Versioned JSON envelope for a dispatcher grant (the grant renders

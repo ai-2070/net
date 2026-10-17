@@ -99,6 +99,7 @@ pub use serve::{
 pub(crate) use serve::{auto_register_org_channels, org_bytes_handler};
 // Removing members at running enforcement points: attested floor application.
 pub mod floors;
+pub mod grant_revocation;
 #[cfg(feature = "cortex")]
 mod provision;
 #[cfg(feature = "cortex")]

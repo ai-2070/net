@@ -130,6 +130,12 @@ carry in a join token — and the org root still never reaches a node:
   signs a floor with the offline root and has each named node apply it. Reported
   per node from that node's own signed attestation; `complete` holds only when
   every named verifier persisted it. Nodes not named are never assumed.
+- **`org revoke-grant --org-key … (--grant <file> | --dispatcher-grant <file>)… --verifier …`**
+  — withdraws grants this org issued before they expire. Only the issuing org
+  can revoke a grant (a capability grant by the provider org, a dispatcher grant
+  by the org it acts for). Each named node refuses new calls under a revoked
+  grant and retires any call or stream still running under it; reported per
+  node from its signed attestation. `--out` also writes the bundle.
 - **`org leave`** — records the departure durably, then stops the running node;
   its next `up` runs on the mesh without the org. **Local only** — the org still
   accepts this device's certificate until `org remove`. Rejoining takes a new

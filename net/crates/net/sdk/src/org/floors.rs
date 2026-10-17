@@ -43,24 +43,24 @@ const ATTESTATION_DOMAIN: &[u8] = b"net-mesh org floor attestation v1";
 const MAX_REQUEST_BUNDLE_BYTES: usize = 64 * 1024;
 const MAX_ATTESTED_FLOORS: usize = 1024;
 
-fn now_unix() -> u64 {
+pub(super) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(super) fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
 }
 
-struct Cursor<'a> {
-    buf: &'a [u8],
+pub(super) struct Cursor<'a> {
+    pub(super) buf: &'a [u8],
 }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(super) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if n > self.buf.len() {
             return None;
         }
@@ -68,16 +68,16 @@ impl<'a> Cursor<'a> {
         self.buf = tail;
         Some(head)
     }
-    fn arr<const N: usize>(&mut self) -> Option<[u8; N]> {
+    pub(super) fn arr<const N: usize>(&mut self) -> Option<[u8; N]> {
         self.take(N)?.try_into().ok()
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(super) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.arr()?))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(super) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.arr()?))
     }
-    fn lp(&mut self, max: usize) -> Option<&'a [u8]> {
+    pub(super) fn lp(&mut self, max: usize) -> Option<&'a [u8]> {
         let n = self.u32()? as usize;
         if n > max {
             return None;
@@ -367,8 +367,27 @@ pub fn answer_org_floor(
     Ok(attestation)
 }
 
+/// Node side, for either request kind the floor service carries: a floor
+/// request ([`OrgFloorRequest`]) or a grant-revocation request
+/// ([`super::grant_revocation::OrgGrantRevocationRequest`]), told apart by
+/// their magic. Returns the signed attestation's wire bytes.
+pub fn answer_org_revocation_request(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+) -> Result<Vec<u8>, String> {
+    if super::grant_revocation::is_grant_revocation_request(request_bytes) {
+        super::grant_revocation::answer_org_grant_revocation(request_bytes, keypair, authority, now)
+            .map(|a| a.to_bytes())
+    } else {
+        answer_org_floor(request_bytes, keypair, authority, now).map(|a| a.to_bytes())
+    }
+}
+
 /// Serve floor application on [`ORG_FLOOR_SERVICE`]. Drop the handle to
-/// stop serving.
+/// stop serving. The same service applies grant revocations
+/// ([`super::grant_revocation`]).
 #[cfg(feature = "cortex")]
 pub fn serve_org_floor(
     node: &std::sync::Arc<net::adapter::net::MeshNode>,
@@ -405,7 +424,7 @@ impl net::adapter::net::cortex::rpc::RpcHandler for FloorHandler {
                 let keypair = node.entity_keypair_arc();
                 // Floor application persists (fsync): off the async runtime.
                 tokio::task::spawn_blocking(move || {
-                    answer_org_floor(&body, &keypair, authority.as_deref(), now_unix())
+                    answer_org_revocation_request(&body, &keypair, authority.as_deref(), now_unix())
                 })
                 .await
                 .unwrap_or_else(|_| Err("org floor task failed".to_string()))
@@ -415,7 +434,7 @@ impl net::adapter::net::cortex::rpc::RpcHandler for FloorHandler {
             Ok(attestation) => RpcResponsePayload {
                 status: RpcStatus::Ok,
                 headers: Vec::new(),
-                body: bytes::Bytes::from(attestation.to_bytes()),
+                body: bytes::Bytes::from(attestation),
             },
             Err(e) => RpcResponsePayload {
                 status: RpcStatus::Unauthorized,

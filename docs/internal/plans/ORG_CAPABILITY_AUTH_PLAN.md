@@ -110,6 +110,16 @@ is immediate"), but the unqualified invariant above read as a stronger
 guarantee than the cross-org path provides. The mechanism to close it
 exists — `grant_id` is in the proof the policy sees — and is not built.
 
+**Update (2026-10-17, branch `LZL0/cross-org`): built.** Grant revocation
+ships as `OrgGrantRevocationBundle` (`behavior/org_grant_revocation.rs`):
+the issuing org revokes its capability grants (by `grant_id`) or dispatcher
+grants (by a derived revocation id); entries merge into
+`revocation-state.json` (version 2 once any exist), admission step 8 denies
+`CapabilityGrantRevoked` / `DispatcherGrantRevoked`, and live protected
+streams under a revoked grant retire `Revoked` through a grant feed on the
+store. Delivery rides the floor service; `net org revoke-grant` is the
+operator verb. See `ORGANIZATIONS.md` §Grant revocation.
+
 ---
 
 ## Model

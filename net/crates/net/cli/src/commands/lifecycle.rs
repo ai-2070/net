@@ -2315,10 +2315,20 @@ async fn forward_org_floor(
     node: &Arc<net::adapter::net::MeshNode>,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    use net_sdk::org::floors::{answer_org_floor, request_org_floor, OrgFloorRequest};
+    use net_sdk::org::floors::{answer_org_revocation_request, OrgFloorRequest, ORG_FLOOR_SERVICE};
+    use net_sdk::org::grant_revocation::{is_grant_revocation_request, OrgGrantRevocationRequest};
     let parsed = (|| {
         let bytes = hex::decode(request["request"].as_str()?).ok()?;
-        let floor = OrgFloorRequest::from_bytes(&bytes).ok()?;
+        // Either request kind the floor service answers: the verifier is
+        // all this node needs from it.
+        let verifier = if is_grant_revocation_request(&bytes) {
+            OrgGrantRevocationRequest::from_bytes(&bytes)
+                .ok()?
+                .verifier()
+                .clone()
+        } else {
+            OrgFloorRequest::from_bytes(&bytes).ok()?.verifier().clone()
+        };
         let addr: Option<std::net::SocketAddr> =
             request["addr"].as_str().and_then(|a| a.parse().ok());
         let key = request["noise_pubkey"]
@@ -2327,24 +2337,24 @@ async fn forward_org_floor(
             .and_then(|k| <[u8; 32]>::try_from(k).ok());
         let wait = Duration::from_millis(request["wait_ms"].as_u64().unwrap_or(10_000))
             .min(MAX_FLOOR_FORWARD_WAIT);
-        Some((bytes, floor, addr.zip(key), wait))
+        Some((bytes, verifier, addr.zip(key), wait))
     })();
-    let Some((bytes, floor, contact, wait)) = parsed else {
+    let Some((bytes, verifier, contact, wait)) = parsed else {
         return serde_json::json!({ "error": "malformed org floor request" });
     };
-    if floor.verifier() == node.entity_id() {
+    if &verifier == node.entity_id() {
         let (keypair, authority) = (node.entity_keypair_arc(), node.node_authority());
         let answered = tokio::task::spawn_blocking(move || {
-            answer_org_floor(&bytes, &keypair, authority.as_deref(), now_unix())
+            answer_org_revocation_request(&bytes, &keypair, authority.as_deref(), now_unix())
         })
         .await
         .unwrap_or_else(|_| Err("org floor task failed".to_string()));
         return match answered {
-            Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+            Ok(a) => serde_json::json!({ "attestation": hex::encode(a) }),
             Err(e) => serde_json::json!({ "refused": e }),
         };
     }
-    let target = floor.verifier().node_id();
+    let target = verifier.node_id();
     let outcome = tokio::time::timeout(wait, async {
         if node.peer_session_id(target).is_none() {
             let (addr, key) =
@@ -2353,12 +2363,21 @@ async fn forward_org_floor(
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        request_org_floor(node, target, &floor, wait).await
+        // The bytes go as built: the CLI decodes and verifies the reply
+        // against its own request, so this node only carries them.
+        let opts = net::adapter::net::mesh_rpc::CallOptions {
+            deadline: Some(std::time::Instant::now() + wait),
+            ..Default::default()
+        };
+        node.call(target, ORG_FLOOR_SERVICE, bytes.into(), opts)
+            .await
+            .map(|reply| reply.body.to_vec())
+            .map_err(|e| e.to_string())
     })
     .await
     .unwrap_or_else(|_| Err("timed out".to_string()));
     match outcome {
-        Ok(a) => serde_json::json!({ "attestation": hex::encode(a.to_bytes()) }),
+        Ok(a) => serde_json::json!({ "attestation": hex::encode(a) }),
         Err(e) => serde_json::json!({ "no_answer": e }),
     }
 }

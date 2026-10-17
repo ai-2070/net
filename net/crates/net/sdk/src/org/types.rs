@@ -57,7 +57,15 @@ pub use net::adapter::net::behavior::org_authority::{
 /// Membership revocation: signed floor bundles merged into a restart-durable
 /// maxima store.
 pub use net::adapter::net::behavior::org_revocation::{
-    OrgRevocationError, OrgRevocationState, OrgRevocationStore, ORG_REVOCATION_STATE_VERSION,
+    OrgRevocationError, OrgRevocationState, OrgRevocationStore, RevokedGrantKey,
+    ORG_REVOCATION_STATE_VERSION, ORG_REVOCATION_STATE_VERSION_WITH_GRANTS,
+};
+
+/// Grant revocation: an issuing org withdraws a capability or dispatcher
+/// grant before its `not_after`, merged into the same durable store.
+pub use net::adapter::net::behavior::org_grant_revocation::{
+    OrgGrantRevocationBundle, RevokedGrant, RevokedGrantKind, DISPATCHER_GRANT_ID_CONTEXT,
+    MAX_GRANT_REVOCATIONS_PER_BUNDLE, ORG_GRANT_REVOCATION_SIG_DOMAIN,
 };
 
 /// OA-2 admission results and modes.

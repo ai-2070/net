@@ -611,7 +611,7 @@ const KEYWORDS: [&str; 13] = [
 
 /// Every type the trait and its implementations may name. Adding one
 /// is a deliberate act here — that is the closure.
-const VOCABULARY: [&str; 16] = [
+const VOCABULARY: [&str; 17] = [
     "Sdp",
     "BootstrapAccepted",
     "LeafError",
@@ -619,6 +619,9 @@ const VOCABULARY: [&str; 16] = [
     "IceCandidate",
     "SignedAnnouncement",
     "RevocationBundle",
+    // The grant half of the revocation feed: opaque signed bytes, exactly
+    // as `RevocationBundle`.
+    "GrantRevocationBundle",
     "SignalEnvelope",
     "ControlEvent",
     "Vec",

@@ -1426,7 +1426,7 @@ pub fn admit_protected_opening(
     // §3 step 4 — INSTALL under the registry lock with the §2.3
     // requalification. The member generation comes from the decoded
     // proof's membership certificate (the floor comparison term).
-    let (member_generation, mut deadline_inputs) = match registered_shape {
+    let (member_generation, mut deadline_inputs, grants) = match registered_shape {
         RpcCallShape::Unary => crate::adapter::net::behavior::org_call::OrgCallProof::decode(
             admission_headers.first().copied().unwrap_or(&[]),
         )
@@ -1438,6 +1438,7 @@ pub fn admit_protected_opening(
                     Some(proof.dispatcher_grant.not_after),
                     proof.capability_grant.as_ref().map(|g| g.not_after),
                 ],
+                fold::CallGrantKeys::of(&proof.dispatcher_grant, proof.capability_grant.as_ref()),
             )
         }),
         _ => crate::adapter::net::behavior::org_call::OrgStreamCallProof::decode(
@@ -1451,6 +1452,7 @@ pub fn admit_protected_opening(
                     Some(proof.dispatcher_grant.not_after),
                     proof.capability_grant.as_ref().map(|g| g.not_after),
                 ],
+                fold::CallGrantKeys::of(&proof.dispatcher_grant, proof.capability_grant.as_ref()),
             )
         }),
     }
@@ -1474,6 +1476,7 @@ pub fn admit_protected_opening(
             acting_org: admitted.acting_org,
             member: admitted.caller.clone(),
             member_generation,
+            grants,
             // The §2.1 deadline lives at the fold (`StreamCallLifetime`);
             // unary records carry none (enforcing §2.1 on unary would
             // change unary behavior).

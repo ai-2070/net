@@ -502,6 +502,15 @@ net-mesh org members <ORG> --state-dir <DIR> \
 
 `remove` signs a floor here with the offline org root — every membership certificate of the member below `--minimum-generation` is revoked — and has each named verifier (`self`, or `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`) apply it. Each verifier's own signed attestation is reported, and `complete` holds only when every named verifier persisted the floor; unnamed nodes are never assumed. `members` reports what the node of `--state-dir` issued for the org and each member's standing against its own floors — explicitly not a global roster or a claim about activity.
 
+### `revoke-grant`
+
+```
+net-mesh org revoke-grant --org-key <PATH> [--grant <PATH> …] [--dispatcher-grant <PATH> …] \
+                          [--verifier <NODE> …] [--out <PATH>] [--state-dir <DIR>] [--dry-run]
+```
+
+Withdraws grants this org issued before they expire: capability grants (`--grant`, files from `grant-capability`) and dispatcher grants (`--dispatcher-grant`, files from `grant-dispatcher`). Every named grant must verify and must have been issued by the `--org-key` org; anything else is refused before signing. One grant-revocation bundle is signed here with the org root. `--out` writes it for nodes reached another way, and each `--verifier` applies it and answers with a signed attestation giving every grant's state there (`revoked`, `not_revoked`, or `expired`). A capability grant is enforced by the providers of the org that issued it, so name those providers. At a verifier, new calls under a revoked grant are refused, and a call or stream still running under it is retired immediately. `complete` holds only when every named verifier reports every grant revoked or already expired.
+
 ### `leave`
 
 ```

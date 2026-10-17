@@ -221,6 +221,8 @@ struct ServeShared {
     generation: u32,
     acting_org: OrgId,
     member: EntityId,
+    /// The grants the call rode on, for grant-revocation sweeps.
+    grants: CallGrantKeys,
     input: VecDeque<Bytes>,
     input_ended: bool,
     /// How many request items the handler has consumed (grant pacing).
@@ -808,6 +810,7 @@ impl ServeRegistry {
             generation: facts.generation,
             acting_org: facts.acting_org,
             member: facts.member,
+            grants: facts.grants,
             input: preloaded.into_iter().collect(),
             input_ended: matches!(input, InputHalf::Ended | InputHalf::Closed),
             consumed: 0,
@@ -974,6 +977,7 @@ impl ServeRegistry {
             .filter(|(_, state)| {
                 let sh = state.shared.borrow();
                 sh.generation < facts.floor_for(&sh.acting_org, &sh.member)
+                    || sh.grants.revoked_in(facts)
             })
             .map(|(k, _)| *k)
             .collect();
@@ -1390,7 +1394,29 @@ struct ProofFacts {
     generation: u32,
     acting_org: OrgId,
     member: EntityId,
+    grants: CallGrantKeys,
     credential_ends_ns: Vec<Option<u64>>,
+}
+
+/// The grants one served call rode on, each keyed by its issuing org and
+/// revocation id (mirrors core's `CallGrantKeys`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallGrantKeys {
+    dispatcher: (OrgId, [u8; 32]),
+    capability: Option<(OrgId, [u8; 32])>,
+}
+
+impl CallGrantKeys {
+    fn revoked_in(&self, facts: &RevocationFacts) -> bool {
+        use crate::org::grant_revocation::RevokedGrantKind;
+        facts.is_grant_revoked(
+            &self.dispatcher.0,
+            RevokedGrantKind::Dispatcher,
+            &self.dispatcher.1,
+        ) || self.capability.is_some_and(|(org, id)| {
+            facts.is_grant_revoked(&org, RevokedGrantKind::Capability, &id)
+        })
+    }
 }
 
 fn extract_proof_facts(shape: RpcCallShape, proof: Option<&[u8]>) -> Option<ProofFacts> {
@@ -1410,6 +1436,13 @@ fn extract_proof_facts(shape: RpcCallShape, proof: Option<&[u8]>) -> Option<Proo
         generation: membership.generation,
         acting_org: membership.org_id,
         member: membership.member.clone(),
+        grants: CallGrantKeys {
+            dispatcher: (
+                dispatcher.org_id,
+                crate::org::grant_revocation::dispatcher_revocation_id(&dispatcher),
+            ),
+            capability: grant.as_ref().map(|g| (g.issuer_org, g.grant_id)),
+        },
         credential_ends_ns: vec![
             secs(membership.not_after),
             secs(dispatcher.not_after),

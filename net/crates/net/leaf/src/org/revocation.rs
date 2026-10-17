@@ -15,6 +15,13 @@ use std::collections::BTreeMap;
 
 use crate::org::cert::OrgId;
 use crate::org::entity::EntityId;
+use crate::org::grant_revocation::{
+    revocation_entry_expired, OrgGrantRevocationBundle, RevokedGrantKind,
+};
+
+/// A revoked grant as the facts key it: the issuing org, the grant
+/// family, and the revocation id.
+pub type RevokedGrantKey = (OrgId, RevokedGrantKind, [u8; 32]);
 
 /// The revocation facts one admission verifies against — the leaf's
 /// stand-in for core's `OrgRevocationState` snapshot.
@@ -27,6 +34,9 @@ pub struct RevocationFacts {
     /// Merged raise-only maxima keyed `(org, member)`; a missing key
     /// means floor 0 — every generation admissible.
     pub floors: BTreeMap<(OrgId, EntityId), u32>,
+    /// Grants revoked by their issuing org, with each revoked grant's
+    /// `not_after` (entries are dropped once that has passed).
+    pub revoked_grants: BTreeMap<RevokedGrantKey, u64>,
     /// Publish epoch (core's `BarrieredGeneration::get`); bumps on
     /// every raise — `stability_recheck` uses it to detect "floor
     /// rose mid-admission".
@@ -45,6 +55,49 @@ impl RevocationFacts {
             .get(&(*org, member.clone()))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// `true` iff `issuer` revoked the `kind` grant named `grant_id`.
+    pub fn is_grant_revoked(
+        &self,
+        issuer: &OrgId,
+        kind: RevokedGrantKind,
+        grant_id: &[u8; 32],
+    ) -> bool {
+        self.revoked_grants
+            .contains_key(&(*issuer, kind, *grant_id))
+    }
+
+    /// Merge a VERIFIED grant-revocation bundle (mirrors core's
+    /// `OrgRevocationState::merge_grant_revocations`): entries already
+    /// expired at `now_secs` are skipped, a present entry keeps the later
+    /// `not_after`, and expired entries are pruned. Returns how many
+    /// entries were newly added; the epoch bumps once if any were.
+    pub fn merge_grant_revocations(
+        &mut self,
+        bundle: &OrgGrantRevocationBundle,
+        now_secs: u64,
+    ) -> usize {
+        let mut added = 0;
+        for entry in bundle.entries() {
+            if revocation_entry_expired(entry.not_after, now_secs) {
+                continue;
+            }
+            let key = (bundle.org_id, entry.kind, entry.grant_id);
+            match self.revoked_grants.get_mut(&key) {
+                Some(not_after) => *not_after = (*not_after).max(entry.not_after),
+                None => {
+                    self.revoked_grants.insert(key, entry.not_after);
+                    added += 1;
+                }
+            }
+        }
+        self.revoked_grants
+            .retain(|_, not_after| !revocation_entry_expired(*not_after, now_secs));
+        if added > 0 {
+            self.epoch = self.epoch.saturating_add(1);
+        }
+        added
     }
 
     /// Raise-only merge (mirrors core's

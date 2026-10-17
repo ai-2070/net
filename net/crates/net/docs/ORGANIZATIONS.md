@@ -114,13 +114,51 @@ The fix is deliberately minimal: one small atomic local file of merged maxima
 (`revocation-state.json`), not the deferred WAL/replication system. Types:
 `OrgRevocationStore`, `OrgRevocationState`, `OrgRevocationError`.
 
-**Explicit limitation (grant revocation).** Floors cover **membership
-certificates only**. Cross-org capability grants and dispatcher grants have no
-floor mechanism, so their revocation is **not** actively enforced while a call
-runs: what bounds a granted call is the grant's `not_after` (clamped into the
-call's effective deadline) and the provider policy at opening. A grant revoked
-mid-call therefore stops at its validity end or the next opening — never in
-flight. This is a documented limitation, not continuous enforcement.
+## Grant revocation
+
+Floors cover membership certificates. Grants are withdrawn separately, by the
+org that issued them, with an `OrgGrantRevocationBundle`: an org-root-signed
+list of revoked grants under its own signing domain
+(`net-org-grant-revocation-v1`). Each entry names one grant:
+
+| Kind | Named by | Who can revoke it |
+|---|---|---|
+| Capability grant (B → A) | its `grant_id` | B, the provider org that issued it |
+| Dispatcher grant (A → S) | `blake3::derive_key("net-org-dispatcher-grant-id-v1", wire bytes)` | A, the org the dispatcher acts for |
+
+The store keys every entry by the bundle's own org, and admission looks a
+capability grant up under its `issuer_org` and a dispatcher grant under its
+`org_id`. A bundle can therefore only withdraw grants its signer issued.
+
+Entries merge into the same `revocation-state.json` as floors, under the same
+locked verify → reread → merge → persist → publish order, so a revocation
+survives restart and an older bundle never re-admits a grant. Each entry
+carries the revoked grant's own `not_after` and is dropped once that has
+passed (plus the five-minute skew ceiling): the grant could no longer verify
+anyway, and grants live at most 30 days, so the set stays bounded. A state
+file holding no grant revocations is still written as version 1; one that
+holds any is version 2, which older builds refuse rather than load without
+the revocations.
+
+Enforcement has two halves:
+
+- **New calls.** Admission step 8 refuses a revoked dispatcher grant
+  (`DispatcherGrantRevoked`) or capability grant (`CapabilityGrantRevoked`)
+  before the replay insert. The publish advances the store generation, so an
+  admission already in flight fails its stability recheck instead of admitting
+  under the old view.
+- **Live streams.** The store notifies grant subscribers after the publish;
+  the protected-call registry retires every live call that rode on a revoked
+  grant with the `Revoked` terminal, the same one a floor raise produces. Calls
+  under other grants keep running.
+
+Delivery to running nodes uses the floor service (`net.org.floor.apply`),
+which accepts a grant-revocation request beside a floor request and answers
+with a signed attestation per entry. From the CLI, `net-mesh org revoke-grant`
+signs the bundle and has each `--verifier` apply it. A provider applies the
+revocations of its own org, which is what it needs to withdraw the capability
+grants that org issued. A caller org's dispatcher-grant revocations reach a
+provider in another org the same way that org's membership floors do.
 
 ## Routing
 

@@ -58,6 +58,7 @@ use super::org::OrgId;
 use super::org_admission_replay::{AdmissionReplayGuard, ReplayOutcome, ReplayPrincipal};
 use super::org_call::{OrgCallProof, OrgStreamCallProof, RpcCallShape, MAX_ORG_CALL_PROOF_BYTES};
 use super::org_grant::CapabilityAuthorityId;
+use super::org_grant_revocation::RevokedGrantKind;
 use super::org_revocation::OrgRevocationState;
 use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
 
@@ -187,6 +188,12 @@ pub enum AdmissionDenied {
     /// The capability grant failed signature/structure/window
     /// verification.
     CapabilityGrantInvalid,
+    /// The capability grant is valid but its issuer (this provider's
+    /// owner org) has revoked it before its `not_after`.
+    CapabilityGrantRevoked,
+    /// The dispatcher grant is valid but its issuing org has revoked it
+    /// before its `not_after`.
+    DispatcherGrantRevoked,
     /// The proof's finite expiry has passed, or exceeds the TTL
     /// ceiling.
     ProofExpired,
@@ -331,6 +338,8 @@ impl AdmissionDenied {
             | D::MembershipInvalid
             | D::MembershipRevoked
             | D::CapabilityGrantInvalid
+            | D::CapabilityGrantRevoked
+            | D::DispatcherGrantRevoked
             | D::ProofExpired
             | D::BindingInvalid
             | D::Replay
@@ -651,10 +660,11 @@ pub fn verify_org_admission(
     //
     // So a compromised A member keeps invoking B's protected capability for
     // the life of its membership certificate — up to `MAX_ORG_CERT_TTL_SECS`
-    // (2 years) — and B cannot revoke the capability grant it issued either,
-    // because floors apply to the membership cert and NOT to grants (v1, see
-    // `org_grant.rs`). The only live provider-side kill switch is the
-    // `provider_policy` closure at step 11.
+    // (2 years) — unless B withdraws the capability grant it issued. That is
+    // what grant revocation (below, `org_grant_revocation.rs`) is for: B's
+    // own operator revokes the grant at B's own providers, cutting off EVERY
+    // A member at once, with no help from A. The finer cut (one A member)
+    // still needs A's floors here.
     //
     // Deliberately not "fixed" here: making an absent foreign floor set DENY
     // would break every cross-org deployment that has not built bundle
@@ -676,6 +686,29 @@ pub fn verify_org_admission(
         grant
             .is_valid_at_with_skew(now_secs, ctx.skew_secs)
             .map_err(|_| AdmissionDenied::CapabilityGrantInvalid)?;
+    }
+    // Grant revocation: a grant its issuer has withdrawn early. Each
+    // grant is looked up under its OWN issuer, so only that org's
+    // bundles can revoke it: the capability grant under `issuer_org`
+    // (checked above to be this provider's owner), the dispatcher grant
+    // under `org_id` (the acting org). For a cross-org caller the
+    // dispatcher half sees the acting org's revocations only once this
+    // provider holds them, the same reach as membership floors above.
+    if ctx.floors.is_grant_revoked(
+        &dispatcher.org_id,
+        RevokedGrantKind::Dispatcher,
+        &dispatcher.revocation_id(),
+    ) {
+        return Err(AdmissionDenied::DispatcherGrantRevoked);
+    }
+    if let Some(grant) = &cap_grant {
+        if ctx.floors.is_grant_revoked(
+            &grant.issuer_org,
+            RevokedGrantKind::Capability,
+            &grant.grant_id,
+        ) {
+            return Err(AdmissionDenied::CapabilityGrantRevoked);
+        }
     }
     match &proof {
         DecodedProof::Unary(p) => p.check_expiry_at(clock.wall_ns, ctx.skew_secs),
@@ -1122,6 +1155,105 @@ mod tests {
         assert_eq!(admitted.provider_org, org_b().org_id());
         assert_eq!(admitted.provider, provider());
         assert_eq!(admitted.capability, cap());
+    }
+
+    /// Floors with `entries` revoked by `issuer`, through the real merge.
+    fn floors_revoking(
+        issuer: &OrgKeypair,
+        entries: impl IntoIterator<
+            Item = crate::adapter::net::behavior::org_grant_revocation::RevokedGrant,
+        >,
+    ) -> OrgRevocationState {
+        use crate::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle;
+        let now = crate::adapter::net::behavior::org::current_timestamp();
+        let bundle = OrgGrantRevocationBundle::try_issue(issuer, entries).expect("bundle");
+        bundle.verify().expect("verifies");
+        let mut floors = OrgRevocationState::empty();
+        floors.merge_grant_revocations(&bundle, now);
+        floors
+    }
+
+    /// The provider org revokes the capability grant it issued: the
+    /// cross-org call is refused with its own reason, before the replay
+    /// insert (the same proof admits once the revocation is gone).
+    #[test]
+    fn a_revoked_capability_grant_is_denied_without_consuming_the_replay_slot() {
+        use crate::adapter::net::behavior::org_grant_revocation::RevokedGrant;
+        let proof = cross_org_proof();
+        let grant = proof.capability_grant.clone().expect("cross-org grant");
+        let floors = floors_revoking(&org_b(), [RevokedGrant::capability(&grant)]);
+        let replay = AdmissionReplayGuard::with_defaults();
+        assert_eq!(
+            admit(&cross_org_ctx(&floors), &proof, &replay),
+            Err(AdmissionDenied::CapabilityGrantRevoked)
+        );
+        let clean = empty_floors();
+        admit(&cross_org_ctx(&clean), &proof, &replay).expect("the denial consumed no replay slot");
+    }
+
+    /// The caller's org revokes the dispatcher grant it issued; once the
+    /// provider holds that revocation the call is refused.
+    #[test]
+    fn a_revoked_dispatcher_grant_is_denied() {
+        use crate::adapter::net::behavior::org_grant_revocation::RevokedGrant;
+        let proof = cross_org_proof();
+        let floors = floors_revoking(
+            &org_a(),
+            [RevokedGrant::dispatcher(&proof.dispatcher_grant)],
+        );
+        let replay = AdmissionReplayGuard::with_defaults();
+        assert_eq!(
+            admit(&cross_org_ctx(&floors), &proof, &replay),
+            Err(AdmissionDenied::DispatcherGrantRevoked)
+        );
+
+        let owner = owner_delegated_proof();
+        let floors = floors_revoking(
+            &org_b(),
+            [RevokedGrant::dispatcher(&owner.dispatcher_grant)],
+        );
+        assert_eq!(
+            admit(&owner_ctx(&floors), &owner, &replay),
+            Err(AdmissionDenied::DispatcherGrantRevoked),
+            "same-org dispatcher revocation bites the same way"
+        );
+    }
+
+    /// Only the issuer can revoke a grant: a revocation of B's capability
+    /// grant signed by A (or of A's dispatcher grant signed by B) is keyed
+    /// under the wrong org and changes nothing. Revoking an unrelated
+    /// grant id changes nothing either.
+    #[test]
+    fn a_revocation_by_anyone_but_the_issuer_or_of_another_grant_is_inert() {
+        use crate::adapter::net::behavior::org_grant_revocation::{RevokedGrant, RevokedGrantKind};
+        let proof = cross_org_proof();
+        let grant = proof.capability_grant.clone().expect("cross-org grant");
+        let replay = AdmissionReplayGuard::with_defaults();
+
+        let wrong_issuers = {
+            use crate::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle;
+            let now = crate::adapter::net::behavior::org::current_timestamp();
+            let mut floors = OrgRevocationState::empty();
+            for (issuer, entry) in [
+                (org_a(), RevokedGrant::capability(&grant)),
+                (org_b(), RevokedGrant::dispatcher(&proof.dispatcher_grant)),
+                (
+                    org_b(),
+                    RevokedGrant {
+                        kind: RevokedGrantKind::Capability,
+                        grant_id: [0xeeu8; 32],
+                        not_after: grant.not_after,
+                    },
+                ),
+            ] {
+                let bundle = OrgGrantRevocationBundle::try_issue(&issuer, [entry]).expect("bundle");
+                floors.merge_grant_revocations(&bundle, now);
+            }
+            floors
+        };
+        assert_eq!(wrong_issuers.revoked_grant_count(), 3);
+        admit(&cross_org_ctx(&wrong_issuers), &proof, &replay)
+            .expect("none of those revocations names this call's grants under their issuers");
     }
 
     #[test]

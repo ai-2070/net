@@ -2399,6 +2399,141 @@ mod node_level {
         );
     }
 
+    /// Grant revocation on the leaf: two live calls from one caller, each
+    /// admitted under its OWN dispatcher grant. A grant-revocation bundle
+    /// naming the first grant retires exactly that call (`Revoked`), while
+    /// the sibling keeps delivering. A bundle signed by a different org,
+    /// naming the same grant, revokes nothing: an org can only withdraw
+    /// grants it issued.
+    #[test]
+    fn a_grant_revocation_retires_only_the_call_under_the_revoked_grant() {
+        use net_leaf::org::grant_revocation::{OrgGrantRevocationBundle, RevokedGrant};
+
+        let world = World::at(clock::now_unix_secs());
+        let peer_ident = peer_identity();
+        let peer = peer_ident.node_id();
+        let (mut node, peer_session) = connected(peer);
+        let signed = net_leaf::announce::build_announcement(
+            &peer_ident,
+            &["test.anchor".to_string()],
+            1,
+            clock::now_unix_nanos(),
+            300,
+        )
+        .expect("announcement");
+        assert!(node.ingest_announcement(&signed), "the pin is installed");
+
+        let calls: Rc<RefCell<Vec<ServeCall>>> = Rc::new(RefCell::new(Vec::new()));
+        let handler_calls = Rc::clone(&calls);
+        let opts = ServeOptions {
+            shape: RpcCallShape::ServerStreaming,
+            access: ServeAccess::SameOrg,
+            provider_owner_org: world.owner_org,
+            skew_secs: 0,
+            default_live_ns: 300 * 1_000_000_000,
+            max_live_ns: 3600 * 1_000_000_000,
+            policy: None,
+        };
+        node.org_serve(
+            SERVICE,
+            opts,
+            Rc::new(move |call| handler_calls.borrow_mut().push(call)),
+        )
+        .expect("serve");
+
+        // Two dispatcher grants for the same caller, distinct by nonce.
+        let revoked_grant = world.dispatcher();
+        let kept_grant = OrgDispatcherGrant::issue_at(
+            &world.org,
+            world.caller_entity.clone(),
+            DispatcherScope::Exact(service_capability()),
+            world.now_secs,
+            world.now_secs + 3_600,
+            0x9999_aaaa_bbbb_cccc,
+        );
+        let request_route =
+            Channel::from_name(channel::request_channel(SERVICE).expect("c")).canonical();
+        let stream_id = channel::publish_stream_id(request_route);
+        let binding = node.peer_session_binding(peer).expect("session binding");
+        let node_entity = EntityId::from_bytes(*node.identity().entity().entity_id());
+        for (call_id, grant) in [(0x4001u64, &revoked_grant), (0x4002, &kept_grant)] {
+            let mut intent = world.intent_at(5, node_entity.clone());
+            intent.dispatcher_grant = grant.clone();
+            let mut req = RpcRequestPayload {
+                service: SERVICE.to_string(),
+                deadline_ns: 0,
+                flags: FLAG_RPC_STREAMING_RESPONSE,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"open"),
+            };
+            attach_signed_admission(
+                &mut req,
+                &intent,
+                call_id,
+                SERVICE,
+                RpcCallShape::ServerStreaming,
+                Some(binding),
+                clock::now_unix_nanos(),
+            )
+            .expect("mint");
+            let frame = rpc_wire::encode_request_frame(
+                world.caller_entity.origin_hash(),
+                call_id,
+                request_route,
+                &req,
+            )
+            .expect("frame");
+            let packet = peer_packet(&peer_session, stream_id, 0, request_route as u16, &frame);
+            node.on_datagram(peer, packet, clock::now());
+        }
+        assert_eq!(calls.borrow().len(), 2, "both openings were admitted");
+        let handles = calls.borrow().clone();
+
+        // A foreign org naming the same grant id moves nothing.
+        let foreign = OrgKeypair::from_bytes([0x99; 32]);
+        let forged = OrgGrantRevocationBundle::issue_at(
+            &foreign,
+            [RevokedGrant::dispatcher(&revoked_grant)],
+            world.now_secs,
+        )
+        .expect("foreign bundle");
+        assert_eq!(
+            node.ingest_org_grant_revocation_bundle(&forged.to_bytes(), world.now_secs)
+                .expect("verifies under its own org"),
+            1,
+            "merged, but keyed by the foreign org"
+        );
+        assert_eq!(handles[0].retired(), None, "another org cannot revoke it");
+
+        // The issuing org revokes the first grant.
+        let bundle = OrgGrantRevocationBundle::issue_at(
+            &world.org,
+            [RevokedGrant::dispatcher(&revoked_grant)],
+            world.now_secs,
+        )
+        .expect("bundle");
+        assert_eq!(
+            node.ingest_org_grant_revocation_bundle(&bundle.to_bytes(), world.now_secs)
+                .expect("verifies"),
+            1
+        );
+        assert_eq!(handles[0].retired(), Some(RetireReason::Revoked));
+        assert_eq!(handles[0].send(b"after"), Err(SinkError::Closed));
+        assert_eq!(handles[1].retired(), None, "the sibling's grant is intact");
+        handles[1]
+            .send(b"still-delivering")
+            .expect("the sibling keeps delivering");
+
+        // A tampered bundle is refused and changes nothing.
+        let mut tampered = bundle.to_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(node
+            .ingest_org_grant_revocation_bundle(&tampered, world.now_secs)
+            .is_err());
+        assert_eq!(handles[1].retired(), None);
+    }
+
     /// LEAF-20: the revocation feed's authenticity, negatively. A
     /// forged bundle — the real org id and floors under a wrong
     /// signature, and a genuine signature over tampered floor values

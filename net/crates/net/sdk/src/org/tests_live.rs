@@ -1233,6 +1233,96 @@ async fn live_cross_org_call_through_the_facade() {
     let _ = std::fs::remove_dir_all(&c_dir);
 }
 
+/// Grant revocation, end to end over real transport: an admitted cross-org
+/// call works; org B then revokes the capability grant it issued, carried to
+/// the provider over the live floor service with a signed attestation; the
+/// very next call under that grant is refused before the handler runs. Before
+/// grant revocation existed, B's only recourse was to wait out `not_after`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_cross_org_call_is_refused_after_the_provider_org_revokes_the_grant() {
+    use super::grant_revocation::{
+        request_org_grant_revocation, GrantEntryState, OrgGrantRevocationOutcome,
+        OrgGrantRevocationRequest,
+    };
+    let (a, b) = (org_a(), org_b());
+    let (provider, _p_identity, p_dir) = fast_mesh("live-revoke-provider", &b, None).await;
+    let (caller, c_identity, c_dir) = fast_mesh("live-revoke-caller", &a, None).await;
+    bring_up(&caller, &provider).await;
+    let _floors = super::floors::serve_org_floor(provider.node()).expect("floor service");
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_h = ran.clone();
+    let _serve = provider
+        .serve_org(
+            "customer.read",
+            OrgAccess::Granted,
+            move |_c: OrgCaller, req: Ping| {
+                let ran = ran_h.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(Pong {
+                        n: req.n + 1,
+                        served_by: "b-provider".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("serve_org");
+    let (grant, secret) = discover_grant(&b, a.org_id(), cap("nrpc:customer.read"), 3600);
+    let provider_secret =
+        OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy secret");
+    provider
+        .node()
+        .install_provider_grant_audience(grant.clone(), provider_secret)
+        .expect("provider audience");
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials =
+        OrgCredentials::new(cert, dg, vec![grant.clone()], vec![secret]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+    assert!(converge_discovery(&provider, &org, &cap("nrpc:customer.read")).await);
+    let _: Pong = org
+        .call("customer.read", &Ping { n: 1 })
+        .await
+        .expect("admitted before the revocation");
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    // B revokes the grant at the provider, and gets the provider's signed word.
+    let bundle = OrgGrantRevocationBundle::try_issue(&b, [RevokedGrant::capability(&grant)])
+        .expect("bundle");
+    let request = OrgGrantRevocationRequest::new(&bundle, provider.node().entity_id().clone())
+        .expect("request");
+    let attestation = request_org_grant_revocation(
+        caller.node(),
+        provider.node_id(),
+        &request,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the provider answers");
+    attestation
+        .verify_for(&request)
+        .expect("signed by the provider, for this request");
+    assert_eq!(attestation.outcome, OrgGrantRevocationOutcome::Applied);
+    assert_eq!(
+        attestation.state_of(RevokedGrantKind::Capability, &grant.grant_id),
+        Some(GrantEntryState::Revoked)
+    );
+
+    let refused = org.call::<_, Pong>("customer.read", &Ping { n: 2 }).await;
+    assert!(
+        refused.is_err(),
+        "a call under the revoked grant is refused"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the handler never ran for the refused call"
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
 /// A caller whose org holds NO grant for the capability cannot even discover
 /// the cross-org provider: the encrypted announcement is opaque without the
 /// audience, so the facade refuses locally and sends nothing.

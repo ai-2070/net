@@ -92,8 +92,8 @@ use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
 use crate::bootstrap::{AnchorInfo, Credential, OfferAccepted};
 use crate::control_plane::{
-    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, IceCandidate, NodeId,
-    RevocationBundle, Sdp, SignalEnvelope, SignedAnnouncement,
+    BootstrapAccepted, ControlEvent, ControlPlane, DialogId, GrantRevocationBundle, IceCandidate,
+    NodeId, RevocationBundle, Sdp, SignalEnvelope, SignedAnnouncement,
 };
 use crate::error::{LeafError, Result};
 use crate::signal;
@@ -132,7 +132,7 @@ struct State {
     /// org-control socket, waiting for `take_revocation_bundles`.
     /// Verbatim bytes in arrival order: the envelope is parsed, the
     /// bundle never is.
-    revocation: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    revocation: Rc<RefCell<RevocationQueues>>,
     /// The org-control socket's handlers, kept alive for the
     /// connection's lifetime. Not dialog-scoped — the feed outlives
     /// any one attempt — so they live here, not in a `Trickle`.
@@ -245,7 +245,7 @@ impl AnchorControlPlane {
                 dialog: Cell::new(None),
                 trickle: RefCell::new(None),
                 events: Rc::new(RefCell::new(VecDeque::new())),
-                revocation: Rc::new(RefCell::new(VecDeque::new())),
+                revocation: Rc::new(RefCell::new(RevocationQueues::default())),
                 org_control_handlers: RefCell::new(Vec::new()),
             }),
         };
@@ -644,10 +644,30 @@ impl ControlPlane for AnchorControlPlane {
         self.state
             .revocation
             .borrow_mut()
+            .floors
             .drain(..)
             .map(RevocationBundle)
             .collect()
     }
+
+    fn take_grant_revocation_bundles(&mut self) -> Vec<GrantRevocationBundle> {
+        self.state
+            .revocation
+            .borrow_mut()
+            .grants
+            .drain(..)
+            .map(GrantRevocationBundle)
+            .collect()
+    }
+}
+
+/// Both revocation feeds, each in arrival order. Kept as two queues so
+/// a grant bundle is never handed to the floor merge or the other way
+/// round; the frame type decides which.
+#[derive(Default)]
+struct RevocationQueues {
+    floors: VecDeque<Vec<u8>>,
+    grants: VecDeque<Vec<u8>>,
 }
 
 /// Route one inbound anchor-protocol frame: the revocation feed's
@@ -660,10 +680,14 @@ fn route_frame(
     text: &str,
     dialog: DialogId,
     events: &RefCell<VecDeque<ControlEvent>>,
-    revocation: &RefCell<VecDeque<Vec<u8>>>,
+    revocation: &RefCell<RevocationQueues>,
 ) {
-    if let Some(bundle) = parse_revocation_frame(text) {
-        revocation.borrow_mut().push_back(bundle);
+    if let Some(bundle) = parse_revocation_frame(text, "org_revocation_bundle") {
+        revocation.borrow_mut().floors.push_back(bundle);
+        return;
+    }
+    if let Some(bundle) = parse_revocation_frame(text, "org_grant_revocation_bundle") {
+        revocation.borrow_mut().grants.push_back(bundle);
         return;
     }
     if let Some(event) = parse_trickle_frame(text, dialog) {
@@ -680,9 +704,13 @@ fn route_frame(
 /// leaf's org module (`ControlPlane`'s "verified by the leaf, not by
 /// the transport" rule). Anything else returns `None`, so the trickle
 /// parser still decides what any other frame means.
-fn parse_revocation_frame(text: &str) -> Option<Vec<u8>> {
+///
+/// The grant half of the feed is the same envelope with
+/// `"type":"org_grant_revocation_bundle"`; `frame_type` names which one
+/// to accept.
+fn parse_revocation_frame(text: &str, frame_type: &str) -> Option<Vec<u8>> {
     let document: serde_json::Value = serde_json::from_str(text).ok()?;
-    if document.get("type").and_then(|v| v.as_str()) != Some("org_revocation_bundle") {
+    if document.get("type").and_then(|v| v.as_str()) != Some(frame_type) {
         return None;
     }
     let encoded = document.get("bundle").and_then(|v| v.as_str())?;

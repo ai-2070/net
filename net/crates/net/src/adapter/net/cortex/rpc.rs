@@ -3815,8 +3815,9 @@ use crate::adapter::net::behavior::org::OrgId;
 use crate::adapter::net::behavior::org_admission::AdmissionDenied;
 use crate::adapter::net::behavior::org_authority::NodeAuthority;
 use crate::adapter::net::behavior::org_call::RpcCallShape;
+use crate::adapter::net::behavior::org_grant_revocation::RevokedGrantKind;
 use crate::adapter::net::behavior::org_revocation::{
-    OrgRevocationState, OrgRevocationStore, RaiseSubscription, RaisedFloor,
+    OrgRevocationState, OrgRevocationStore, RaiseSubscription, RaisedFloor, RevokedGrantKey,
 };
 use crate::adapter::net::identity::EntityId;
 use crate::adapter::net::org_admission_gate::AdmissionStamp;
@@ -4402,11 +4403,69 @@ pub struct VerifiedCallFacts {
     pub member: EntityId,
     /// That member's certificate generation (the floor comparison term).
     pub member_generation: u32,
+    /// The grants the call was admitted under (the grant-revocation
+    /// comparison terms).
+    pub grants: CallGrantKeys,
     /// The §2.1 effective deadline, when this shape resolves one
     /// (`None` for unary records at slice 1.4 — the §2.1 machinery is
     /// streaming-scoped, and enforcing it on unary would change unary
     /// behavior).
     pub deadline: Option<ResolvedStreamDeadline>,
+}
+
+/// The grants one admitted call rode on, each named by its issuing org
+/// and revocation id, so a later grant revocation can find the calls it
+/// retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallGrantKeys {
+    /// `(org_id, revocation_id)` of the dispatcher grant.
+    pub dispatcher: (OrgId, [u8; 32]),
+    /// `(issuer_org, grant_id)` of the capability grant, for a cross-org
+    /// call.
+    pub capability: Option<(OrgId, [u8; 32])>,
+}
+
+impl CallGrantKeys {
+    /// The keys of a verified proof's grants.
+    pub fn of(
+        dispatcher: &crate::adapter::net::behavior::org_grant::OrgDispatcherGrant,
+        capability: Option<&crate::adapter::net::behavior::org_grant::OrgCapabilityGrant>,
+    ) -> Self {
+        Self {
+            dispatcher: (dispatcher.org_id, dispatcher.revocation_id()),
+            capability: capability.map(|g| (g.issuer_org, g.grant_id)),
+        }
+    }
+
+    /// Whether `key` names one of these grants.
+    pub fn matches(&self, key: &RevokedGrantKey) -> bool {
+        let (org, kind, id) = key;
+        match kind {
+            RevokedGrantKind::Dispatcher => self.dispatcher == (*org, *id),
+            RevokedGrantKind::Capability => self.capability == Some((*org, *id)),
+        }
+    }
+
+    /// Whether `floors` revokes either grant.
+    pub fn revoked_in(&self, floors: &OrgRevocationState) -> bool {
+        floors.is_grant_revoked(
+            &self.dispatcher.0,
+            RevokedGrantKind::Dispatcher,
+            &self.dispatcher.1,
+        ) || self.capability.is_some_and(|(org, id)| {
+            floors.is_grant_revoked(&org, RevokedGrantKind::Capability, &id)
+        })
+    }
+}
+
+impl VerifiedCallFacts {
+    /// Whether `floors` revokes this call's credentials: its member's
+    /// certificate generation fell below a floor, or a grant it rode on
+    /// was revoked.
+    pub fn revoked_in(&self, floors: &OrgRevocationState) -> bool {
+        floors.floor_for(&self.acting_org, &self.member) > self.member_generation
+            || self.grants.revoked_in(floors)
+    }
 }
 
 /// Everything `reserve` can know before decode (the model's
@@ -4620,6 +4679,9 @@ pub struct ProtectedCallRegistry {
     /// subscriber, owned here so replacement can drop it outside the
     /// registry lock (a subscription drop drains in-flight callbacks).
     subscription: Mutex<Option<RaiseSubscription>>,
+    /// The grant-revocation feed, held beside the raise feed and replaced
+    /// with it.
+    grant_subscription: Mutex<Option<RaiseSubscription>>,
     removals: Mutex<HashMap<(ProtectedCallKey, u64), usize>>,
 }
 
@@ -4649,6 +4711,7 @@ impl ProtectedCallRegistry {
             limits,
             bytes,
             subscription: Mutex::new(None),
+            grant_subscription: Mutex::new(None),
             removals: Mutex::new(HashMap::new()),
         }))
     }
@@ -4831,8 +4894,29 @@ impl ProtectedCallRegistry {
             }
             registry.on_floors_raised(raised);
         });
+        // The same store-identity gate for grant revocations.
+        let weak = Arc::downgrade(self);
+        let grant_subscription =
+            store.subscribe_grants_revoked(move |revoked: &[RevokedGrantKey]| {
+                let Some(registry) = weak.upgrade() else {
+                    return;
+                };
+                let still_bound = {
+                    let inner = registry.inner.lock();
+                    inner
+                        .store
+                        .as_ref()
+                        .is_some_and(|s| Arc::as_ptr(s) as *const () as usize == new_store_ptr)
+                };
+                if !still_bound {
+                    return;
+                }
+                registry.on_grants_revoked(revoked);
+            });
         let old_subscription = self.subscription.lock().replace(subscription);
+        let old_grant_subscription = self.grant_subscription.lock().replace(grant_subscription);
         drop(old_subscription);
+        drop(old_grant_subscription);
     }
 
     /// Selective raise callback (§2.3). Bumps the epoch, then retires
@@ -4875,6 +4959,35 @@ impl ProtectedCallRegistry {
             .collect();
         for (key, incarnation, reason) in victims {
             self.retire_locked(&mut inner, &key, incarnation, reason);
+        }
+    }
+
+    /// Grant-revocation callback: bumps the epoch, then retires every
+    /// live record admitted under one of the revoked grants. Records
+    /// still `Opening` carry no facts yet; the epoch bump sends them
+    /// through the promotion recheck, which consults the new view.
+    pub fn on_grants_revoked(&self, revoked: &[RevokedGrantKey]) {
+        if revoked.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        inner.authority_epoch = inner.authority_epoch.wrapping_add(1);
+        let victims: Vec<(ProtectedCallKey, u64)> = inner
+            .records
+            .iter()
+            .filter_map(|(key, record)| {
+                if record.phase == RegistryPhase::Terminal {
+                    return None;
+                }
+                let facts = record.facts.as_ref()?;
+                revoked
+                    .iter()
+                    .any(|grant| facts.grants.matches(grant))
+                    .then_some((key.clone(), record.incarnation))
+            })
+            .collect();
+        for (key, incarnation) in victims {
+            self.retire_locked(&mut inner, &key, incarnation, StreamTerminalReason::Revoked);
         }
     }
 
@@ -5142,8 +5255,7 @@ impl ProtectedCallRegistry {
                     return Err(AdmissionDenied::ProviderAuthorityUnavailable);
                 }
                 ViewMovement::Unchanged | ViewMovement::GenerationOnly => {
-                    if floors.floor_for(&facts.acting_org, &facts.member) > facts.member_generation
-                    {
+                    if facts.revoked_in(&floors) {
                         self.retire_locked(
                             &mut inner,
                             &reservation.key,
@@ -5348,7 +5460,7 @@ impl ProtectedCallRegistry {
             }
             ViewMovement::Unchanged => CommitVerdict::Proceed,
             ViewMovement::GenerationOnly => {
-                if floors.floor_for(&facts.acting_org, &facts.member) > facts.member_generation {
+                if facts.revoked_in(&floors) {
                     self.retire_locked(inner, key, incarnation, StreamTerminalReason::Revoked);
                     CommitVerdict::Retired(StreamTerminalReason::Revoked)
                 } else {
@@ -14212,6 +14324,13 @@ mod tests {
                     acting_org: crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
                     member: EntityId::from_bytes([1u8; 32]),
                     member_generation: 1,
+                    grants: CallGrantKeys {
+                        dispatcher: (
+                            crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
+                            [0xd1u8; 32],
+                        ),
+                        capability: None,
+                    },
                     deadline: None,
                 },
                 0,
@@ -14360,6 +14479,13 @@ mod tests {
             acting_org: crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
             member: EntityId::from_bytes([1u8; 32]),
             member_generation: 1,
+            grants: CallGrantKeys {
+                dispatcher: (
+                    crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
+                    [0xd1u8; 32],
+                ),
+                capability: None,
+            },
             deadline: None,
         };
 
@@ -14456,6 +14582,139 @@ mod tests {
         assert_eq!(registry.removals(&key, second_incarnation), 1);
     }
 
+    /// Grant revocation reaches live calls through the store's grant
+    /// feed: revoking one call's dispatcher grant retires that call
+    /// `Revoked` and leaves a sibling under other grants running; revoking
+    /// the sibling's capability grant then retires it too. Before this
+    /// feed existed a revoked grant stopped nothing until its `not_after`.
+    #[test]
+    fn a_grant_revocation_retires_exactly_the_live_calls_under_that_grant() {
+        use crate::adapter::net::behavior::org::OrgKeypair;
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "net-grant-revocation-registry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(
+            crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+                &dir,
+                crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+            )
+            .expect("real store"),
+        );
+        let registry = ProtectedCallRegistry::with_q1_defaults().expect("limits validate");
+        registry.bind_store(None, Arc::clone(&store));
+
+        let acting = OrgKeypair::from_bytes([0x61u8; 32]);
+        let provider_org = OrgKeypair::from_bytes([0x62u8; 32]);
+        let open = |call_id: u64, grants: CallGrantKeys| {
+            let key = ProtectedCallKey {
+                caller: EntityId::from_bytes([1u8; 32]),
+                call_id,
+            };
+            let mut guard = registry
+                .reserve(OpeningRequest {
+                    key: key.clone(),
+                    session: SessionIdentity {
+                        peer: 2,
+                        session_id: 3,
+                        establishment: Some([4u8; 32]),
+                    },
+                    session_generation: Some(1),
+                    registration: 1,
+                    shape: RpcCallShape::ServerStreaming,
+                    now_ns: 0,
+                })
+                .expect("reserve");
+            let mut lease = registry
+                .install(
+                    &mut guard,
+                    VerifiedCallFacts {
+                        acting_org: acting.org_id(),
+                        member: EntityId::from_bytes([1u8; 32]),
+                        member_generation: 1,
+                        grants,
+                        deadline: None,
+                    },
+                    0,
+                )
+                .expect("install");
+            registry
+                .confirm(&mut lease, Arc::new(StreamRetireSignal::new()), None)
+                .expect("transfer");
+            key
+        };
+        let first = open(
+            21,
+            CallGrantKeys {
+                dispatcher: (acting.org_id(), [0xd1u8; 32]),
+                capability: Some((provider_org.org_id(), [0xc1u8; 32])),
+            },
+        );
+        let second = open(
+            22,
+            CallGrantKeys {
+                dispatcher: (acting.org_id(), [0xd2u8; 32]),
+                capability: Some((provider_org.org_id(), [0xc2u8; 32])),
+            },
+        );
+
+        let not_after = crate::adapter::net::behavior::org::current_timestamp() + 3_600;
+        let revoke = |org: &OrgKeypair, entry: RevokedGrant| {
+            store
+                .apply_grant_revocations(
+                    &OrgGrantRevocationBundle::try_issue(org, [entry]).expect("bundle"),
+                )
+                .expect("apply")
+        };
+        revoke(
+            &acting,
+            RevokedGrant {
+                kind: RevokedGrantKind::Dispatcher,
+                grant_id: [0xd1u8; 32],
+                not_after,
+            },
+        );
+        assert_eq!(
+            registry.terminal_reason(&first),
+            Some(StreamTerminalReason::Revoked)
+        );
+        assert_eq!(
+            registry.terminal_reason(&second),
+            None,
+            "the sibling runs on"
+        );
+
+        // The provider org's capability-grant revocation, for the sibling.
+        // A revocation of the same id by the WRONG org first: inert.
+        revoke(
+            &acting,
+            RevokedGrant {
+                kind: RevokedGrantKind::Capability,
+                grant_id: [0xc2u8; 32],
+                not_after,
+            },
+        );
+        assert_eq!(registry.terminal_reason(&second), None, "not the issuer");
+        revoke(
+            &provider_org,
+            RevokedGrant {
+                kind: RevokedGrantKind::Capability,
+                grant_id: [0xc2u8; 32],
+                not_after,
+            },
+        );
+        assert_eq!(
+            registry.terminal_reason(&second),
+            Some(StreamTerminalReason::Revoked)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --------------------------------------------------------------------
     // S2R (F-S2R-2) — the post-transfer scope guard (probe-witness).
     // --------------------------------------------------------------------
@@ -14536,6 +14795,13 @@ mod tests {
             acting_org: crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
             member: EntityId::from_bytes([0x24u8; 32]),
             member_generation: 1,
+            grants: CallGrantKeys {
+                dispatcher: (
+                    crate::adapter::net::behavior::org::OrgId::from_bytes([9u8; 32]),
+                    [0xd1u8; 32],
+                ),
+                capability: None,
+            },
             deadline: None,
         };
 
