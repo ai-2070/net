@@ -188,6 +188,7 @@ net/crates/net/sdk/examples/tool_calling.rs
   s_68458b432a1e7f::t_74f4bb214f65eb 139-140
 go/abi_stability_start_refused_test.go
   s_b5e025ec544d7a::t_26c63576fcd677 1-36
+  s_68458b432a1e7f::t_091d5ad28f2cb4 1-36
 ---
 {
   "schema_version": "authorship/3.0.0",
