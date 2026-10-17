@@ -3577,6 +3577,12 @@ pub async fn run_up(
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
+    // The freshness policy is in force before the node processes a single
+    // inbound packet: set after `start()`, a restart would admit the very
+    // callers the flag exists to refuse until the policy landed.
+    for (org, age) in &fresh_revocations {
+        mesh.node().require_fresh_org_revocations(*org, Some(*age));
+    }
     mesh.start()
         .map_err(|e| connection_failure(format!("mesh start on {bind}: {e}")))?;
     // Channels served from this state directory (`channel serve`) are gated
@@ -3651,9 +3657,6 @@ pub async fn run_up(
     // Any node may be asked to apply a root-signed org floor (and attest).
     let _org_floor = net_sdk::org::floors::serve_org_floor(mesh.node())
         .map_err(|e| generic(format!("org floor service: {e}")))?;
-    for (org, age) in &fresh_revocations {
-        mesh.node().require_fresh_org_revocations(*org, Some(*age));
-    }
     let _subnet_readback = match &subnet_issuer {
         Some(_) => Some(
             mesh.node()
