@@ -1,0 +1,19 @@
+docs/internal/plans/CROSS_ORG_INVOCATION_GAPS_PLAN.md
+  s_68458b432a1e7f::t_8ed2fbcd6ee90f 1-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "63b0c3c28175111e5af3698eb9a910da048ce230",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

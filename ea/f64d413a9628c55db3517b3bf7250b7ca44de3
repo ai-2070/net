@@ -1,0 +1,125 @@
+.claude/skills/net-event-bus/cli.md
+  s_68458b432a1e7f::t_df3dfe4c30f684 191,326,333
+net/crates/net/leaf/src/wasm.rs
+  s_68458b432a1e7f::t_0fab7db2bfad06 4816-4827,7330-7348
+  s_68458b432a1e7f::t_5df4de08086373 7349-7350
+net/crates/net/leaf/src/anchor_control_plane.rs
+  s_68458b432a1e7f::t_3320e15500d8df 95-96
+  s_68458b432a1e7f::t_cdf26a243cb55f 135,248,647,652-670,683,685-690,707-711,713
+net/crates/net/leaf/src/rpc_serve.rs
+  s_68458b432a1e7f::t_9d000512720e7e 224-225,813,980,1397,1401-1421,1439-1445
+net/crates/net/src/adapter/net/behavior/org_revocation.rs
+  s_68458b432a1e7f::t_c802fc866333e0 448-463
+  s_68458b432a1e7f::t_1212bc3ad25e51 1221-1235,2147,2179,2181-2205,2207
+  s_68458b432a1e7f::t_aff0487591eb74 929-940,944-947,950,954-972,987
+  s_68458b432a1e7f::t_041f6fcdac9af6 124-174,179-194
+  s_68458b432a1e7f::t_6234a91892309c 175-178
+  s_68458b432a1e7f::t_86d867de5bc219 4574-4603,4608-4635,4641-4717,4722-4754
+  s_68458b432a1e7f::t_2e00ddbd0bfc8d 75-78,84-87,90-98
+  s_68458b432a1e7f::t_b533e87f784b5f 4604-4607,4636-4640,4718-4721
+  s_68458b432a1e7f::t_0d1a2772533891 106-110
+  s_68458b432a1e7f::t_d89d2f3da4fabe 326-328,334-366
+  s_68458b432a1e7f::t_ec184917d698b1 424-427
+  s_68458b432a1e7f::t_9f73436e3c541b 265-274,276-282,292
+  s_68458b432a1e7f::t_c9ab369ef31dda 909,2259-2312,2367,2372,2433-2436,2441-2442,2447,2449,2455-2456
+  s_68458b432a1e7f::t_3fa57ca29b315b 622-641,737,778,852-882,906-908,1236
+  s_68458b432a1e7f::t_a7a087b8d896f0 1446,1508,1830,1888,2423
+  s_68458b432a1e7f::t_5a2cf77548cc8d 99,1237
+net/crates/net/sdk/src/org.rs
+  s_68458b432a1e7f::t_8a37418a0ef556 102
+net/crates/net/leaf/src/org/grant_revocation.rs
+  s_68458b432a1e7f::t_7003ac8c6f06e3 1-294
+net/crates/net/cli/src/commands/lifecycle.rs
+  s_68458b432a1e7f::t_4ffbe47c0b11fb 2318-2319,2322-2331,2340,2342,2345,2348,2353,2357,2366-2371,2373-2375,2380
+  s_68458b432a1e7f::t_58dceaeba4c861 2372
+net/crates/net/leaf/src/org/admission.rs
+  s_68458b432a1e7f::t_9d000512720e7e 145-149,276-277,587-604
+net/crates/net/leaf/src/org/mod.rs
+  s_68458b432a1e7f::t_9d000512720e7e 62,84-86
+  s_68458b432a1e7f::t_7a7918a601022b 87
+net/crates/net/src/adapter/net/behavior/org.rs
+  s_68458b432a1e7f::t_3ecbd017fc0399 319-325,383-390
+net/crates/net/leaf/src/control_plane.rs
+  s_68458b432a1e7f::t_cdf26a243cb55f 123-129,314-320
+  s_68458b432a1e7f::t_82efd9ee744ab0 321-322
+net/crates/net/sdk/src/org/grant_revocation.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 279-280,361-362,459-460
+  s_68458b432a1e7f::t_72cc22d63607ad 1-278,281-360,363-458,461-480
+net/crates/net/cli/src/commands/org.rs
+  s_68458b432a1e7f::t_6f5e2f4fdc87cd 105-112,191-229,641,711-808,810,813,826-836,843-919,921-930,934-943,947,971,975-983,990-994,1017-1018,1023,1711-1717
+  s_68458b432a1e7f::t_b533e87f784b5f 837-842
+  s_68458b432a1e7f::t_7978824e635d44 1718
+net/crates/net/docs/ORGANIZATIONS.md
+  s_68458b432a1e7f::t_cdcc08c310a69c 117-161
+net/crates/net/leaf/src/node.rs
+  s_68458b432a1e7f::t_95abff886cba13 2941-2943
+  s_68458b432a1e7f::t_9cc01ade4a3530 2928-2940,2944-2956
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 4451-4457,4899-4915,14685-14689
+  s_68458b432a1e7f::t_f91fdf41261093 14585-14684,14690-14715
+  s_68458b432a1e7f::t_6c03749f3dfae6 3818,3820,4682-4684,4714,4897-4898,4917,4919,4965-4991
+  s_68458b432a1e7f::t_ac6ef7a9d216cf 14327-14333,14482-14488,14798-14804
+  s_68458b432a1e7f::t_a761fd399ec91f 4406-4408,4416-4450,4458-4470,4992,5258,5463,14716
+  s_68458b432a1e7f::t_df76745f2d29bd 4993,14717
+web/src/content/docs/reference/cli.md
+  s_68458b432a1e7f::t_1d0c846f37a107 505-513
+net/crates/net/cli/tests/org_grant.rs
+  s_68458b432a1e7f::t_8a598cb4c35513 707-864
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_68458b432a1e7f::t_a761fd399ec91f 1429,1441,1455,1479
+net/crates/net/leaf/src/org/revocation.rs
+  s_68458b432a1e7f::t_9d000512720e7e 18-24,37-39,60-101
+  s_68458b432a1e7f::t_571dcda138693c 102
+.claude/skills/net-event-bus/org.md
+  s_68458b432a1e7f::t_df3dfe4c30f684 133-138
+net/crates/net/src/adapter/net/behavior/org_admission.rs
+  s_68458b432a1e7f::t_3613c9b0ecc810 663-667
+  s_68458b432a1e7f::t_08aa3ce73cb176 61,191-196,341-342,690-711
+  s_68458b432a1e7f::t_b533e87f784b5f 1163-1165,1191,1200-1203,1211-1214
+  s_68458b432a1e7f::t_7496ba447061ad 712,1160-1162,1166-1190,1192-1199,1204-1210,1215-1257
+  s_68458b432a1e7f::t_044b6758517ed9 1258
+net/crates/net/tests/org_rpc_streaming.rs
+  s_68458b432a1e7f::t_a629ef5e8b5ac2 2167-2170
+net/crates/net/sdk/src/org/types.rs
+  s_68458b432a1e7f::t_1890c7f610df20 60-68
+net/crates/net/src/adapter/net/behavior/org_grant_revocation.rs
+  s_68458b432a1e7f::t_d3f8e8e27e4c37 1-380,416-427,433-468,472-601
+  s_68458b432a1e7f::t_53186320ba8890 385
+  s_68458b432a1e7f::t_e44380a3626d7e 381-384,386-410,413-415
+  s_68458b432a1e7f::t_b533e87f784b5f 411-412,428-432,469-471
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_68458b432a1e7f::t_b533e87f784b5f 66
+.github/workflows/ci.yml
+  s_68458b432a1e7f::t_65321c74503e66 7348-7349
+  s_68458b432a1e7f::t_65d819782931e6 7361-7363
+  s_68458b432a1e7f::t_471e31396021fa 7342-7343
+net/crates/net/leaf/src/org/cert.rs
+  s_68458b432a1e7f::t_9d000512720e7e 232-237,289-296
+docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md
+  s_68458b432a1e7f::t_efd4ba8f128af4 113-122
+net/crates/net/sdk/src/org/floors.rs
+  s_68458b432a1e7f::t_8a37418a0ef556 46,53,58-59,63,71,74,77,80,370-387,389-390,427,437
+net/crates/net/leaf/tests/org_streaming_lifecycle.rs
+  s_68458b432a1e7f::t_198e3687379a49 2402-2536
+net/crates/net/sdk/src/org/tests_live.rs
+  s_68458b432a1e7f::t_315fb25d314db9 1236-1301,1305-1311,1316-1325
+  s_68458b432a1e7f::t_b533e87f784b5f 1302-1304,1312-1315
+net/crates/net/leaf/tests/control_plane_boundary.rs
+  s_68458b432a1e7f::t_ac64cb13f5f881 614,622-624
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eaf64d413a9628c55db3517b3bf7250b7ca44de3",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

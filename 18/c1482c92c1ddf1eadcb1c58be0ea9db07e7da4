@@ -1,0 +1,43 @@
+net/crates/net/sdk/Cargo.toml
+  s_68458b432a1e7f::t_d2b286ed1bc1ae 482-487
+net/crates/net/tests/cross_lang_org/matrix/PROTOCOL.md
+  s_68458b432a1e7f::t_d3e1a14d956e67 1-114
+net/crates/net/tests/cross_lang_org/matrix/driver.py
+  s_68458b432a1e7f::t_56f5309257b1a9 1-517
+net/crates/net/tests/cross_lang_org/matrix/run_matrix.py
+  s_68458b432a1e7f::t_d19e05b60a1b0b 103-114,122-125
+  s_68458b432a1e7f::t_8d1438bc55b9ea 1-102,115-121,126-250
+net/crates/net/tests/cross_lang_org/matrix/driver.mjs
+  s_68458b432a1e7f::t_1c8491622510a4 331-333
+  s_68458b432a1e7f::t_e25592c98fdeb8 1-330,334-549
+.github/workflows/ci.yml
+  s_68458b432a1e7f::t_aea2c20274d5ad 5219-5309
+net/crates/net/sdk/examples/org_matrix_peer.rs
+  s_68458b432a1e7f::t_add0784ffdce1d 32-36,38-45,139,146,194,293,383-384
+  s_68458b432a1e7f::t_0fc0ded6c102e0 154-156
+  s_68458b432a1e7f::t_b9545ea26ff815 18-20,37,322,324,381,391
+  s_68458b432a1e7f::t_fec9e2520781d9 247
+  s_68458b432a1e7f::t_7260c3d02e531b 72-74,217-219,227-232,235-246,249-261,263,265,314-319,353-355
+  s_68458b432a1e7f::t_9f4014af18a7a9 1-17,21-31,46-71,75-138,140-145,147-153,157-193,195-216,220-226,233-234,248,262,264,266-292,294-313,320-321,323,325-352,356-380,382,385-390,392-422
+go/cmd/org-matrix-peer/main.go
+  s_68458b432a1e7f::t_8cfc4079e405ff 507-510,512-513,546-744
+  s_68458b432a1e7f::t_533beec877c0af 305
+  s_68458b432a1e7f::t_79840b6b418f07 1-158,162-163,165-173,175-176,178-304,306-506,511,514-545
+  s_68458b432a1e7f::t_9f84374888b4fa 159-161,164,174,177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "18c1482c92c1ddf1eadcb1c58be0ea9db07e7da4",
+  "prompts": {},
+  "sessions": {
+    "s_68458b432a1e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "314482ff-bc60-4730-afcf-8a25a4abf2d6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
