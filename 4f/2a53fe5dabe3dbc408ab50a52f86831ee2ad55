@@ -1,0 +1,20 @@
+docs/internal/misc/CODE_REVIEW_2026_10_17_CROSS_ORG.md
+  s_b5e025ec544d7a::t_dbf28fa229b9b1 1-240
+  s_b5e025ec544d7a::t_b22214ce2df438 241-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f2a53fe5dabe3dbc408ab50a52f86831ee2ad55",
+  "prompts": {},
+  "sessions": {
+    "s_b5e025ec544d7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "921d8ae7-db38-46d3-b4a7-43ea26db2e58",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
