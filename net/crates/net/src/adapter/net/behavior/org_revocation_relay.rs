@@ -17,7 +17,9 @@
 //! - **Relay.** A caller attaches its org's retained bundles to a cross-org
 //!   protected call in the [`ORG_REVOCATIONS_HEADER`], within a byte budget
 //!   ([`encode_relay_header`] / [`decode_relay_header`]). The provider verifies
-//!   each bundle's signature and merges it before admitting the call.
+//!   each bundle's signature and merges it in the background, except material
+//!   the call's own freshness check needs, which is applied before admission
+//!   (`ingest_relayed_org_revocations` in `mesh_rpc.rs`).
 //!
 //! Bundles authenticate themselves (root-signed) and can only raise floors or
 //! add revocations, so any carrier may carry them: a caller relaying its own
