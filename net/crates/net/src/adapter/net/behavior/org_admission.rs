@@ -194,6 +194,12 @@ pub enum AdmissionDenied {
     /// The dispatcher grant is valid but its issuing org has revoked it
     /// before its `not_after`.
     DispatcherGrantRevoked,
+    /// This provider requires recent revocation material from the
+    /// caller's acting org, and the newest it holds is older than allowed
+    /// (or there is none). Without it the acting org's floors and
+    /// dispatcher-grant revocations may not have arrived here, so the
+    /// provider refuses rather than admit on a view it cannot vouch for.
+    RevocationsStale,
     /// The proof's finite expiry has passed, or exceeds the TTL
     /// ceiling.
     ProofExpired,
@@ -340,6 +346,7 @@ impl AdmissionDenied {
             | D::CapabilityGrantInvalid
             | D::CapabilityGrantRevoked
             | D::DispatcherGrantRevoked
+            | D::RevocationsStale
             | D::ProofExpired
             | D::BindingInvalid
             | D::Replay
@@ -413,9 +420,23 @@ pub struct AdmissionContext<'a> {
     pub floors: &'a OrgRevocationState,
     /// Clock-skew tolerance for every wall-clock check.
     pub skew_secs: u64,
+    /// The provider's revocation-freshness policy, when it has one: called
+    /// with the verified acting org and the admission's wall-clock seconds,
+    /// it answers whether this provider holds recent enough revocation
+    /// material from that org. `None` (the default) checks nothing.
+    pub revocation_freshness: Option<&'a RevocationFreshness<'a>>,
 }
 
+/// See [`AdmissionContext::revocation_freshness`].
+pub type RevocationFreshness<'a> = dyn Fn(&OrgId, u64) -> bool + Sync + 'a;
+
 impl<'a> AdmissionContext<'a> {
+    /// Attach the provider's revocation-freshness policy.
+    pub fn with_revocation_freshness(mut self, policy: &'a RevocationFreshness<'a>) -> Self {
+        self.revocation_freshness = Some(policy);
+        self
+    }
+
     /// The stable external constructor (C3). `client_streaming` /
     /// `streaming_response` are the two nRPC streaming-flag bits of the
     /// REQUEST payload, resolved to plain bools at the cortex layer;
@@ -451,6 +472,7 @@ impl<'a> AdmissionContext<'a> {
             session_binding,
             floors,
             skew_secs,
+            revocation_freshness: None,
         }
     }
 }
@@ -678,6 +700,16 @@ pub fn verify_org_admission(
     let floor = ctx.floors.floor_for(&acting_org, &membership.member);
     if membership.generation < floor {
         return Err(AdmissionDenied::MembershipRevoked);
+    }
+    // Revocation freshness (opt-in, per acting org): the floor check above
+    // is only as good as the floors that reached this provider. A provider
+    // that requires it refuses an acting org whose newest signed revocation
+    // material here is too old, turning "nothing arrived" from a silent
+    // pass into a refusal.
+    if let Some(fresh) = ctx.revocation_freshness {
+        if !fresh(&acting_org, now_secs) {
+            return Err(AdmissionDenied::RevocationsStale);
+        }
     }
     dispatcher
         .is_valid_at_with_skew(now_secs, ctx.skew_secs)
@@ -1061,6 +1093,7 @@ mod tests {
             session_binding: Some(session_binding),
             floors,
             skew_secs: 0,
+            revocation_freshness: None,
         }
     }
 
@@ -1108,6 +1141,7 @@ mod tests {
             session_binding: None,
             floors,
             skew_secs: 0,
+            revocation_freshness: None,
         }
     }
 
@@ -1125,6 +1159,7 @@ mod tests {
             session_binding: None,
             floors,
             skew_secs: 0,
+            revocation_freshness: None,
         }
     }
 

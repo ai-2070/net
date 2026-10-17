@@ -133,4 +133,40 @@ impl Mesh {
     ) -> Result<(), OrgProvisionError> {
         install_provider_grant_audience_node(self.node(), grant_bytes, secret_path)
     }
+
+    /// As a provider, refuse callers acting for `org` unless this node holds
+    /// signed revocation material from `org` issued within `max_age`
+    /// (`None` lifts the requirement). See
+    /// `MeshNode::require_fresh_org_revocations` for how material arrives.
+    ///
+    /// Without a requirement a cross-org caller is admitted even when none of
+    /// its org's revocations have reached this node; that is counted
+    /// ([`Self::foreign_revocation_unverified_admissions`]) and logged once
+    /// per org, but not refused.
+    pub fn require_fresh_org_revocations(
+        &self,
+        org: net::adapter::net::behavior::org::OrgId,
+        max_age: Option<std::time::Duration>,
+    ) {
+        self.node().require_fresh_org_revocations(org, max_age);
+    }
+
+    /// Apply one signed revocation bundle (floors or grant revocations) that
+    /// reached this node outside the mesh, under the same acceptance rule and
+    /// caps as relayed material: this node's own org, an org it granted to,
+    /// or one its freshness policy names.
+    pub fn apply_org_revocation_material(
+        &self,
+        material: &net::adapter::net::behavior::org_revocation_relay::RevocationMaterial,
+    ) -> Result<(), net::adapter::net::behavior::org_revocation_relay::MaterialRefusal> {
+        self.node()
+            .apply_org_revocation_material(material)
+            .map(|_| ())
+    }
+
+    /// Cross-org admissions this node made with no revocation material at all
+    /// from the caller's org (see [`Self::require_fresh_org_revocations`]).
+    pub fn foreign_revocation_unverified_admissions(&self) -> u64 {
+        self.node().foreign_revocation_unverified_admissions()
+    }
 }

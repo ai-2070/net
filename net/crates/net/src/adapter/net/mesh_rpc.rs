@@ -1153,6 +1153,54 @@ fn strip_public_admission_header(inbound: &RpcInboundEvent) -> Option<RpcInbound
     })
 }
 
+/// Ingest revocation material a cross-org caller relayed in the
+/// `net-org-revocations` header of a protected REQUEST, before admission
+/// snapshots the floors. Best-effort and never a reason to refuse the call:
+/// a malformed header is ignored, each bundle is verified and accepted or
+/// refused on its own ([`MeshNode::apply_org_revocation_material`]), and
+/// bundles already handled are skipped by digest. The apply persists, so it
+/// runs on the blocking pool.
+async fn ingest_relayed_org_revocations(mesh: &Arc<MeshNode>, inbound: &RpcInboundEvent) {
+    use crate::adapter::net::behavior::org_revocation_relay::{
+        decode_relay_header, MaterialRefusal, ORG_REVOCATIONS_HEADER,
+    };
+    let needle = ORG_REVOCATIONS_HEADER.as_bytes();
+    if inbound.payload.len() < RPC_FRAME_BODY_OFFSET
+        || !inbound.payload.windows(needle.len()).any(|w| w == needle)
+    {
+        return;
+    }
+    let Ok(req) = RpcRequestPayload::decode(inbound.payload.slice(RPC_FRAME_BODY_OFFSET..)) else {
+        return;
+    };
+    let fresh: Vec<_> = req
+        .headers
+        .iter()
+        .filter(|(name, _)| name == ORG_REVOCATIONS_HEADER)
+        .filter_map(|(_, value)| decode_relay_header(value))
+        .flatten()
+        .filter(|item| mesh.org_relay().first_sighting(item.digest()))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let node = Arc::clone(mesh);
+    let _ = tokio::task::spawn_blocking(move || {
+        for item in fresh {
+            if let Err(refusal) = node.apply_org_revocation_material(&item) {
+                node.org_relay().note_refused();
+                // A failed apply may succeed later; anything else is the
+                // bundle's own fault and stays seen.
+                if matches!(refusal, MaterialRefusal::Store(_)) {
+                    node.org_relay().forget(&item.digest());
+                }
+                tracing::debug!(%refusal, "relayed org revocation material refused");
+            }
+        }
+    })
+    .await;
+}
+
 /// §2.4a v0.4 compatibility: a legacy fire-and-forget publish carries
 /// `flags: 0` — an OMITTED shape. The streaming folds' contract-4 check
 /// (`ss_request_flags_ok` and the CS/DX twins) refuses a flag-less REQUEST on
@@ -1376,7 +1424,22 @@ pub fn admit_protected_opening(
         session_binding,
         floors: facts.floors.as_ref(),
         skew_secs: facts.skew_secs,
+        revocation_freshness: None,
     };
+    // Revocation freshness (opt-in): an acting org named in this node's
+    // policy must have signed material here no older than its max age.
+    let freshness_policy = mesh.org_relay().freshness();
+    let freshness_store = mesh.org_revocation_store();
+    let freshness = move |org: &crate::adapter::net::behavior::org::OrgId, now: u64| -> bool {
+        match freshness_policy.get(org) {
+            None => true,
+            Some(max_age) => freshness_store
+                .as_ref()
+                .and_then(|store| store.latest_issued_at(org, now))
+                .is_some_and(|issued| now <= issued.saturating_add(*max_age)),
+        }
+    };
+    let ctx = ctx.with_revocation_freshness(&freshness);
     let captured_stamp = facts.stamp;
 
     // Review-7 RED negative-control seam — registration-local,
@@ -1422,6 +1485,19 @@ pub fn admit_protected_opening(
         |proof| (reg.provider_policy())(proof),
     );
     let admitted = outcome?;
+    // Default-permissive is not silent: a cross-org call admitted while this
+    // node holds no revocation material at all from the acting org (and no
+    // freshness requirement applied) is counted and, once per org, logged.
+    if admitted.acting_org != admitted.provider_org
+        && !mesh.org_relay().has_freshness_policy(&admitted.acting_org)
+        && mesh
+            .org_revocation_store()
+            .and_then(|store| store.latest_issued_at(&admitted.acting_org, clock.wall_secs()))
+            .is_none()
+    {
+        mesh.org_relay()
+            .note_unverified_admission(&admitted.acting_org);
+    }
 
     // §3 step 4 — INSTALL under the registry lock with the §2.3
     // requalification. The member generation comes from the decoded
@@ -1596,6 +1672,10 @@ async fn admit_and_dispatch_protected(
     // (the reservation guard; the Q4 policy-veto guard slot stays
     // consumed) → install under the registry lock (§2.3 requalification).
     // The fold seam then TRANSFERS the lease at its effect boundary.
+    //
+    // Relayed revocation material lands FIRST, so the snapshot this
+    // admission verifies against already holds it.
+    ingest_relayed_org_revocations(mesh, inbound).await;
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
     // WIRE-1: ONE atomic snapshot of the peer's live session (the streaming
     // twin's verbatim clause): the record's `(session_id, establishment)`
@@ -1912,6 +1992,7 @@ async fn admit_and_dispatch_protected_stream<F: ProtectedStreamFold>(
     // RECEIVING session's full Noise handshake hash — resolved here and
     // required to equal `proof.session_binding` at step 9b (a hand-built
     // session with `None` can never admit a protected stream).
+    ingest_relayed_org_revocations(mesh, inbound).await;
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
     // WIRE-1: ONE atomic snapshot of the peer's live session. The record's
     // `(session_id, establishment)` must BOTH come from the exact
@@ -8767,7 +8848,20 @@ fn attach_signed_admission(
         RpcCallShape::Unary => None,
         _ => mesh.peer_session_binding(target_node_id),
     };
-    let header = sign_admission_proof(intent, call_id, req, call_shape, session_binding)?;
+    let relayed = attach_relayed_org_revocations(mesh, intent, req);
+    let mut header = sign_admission_proof(intent, call_id, req, call_shape, session_binding)?;
+    // The relay rides the same single packet as the request and its proof.
+    // If adding it would not fit, drop it and sign again: the call matters
+    // more than the relay, which the next due call retries.
+    if relayed
+        && request_wire_size(req) + header.1.len() + 64
+            > crate::adapter::net::protocol::MAX_PAYLOAD_SIZE
+    {
+        req.headers.retain(|(name, _)| {
+            name != crate::adapter::net::behavior::org_revocation_relay::ORG_REVOCATIONS_HEADER
+        });
+        header = sign_admission_proof(intent, call_id, req, call_shape, session_binding)?;
+    }
     req.headers.push(header);
     req.validate_wire_bounds().map_err(|e| RpcError::Codec {
         direction: CodecDirection::Encode,
@@ -8837,6 +8931,49 @@ fn attach_signed_admission(
 /// broader stack won't be functional anyway; the pool cursor is
 /// left exhausted so the next mint retries the refill. `0` is
 /// reserved as a sentinel and never returned.
+/// Caller side of the cross-org revocation relay: on a cross-org protected
+/// call, attach this node's retained revocation material for the acting org
+/// (newest first, within the relay budget) unless the same set went to this
+/// provider recently. Returns whether a header was attached. A caller-set
+/// relay header is left alone.
+fn attach_relayed_org_revocations(
+    mesh: &MeshNode,
+    intent: &OrgProofIntent,
+    req: &mut RpcRequestPayload,
+) -> bool {
+    use crate::adapter::net::behavior::org_revocation_relay::{
+        encode_relay_header, relay_set_digest, MAX_RELAY_HEADER_BYTES, ORG_REVOCATIONS_HEADER,
+    };
+    if intent.acting_org == intent.provider_owner_org
+        || req.headers.iter().any(|(n, _)| n == ORG_REVOCATIONS_HEADER)
+    {
+        return false;
+    }
+    let Some(store) = mesh.org_revocation_store() else {
+        return false;
+    };
+    let material = store.relay_material(&intent.acting_org);
+    if material.is_empty() {
+        return false;
+    }
+    // Leave room for the proof (about a kilobyte) and the rest of the frame.
+    let room = crate::adapter::net::protocol::MAX_PAYLOAD_SIZE
+        .saturating_sub(request_wire_size(req))
+        .saturating_sub(2048);
+    let Some(value) = encode_relay_header(&material, room.min(MAX_RELAY_HEADER_BYTES)) else {
+        return false;
+    };
+    if !mesh
+        .org_relay()
+        .relay_due(&intent.provider, relay_set_digest(&material))
+    {
+        return false;
+    }
+    req.headers
+        .push((ORG_REVOCATIONS_HEADER.to_string(), value));
+    true
+}
+
 /// Mint the `net-org-admission` proof header for a protected call (E2.1,
 /// `ORG_SCOPED_STREAMING_PLAN.md` contract 2) — the mint helper SHARED by
 /// the unary [`MeshNode::call`] and the protected streaming caller: sign

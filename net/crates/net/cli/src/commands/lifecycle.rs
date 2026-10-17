@@ -1515,6 +1515,39 @@ pub struct UpArgs {
     /// minted from it. The channel root never sits on this node.
     #[arg(long = "channel-grant", value_name = "PATH", requires = "enroll")]
     pub channel_grants: Vec<PathBuf>,
+
+    /// As a provider, refuse callers acting for org `ORG_HEX` unless this
+    /// node holds signed revocation material from that org issued within
+    /// `DURATION` (e.g. `<org>=7d`). Repeat per org. The org proves itself
+    /// current with `org heartbeat`; its callers relay what their nodes hold.
+    /// Without this, such callers are admitted even when none of their org's
+    /// revocations have reached this node (counted and logged once).
+    #[arg(long = "require-fresh-revocations", value_name = "ORG_HEX=DURATION")]
+    pub require_fresh_revocations: Vec<String>,
+}
+
+/// Parse `--require-fresh-revocations ORG_HEX=DURATION` values.
+fn parse_fresh_revocations(
+    raw: &[String],
+) -> Result<Vec<(net::adapter::net::behavior::org::OrgId, Duration)>, CliError> {
+    raw.iter()
+        .map(|entry| {
+            let (org, age) = entry.split_once('=').ok_or_else(|| {
+                invalid_args(format!(
+                    "--require-fresh-revocations '{entry}' must be <org-hex>=<duration>"
+                ))
+            })?;
+            let org = super::enrollment::parse_org_id(org).map_err(invalid_args)?;
+            let age = crate::humantime::parse_duration(age)
+                .map_err(|e| invalid_args(format!("--require-fresh-revocations '{entry}': {e}")))?;
+            if age.is_zero() {
+                return Err(invalid_args(format!(
+                    "--require-fresh-revocations '{entry}': the age must be positive"
+                )));
+            }
+            Ok((org, age))
+        })
+        .collect()
 }
 
 /// `net-mesh down` arguments.
@@ -2315,7 +2348,9 @@ async fn forward_org_floor(
     node: &Arc<net::adapter::net::MeshNode>,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    use net_sdk::org::floors::{answer_org_revocation_request, OrgFloorRequest, ORG_FLOOR_SERVICE};
+    use net_sdk::org::floors::{
+        answer_org_revocation_request_with, node_foreign_apply, OrgFloorRequest, ORG_FLOOR_SERVICE,
+    };
     use net_sdk::org::grant_revocation::{is_grant_revocation_request, OrgGrantRevocationRequest};
     let parsed = (|| {
         let bytes = hex::decode(request["request"].as_str()?).ok()?;
@@ -2344,8 +2379,16 @@ async fn forward_org_floor(
     };
     if &verifier == node.entity_id() {
         let (keypair, authority) = (node.entity_keypair_arc(), node.node_authority());
+        let node = Arc::clone(node);
         let answered = tokio::task::spawn_blocking(move || {
-            answer_org_revocation_request(&bytes, &keypair, authority.as_deref(), now_unix())
+            let foreign = node_foreign_apply(&node);
+            answer_org_revocation_request_with(
+                &bytes,
+                &keypair,
+                authority.as_deref(),
+                now_unix(),
+                Some(&foreign),
+            )
         })
         .await
         .unwrap_or_else(|_| Err("org floor task failed".to_string()));
@@ -3352,6 +3395,7 @@ pub async fn run_up(
 ) -> Result<(), CliError> {
     // Resolve and validate everything before any filesystem or network effect.
     let profile = crate::context::resolve_profile(config_path, profile_name).await?;
+    let fresh_revocations = parse_fresh_revocations(&args.require_fresh_revocations)?;
     let state = state_dir(args.state_dir, profile_name)?;
     let source = PskSource::parse(args.psk_from.as_deref())?;
     let bind_raw = args
@@ -3607,6 +3651,9 @@ pub async fn run_up(
     // Any node may be asked to apply a root-signed org floor (and attest).
     let _org_floor = net_sdk::org::floors::serve_org_floor(mesh.node())
         .map_err(|e| generic(format!("org floor service: {e}")))?;
+    for (org, age) in &fresh_revocations {
+        mesh.node().require_fresh_org_revocations(*org, Some(*age));
+    }
     let _subnet_readback = match &subnet_issuer {
         Some(_) => Some(
             mesh.node()

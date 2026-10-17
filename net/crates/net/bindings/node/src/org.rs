@@ -424,6 +424,44 @@ pub fn install_provider_grant_audience(
     .map_err(|e| Error::from_reason(e.to_string()))
 }
 
+/// As a provider, refuse callers acting for `org` (32 raw bytes) unless this
+/// node holds signed revocation material from that org issued within
+/// `maxAgeSecs`; `null` lifts the requirement. Without it, a cross-org caller
+/// is admitted even when none of its org's revocations have reached this node
+/// (counted by `foreignRevocationUnverifiedAdmissions`).
+#[napi]
+pub fn require_fresh_org_revocations(
+    mesh: &crate::NetMesh,
+    org: Buffer,
+    max_age_secs: Option<u32>,
+) -> Result<()> {
+    let org: [u8; 32] = org
+        .as_ref()
+        .try_into()
+        .map_err(|_| Error::from_reason("org must be 32 bytes"))?;
+    if max_age_secs == Some(0) {
+        return Err(Error::from_reason(
+            "maxAgeSecs must be positive (pass null to lift the requirement)",
+        ));
+    }
+    let node = mesh.node_arc_clone()?;
+    node.require_fresh_org_revocations(
+        net::adapter::net::behavior::org::OrgId::from_bytes(org),
+        max_age_secs.map(|s| std::time::Duration::from_secs(u64::from(s))),
+    );
+    Ok(())
+}
+
+/// Cross-org admissions this node made with no revocation material at all
+/// from the caller's org.
+#[napi]
+pub fn foreign_revocation_unverified_admissions(mesh: &crate::NetMesh) -> Result<i64> {
+    let n = mesh
+        .node_arc_clone()?
+        .foreign_revocation_unverified_admissions();
+    Ok(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
 // ---------------------------------------------------------------------------
 // The provider verb
 // ---------------------------------------------------------------------------

@@ -5663,6 +5663,19 @@ def install_provider_grant_audience(
     so a ``"granted"`` service can seal envelopes."""
     ...
 
+def require_fresh_org_revocations(
+    mesh: Any, org: bytes, max_age_secs: Optional[int]
+) -> None:
+    """As a provider, refuse callers acting for ``org`` (32 raw bytes) unless
+    this node holds signed revocation material from that org issued within
+    ``max_age_secs``; ``None`` lifts the requirement."""
+    ...
+
+def foreign_revocation_unverified_admissions(mesh: Any) -> int:
+    """Cross-org admissions made with no revocation material at all from the
+    caller's org."""
+    ...
+
 # ---------------------------------------------------------------------------
 # Subnet authority (SSDK S4b, the `org` feature)
 # ---------------------------------------------------------------------------

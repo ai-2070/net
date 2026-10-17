@@ -2031,7 +2031,7 @@ impl RpcServerFold {
                 // keep their headers untouched.
                 if org_admission.is_some() {
                     payload.headers.retain(|(name, _)| {
-                        name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+                        !crate::adapter::net::behavior::org_call::is_org_credential_header(name)
                     });
                 }
                 // Fast deadline-already-passed short-circuit.
@@ -6791,7 +6791,7 @@ impl RpcServerStreamingFold {
         })?;
         // E1.6: verified attribution in, raw credential material out.
         payload.headers.retain(|(name, _)| {
-            name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+            !crate::adapter::net::behavior::org_call::is_org_credential_header(name)
         });
 
         // §3 step 5 — the registry's ownership TRANSFER (slice 1.4),
@@ -7972,7 +7972,7 @@ impl RpcStreamingRequestFold {
         })?;
         // E1.6: verified attribution in, raw credential material out.
         payload.headers.retain(|(name, _)| {
-            name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+            !crate::adapter::net::behavior::org_call::is_org_credential_header(name)
         });
 
         // §3 step 5 — the registry's ownership TRANSFER before any fold
@@ -8843,7 +8843,7 @@ impl RpcDuplexFold {
         })?;
         // E1.6: verified attribution in, raw credential material out.
         payload.headers.retain(|(name, _)| {
-            name != crate::adapter::net::behavior::org_call::ORG_ADMISSION_HEADER
+            !crate::adapter::net::behavior::org_call::is_org_credential_header(name)
         });
 
         // §3 step 5 — the registry's ownership TRANSFER before any fold

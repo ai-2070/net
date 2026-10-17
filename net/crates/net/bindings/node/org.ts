@@ -44,6 +44,8 @@ import {
   serveOrgDuplex as nativeServeOrgDuplex,
   installOrgAuthority,
   installProviderGrantAudience,
+  requireFreshOrgRevocations,
+  foreignRevocationUnverifiedAdmissions,
 } from './index'
 import type { JsRequestStream, JsResponseSink, NetMesh, OrgCaller, OrgRequest, OrgServeHandle } from './index'
 import {
@@ -64,7 +66,14 @@ import type {
 } from './mesh_rpc'
 import { classifyOrgError } from './errors'
 
-export { OrgAccess, OrgCredentials, installOrgAuthority, installProviderGrantAudience }
+export {
+  OrgAccess,
+  OrgCredentials,
+  installOrgAuthority,
+  installProviderGrantAudience,
+  requireFreshOrgRevocations,
+  foreignRevocationUnverifiedAdmissions,
+}
 export {
   classifyOrgError,
   OrgAdmissionDeniedError,

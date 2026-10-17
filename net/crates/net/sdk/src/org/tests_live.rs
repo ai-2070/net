@@ -1323,6 +1323,192 @@ async fn live_cross_org_call_is_refused_after_the_provider_org_revokes_the_grant
     let _ = std::fs::remove_dir_all(&c_dir);
 }
 
+/// A Granted `customer.read` provider in org B, its grant to org A
+/// installed, counting handler runs.
+fn serve_granted_counting(
+    provider: &Mesh,
+    b: &OrgKeypair,
+    a_org: OrgId,
+) -> (
+    Arc<AtomicUsize>,
+    OrgCapabilityGrant,
+    OrgAudienceSecret,
+    impl Drop,
+) {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_h = ran.clone();
+    let serve = provider
+        .serve_org(
+            "customer.read",
+            OrgAccess::Granted,
+            move |_c: OrgCaller, req: Ping| {
+                let ran = ran_h.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(Pong {
+                        n: req.n + 1,
+                        served_by: "b-provider".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("serve_org");
+    let (grant, secret) = discover_grant(b, a_org, cap("nrpc:customer.read"), 3600);
+    let provider_secret =
+        OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy secret");
+    provider
+        .node()
+        .install_provider_grant_audience(grant.clone(), provider_secret)
+        .expect("provider audience");
+    (ran, grant, secret, serve)
+}
+
+/// Bind a granted org client for `identity` in org `a`.
+async fn granted_client(
+    caller: &Mesh,
+    provider: &Mesh,
+    a: &OrgKeypair,
+    identity: &Identity,
+    grant: &OrgCapabilityGrant,
+    secret: &OrgAudienceSecret,
+) -> super::OrgClient {
+    let (cert, dg) = belonging(a, identity.entity_id());
+    let secret = OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy secret");
+    let credentials =
+        OrgCredentials::new(cert, dg, vec![grant.clone()], vec![secret]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+    assert!(converge_discovery(provider, &org, &cap("nrpc:customer.read")).await);
+    org
+}
+
+/// The cross-org revocation relay, end to end: the provider in org B starts
+/// with NONE of org A's floors, so it admits A's member M (counted as an
+/// unverified admission). A's operator then removes M at A's own node C1
+/// only. C1's next call to B carries A's signed floor bundle in its request;
+/// B merges it before admitting C1, and M's next call is refused. Before
+/// the relay, B kept admitting M for the life of its certificate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_relays_its_orgs_floor_and_the_provider_then_refuses_the_removed_member() {
+    let (a, b) = (org_a(), org_b());
+    let (provider, _p_identity, p_dir) = fast_mesh("relay-provider", &b, None).await;
+    let (c1, c1_identity, c1_dir) = fast_mesh("relay-c1", &a, None).await;
+    let (c2, c2_identity, c2_dir) = fast_mesh("relay-c2", &a, None).await;
+    bring_up_all(&[&c1, &c2], &provider).await;
+    let (ran, grant, secret, _serve) = serve_granted_counting(&provider, &b, a.org_id());
+    let org1 = granted_client(&c1, &provider, &a, &c1_identity, &grant, &secret).await;
+    let org2 = granted_client(&c2, &provider, &a, &c2_identity, &grant, &secret).await;
+
+    let _: Pong = org2
+        .call("customer.read", &Ping { n: 1 })
+        .await
+        .expect("M is admitted while B holds none of A's floors");
+    assert!(
+        provider.foreign_revocation_unverified_admissions() >= 1,
+        "the admission without any of A's material is counted"
+    );
+
+    // A's operator removes M (floor 2 over its generation-1 cert) at C1.
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(c2_identity.entity_id().clone(), 2u32);
+    let removal = OrgRevocationBundle::try_issue(&a, &floors).expect("floor bundle");
+    c1.node()
+        .org_revocation_store()
+        .expect("C1 store")
+        .apply_bundle(&removal)
+        .expect("applied at C1");
+
+    let _: Pong = org1
+        .call("customer.read", &Ping { n: 2 })
+        .await
+        .expect("C1 is admitted, and its call carried A's floor");
+    let provider_store = provider.node().org_revocation_store().expect("B store");
+    assert_eq!(
+        provider_store.floor_for(&a.org_id(), c2_identity.entity_id()),
+        2,
+        "B merged A's relayed floor"
+    );
+    assert!(provider_store
+        .latest_issued_at(&a.org_id(), unix_now_secs())
+        .is_some());
+
+    let before = ran.load(Ordering::SeqCst);
+    let refused = org2.call::<_, Pong>("customer.read", &Ping { n: 3 }).await;
+    assert!(refused.is_err(), "the removed member is refused at B");
+    assert_eq!(ran.load(Ordering::SeqCst), before, "its handler never ran");
+
+    // B takes material only from orgs it has a reason to: a stranger's
+    // self-signed bundle is refused, and a grantee cannot grow B's state
+    // past the foreign-org cap.
+    use super::types::{MaterialRefusal, RevocationMaterial, MAX_FOREIGN_ORG_ENTRIES};
+    let stranger = OrgKeypair::generate();
+    let strange = OrgRevocationBundle::try_issue(&stranger, &floors).expect("bundle");
+    assert_eq!(
+        provider.apply_org_revocation_material(&RevocationMaterial::floors(&strange)),
+        Err(MaterialRefusal::NotAccepted(stranger.org_id()))
+    );
+    let flood: std::collections::BTreeMap<_, _> = (0..=MAX_FOREIGN_ORG_ENTRIES as u32)
+        .map(|i| {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            (EntityId::from_bytes(id), 1u32)
+        })
+        .collect();
+    let flood = OrgRevocationBundle::try_issue(&a, &flood).expect("bundle");
+    assert_eq!(
+        provider.apply_org_revocation_material(&RevocationMaterial::floors(&flood)),
+        Err(MaterialRefusal::OverCap(a.org_id()))
+    );
+
+    for dir in [p_dir, c1_dir, c2_dir] {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Opt-in freshness: a provider that requires recent revocation material
+/// from org A refuses A's callers while it holds none, instead of silently
+/// admitting them. Once A's operator issues a heartbeat (an empty, signed
+/// floor bundle) at an A node, that node's next call relays it and is
+/// admitted on the same request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_freshness_requirement_refuses_until_the_callers_org_proves_itself_current() {
+    let (a, b) = (org_a(), org_b());
+    let (provider, _p_identity, p_dir) = fast_mesh("fresh-provider", &b, None).await;
+    let (caller, c_identity, c_dir) = fast_mesh("fresh-caller", &a, None).await;
+    bring_up(&caller, &provider).await;
+    let (ran, grant, secret, _serve) = serve_granted_counting(&provider, &b, a.org_id());
+    provider.require_fresh_org_revocations(a.org_id(), Some(Duration::from_secs(3600)));
+    let org = granted_client(&caller, &provider, &a, &c_identity, &grant, &secret).await;
+
+    let refused = org.call::<_, Pong>("customer.read", &Ping { n: 1 }).await;
+    assert!(
+        refused.is_err(),
+        "no material from A: refused, not admitted"
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.foreign_revocation_unverified_admissions(),
+        0,
+        "nothing was admitted unverified"
+    );
+
+    let heartbeat =
+        OrgRevocationBundle::try_issue(&a, &std::collections::BTreeMap::new()).expect("heartbeat");
+    caller
+        .node()
+        .org_revocation_store()
+        .expect("caller store")
+        .apply_bundle(&heartbeat)
+        .expect("applied at the caller");
+    let _: Pong = org
+        .call("customer.read", &Ping { n: 2 })
+        .await
+        .expect("the heartbeat rode the call and satisfied the requirement");
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
 /// A caller whose org holds NO grant for the capability cannot even discover
 /// the cross-org provider: the encrypted announcement is opaque without the
 /// audience, so the facade refuses locally and sends nothing.

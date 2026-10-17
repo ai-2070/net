@@ -61,6 +61,13 @@ pub use net::adapter::net::behavior::org_revocation::{
     ORG_REVOCATION_STATE_VERSION, ORG_REVOCATION_STATE_VERSION_WITH_GRANTS,
 };
 
+/// Cross-org revocation relay: signed material carried to other orgs'
+/// providers, and why a node would refuse a bundle.
+pub use net::adapter::net::behavior::org_revocation_relay::{
+    MaterialRefusal, RevocationMaterial, RevocationMaterialKind, VerifiedMaterial,
+    MAX_FOREIGN_ORG_ENTRIES, MAX_RELAY_HEADER_BYTES, ORG_REVOCATIONS_HEADER,
+};
+
 /// Grant revocation: an issuing org withdraws a capability or dispatcher
 /// grant before its `not_after`, merged into the same durable store.
 pub use net::adapter::net::behavior::org_grant_revocation::{

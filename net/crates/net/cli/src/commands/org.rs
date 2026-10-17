@@ -110,6 +110,13 @@ pub enum OrgCommand {
     /// of the org that issued it, so name those providers; a call or stream
     /// still running there under a revoked grant is retired at once.
     RevokeGrant(OrgRevokeGrantArgs),
+    /// Prove the org's revocation state current: sign an empty floor bundle
+    /// (it revokes nothing) and have each `--verifier` take it. A provider
+    /// that requires recent revocation material from this org
+    /// (`up --require-fresh-revocations`) refuses its callers once the newest
+    /// it holds is too old; send one to the org's own nodes (they relay it on
+    /// their calls) or to the providers directly, inside that age.
+    Heartbeat(OrgHeartbeatArgs),
     /// Leave this device's org: record it durably, then stop the running
     /// node; its next `up` runs on the mesh without the org. Local only —
     /// the org still accepts this device's certificate until `org remove`.
@@ -183,6 +190,31 @@ pub struct OrgRemoveArgs {
     /// Show what would be signed and asked, without signing or sending.
     #[arg(long)]
     pub dry_run: bool,
+    /// Accept a group/world-readable org key file (Unix).
+    #[arg(long)]
+    pub insecure_permissions: bool,
+}
+
+/// `org heartbeat` arguments.
+#[derive(Args, Debug)]
+pub struct OrgHeartbeatArgs {
+    /// The org root key file; stays on this machine.
+    #[arg(long = "org-key", value_name = "PATH")]
+    pub org_key: PathBuf,
+    /// A node to take the heartbeat: `self` (the node of `--state-dir`) or
+    /// `ENTITY_HEX@HOST:PORT#NOISE_PUBKEY_HEX`. Repeat for each.
+    #[arg(long = "verifier", value_name = "NODE")]
+    pub verifiers: Vec<String>,
+    /// Also write the signed bundle here (refuses an existing file).
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+    /// State directory of the operator's running node, which carries the
+    /// requests (as given to `net-mesh up`).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// How long to wait for each node's answer.
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = crate::humantime::parse_duration)]
+    pub wait: std::time::Duration,
     /// Accept a group/world-readable org key file (Unix).
     #[arg(long)]
     pub insecure_permissions: bool,
@@ -639,6 +671,7 @@ pub async fn run(
         OrgCommand::Join(args) => run_org_join(args, output, profile_name).await,
         OrgCommand::Remove(args) => run_remove(args, output, profile_name).await,
         OrgCommand::RevokeGrant(args) => run_revoke_grant(args, output, profile_name).await,
+        OrgCommand::Heartbeat(args) => run_heartbeat(args, output, profile_name).await,
         OrgCommand::Members(args) => {
             let org = super::enrollment::parse_org_id(&args.org).map_err(invalid_args)?;
             let remote = match (&args.org_key, args.verifiers.is_empty()) {
@@ -685,7 +718,7 @@ async fn run_remove(
     output: Option<OutputFormat>,
     profile_name: &str,
 ) -> Result<(), CliError> {
-    use net_sdk::org::floors::{OrgFloorAttestation, OrgFloorOutcome, OrgFloorRequest};
+    use net_sdk::org::floors::OrgFloorOutcome;
     let member = parse_entity_hex(&args.member)?;
     if args.minimum_generation == 0 {
         return Err(invalid_args(
@@ -717,65 +750,13 @@ async fn run_remove(
     let org = hex::encode(keypair.org_id().as_bytes());
     drop(keypair);
 
-    let mut rows = Vec::with_capacity(targets.len());
-    let mut applied = 0usize;
-    for (verifier, contact) in &targets {
-        let request = OrgFloorRequest::new(&bundle, verifier.clone()).map_err(generic)?;
-        let mut call = serde_json::json!({
-            "op": "org_floor_forward",
-            "request": hex::encode(request.to_bytes()),
-            "wait_ms": args.wait.as_millis() as u64,
-        });
-        if let Some(c) = contact {
-            call["addr"] = serde_json::json!(c.addr.to_string());
-            call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
-        }
-        let entity = hex::encode(verifier.as_bytes());
-        let row = match super::lifecycle::control_call_within(
-            &node_dir,
-            call,
-            args.wait + std::time::Duration::from_secs(5),
-        )
-        .await
-        {
-            Err(e) => serde_json::json!({
-                "verifier": entity, "state": "no_answer", "detail": format!("operator node: {e:?}"),
-            }),
-            Ok((_, reply)) => match reply["attestation"].as_str() {
-                Some(hex_a) => match hex::decode(hex_a)
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| OrgFloorAttestation::from_bytes(&b))
-                    .and_then(|a| a.verify_for(&request).map(|()| a))
-                {
-                    Ok(a) => {
-                        let floor = a.floor_of(&member);
-                        let done = a.outcome == OrgFloorOutcome::Applied
-                            && floor.is_some_and(|f| f >= args.minimum_generation);
-                        if done {
-                            applied += 1;
-                        }
-                        serde_json::json!({
-                            "verifier": entity,
-                            "state": if done { "applied" } else { a.outcome.as_str() },
-                            "floor": floor,
-                        })
-                    }
-                    Err(e) => serde_json::json!({
-                        "verifier": entity, "state": "bad_attestation", "detail": e,
-                    }),
-                },
-                None => serde_json::json!({
-                    "verifier": entity,
-                    "state": if reply["refused"].is_string() { "refused" } else { "no_answer" },
-                    "detail": reply["refused"]
-                        .as_str()
-                        .or_else(|| reply["no_answer"].as_str())
-                        .or_else(|| reply["error"].as_str()),
-                }),
-            },
-        };
-        rows.push(row);
-    }
+    let (rows, applied) = push_floor_bundle(&bundle, &targets, &node_dir, args.wait, |a| {
+        let floor = a.floor_of(&member);
+        let done = a.outcome == OrgFloorOutcome::Applied
+            && floor.is_some_and(|f| f >= args.minimum_generation);
+        (done, serde_json::json!({ "floor": floor }))
+    })
+    .await?;
     emit_value(
         fmt,
         &serde_json::json!({
@@ -840,6 +821,133 @@ async fn read_grant_file<T: serde::de::DeserializeOwned>(
             path.display()
         ))
     })
+}
+
+/// Carry a signed floor bundle through the operator's node to each target and
+/// verify each answer. `judge` decides, from a verified attestation, whether
+/// that target counts as applied, and adds fields to its row. Returns the
+/// rows and how many targets applied it.
+async fn push_floor_bundle(
+    bundle: &OrgRevocationBundle,
+    targets: &[VerifierTarget],
+    node_dir: &Path,
+    wait: std::time::Duration,
+    judge: impl Fn(&net_sdk::org::floors::OrgFloorAttestation) -> (bool, serde_json::Value),
+) -> Result<(Vec<serde_json::Value>, usize), CliError> {
+    use net_sdk::org::floors::{OrgFloorAttestation, OrgFloorRequest};
+    let mut rows = Vec::with_capacity(targets.len());
+    let mut applied = 0usize;
+    for (verifier, contact) in targets {
+        let request = OrgFloorRequest::new(bundle, verifier.clone()).map_err(generic)?;
+        let mut call = serde_json::json!({
+            "op": "org_floor_forward",
+            "request": hex::encode(request.to_bytes()),
+            "wait_ms": wait.as_millis() as u64,
+        });
+        if let Some(c) = contact {
+            call["addr"] = serde_json::json!(c.addr.to_string());
+            call["noise_pubkey"] = serde_json::json!(hex::encode(c.noise_pubkey));
+        }
+        let entity = hex::encode(verifier.as_bytes());
+        let row = match super::lifecycle::control_call_within(
+            node_dir,
+            call,
+            wait + std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Err(e) => serde_json::json!({
+                "verifier": entity, "state": "no_answer", "detail": format!("operator node: {e:?}"),
+            }),
+            Ok((_, reply)) => match reply["attestation"].as_str() {
+                Some(hex_a) => match hex::decode(hex_a)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| OrgFloorAttestation::from_bytes(&b))
+                    .and_then(|a| a.verify_for(&request).map(|()| a))
+                {
+                    Ok(a) => {
+                        let (done, extra) = judge(&a);
+                        if done {
+                            applied += 1;
+                        }
+                        let mut row = serde_json::json!({
+                            "verifier": entity,
+                            "state": if done { "applied" } else { a.outcome.as_str() },
+                        });
+                        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
+                            row.extend(extra.clone());
+                        }
+                        row
+                    }
+                    Err(e) => serde_json::json!({
+                        "verifier": entity, "state": "bad_attestation", "detail": e,
+                    }),
+                },
+                None => serde_json::json!({
+                    "verifier": entity,
+                    "state": if reply["refused"].is_string() { "refused" } else { "no_answer" },
+                    "detail": reply["refused"]
+                        .as_str()
+                        .or_else(|| reply["no_answer"].as_str())
+                        .or_else(|| reply["error"].as_str()),
+                }),
+            },
+        };
+        rows.push(row);
+    }
+    Ok((rows, applied))
+}
+
+/// `org heartbeat`: sign an empty floor bundle (revokes nothing, proves the
+/// org's revocation state current as of now) and have each named node take
+/// it. Providers that require fresh material from this org, and every org
+/// node that relays it to them, need one inside the providers' max age.
+async fn run_heartbeat(
+    args: OrgHeartbeatArgs,
+    output: Option<OutputFormat>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    use net_sdk::org::floors::OrgFloorOutcome;
+    let fmt = OutputFormat::resolve_oneshot(output);
+    if args.verifiers.is_empty() && args.out.is_none() {
+        return Err(invalid_args(
+            "nothing would receive the heartbeat: pass --verifier, --out, or both",
+        ));
+    }
+    let node_dir = super::lifecycle::state_dir(args.state_dir.clone(), profile_name)?
+        .join(super::lifecycle::NODE_SUBDIR);
+    let targets = resolve_verifier_targets(&args.verifiers, &node_dir).await?;
+    let keypair = load_org_key(&args.org_key, args.insecure_permissions).await?;
+    let bundle = OrgRevocationBundle::try_issue(&keypair, &BTreeMap::new())
+        .map_err(|e| invalid_args(format!("heartbeat: {e}")))?;
+    let org = hex::encode(keypair.org_id().as_bytes());
+    drop(keypair);
+    if let Some(out) = &args.out {
+        refuse_aliased_paths(&[("--org-key", &args.org_key), ("--out", out)])?;
+        refuse_existing(out, false).await?;
+        let json = serialize_json(&OrgFloorsFile {
+            version: ORG_FILE_VERSION,
+            bundle: bundle.clone(),
+        })?;
+        publish_json_artifact(out, &json, false).await?;
+    }
+    let (rows, applied) = push_floor_bundle(&bundle, &targets, &node_dir, args.wait, |a| {
+        (a.outcome == OrgFloorOutcome::Applied, serde_json::json!({}))
+    })
+    .await?;
+    emit_value(
+        fmt,
+        &serde_json::json!({
+            "org": org,
+            "issued_at": bundle.issued_at,
+            "out": args.out.as_ref().map(|p| p.display().to_string()),
+            "verifiers": rows,
+            "applied": applied,
+            "pending": targets.len() - applied,
+            "complete": applied == targets.len(),
+        }),
+    )
+    .map_err(|e| generic(format!("write result: {e}")))
 }
 
 /// `org revoke-grant`: sign one grant-revocation bundle here with the org

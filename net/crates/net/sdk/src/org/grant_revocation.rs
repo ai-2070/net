@@ -331,6 +331,19 @@ pub fn answer_org_grant_revocation(
     authority: Option<&NodeAuthority>,
     now: u64,
 ) -> Result<OrgGrantRevocationAttestation, String> {
+    answer_org_grant_revocation_with(request_bytes, keypair, authority, now, None)
+}
+
+/// [`answer_org_grant_revocation`], plus `foreign`: how to apply a bundle
+/// signed by an org other than this node's own (see
+/// [`super::floors::ForeignApply`]). `None` answers it `NotMember`.
+pub fn answer_org_grant_revocation_with(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+    foreign: Option<&super::floors::ForeignApply<'_>>,
+) -> Result<OrgGrantRevocationAttestation, String> {
     let request = OrgGrantRevocationRequest::from_bytes(request_bytes)?;
     if request.issued_at > now.saturating_add(ORG_FLOOR_FRESHNESS_SECS)
         || now > request.issued_at.saturating_add(ORG_FLOOR_FRESHNESS_SECS)
@@ -343,13 +356,28 @@ pub fn answer_org_grant_revocation(
     let bundle = request.bundle()?;
     let entries = bundle.entries();
     let (outcome, entries) = match authority {
-        Some(authority) if bundle.org_id == authority.config.owner_org => {
-            let outcome = match authority.revocation.apply_grant_revocations(&bundle) {
-                Ok(_) => OrgGrantRevocationOutcome::Applied,
-                Err(OrgRevocationError::DurabilityUncertain { .. }) => {
-                    OrgGrantRevocationOutcome::Uncertain
+        Some(authority) if bundle.org_id == authority.config.owner_org || foreign.is_some() => {
+            let outcome = if bundle.org_id == authority.config.owner_org {
+                match authority.revocation.apply_grant_revocations(&bundle) {
+                    Ok(_) => OrgGrantRevocationOutcome::Applied,
+                    Err(OrgRevocationError::DurabilityUncertain { .. }) => {
+                        OrgGrantRevocationOutcome::Uncertain
+                    }
+                    Err(_) => OrgGrantRevocationOutcome::Refused,
                 }
-                Err(_) => OrgGrantRevocationOutcome::Refused,
+            } else {
+                // Another org's revocations (its dispatcher grants, when it
+                // is a grantee here): only through the node's own rule.
+                match foreign.map(|apply| {
+                    apply(
+                        &net::adapter::net::behavior::org_revocation_relay::RevocationMaterial::grants(
+                            &bundle,
+                        ),
+                    )
+                }) {
+                    Some(Ok(())) => OrgGrantRevocationOutcome::Applied,
+                    _ => OrgGrantRevocationOutcome::Refused,
+                }
             };
             let view = authority.revocation.snapshot();
             let attested = entries

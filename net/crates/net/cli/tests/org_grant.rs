@@ -862,3 +862,41 @@ fn revoke_grant_needs_a_grant_and_a_destination() {
     assert!(!nowhere.status.success());
     assert!(String::from_utf8_lossy(&nowhere.stderr).contains("nothing would receive"));
 }
+
+/// `org heartbeat --out` writes an empty, verifiable floor bundle: it revokes
+/// nothing and carries the org's signed `issued_at`.
+#[test]
+fn heartbeat_writes_an_empty_signed_floor_bundle() {
+    use net_sdk::org::OrgRevocationBundle;
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let out_path = dir.path().join("heartbeat.json");
+    let out = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["--output", "json", "org", "heartbeat", "--org-key"])
+        .arg(&key)
+        .arg("--out")
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+    let bundle: OrgRevocationBundle = serde_json::from_value(envelope["bundle"].clone()).unwrap();
+    bundle.verify().expect("signed by the org root");
+    assert!(bundle.floors().is_empty(), "a heartbeat revokes nothing");
+    assert_eq!(hex::encode(bundle.org_id.as_bytes()), org_id_of(&key));
+
+    let nowhere = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["org", "heartbeat", "--org-key"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(!nowhere.status.success());
+    assert!(String::from_utf8_lossy(&nowhere.stderr).contains("nothing would receive"));
+}

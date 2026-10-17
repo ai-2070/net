@@ -158,7 +158,66 @@ with a signed attestation per entry. From the CLI, `net-mesh org revoke-grant`
 signs the bundle and has each `--verifier` apply it. A provider applies the
 revocations of its own org, which is what it needs to withdraw the capability
 grants that org issued. A caller org's dispatcher-grant revocations reach a
-provider in another org the same way that org's membership floors do.
+provider in another org the same way that org's membership floors do (next
+section).
+
+## Cross-org revocations: relay and freshness
+
+A provider in org B checks a cross-org caller against org A's membership
+floors and dispatcher-grant revocations, and both are signed by A's root. On
+their own they never reach B: the floor for an org B has heard nothing from
+is zero, so every A certificate passes until it expires. Two mechanisms close
+that.
+
+**Relay.** Every node keeps the signed revocation bundles it has applied, as a
+minimal covering set per org: a bundle stays while it is the newest source of
+a floor the node enforces or of an unexpired grant revocation, plus the newest
+bundle of each org. Superseded bundles are dropped, and each org is capped at
+64 KiB. The set lives in a best-effort sidecar beside the state file
+(`revocation-state.relay.json`); losing it only means relaying less. When an A
+node makes a cross-org protected call, it attaches A's retained bundles in the
+`net-org-revocations` request header (at most 4 KiB and 16 bundles, and only
+when the set changed or five minutes have passed since it last went to that
+provider). The header is inside the signed request digest, and the provider
+strips it before the handler runs.
+
+The provider verifies each relayed bundle and merges it **before** admitting
+the call, so a revocation relayed by one A member applies to the very next
+admission. It takes material only from orgs it has a reason to: its own, any
+org it has granted a capability to, and any org named in its freshness policy.
+A foreign org is capped at 4,096 floors and 4,096 grant revocations, and grant
+expiries are clamped to the grant TTL ceiling, so a grantee cannot grow the
+provider's state without bound. The floor service (`net.org.floor.apply`)
+accepts pushed bundles from the same orgs under the same rule, so A's operator
+can also push directly to B's providers.
+
+A revoked member relays nothing useful, but cannot stop the rest of its org,
+or its operator, from delivering the bundle that removes it.
+
+**Freshness (opt-in).** Relay is best-effort: if no honest A node calls B, A's
+newest revocations never arrive. A provider that must not depend on that sets
+a requirement per org (`MeshNode::require_fresh_org_revocations`, SDK
+`Mesh::require_fresh_org_revocations`, `net-mesh up
+--require-fresh-revocations <ORG>=<AGE>`, Python/Node
+`require_fresh_org_revocations`). A caller acting for that org is then refused
+(`RevocationsStale`) unless the provider holds signed material from the org
+issued within the age. The newest `issued_at` comes from the retained,
+re-verified bundles; one dated in the future does not count.
+
+An org with nothing new to revoke proves itself current with `net-mesh org
+heartbeat`, which signs an empty floor bundle and has each `--verifier` take
+it. Sent to the org's own nodes, it rides their next calls to every provider;
+sent to the providers, it lands directly. The heartbeat cadence must sit inside
+the providers' age. Because the org root stays offline, choose an age that
+matches how often the operator already signs: grants are re-issued at most
+every 30 days.
+
+Without a requirement the default stays permissive: a cross-org call admitted
+while the provider holds no material at all from the acting org is counted
+(`foreign_revocation_unverified_admissions`) and logged once per org.
+
+The browser leaf neither relays nor enforces freshness; it applies grant
+revocations and floors fed to it through its control plane.
 
 ## Routing
 

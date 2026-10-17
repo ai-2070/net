@@ -27,6 +27,7 @@
 use net::adapter::net::behavior::org::{OrgId, OrgRevocationBundle};
 use net::adapter::net::behavior::org_authority::NodeAuthority;
 use net::adapter::net::behavior::org_revocation::OrgRevocationError;
+use net::adapter::net::behavior::org_revocation_relay::RevocationMaterial;
 use net::adapter::net::identity::{EntityId, EntityKeypair};
 
 /// nRPC service every node serves floor application on.
@@ -319,6 +320,24 @@ pub fn answer_org_floor(
     authority: Option<&NodeAuthority>,
     now: u64,
 ) -> Result<OrgFloorAttestation, String> {
+    answer_org_floor_with(request_bytes, keypair, authority, now, None)
+}
+
+/// How a node applies revocation material signed by an org other than its
+/// own, when it takes any: an org it granted to, or one its freshness
+/// policy names (`MeshNode::apply_org_revocation_material`, which also
+/// enforces the foreign-org caps). `Err` carries why it was refused.
+pub type ForeignApply<'a> = dyn Fn(&RevocationMaterial) -> Result<(), String> + 'a;
+
+/// [`answer_org_floor`], plus `foreign`: how to apply a bundle signed by an
+/// org other than this node's own. `None` answers such a bundle `NotMember`.
+pub fn answer_org_floor_with(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+    foreign: Option<&ForeignApply<'_>>,
+) -> Result<OrgFloorAttestation, String> {
     let request = OrgFloorRequest::from_bytes(request_bytes)?;
     if request.issued_at > now.saturating_add(ORG_FLOOR_FRESHNESS_SECS)
         || now > request.issued_at.saturating_add(ORG_FLOOR_FRESHNESS_SECS)
@@ -332,10 +351,25 @@ pub fn answer_org_floor(
     let members: Vec<EntityId> = bundle.floors().iter().map(|f| f.0.clone()).collect();
     let (outcome, floors) = match authority {
         None => (OrgFloorOutcome::NotMember, Vec::new()),
-        // Only the owner org's floors are applied from the network.
-        Some(authority) if bundle.org_id != authority.config.owner_org => {
-            (OrgFloorOutcome::NotMember, Vec::new())
-        }
+        // Another org's floors: applied only through `foreign` (an org this
+        // node granted to, or one its freshness policy names).
+        Some(authority) if bundle.org_id != authority.config.owner_org => match foreign {
+            None => (OrgFloorOutcome::NotMember, Vec::new()),
+            Some(apply) => {
+                let outcome = match apply(&RevocationMaterial::floors(&bundle)) {
+                    Ok(()) => OrgFloorOutcome::Applied,
+                    Err(_) => OrgFloorOutcome::Refused,
+                };
+                let floors = members
+                    .into_iter()
+                    .map(|m| {
+                        let floor = authority.revocation.floor_for(&bundle.org_id, &m);
+                        (m, floor)
+                    })
+                    .collect();
+                (outcome, floors)
+            }
+        },
         Some(authority) => {
             let outcome = match authority.revocation.apply_bundle(&bundle) {
                 Ok(_) => OrgFloorOutcome::Applied,
@@ -377,11 +411,42 @@ pub fn answer_org_revocation_request(
     authority: Option<&NodeAuthority>,
     now: u64,
 ) -> Result<Vec<u8>, String> {
+    answer_org_revocation_request_with(request_bytes, keypair, authority, now, None)
+}
+
+/// [`answer_org_revocation_request`] with a [`ForeignApply`] hook for
+/// bundles signed by another org.
+pub fn answer_org_revocation_request_with(
+    request_bytes: &[u8],
+    keypair: &EntityKeypair,
+    authority: Option<&NodeAuthority>,
+    now: u64,
+    foreign: Option<&ForeignApply<'_>>,
+) -> Result<Vec<u8>, String> {
     if super::grant_revocation::is_grant_revocation_request(request_bytes) {
-        super::grant_revocation::answer_org_grant_revocation(request_bytes, keypair, authority, now)
-            .map(|a| a.to_bytes())
+        super::grant_revocation::answer_org_grant_revocation_with(
+            request_bytes,
+            keypair,
+            authority,
+            now,
+            foreign,
+        )
+        .map(|a| a.to_bytes())
     } else {
-        answer_org_floor(request_bytes, keypair, authority, now).map(|a| a.to_bytes())
+        answer_org_floor_with(request_bytes, keypair, authority, now, foreign).map(|a| a.to_bytes())
+    }
+}
+
+/// The [`ForeignApply`] hook backed by a node: its own acceptance rule and
+/// caps (`MeshNode::apply_org_revocation_material`).
+#[cfg(feature = "cortex")]
+pub fn node_foreign_apply(
+    node: &net::adapter::net::MeshNode,
+) -> impl Fn(&RevocationMaterial) -> Result<(), String> + '_ {
+    move |material| {
+        node.apply_org_revocation_material(material)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -424,7 +489,14 @@ impl net::adapter::net::cortex::rpc::RpcHandler for FloorHandler {
                 let keypair = node.entity_keypair_arc();
                 // Floor application persists (fsync): off the async runtime.
                 tokio::task::spawn_blocking(move || {
-                    answer_org_revocation_request(&body, &keypair, authority.as_deref(), now_unix())
+                    let foreign = node_foreign_apply(&node);
+                    answer_org_revocation_request_with(
+                        &body,
+                        &keypair,
+                        authority.as_deref(),
+                        now_unix(),
+                        Some(&foreign),
+                    )
                 })
                 .await
                 .unwrap_or_else(|_| Err("org floor task failed".to_string()))

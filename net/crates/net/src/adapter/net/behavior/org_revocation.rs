@@ -73,9 +73,11 @@ use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
 use super::org::{current_timestamp, OrgError, OrgId, OrgRevocationBundle};
+use super::org_grant::MAX_ORG_GRANT_TTL_SECS;
 use super::org_grant_revocation::{
     revocation_entry_expired, OrgGrantRevocationBundle, RevokedGrantKind,
 };
+use super::org_revocation_relay::{RetainedMaterial, RevocationMaterial, VerifiedMaterial};
 use crate::adapter::net::identity::EntityId;
 
 /// Format version of `revocation-state.json`. Bump requires an
@@ -146,6 +148,19 @@ impl OrgRevocationState {
         self.revoked_grants.len()
     }
 
+    /// Number of floors tracked for `org`.
+    pub fn floor_count_for(&self, org: &OrgId) -> usize {
+        self.floors.keys().filter(|(o, _)| o == org).count()
+    }
+
+    /// Number of grant revocations tracked for `org`.
+    pub fn revoked_grant_count_for(&self, org: &OrgId) -> usize {
+        self.revoked_grants
+            .keys()
+            .filter(|(o, _, _)| o == org)
+            .count()
+    }
+
     /// Iterate grant revocations in canonical order, each with the
     /// revoked grant's `not_after`.
     pub fn iter_revoked_grants(&self) -> impl Iterator<Item = (&RevokedGrantKey, &u64)> {
@@ -165,19 +180,26 @@ impl OrgRevocationState {
         now_secs: u64,
     ) -> usize {
         let mut changed = 0;
+        // No genuine grant can be valid past now + the grant TTL ceiling
+        // (plus skew), so an entry claiming a later `not_after` is clamped:
+        // it revokes exactly as much, but cannot pin state indefinitely.
+        let horizon = now_secs
+            .saturating_add(MAX_ORG_GRANT_TTL_SECS)
+            .saturating_add(crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS);
         for entry in bundle.entries() {
             if revocation_entry_expired(entry.not_after, now_secs) {
                 continue;
             }
+            let entry_not_after = entry.not_after.min(horizon);
             let key = (bundle.org_id, entry.kind, entry.grant_id);
             match self.revoked_grants.get_mut(&key) {
-                Some(not_after) if *not_after >= entry.not_after => {}
+                Some(not_after) if *not_after >= entry_not_after => {}
                 Some(not_after) => {
-                    *not_after = entry.not_after;
+                    *not_after = entry_not_after;
                     changed += 1;
                 }
                 None => {
-                    self.revoked_grants.insert(key, entry.not_after);
+                    self.revoked_grants.insert(key, entry_not_after);
                     changed += 1;
                 }
             }
@@ -735,6 +757,10 @@ struct StoreCore {
     /// observer must never silently steal the first one's
     /// notifications.
     subscribers: RwLock<Vec<(u64, Subscriber)>>,
+    /// The signed bundles kept for relay to other orgs' providers, and the
+    /// source of each org's freshness. Not security state (losing it only
+    /// means relaying less); persisted best-effort beside the state file.
+    relay: Mutex<RetainedMaterial>,
     /// Token source for [`Self::subscribers`].
     next_subscriber: AtomicU64,
     /// Test-only pause fired ONCE, from inside [`Self::publish`],
@@ -1500,6 +1526,7 @@ fn join_or_create_core(
         #[cfg(test)]
         poison_contended_hook: Mutex::new(None),
         subscribers: RwLock::new(Vec::new()),
+        relay: Mutex::new(load_relay_sidecar(path)),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
         publish_pause: parking_lot::Mutex::new(None),
@@ -2256,8 +2283,12 @@ impl OrgRevocationStore {
             );
             return Err(err);
         }
-        self.apply_locked(|merged| merged.merge_bundle(bundle) > 0)
-            .map(|published| published.floors)
+        let published = self.apply_locked(|merged| merged.merge_bundle(bundle) > 0)?;
+        self.retain_for_relay(
+            &RevocationMaterial::floors(bundle),
+            &VerifiedMaterial::Floors(bundle.clone()),
+        );
+        Ok(published.floors)
     }
 
     /// Apply a grant-revocation bundle under the same locked order as
@@ -2282,8 +2313,66 @@ impl OrgRevocationStore {
             return Err(err);
         }
         let now_secs = current_timestamp();
-        self.apply_locked(|merged| merged.merge_grant_revocations(bundle, now_secs) > 0)
-            .map(|published| published.grants)
+        let published =
+            self.apply_locked(|merged| merged.merge_grant_revocations(bundle, now_secs) > 0)?;
+        self.retain_for_relay(
+            &RevocationMaterial::grants(bundle),
+            &VerifiedMaterial::Grants(bundle.clone()),
+        );
+        Ok(published.grants)
+    }
+
+    /// Apply one signed bundle of either kind. Verifies first; returns
+    /// what was verified so the caller can attribute it.
+    pub fn apply_material(
+        &self,
+        material: &RevocationMaterial,
+    ) -> Result<VerifiedMaterial, OrgRevocationError> {
+        let verified = material
+            .verify()
+            .map_err(OrgRevocationError::InvalidBundle)?;
+        match &verified {
+            VerifiedMaterial::Floors(b) => {
+                self.apply_bundle(b)?;
+            }
+            VerifiedMaterial::Grants(b) => {
+                self.apply_grant_revocations(b)?;
+            }
+        }
+        Ok(verified)
+    }
+
+    /// Keep a just-applied bundle for relay, then persist the relay cache
+    /// best-effort. Runs after the apply transaction, outside its locks.
+    fn retain_for_relay(&self, material: &RevocationMaterial, verified: &VerifiedMaterial) {
+        let view = self.snapshot();
+        let bytes = {
+            let mut relay = self.core.relay.lock();
+            if !relay.retain(material, verified, &view, current_timestamp()) {
+                return;
+            }
+            relay.to_file_bytes()
+        };
+        let sidecar = relay_sidecar_path(&self.core.path);
+        if let Err(e) = write_relay_sidecar(&sidecar, &bytes) {
+            tracing::warn!(
+                path = %sidecar.display(),
+                "org revocation relay: could not persist the relay cache ({e}); \
+                 enforcement is unaffected, relay restarts from what arrives next",
+            );
+        }
+    }
+
+    /// The signed bundles to relay for `org`, newest first.
+    pub fn relay_material(&self, org: &OrgId) -> Vec<RevocationMaterial> {
+        self.core.relay.lock().for_org(org)
+    }
+
+    /// The newest signed `issued_at` this node holds from `org`, ignoring
+    /// any dated beyond `now_secs` plus the skew ceiling. `None` when the
+    /// node has never applied material from `org`.
+    pub fn latest_issued_at(&self, org: &OrgId, now_secs: u64) -> Option<u64> {
+        self.core.relay.lock().latest_issued_at(org, now_secs)
     }
 
     /// The locked merge, persist, publish, notify transaction shared by
@@ -2476,6 +2565,35 @@ impl OrgRevocationStore {
             }
         }
     }
+}
+
+/// The relay cache's sidecar: `revocation-state.json` →
+/// `revocation-state.relay.json`.
+fn relay_sidecar_path(state: &Path) -> PathBuf {
+    state.with_extension("relay.json")
+}
+
+/// Load the relay cache beside `state`, re-verifying every bundle. A missing
+/// or unreadable sidecar is an empty cache, never an error.
+fn load_relay_sidecar(state: &Path) -> RetainedMaterial {
+    let sidecar = relay_sidecar_path(state);
+    let Ok(bytes) = std::fs::read(&sidecar) else {
+        return RetainedMaterial::default();
+    };
+    // Re-run the covering rule against the persisted state when it parses;
+    // otherwise keep only what re-verifies.
+    let view = std::fs::read(state)
+        .ok()
+        .and_then(|b| OrgRevocationState::from_file_bytes(&b, state).ok())
+        .unwrap_or_default();
+    RetainedMaterial::from_file_bytes(&bytes, &view, current_timestamp())
+}
+
+/// Best-effort atomic replace (temp + rename); no durability promise.
+fn write_relay_sidecar(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("relay.json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 impl std::fmt::Debug for OrgRevocationStore {

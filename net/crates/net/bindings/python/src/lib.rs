@@ -4349,6 +4349,14 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             org_serve::install_provider_grant_audience,
             m
         )?)?;
+        m.add_function(wrap_pyfunction!(
+            org_serve::require_fresh_org_revocations,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            org_serve::foreign_revocation_unverified_admissions,
+            m
+        )?)?;
         m.add("OrgError", m.py().get_type::<org::OrgError>())?;
         m.add(
             "OrgCredentialsError",

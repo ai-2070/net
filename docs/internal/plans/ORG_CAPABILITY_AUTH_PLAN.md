@@ -120,6 +120,15 @@ streams under a revoked grant retire `Revoked` through a grant feed on the
 store. Delivery rides the floor service; `net org revoke-grant` is the
 operator verb. See `ORGANIZATIONS.md` §Grant revocation.
 
+The cross-org half of this limitation ("absent means zero": A's floors and
+dispatcher revocations never reaching B) is closed the same day by the
+revocation relay plus opt-in freshness (`behavior/org_revocation_relay.rs`):
+A's nodes carry A's retained signed bundles on their cross-org calls, B
+merges them before admission (from its own org, its grantees and its policy
+orgs only, capped per foreign org), and a provider may require recent
+material per org (`RevocationsStale`), fed by `net org heartbeat`. See
+`ORGANIZATIONS.md` §Cross-org revocations.
+
 ---
 
 ## Model

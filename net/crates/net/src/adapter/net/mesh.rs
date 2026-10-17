@@ -13831,6 +13831,10 @@ pub struct MeshNode {
     /// exit, and `start()` refuses while any `accept()` is in
     /// flight.
     accept_in_flight: std::sync::atomic::AtomicUsize,
+    /// Cross-org revocation relay: the freshness policy this node enforces
+    /// as a provider, relayed-bundle de-duplication, and when it last
+    /// relayed its own org's material to each provider.
+    org_relay: super::behavior::org_revocation_relay::NodeRelayState,
 }
 
 /// Verify an announcement's owner cert against `floors`, apply the
@@ -15269,6 +15273,7 @@ impl MeshNode {
             started: AtomicBool::new(false),
             self_weak: Arc::new(std::sync::OnceLock::new()),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            org_relay: Default::default(),
         };
 
         // OA-1 (review-8 §2): install the authority loaded above as
@@ -22226,6 +22231,124 @@ impl MeshNode {
             self.wake_baseline_reannounce();
         }
         removed
+    }
+
+    /// Require recent revocation material from `org` before admitting its
+    /// callers (`Some(max_age)`), or stop requiring it (`None`).
+    ///
+    /// A provider checks a caller against the acting org's membership floors
+    /// and dispatcher-grant revocations, but only those that have reached it.
+    /// With a requirement set, a caller from `org` is refused
+    /// ([`AdmissionDenied::RevocationsStale`]) unless this node holds signed
+    /// revocation material from `org` issued within `max_age`. That material
+    /// arrives relayed by `org`'s own callers or pushed by its operator; an
+    /// org with nothing new to revoke proves itself current by issuing an
+    /// empty bundle (`net-mesh org heartbeat`). Naming an org here also makes
+    /// this node accept that org's material from the network.
+    ///
+    /// [`AdmissionDenied::RevocationsStale`]:
+    ///     super::behavior::org_admission::AdmissionDenied::RevocationsStale
+    pub fn require_fresh_org_revocations(
+        &self,
+        org: super::behavior::org::OrgId,
+        max_age: Option<std::time::Duration>,
+    ) {
+        self.org_relay
+            .set_freshness(org, max_age.map(|d| d.as_secs().max(1)));
+    }
+
+    /// The freshness requirements set with
+    /// [`Self::require_fresh_org_revocations`].
+    pub fn org_revocation_freshness(
+        &self,
+    ) -> std::collections::BTreeMap<super::behavior::org::OrgId, std::time::Duration> {
+        self.org_relay
+            .freshness()
+            .into_iter()
+            .map(|(org, secs)| (org, std::time::Duration::from_secs(secs)))
+            .collect()
+    }
+
+    /// The relay bookkeeping (crate-internal).
+    pub(crate) fn org_relay(&self) -> &super::behavior::org_revocation_relay::NodeRelayState {
+        &self.org_relay
+    }
+
+    /// Whether this node takes revocation material signed by `org` from the
+    /// network: its own org, an org it has granted a capability to (a
+    /// grantee of an installed provider grant), or an org named in its
+    /// freshness policy. Anything else is refused, so a stranger cannot grow
+    /// this node's persisted state under a throwaway org.
+    pub fn accepts_org_revocations_from(&self, org: &super::behavior::org::OrgId) -> bool {
+        if self
+            .node_authority()
+            .is_some_and(|authority| authority.owner_org() == *org)
+        {
+            return true;
+        }
+        if self.org_relay.has_freshness_policy(org) {
+            return true;
+        }
+        self.provider_grant_audiences
+            .load()
+            .records()
+            .any(|record| record.grant().grantee_org == *org)
+    }
+
+    /// Verify and apply one signed revocation bundle that arrived from the
+    /// network (relayed on a call, or pushed by an operator), if this node
+    /// takes material from its org ([`Self::accepts_org_revocations_from`]).
+    /// A foreign org is capped at
+    /// [`MAX_FOREIGN_ORG_ENTRIES`](super::behavior::org_revocation_relay::MAX_FOREIGN_ORG_ENTRIES)
+    /// entries. Blocking: the apply persists before it publishes.
+    pub fn apply_org_revocation_material(
+        &self,
+        material: &super::behavior::org_revocation_relay::RevocationMaterial,
+    ) -> Result<
+        super::behavior::org_revocation_relay::VerifiedMaterial,
+        super::behavior::org_revocation_relay::MaterialRefusal,
+    > {
+        use super::behavior::org_revocation_relay::{
+            MaterialRefusal, VerifiedMaterial, MAX_FOREIGN_ORG_ENTRIES,
+        };
+        let verified = material.verify().map_err(MaterialRefusal::Invalid)?;
+        let org = verified.org_id();
+        let authority = self.node_authority().ok_or(MaterialRefusal::NoAuthority)?;
+        let store = self
+            .org_revocation_store()
+            .ok_or(MaterialRefusal::NoAuthority)?;
+        if !self.accepts_org_revocations_from(&org) {
+            return Err(MaterialRefusal::NotAccepted(org));
+        }
+        if org != authority.owner_org() {
+            let view = store.snapshot();
+            let over = match &verified {
+                VerifiedMaterial::Floors(b) => {
+                    view.floor_count_for(&org) + b.floors().len() > MAX_FOREIGN_ORG_ENTRIES
+                }
+                VerifiedMaterial::Grants(b) => {
+                    view.revoked_grant_count_for(&org) + b.entries().len() > MAX_FOREIGN_ORG_ENTRIES
+                }
+            };
+            if over {
+                return Err(MaterialRefusal::OverCap(org));
+            }
+        }
+        store
+            .apply_material(material)
+            .map_err(|e| MaterialRefusal::Store(e.to_string()))
+    }
+
+    /// Cross-org admissions made while this node held no revocation material
+    /// at all from the caller's org and no freshness requirement applied.
+    /// Each such org is also logged once.
+    pub fn foreign_revocation_unverified_admissions(&self) -> u64 {
+        self.org_relay.unverified_admissions()
+    }
+
+    /// Relayed or pushed revocation bundles this node refused.
+    pub fn refused_org_revocation_material(&self) -> u64 {
+        self.org_relay.refused()
     }
 
     /// OA3-4b2: install a CONSUMER grant-audience record — a grant whose

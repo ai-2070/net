@@ -65,6 +65,7 @@ pub mod org_grant;
 pub mod org_grant_registry;
 pub mod org_grant_revocation;
 pub mod org_revocation;
+pub mod org_revocation_relay;
 pub mod org_routing;
 pub mod org_routing_registry;
 pub(crate) mod org_routing_state;
