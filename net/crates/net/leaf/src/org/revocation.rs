@@ -159,9 +159,8 @@ mod tests {
         .expect("bundle");
         let mut facts = RevocationFacts::default();
         assert_eq!(facts.merge_grant_revocations(&bundle, now), 1);
-        let horizon = now
-            + crate::org::grant::MAX_ORG_GRANT_TTL_SECS
-            + crate::org::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let horizon =
+            now + crate::org::grant::MAX_ORG_GRANT_TTL_SECS + crate::org::MAX_TOKEN_CLOCK_SKEW_SECS;
         let stored = facts
             .revoked_grants
             .values()
@@ -173,12 +172,9 @@ mod tests {
         // horizon computed then, and once that horizon has passed the
         // entry is pruned.
         let later = horizon + crate::org::MAX_TOKEN_CLOCK_SKEW_SECS + 1;
-        let empty = OrgGrantRevocationBundle::issue_at(
-            &OrgKeypair::from_bytes([0x5au8; 32]),
-            [],
-            later,
-        )
-        .expect("empty bundle");
+        let empty =
+            OrgGrantRevocationBundle::issue_at(&OrgKeypair::from_bytes([0x5au8; 32]), [], later)
+                .expect("empty bundle");
         facts.merge_grant_revocations(&empty, later);
         assert!(facts.revoked_grants.is_empty());
     }
