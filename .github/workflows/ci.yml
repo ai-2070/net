@@ -6175,7 +6175,8 @@ jobs:
           for t in two_node_mcp_consent_then_authorized_invocation \
                    two_node_mcp_pin_does_not_override_provider_owner_scope \
                    native_typed_call_and_generated_consumer_reuse_captured_contract_offline \
-                   two_node_protected_native_denial_then_authorized_typed_call; do
+                   two_node_protected_native_denial_then_authorized_typed_call \
+                   two_org_granted_native_denial_then_authorized_generated_call; do
             grep -q "test $t ... ok" /tmp/cli_default.log || {
               echo "::error::$t did not run"; exit 1; }
           done
@@ -6480,8 +6481,9 @@ jobs:
       # aliasing the lexical guard cannot catch).
       # This full-crate run includes the journey witnesses, and two of them
       # REQUIRE Python + Pydantic v2 on PATH rather than skipping when it is
-      # missing: `native_contract_workflow` and `protected_native_workflow`
-      # assert `import pydantic; major == 2` before doing anything. The ubuntu
+      # missing: `native_contract_workflow`, `protected_native_workflow` and
+      # `cross_org_protected_workflow` assert `import pydantic; major == 2`
+      # before doing anything. The ubuntu
       # `cli-tests` job installs both; windows-latest's preinstalled Python
       # does not carry pydantic, so without this step the Windows run is red.
       # mypy additionally stops `typegen_downstream_python` from silently
