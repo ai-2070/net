@@ -1,0 +1,19 @@
+net/crates/net/leaf/src/org/revocation.rs
+  s_b5e025ec544d7a::t_af7327d0370380 162-163,175-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "51b08aabe634a281263428db0b12e50422847f9b",
+  "prompts": {},
+  "sessions": {
+    "s_b5e025ec544d7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "921d8ae7-db38-46d3-b4a7-43ea26db2e58",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
