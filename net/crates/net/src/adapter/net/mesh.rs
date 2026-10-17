@@ -25276,6 +25276,23 @@ impl MeshNode {
                 if Some(old_owned) != transport.owned_addr() {
                     self.addr_to_node
                         .remove_if(&old_owned, |_, n| *n == peer_node_id);
+                    // An RTC endpoint the successor did not inherit is
+                    // closed as well. It is a browser's previous
+                    // DataChannel (a reloaded tab, a reconnect after a
+                    // network change): with its reverse mapping gone,
+                    // nothing could reach it again, and the driver held
+                    // its `str0m` session and a `max_peers` slot for the
+                    // node's lifetime. The driver's close notification
+                    // that follows finds no peer on the endpoint, so it
+                    // cannot touch the successor.
+                    #[cfg(feature = "webrtc")]
+                    if let (Some(driver), PeerAddr::Rtc(id)) = (self.rtc_driver.as_ref(), old_owned)
+                    {
+                        let driver = driver.clone();
+                        tokio::spawn(async move {
+                            let _ = driver.close(id).await;
+                        });
+                    }
                 }
             }
         }
@@ -33191,6 +33208,10 @@ impl MeshNode {
         // ordinary close path does.
         #[cfg(feature = "webrtc")]
         let rtc_reassembly_evict = Arc::clone(&self.rtc_reassembly);
+        // And it closes the swept peer's RTC endpoint, which nothing
+        // else will.
+        #[cfg(feature = "webrtc")]
+        let rtc_driver_evict = self.rtc_driver.clone();
         let identity_challenges_evict = self.identity_challenges.clone();
         let peer_identity_sessions_evict = self.peer_identity_sessions.clone();
         // Eviction is a peer-state transition like any other and runs
@@ -33971,7 +33992,9 @@ impl MeshNode {
                             // longer exists — so a build must not be able to
                             // publish between its revalidation and its store
                             // while this removal lands.
-                            let evicted = commit_peer_transition(
+                            // The transition yields the evicted peer's
+                            // endpoint, which the sweep closes below.
+                            let evicted_endpoint = commit_peer_transition(
                                 &session_routing_evict,
                                 &routing_registry_evict,
                                 &peers,
@@ -33982,7 +34005,7 @@ impl MeshNode {
                                     info.session.session_id() == observed_session_id
                                 });
                                 let Some((_, old_info)) = &evicted else {
-                                    return false;
+                                    return None;
                                 };
                                 let old_session_id = old_info.session.session_id();
                                 // §2.3 (org-streaming slice 1.4): a dead
@@ -34054,19 +34077,43 @@ impl MeshNode {
                                 // incarnation's record.
                                 identity_challenges_evict.forget_peer(node_id);
                                 peer_identity_sessions_evict.remove(&node_id);
-                                true
+                                Some(old_info.addr())
                             });
                                     // An eviction that declined (the
                                     // exact-session guard) leaves `evicted`
-                                    // false and wakes nothing.
-                                    (evicted, evicted)
+                                    // `None` and wakes nothing.
+                                    let woke = evicted.is_some();
+                                    (evicted, woke)
                                 },
                             );
-                            if evicted {
+                            if let Some(endpoint) = evicted_endpoint {
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",
                                 );
+                                // The swept peer's RTC endpoint is closed
+                                // too. The driver reaps a session only once
+                                // it is closed or `str0m` calls it dead,
+                                // and ICE disconnection never makes it
+                                // dead, so a peer the sweep removed kept
+                                // its `str0m` session and a `max_peers`
+                                // slot for the node's lifetime: the public
+                                // anchor filled all 256 with browsers that
+                                // vanished without a clean close. The
+                                // driver's close notification that follows
+                                // finds no peer on the endpoint and is a
+                                // no-op.
+                                #[cfg(feature = "webrtc")]
+                                if let (Some(driver), PeerAddr::Rtc(id)) =
+                                    (rtc_driver_evict.as_ref(), endpoint)
+                                {
+                                    let driver = driver.clone();
+                                    tokio::spawn(async move {
+                                        let _ = driver.close(id).await;
+                                    });
+                                }
+                                #[cfg(not(feature = "webrtc"))]
+                                let _ = endpoint;
                             }
                             // Also drop the failure-detector entry so
                             // a later reconnect under the same node_id

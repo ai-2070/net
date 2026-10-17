@@ -3323,6 +3323,150 @@ async fn a_swept_dead_peers_partial_fragment_group_is_retired() {
     );
 }
 
+/// The failure sweep closes the RTC endpoint of the peer it evicts.
+///
+/// The sweep removed the peer from every mesh table but never told
+/// the driver, and the driver reaps a session only once it is closed
+/// or `str0m` reports it dead, which ICE disconnection never does. So
+/// every swept RTC peer left its `str0m` session, its socket demux
+/// slot and one `max_peers` slot behind for the node's lifetime. The
+/// public anchor filled all 256 slots in 2.5 days of browsers that
+/// vanished without a clean close (closed tabs, reloads, sleeping
+/// laptops), after which it refused every new player.
+///
+/// The setup is `a_swept_dead_peers_partial_fragment_group_is_retired`'s:
+/// B goes silent, so A's heartbeat-tick sweep is the only eviction
+/// that can fire.
+///
+/// Inverse: drop the endpoint close from the sweep. The peer is still
+/// evicted, but A keeps holding one live RTC session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swept_dead_peers_rtc_session_is_closed() {
+    let mut a_cfg = config(Some(rtc_config()));
+    a_cfg.session_timeout = Duration::from_millis(20);
+    a_cfg.heartbeat_interval = Duration::from_millis(50);
+    let mut b_cfg = config(Some(rtc_config()));
+    b_cfg.heartbeat_interval = Duration::from_secs(600);
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), a_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    let b = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), b_cfg)
+            .await
+            .expect("MeshNode::new"),
+    );
+    a.start();
+    b.start();
+    connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise handshake");
+    let b_id = b.node_id();
+    assert_eq!(
+        a.rtc_session_load().map(|(live, _)| live),
+        Some(1),
+        "A holds one RTC session to B before the sweep"
+    );
+
+    assert!(
+        wait_for(|| a.peer_endpoint(b_id).is_none(), Duration::from_secs(15)).await,
+        "the failure sweep must evict the silent peer"
+    );
+    assert!(
+        wait_for(
+            || a.rtc_session_load().map(|(live, _)| live) == Some(0),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the swept peer's RTC session must be closed, not left holding \
+         a max_peers slot; A still holds {:?}",
+        a.rtc_session_load()
+    );
+}
+
+/// A session displaced by its own identity arriving on a NEW RTC
+/// endpoint has that old endpoint closed.
+///
+/// This is a reloaded tab, or a browser that reconnects after a network
+/// change: one identity per origin, a fresh DataChannel each time.
+/// The install retired the displaced session's mesh state and stopped
+/// there, so the old `str0m` session held its `max_peers` slot for the
+/// node's lifetime. Once the reverse mapping was gone, nothing could
+/// ever reach it again.
+///
+/// Inverse: drop the displaced-endpoint close from the install. The
+/// successor installs, and A holds two RTC sessions for one peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_displaced_rtc_endpoint_is_closed() {
+    let b_secret = [0xB3u8; 32];
+    let a = node(Some(rtc_config())).await;
+    let b = node_with_identity(b_secret, rtc_config()).await;
+    a.start();
+    b.start();
+    connect_rtc_loopback(&a, &b)
+        .await
+        .expect("DataChannel + Noise handshake");
+    let b_id = b.node_id();
+    let displaced_sid = a.peer_session_id(b_id).expect("an installed session");
+    assert_eq!(a.rtc_session_load().map(|(live, _)| live), Some(1));
+
+    // B's identity again, on its own socket and a DataChannel A has
+    // never seen. A is the responder, as an anchor is.
+    let b2 = node_with_identity(b_secret, rtc_config()).await;
+    b2.start();
+    assert_eq!(b2.node_id(), b_id, "b2 must be the same identity");
+    let (a_endpoint, b2_endpoint) = open_rtc_channel(&a, &b2)
+        .await
+        .expect("a second DataChannel on its own socket");
+    let accept = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.accept_rtc(a_endpoint, b_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let a_pub = *a.public_key();
+    b2.connect_rtc(b2_endpoint, &a_pub, a.node_id())
+        .await
+        .expect("b2 initiates Noise over the fresh channel");
+    accept
+        .await
+        .expect("join")
+        .expect("the responder installs the successor");
+    assert_ne!(
+        a.peer_session_id(b_id),
+        Some(displaced_sid),
+        "the incumbent must actually have been replaced"
+    );
+    assert_eq!(
+        a.peer_endpoint(b_id),
+        Some(PeerAddr::Rtc(a_endpoint)),
+        "on the new endpoint"
+    );
+
+    assert!(
+        wait_for(
+            || a.rtc_session_load().map(|(live, _)| live) == Some(1),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the displaced endpoint must be closed, leaving one RTC session \
+         for one peer; A holds {:?}",
+        a.rtc_session_load()
+    );
+    a.send_on_stream(
+        &a.open_stream(b_id, 0x0777, StreamConfig::new())
+            .expect("open_stream on the successor"),
+        &[Bytes::from_static(b"LEAKFREE")],
+    )
+    .await
+    .expect("and the successor still delivers");
+    assert_eq!(
+        collect_tagged(&b2, b"LEAKFREE", 1, Duration::from_secs(10)).await,
+        vec![b"LEAKFREE".to_vec()],
+        "closing the displaced endpoint must not touch the successor"
+    );
+}
+
 // ---------------------------------------------------------------
 // Native reassembly and hold lifetimes (NR2, NR3, NR4, NR6)
 // ---------------------------------------------------------------
