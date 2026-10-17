@@ -1385,8 +1385,9 @@ async fn granted_client(
 /// with NONE of org A's floors, so it admits A's member M (counted as an
 /// unverified admission). A's operator then removes M at A's own node C1
 /// only. C1's next call to B carries A's signed floor bundle in its request;
-/// B merges it before admitting C1, and M's next call is refused. Before
-/// the relay, B kept admitting M for the life of its certificate.
+/// B merges it (in the background, off the RPC path), and M's next call is
+/// refused. Before the relay, B kept admitting M for the life of its
+/// certificate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_caller_relays_its_orgs_floor_and_the_provider_then_refuses_the_removed_member() {
     let (a, b) = (org_a(), org_b());
@@ -1421,12 +1422,18 @@ async fn a_caller_relays_its_orgs_floor_and_the_provider_then_refuses_the_remove
         .call("customer.read", &Ping { n: 2 })
         .await
         .expect("C1 is admitted, and its call carried A's floor");
+    // B holds no freshness requirement for A, so nothing about C1's own
+    // admission waits on the relay: B merges it off the RPC path, shortly
+    // after the call.
     let provider_store = provider.node().org_revocation_store().expect("B store");
-    assert_eq!(
-        provider_store.floor_for(&a.org_id(), c2_identity.entity_id()),
-        2,
-        "B merged A's relayed floor"
-    );
+    let merged = async {
+        while provider_store.floor_for(&a.org_id(), c2_identity.entity_id()) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), merged)
+        .await
+        .expect("B merged A's relayed floor");
     assert!(provider_store
         .latest_issued_at(&a.org_id(), unix_now_secs())
         .is_some());

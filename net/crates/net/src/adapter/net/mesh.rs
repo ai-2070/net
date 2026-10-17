@@ -22335,6 +22335,23 @@ impl MeshNode {
         }
     }
 
+    /// Whether this node holds revocation material from `org` recent enough
+    /// for its freshness policy, at `now_secs`. `true` when the policy does
+    /// not name `org`.
+    pub(crate) fn org_revocations_fresh(
+        &self,
+        org: &super::behavior::org::OrgId,
+        now_secs: u64,
+    ) -> bool {
+        match self.org_relay.freshness_for(org) {
+            None => true,
+            Some(max_age) => self
+                .org_revocation_store()
+                .and_then(|store| store.latest_issued_at(org, now_secs))
+                .is_some_and(|issued| now_secs <= issued.saturating_add(max_age)),
+        }
+    }
+
     /// Cross-org admissions made while this node held no revocation material
     /// at all from the caller's org and no freshness requirement applied.
     /// Each such org is also logged once.

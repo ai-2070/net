@@ -469,6 +469,12 @@ pub const MAX_FOREIGN_ORG_ENTRIES: usize = 4_096;
 const SEEN_CAPACITY: usize = 4_096;
 const SENT_CAPACITY: usize = 4_096;
 
+/// Most relayed-material ingests a node runs off the RPC path at once.
+/// Past it a relay is dropped (and forgotten, so a later one retries):
+/// relay is best-effort, and the bound keeps a flood of relay headers from
+/// queueing unbounded signature checks and persists on the blocking pool.
+pub const MAX_BACKGROUND_INGESTS: usize = 2;
+
 /// When a relay set last went to one provider: (set digest, when).
 type SentRelay = ([u8; 32], std::time::Instant);
 
@@ -492,6 +498,9 @@ pub struct NodeRelayState {
     /// Relayed or pushed bundles refused (bad signature, unaccepted org,
     /// over a cap, or a failed apply).
     refused: std::sync::atomic::AtomicU64,
+    /// Background relay ingests running now (see
+    /// [`MAX_BACKGROUND_INGESTS`]).
+    ingests_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for NodeRelayState {
@@ -551,21 +560,46 @@ impl NodeRelayState {
         self.seen.lock().remove(digest);
     }
 
-    /// Whether to relay `set_digest` to `provider` now; records it if so.
+    /// Whether `set_digest` is due to go to `provider`: it is not the set
+    /// last sent there, or that send is older than
+    /// [`RELAY_RESEND_INTERVAL`]. Records nothing; a caller that does send
+    /// it calls [`Self::mark_relayed`] once the request is out, so a relay
+    /// that was dropped or never sent stays due.
     pub fn relay_due(&self, provider: &EntityId, set_digest: [u8; 32]) -> bool {
-        let now = std::time::Instant::now();
-        let mut sent = self.sent.lock();
-        let key = *provider.as_bytes();
-        if let Some((digest, at)) = sent.get(&key) {
-            if *digest == set_digest && now.duration_since(*at) < RELAY_RESEND_INTERVAL {
-                return false;
-            }
+        let sent = self.sent.lock();
+        match sent.get(provider.as_bytes()) {
+            Some((digest, at)) => *digest != set_digest || at.elapsed() >= RELAY_RESEND_INTERVAL,
+            None => true,
         }
+    }
+
+    /// Record that `set_digest` went to `provider` just now.
+    pub fn mark_relayed(&self, provider: &EntityId, set_digest: [u8; 32]) {
+        let mut sent = self.sent.lock();
         if sent.len() >= SENT_CAPACITY {
             sent.clear();
         }
-        sent.insert(key, (set_digest, now));
-        true
+        sent.insert(
+            *provider.as_bytes(),
+            (set_digest, std::time::Instant::now()),
+        );
+    }
+
+    /// Claim one of the [`MAX_BACKGROUND_INGESTS`] slots; `false` when all
+    /// are taken. A `true` must be paired with [`Self::end_ingest`].
+    pub fn begin_ingest(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.ingests_in_flight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_BACKGROUND_INGESTS).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    /// Release a slot taken by [`Self::begin_ingest`].
+    pub fn end_ingest(&self) {
+        self.ingests_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Count (and, once per org, log) a cross-org admission made with no
