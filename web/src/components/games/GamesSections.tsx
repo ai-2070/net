@@ -26,11 +26,11 @@ const SPEED: ReadonlyArray<SpeedStat> = [
   {
     value: "~5",
     unit: "ms",
-    title: "host tick, 8,000 npcs",
-    body: "Measured on one machine, with 16 players and 5% of the world moving each tick. Only the entities that changed are checked, and each player is sent only what is near them.",
+    title: "host tick, 8,000 entities",
+    body: "A benchmark, not a game: one machine, 16 players, 5% of the world moving each tick. Only the entities that changed are checked, and each player is sent only what is near them.",
   },
   {
-    value: "~550",
+    value: "~240",
     unit: "kB",
     title: "total download",
     body: "The whole networking engine, WebAssembly and JavaScript, gzipped. Smaller than most of your textures.",
@@ -42,7 +42,7 @@ export function GamesSpeedSection() {
     <section id="speed" className="border-b border-line px-6 py-20">
       <SectionLabel>§01 / speed</SectionLabel>
       <DisplayHeading>
-        it's natively fast
+        natively fast.
         <br />
         <span className="text-accent">forget the network.</span>
       </DisplayHeading>
@@ -79,7 +79,7 @@ export function GamesSpeedSection() {
   );
 }
 
-// ── §03 modes ───────────────────────────────────────────────────────────────
+// ── §04 modes ───────────────────────────────────────────────────────────────
 
 interface Mode {
   tag: string;
@@ -102,8 +102,8 @@ const MODES: ReadonlyArray<Mode> = [
   {
     tag: "02",
     title: "Multiplayer",
-    players: "up to 16 per room",
-    body: "Create a lobby, share a room code, and play. Lobbies are found over the network itself, so there is no matchmaking server. Movement stays smooth even when packets drop.",
+    players: "128 on one host",
+    body: "Create a lobby, share a room code, and play. Lobbies are found over the network itself, so there is no matchmaking server. Movement stays smooth even when packets drop. One host held 128 players in testing; past that, split the match across hosts.",
     apis: ["createLobby", "joinLobby", "joinNetcode"],
     href: "/docs/sdk/browser/netcode",
   },
@@ -120,7 +120,7 @@ const MODES: ReadonlyArray<Mode> = [
 export function GamesModesSection() {
   return (
     <section id="modes" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§03 / game modes</SectionLabel>
+      <SectionLabel>§04 / game modes</SectionLabel>
       <DisplayHeading>
         couch co-op
         <br />
@@ -174,7 +174,221 @@ export function GamesModesSection() {
   );
 }
 
-// ── §04 code ────────────────────────────────────────────────────────────────
+// ── §05 many hosts ──────────────────────────────────────────────────────────
+
+const SHARD_POINTS: ReadonlyArray<{ title: string; body: string }> = [
+  {
+    title: "Each host runs its own part",
+    body: "A host owns some of the players and NPCs, and runs their AI. Every player joins every host, and NET merges them into one view of one world.",
+  },
+  {
+    title: "Hits across hosts are fair",
+    body: "A hit on someone run by another host is checked against that host's record of where the attacker really was.",
+  },
+  {
+    title: "Players move between hosts",
+    body: "When a player is handed to another host, an input the old host already applied is never applied twice.",
+  },
+  {
+    title: "A host drops, the match goes on",
+    body: "The remaining hosts take over the lost host's players from where they last saw them.",
+  },
+];
+
+const SHARD_STATS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "128", label: "players on one host, measured" },
+  { value: "~30×", label: "less traffic for NPCs on known paths" },
+  { value: "~7×", label: "smaller snapshots with a codec" },
+];
+
+export function GamesShardsSection() {
+  return (
+    <section id="hosts" className="border-b border-line px-6 py-20">
+      <SectionLabel>§05 / many hosts</SectionLabel>
+      <DisplayHeading>
+        one match.
+        <br />
+        <span className="text-accent">many hosts.</span>
+      </DisplayHeading>
+
+      <p className="font-sans text-[18px] text-ink max-w-[760px] leading-[1.55] mb-12">
+        One player doesn&apos;t have to carry the whole match. NET can split it
+        across several hosts in the same game, each running its own part, so no
+        single page does all the work.
+      </p>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_1fr] gap-10 items-start">
+        <figure className="game-card border border-line bg-[#050706] p-5 m-0">
+          <ShardDiagram />
+          <figcaption className="font-sans text-[14px] text-ink-dim leading-[1.6] mt-4 border-t border-line pt-4">
+            You fight three enemies. Another player fights three more, 50 m
+            away. Each of you hosts your own fight and runs its AI. Your page
+            doesn&apos;t run the far fight: it just draws what the other host
+            sends.
+          </figcaption>
+        </figure>
+
+        <div className="flex flex-col gap-6">
+          {SHARD_POINTS.map((p, i) => (
+            <div key={p.title} className="flex gap-5">
+              <span className="font-display text-[28px] text-accent leading-none w-8 shrink-0">
+                {i + 1}
+              </span>
+              <div>
+                <h3 className="font-sans text-[18px] font-semibold text-ink mb-1.5">
+                  {p.title}
+                </h3>
+                <p className="font-sans text-ink-dim text-[15px] leading-[1.6]">
+                  {p.body}
+                </p>
+              </div>
+            </div>
+          ))}
+          <div className="flex flex-wrap gap-1.5">
+            {["joinShards", "hostNetcode", "sampleAt"].map((a) => (
+              <span
+                key={a}
+                className="text-[10px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono"
+              >
+                {a}
+              </span>
+            ))}
+          </div>
+          <Link
+            href="/docs/sdk/browser/netcode#several-hosts-a-sharded-match"
+            className="text-[11px] tracking-[0.12em] uppercase text-ink hover:text-accent transition-colors"
+          >
+            how sharding works →
+          </Link>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 border-t border-l border-line mt-12">
+        {SHARD_STATS.map((s) => (
+          <div
+            key={s.label}
+            className="border-r border-b border-line px-6 py-5"
+          >
+            <div className="font-sans text-accent text-[34px] font-semibold leading-none tabular-nums">
+              {s.value}
+            </div>
+            <div className="text-[10px] tracking-[0.14em] uppercase text-ink-dim mt-2">
+              {s.label}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// Two fights, each run by its own host, linked by the snapshots they trade.
+function ShardDiagram() {
+  const zones = [
+    { cx: 130, label: "host a", who: "you" },
+    { cx: 430, label: "host b", who: "another player" },
+  ];
+  const enemies = [
+    [-46, -30],
+    [44, -36],
+    [10, 48],
+  ];
+
+  return (
+    <svg
+      viewBox="0 0 560 260"
+      className="w-full h-auto"
+      role="img"
+      aria-label="Two hosts 50 metres apart, each running its own fight of one player against three enemies, sending each other snapshots"
+    >
+      <line
+        x1="215"
+        y1="120"
+        x2="345"
+        y2="120"
+        className="stroke-accent-dim"
+        strokeWidth="1.5"
+        strokeDasharray="5 5"
+      />
+      <polygon points="345,120 337,115 337,125" className="fill-accent-dim" />
+      <polygon points="215,120 223,115 223,125" className="fill-accent-dim" />
+      <text
+        x="280"
+        y="108"
+        textAnchor="middle"
+        className="fill-ink-dim font-mono"
+        fontSize="10"
+        letterSpacing="1.5"
+      >
+        SNAPSHOTS
+      </text>
+      <text
+        x="280"
+        y="140"
+        textAnchor="middle"
+        className="fill-ink-dim font-mono"
+        fontSize="10"
+        letterSpacing="1.5"
+      >
+        50 M
+      </text>
+
+      {zones.map((z) => (
+        <g key={z.label}>
+          <circle
+            cx={z.cx}
+            cy="120"
+            r="84"
+            className="stroke-line fill-accent/[0.03]"
+            strokeWidth="1"
+            strokeDasharray="3 4"
+          />
+          {enemies.map(([dx, dy]) => (
+            <g key={`${dx},${dy}`}>
+              <line
+                x1={z.cx}
+                y1="120"
+                x2={z.cx + dx}
+                y2={120 + dy}
+                className="stroke-warn/40"
+                strokeWidth="1"
+              />
+              <circle
+                cx={z.cx + dx}
+                cy={120 + dy}
+                r="6"
+                className="fill-warn"
+              />
+            </g>
+          ))}
+          <circle cx={z.cx} cy="120" r="9" className="fill-accent" />
+          <text
+            x={z.cx}
+            y="226"
+            textAnchor="middle"
+            className="fill-accent font-mono"
+            fontSize="11"
+            letterSpacing="2"
+          >
+            {z.label.toUpperCase()}
+          </text>
+          <text
+            x={z.cx}
+            y="244"
+            textAnchor="middle"
+            className="fill-ink-dim font-mono"
+            fontSize="10"
+            letterSpacing="1"
+          >
+            {z.who} + 3 enemies
+          </text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// ── §06 code ────────────────────────────────────────────────────────────────
 
 interface Snippet {
   key: string;
@@ -194,7 +408,7 @@ const SNIPPETS: ReadonlyArray<Snippet> = [
   from '@net-mesh/browser';
 
 const { credentialB64, bootstrapUrl } = await requestCredential({
-  anchorUrl: 'https://anchor.example.com',
+  anchorUrl: 'https://anchor.ai2070.net', // NET's public anchor
   game: 'my-game',
 });
 
@@ -308,7 +522,7 @@ export function GamesCodeSection() {
 
   return (
     <section id="code" className="border-b border-line px-6 py-20">
-      <SectionLabel>§04 / add it to your game</SectionLabel>
+      <SectionLabel>§06 / add it to your game</SectionLabel>
       <DisplayHeading>
         five steps.
         <br />
@@ -354,7 +568,8 @@ export function GamesCodeSection() {
               {snippet.code}
             </pre>
             <div className="border-t border-line px-5 py-4 font-sans text-[14px] text-ink-dim leading-[1.6]">
-              <span className="text-accent font-mono">//</span> {snippet.note}
+              <span className="text-accent font-mono">{"//"}</span>{" "}
+              {snippet.note}
             </div>
           </div>
         ) : null}
@@ -363,7 +578,7 @@ export function GamesCodeSection() {
   );
 }
 
-// ── §05 any engine ──────────────────────────────────────────────────────────
+// ── §07 any engine ──────────────────────────────────────────────────────────
 
 interface EngineTier {
   level: string;
@@ -406,7 +621,7 @@ const ENGINE_TIERS: ReadonlyArray<EngineTier> = [
 export function GamesEnginesSection() {
   return (
     <section id="engines" className="border-b border-line px-6 py-20">
-      <SectionLabel>§05 / any engine</SectionLabel>
+      <SectionLabel>§07 / any engine</SectionLabel>
       <DisplayHeading>
         a protocol,
         <br />
@@ -468,7 +683,7 @@ export function GamesEnginesSection() {
   );
 }
 
-// ── §06 AI-generated games ──────────────────────────────────────────────────
+// ── §08 AI-generated games ──────────────────────────────────────────────────
 
 // Absolute URL: the prompt is pasted into an agent outside this site. The
 // browser SDK overview links every page an agent needs, quickstart first.
@@ -493,7 +708,7 @@ const AI_POINTS: ReadonlyArray<{ title: string; body: string }> = [
 export function GamesAiSection() {
   return (
     <section id="ai" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§06 / made for ai-built games</SectionLabel>
+      <SectionLabel>§08 / made for ai-built games</SectionLabel>
       <DisplayHeading>
         prompt the game.
         <br />
@@ -536,7 +751,7 @@ export function GamesAiSection() {
   );
 }
 
-// ── §07 built in ────────────────────────────────────────────────────────────
+// ── §09 built in ────────────────────────────────────────────────────────────
 
 const PROPS: ReadonlyArray<{ k: string; title: string; body: string }> = [
   {
@@ -574,7 +789,7 @@ const PROPS: ReadonlyArray<{ k: string; title: string; body: string }> = [
 export function GamesPropsSection() {
   return (
     <section id="properties" className="border-b border-line px-6 py-20">
-      <SectionLabel>§07 / built in</SectionLabel>
+      <SectionLabel>§09 / built in</SectionLabel>
       <DisplayHeading>
         the hard parts,
         <br />
@@ -603,7 +818,7 @@ export function GamesPropsSection() {
   );
 }
 
-// ── §08 open source ─────────────────────────────────────────────────────────
+// ── §10 open source ─────────────────────────────────────────────────────────
 
 export function GamesOpenSection() {
   const [copied, setCopied] = useState(false);
@@ -611,7 +826,7 @@ export function GamesOpenSection() {
 
   return (
     <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§08 / open source</SectionLabel>
+      <SectionLabel>§10 / open source</SectionLabel>
       <DisplayHeading>
         free to use.
         <br />
@@ -657,11 +872,15 @@ export function GamesOpenSection() {
             $ {cmd}
           </pre>
           <div className="font-sans text-ink-dim text-[13px] mt-3">
-            Players get their pass from a small anchor you run with{" "}
+            Players get their pass from NET&apos;s public anchor,{" "}
+            <span className="text-ink font-mono text-[12px]">
+              anchor.ai2070.net
+            </span>
+            , with no setup. Or run your own with{" "}
             <span className="text-ink font-mono text-[12px]">
               net-mesh anchor serve
             </span>
-            . It holds no game state and one anchor serves many games.
+            . An anchor holds no game state, and one serves many games.
           </div>
         </button>
 
