@@ -1,0 +1,25 @@
+net/crates/net/browser-ts/src/stream.ts
+  s_d8b00bedd146e9::t_96dd37a94d03d8 276-283
+net/crates/net/leaf/src/counters.rs
+  s_d8b00bedd146e9::t_58a2363a623ba4 96-101
+net/crates/net/leaf/src/node.rs
+  s_d8b00bedd146e9::t_04e11db7f8cc45 2163-2166,2206-2221,2224-2226,2233,3555-3556,6651-6668,6670,6689-6692,6696-6697,6719-6778
+net/crates/net/leaf/src/stream_ownership.rs
+  s_d8b00bedd146e9::t_9be847aa7f38fe 156-157,159-161,231-233,332-333,582-584,587,589-593,628-631,663-666,867-869,900-901,910-911,918-919,940-941
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "34c0cff236644574181090f94c1b59d7d4daf896",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
