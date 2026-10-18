@@ -273,7 +273,14 @@ export class LeafStream implements AsyncIterable<Uint8Array> {
     this.close();
   }
 
-  /** Close the stream and end every consumer. */
+  /**
+   * Close the stream and end every consumer.
+   *
+   * Close is local: the peer's half is its own. Frames the peer still
+   * sends on this label reach `node.onEvent` as `stream_data`, exactly as
+   * for a stream this page never opened. Before 0.45.1 the node dropped
+   * them (`drops.stream_closed`) until the stream was reopened.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
