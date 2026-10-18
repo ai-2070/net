@@ -51,6 +51,7 @@ With the leaf fixed, a timed-out player is admitted again as soon as it is heard
 
 ## Smaller changes
 
+- The cross-org relay live test (`a_caller_relays_its_orgs_floor_and_the_provider_then_refuses_the_removed_member`) waits for the relayed bundle to be retained, not only for its floor. It failed twice on this release's CI.
 - The website's `/games` page has a section on sharded matches, the open-source Net Shooter demo, and a reworked Rose & Blade section over a gameplay reel.
 - Dependency updates: `arc-swap`.
 
