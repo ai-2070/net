@@ -1,0 +1,27 @@
+docs/data/tiers.yaml
+  s_d8b00bedd146e9::t_ebb1abedf08824 96
+net/crates/net/docs/releases/RELEASE_v0.45.1_BREAKING_THE_LAW.md
+  s_d8b00bedd146e9::t_26bee8552604cf 1-83
+web/scripts/sync-releases.mjs
+  s_d8b00bedd146e9::t_0c9057d186800f 120
+web/src/content/docs/releases/RELEASE_v0.45.1_BREAKING_THE_LAW.md
+  s_d8b00bedd146e9::t_485f23260b9912 1-87
+web/src/docs.order.ts
+  s_d8b00bedd146e9::t_3933c3f3698a9f 177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1bef0a60c1ca99e80a60012436748c394fca2ed3",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
