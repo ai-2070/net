@@ -1,0 +1,25 @@
+net/crates/net/browser-ts/test/netcode/cut-off.test.ts
+  s_d8b00bedd146e9::t_3e4df379f05ebf 1-154
+net/crates/net/browser-ts/CHANGELOG.md
+  s_d8b00bedd146e9::t_6ab7cf615f96d0 17-36
+net/crates/net/browser-ts/src/netcode/client.ts
+  s_d8b00bedd146e9::t_56d4f287b01cec 73-88,363-365,367-375,377-379,447-448,466,476,482,745-747,752-753
+web/src/content/docs/sdk/browser/netcode.md
+  s_d8b00bedd146e9::t_6bd93823a4dfd3 68-70,132-133,138-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4038702521a246f993315e2b2cd0ecd704b7490c",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
