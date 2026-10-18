@@ -1,0 +1,27 @@
+.github/scripts/check-c-abi.py
+  s_d8b00bedd146e9::t_d0977e9146ad35 66
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_868cd2629186ed 5446,5453
+net/crates/net/docs/releases/RELEASE_v0.45.1_BREAKING_THE_LAW.md
+  s_d8b00bedd146e9::t_8f0cb93b23d1bd 80
+net/crates/net/tests/c_abi/breaks.toml
+  s_d8b00bedd146e9::t_f210b867f57659 5
+web/src/content/docs/releases/RELEASE_v0.45.1_BREAKING_THE_LAW.md
+  s_d8b00bedd146e9::t_426f6c575fe8f1 84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "826e2080d6758e1b1958f3c72cee330bf6b91d3b",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
