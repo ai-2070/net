@@ -1424,19 +1424,23 @@ async fn a_caller_relays_its_orgs_floor_and_the_provider_then_refuses_the_remove
         .expect("C1 is admitted, and its call carried A's floor");
     // B holds no freshness requirement for A, so nothing about C1's own
     // admission waits on the relay: B merges it off the RPC path, shortly
-    // after the call.
+    // after the call. The merge publishes the floor first and retains the
+    // bundle for relay just after, outside the apply's locks
+    // (`retain_for_relay`), so wait for both: reading the relay cache the
+    // moment the floor shows raced that second step.
     let provider_store = provider.node().org_revocation_store().expect("B store");
     let merged = async {
-        while provider_store.floor_for(&a.org_id(), c2_identity.entity_id()) < 2 {
+        while provider_store.floor_for(&a.org_id(), c2_identity.entity_id()) < 2
+            || provider_store
+                .latest_issued_at(&a.org_id(), unix_now_secs())
+                .is_none()
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
     tokio::time::timeout(Duration::from_secs(5), merged)
         .await
-        .expect("B merged A's relayed floor");
-    assert!(provider_store
-        .latest_issued_at(&a.org_id(), unix_now_secs())
-        .is_some());
+        .expect("B merged A's relayed floor and retained it for relay");
 
     let before = ran.load(Ordering::SeqCst);
     let refused = org2.call::<_, Pong>("customer.read", &Ping { n: 3 }).await;

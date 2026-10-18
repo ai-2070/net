@@ -34,7 +34,7 @@ wheels = [
 
 [[package]]
 name = "net-mesh"
-version = "0.45.0"
+version = "0.45.1"
 source = { editable = "." }
 
 [package.optional-dependencies]
