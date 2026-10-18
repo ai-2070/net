@@ -697,21 +697,6 @@ pub struct LeafNode {
     /// peer's send half restarting, which is exactly the case a
     /// new receive cursor is correct for.
     recv_failed: std::collections::HashSet<(u64, u64)>,
-    /// `(incarnation, stream id)` whose consumer called
-    /// [`Self::close_stream`] and has not reopened it.
-    ///
-    /// Close is a **local** operation: one DataChannel carries
-    /// every stream, nothing goes on the wire, and the peer's
-    /// transmit sequence for the id is not rewound by it. So the
-    /// receive cursor cannot be deleted — deleting it made a
-    /// reopen build a fresh cursor waiting for sequence zero while
-    /// the peer went on sending sequence one, and the stream
-    /// stalled with nothing lost and no event. The cursor lives
-    /// for the stream's lifetime within the session and this set
-    /// is what suppresses delivery in the meantime;
-    /// [`Self::open_stream`] clears the id, and the reopened
-    /// consumer resumes at the peer's next sequence.
-    rx_closed: std::collections::HashSet<(u64, u64)>,
     /// The org-scoped streaming **caller** half: one sans-IO state
     /// machine per shape, its frames pumped onto the event plane
     /// beside the unary call table ([`crate::rpc_stream`]).
@@ -781,7 +766,6 @@ impl LeafNode {
             rpc_reply_carriers: std::collections::HashSet::new(),
             send_failed: std::collections::HashSet::new(),
             recv_failed: std::collections::HashSet::new(),
-            rx_closed: std::collections::HashSet::new(),
             delegation_chain: None,
             org_calls,
             org_serves,
@@ -1488,7 +1472,6 @@ impl LeafNode {
         self.acks_sent.retain(|(i, _), _| *i != incarnation);
         self.send_failed.retain(|(i, _)| *i != incarnation);
         self.recv_failed.retain(|(i, _)| *i != incarnation);
-        self.rx_closed.retain(|(i, _)| *i != incarnation);
         self.reassembler.retire(incarnation);
         self.calls.fail_incarnation(incarnation);
         // The org-scoped halves retire with the incarnation exactly
@@ -2177,12 +2160,10 @@ impl LeafNode {
         self.stream_kinds
             .insert((peer, stream_id), StreamKind::Stream);
         self.channel_claims.remove(&(peer, stream_id));
-        // Reopening is what un-closes the receive half. The cursor
-        // a previous `close_stream` left in place is deliberately
-        // still there, at the peer's next sequence, so this
-        // consumer resumes where the peer actually is instead of
-        // waiting for a sequence zero the peer sent long ago.
-        self.rx_closed.remove(&(incarnation, stream_id));
+        // The cursor a previous `close_stream` left in place is
+        // deliberately still there, at the peer's next sequence, so
+        // this consumer resumes where the peer actually is instead
+        // of waiting for a sequence zero the peer sent long ago.
         Ok(StreamHandle {
             peer,
             incarnation,
@@ -2222,24 +2203,34 @@ impl LeafNode {
         )
     }
 
-    /// Close an open stream: stop delivering to its consumer and
-    /// drop its stream registration.
+    /// Close an open stream: drop its stream registration.
+    ///
+    /// **Close ends this consumer, not the peer's traffic.** Close
+    /// is local — nothing goes on the wire, one DataChannel carries
+    /// every stream, and the peer's half is its own to close — so
+    /// the peer may go on sending on the id. The stream's own
+    /// consumers are detached by whoever holds them (the wasm
+    /// `LeafStream::close` removes its listeners before it calls
+    /// this), and later arrivals are delivered exactly as for a
+    /// stream this leaf never opened: classified by the id's
+    /// derivation and handed to node-wide listeners. Before 0.45.1
+    /// they were dropped (counted [`DropReason::StreamClosed`])
+    /// until a reopen, which made closing a stream worse than never
+    /// opening it: the netcode host closes a timed-out player's
+    /// stream, on the label that player sends on, and then never
+    /// heard the player again, so it could never re-admit it.
     ///
     /// **The receive cursor stays**, for the rest of this stream's
-    /// lifetime within the session. Close is local — nothing goes
-    /// on the wire, one DataChannel carries every stream, and the
-    /// peer's half is its own to close — so the peer's transmit
-    /// sequence for the id keeps counting up and the wire's receive
-    /// state keeps acknowledging it. Deleting the cursor here made
+    /// lifetime within the session: the peer's transmit sequence
+    /// for the id keeps counting up and the wire's receive state
+    /// keeps acknowledging it. Deleting the cursor here made
     /// [`Self::open_stream`] on the same id build a fresh one
     /// waiting for sequence zero while the peer sent sequence one:
     /// the record was accepted and acknowledged on the wire and
     /// then held against a gap nothing could ever fill, so a
     /// successful close/reopen silently stranded every later
     /// payload with no loss and no event. Keeping it means a reopen
-    /// resumes at the peer's next sequence, and until then arrivals
-    /// are counted [`DropReason::StreamClosed`] rather than
-    /// delivered to a consumer that is gone.
+    /// resumes at the peer's next sequence.
     ///
     /// The send half is untouched: the same id stays sendable, and
     /// the caller's own transmit sequence is not rewound either.
@@ -2249,8 +2240,6 @@ impl LeafNode {
     /// stream state.
     pub fn close_stream(&mut self, handle: StreamHandle) -> Result<()> {
         self.check_handle(handle)?;
-        self.rx_closed
-            .insert((handle.incarnation, handle.stream_id));
         self.stream_kinds.remove(&(handle.peer, handle.stream_id));
         self.channel_claims.remove(&(handle.peer, handle.stream_id));
         Ok(())
@@ -3563,14 +3552,8 @@ impl LeafNode {
             }
         }
         for record in delivered {
-            // A closed consumer still advances its cursor — the
-            // peer's sequence was never rewound — but nothing is
-            // delivered to it until a reopen.
-            if self.rx_closed.contains(&(incarnation, record.stream_id)) {
-                self.counters
-                    .drop_n(DropReason::StreamClosed, record.payloads.len() as u64);
-                continue;
-            }
+            // A stream this leaf closed is delivered exactly like one
+            // it never opened (`close_stream`).
             for payload in record.payloads.clone() {
                 self.handle_event(peer, incarnation, &record, payload, now);
             }
@@ -6665,19 +6648,26 @@ mod tests {
         assert_eq!(drained(&mut b), (vec![body], Vec::new()));
     }
 
-    /// **Close is local, and the peer's sequence is not rewound by
-    /// it.** Deleting the receive cursor made a reopen of the same id
-    /// wait for sequence zero while the peer sent sequence one: the
-    /// record was accepted and acknowledged on the wire and then held
-    /// against a gap nothing could fill, so a successful
-    /// close/reopen silently stranded everything after it.
+    /// **Close is local: it ends this consumer, not the peer's
+    /// traffic, and it does not rewind the peer's sequence.**
     ///
-    /// The cursor therefore survives close, delivery does not, and a
-    /// reopen resumes where the peer actually is. The send half is
-    /// asserted separately, because the wrong repair here is to
-    /// retire the whole bidirectional stream.
+    /// Two regressions are pinned here. Deleting the receive cursor
+    /// made a reopen of the same id wait for sequence zero while the
+    /// peer sent sequence one: the record was accepted and
+    /// acknowledged on the wire and then held against a gap nothing
+    /// could fill. And dropping a closed stream's arrivals made
+    /// closing worse than never opening: the netcode host closes a
+    /// timed-out player's stream on the label the player sends on,
+    /// then never heard the player again and could never re-admit it
+    /// (net-fps report against 0.45.0).
+    ///
+    /// So the cursor survives close, a closed stream's arrivals are
+    /// delivered as a never-opened stream's are, and a reopen resumes
+    /// where the peer actually is. The send half is asserted
+    /// separately, because the wrong repair here is to retire the
+    /// whole bidirectional stream.
     #[test]
-    fn a_closed_stream_delivers_nothing_and_a_reopen_resumes_at_the_peers_next_sequence() {
+    fn a_closed_stream_still_delivers_and_a_reopen_resumes_at_the_peers_next_sequence() {
         const STREAM: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 23;
         let (mut a, mut b) = pair();
         let (aid, bid) = (a.node_id(), b.node_id());
@@ -6696,14 +6686,15 @@ mod tests {
         a.close_stream(receive).expect("close");
         b.stream_send(send, b"while-closed").expect("send");
         pump(&mut b, &mut a);
-        assert!(
-            delivered(&mut a).is_empty(),
-            "a closed consumer is not delivered to"
+        assert_eq!(
+            delivered(&mut a),
+            vec![b"while-closed".to_vec()],
+            "a closed stream's arrivals still reach the node, as a never-opened stream's do"
         );
         assert_eq!(
             a.counters().drops(DropReason::StreamClosed),
-            1,
-            "and the record it did not get is counted, not silent"
+            0,
+            "nothing is dropped for having closed"
         );
         pump(&mut a, &mut b);
 
@@ -6723,6 +6714,66 @@ mod tests {
         a.stream_send(reopened, b"reply").expect("send");
         pump(&mut a, &mut b);
         assert_eq!(delivered(&mut b), vec![b"reply".to_vec()]);
+    }
+
+    /// The field report's own shape, on the fire-and-forget mode
+    /// netcode rides: after the receiver opens and closes its half,
+    /// small and fragmented payloads still arrive, exactly as before
+    /// it ever opened. Before 0.45.1 every one of them was counted
+    /// `StreamClosed` and none was delivered.
+    #[test]
+    fn a_closed_fire_and_forget_stream_delivers_like_one_never_opened() {
+        const STREAM: u64 = crate::stream::LEAF_STREAM_DISCRIMINATOR | 25;
+        let (mut a, mut b) = pair();
+        let (aid, bid) = (a.node_id(), b.node_id());
+        let send = b
+            .open_stream(
+                aid,
+                "repro",
+                Reliability::FireAndForget,
+                Some(STREAM),
+                Some(25),
+            )
+            .expect("open");
+        let small = vec![0x41u8; 200];
+        let big = vec![0x42u8; crate::frame::MAX_FRAGMENT_PAYLOAD * 2 + 7];
+        let round = |a: &mut LeafNode, b: &mut LeafNode| -> Vec<Vec<u8>> {
+            b.stream_send(send, &small).expect("send small");
+            b.stream_send(send, &big).expect("send big");
+            pump(b, a);
+            let got = delivered(a);
+            pump(a, b);
+            got
+        };
+
+        assert_eq!(
+            round(&mut a, &mut b),
+            vec![small.clone(), big.clone()],
+            "never opened: delivered"
+        );
+        let mine = a
+            .open_stream(
+                bid,
+                "repro",
+                Reliability::FireAndForget,
+                Some(STREAM),
+                Some(25),
+            )
+            .expect("open");
+        assert_eq!(
+            round(&mut a, &mut b),
+            vec![small.clone(), big.clone()],
+            "open: delivered"
+        );
+        a.close_stream(mine).expect("close");
+        for n in 0..3 {
+            assert_eq!(
+                round(&mut a, &mut b),
+                vec![small.clone(), big.clone()],
+                "closed, round {n}: delivered exactly as before it was opened"
+            );
+        }
+        assert_eq!(a.counters().drops(DropReason::StreamClosed), 0);
     }
 
     /// **A RESET starts a new receive lifetime inside one session.**

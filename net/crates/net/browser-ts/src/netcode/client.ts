@@ -70,6 +70,22 @@ export class NetcodeError extends Error {
  */
 const MAX_INPUT_BACKLOG = 64;
 
+/**
+ * Largest input frame, bytes. Under one event, as the host's snapshot
+ * default is, so an input frame never rides as fragments: on the lossy
+ * carrier one lost fragment loses the whole frame. A backlog that does not
+ * fit sends its newest inputs.
+ */
+const MAX_INPUT_FRAME_BYTES = 8000;
+
+/**
+ * How long the host may say nothing before input frames stop going out at
+ * the input rate, ms. While it is silent, unacknowledged inputs are repeated
+ * only on the ping timer: a player cut off from its host used to send its
+ * whole backlog, as fragments, with every input (~700 kB/s, net-fps report).
+ */
+const HOST_SILENT_MS = 1000;
+
 /** A chunked snapshot being assembled. */
 interface Assembly<E> {
   readonly t: number;
@@ -344,11 +360,23 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   let lastSnapshotAt: number | null = null;
   const inputEpoch = () => (options.epoch === undefined ? {} : { ep: options.epoch() });
   // The newest `redundancy` inputs — or, past that, the whole backlog up to
-  // MAX_INPUT_BACKLOG, in one frame.
+  // MAX_INPUT_BACKLOG, in one frame of at most MAX_INPUT_FRAME_BYTES. A
+  // backlog too big for one frame sends its newest inputs: a host skips
+  // whatever an earlier frame would have filled anyway.
   const sendInputs = () => {
-    const count = inputs.pending.length > redundancy ? MAX_INPUT_BACKLOG : redundancy;
-    send({ n: label, k: 'i', i: inputs.pending.slice(-count), ...inputEpoch() });
+    let count = Math.min(inputs.pending.length, inputs.pending.length > redundancy ? MAX_INPUT_BACKLOG : redundancy);
+    for (;;) {
+      const bytes = encodeFrame<E, I>({ n: label, k: 'i', i: inputs.pending.slice(-count), ...inputEpoch() });
+      if (bytes.byteLength <= MAX_INPUT_FRAME_BYTES || count <= 1) {
+        sendBytes(bytes);
+        return;
+      }
+      count = Math.max(1, Math.min(count - 1, Math.floor((count * MAX_INPUT_FRAME_BYTES) / bytes.byteLength)));
+    }
   };
+  // When the host was last heard from: any frame of this label, or binary.
+  let hostHeardAt = now();
+  const hostSilent = () => now() - hostHeardAt > HOST_SILENT_MS;
 
   const offset = () => clock.estimate()?.offsetMs ?? null;
   const hostNow = () => {
@@ -416,7 +444,8 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
   // replaced (a reconnect, a relayed → direct upgrade) and a stream handle
   // is fenced to the session it was opened on. The protocol repeats what
   // was lost, so reopening is all recovery needs.
-  const send = (frame: Frame<E, I>) => {
+  const send = (frame: Frame<E, I>) => sendBytes(encodeFrame(frame));
+  const sendBytes = (payload: Uint8Array) => {
     const current = stream;
     if (current === null) {
       void open();
@@ -434,7 +463,7 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       }
     };
     try {
-      void Promise.resolve(current.send(encodeFrame(frame))).catch(retire);
+      void Promise.resolve(current.send(payload)).catch(retire);
     } catch (error) {
       retire(error);
     }
@@ -444,11 +473,13 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
     if (closed || event.type !== 'stream_data') return;
     if (eventPeer(event.peerNode) !== host) return;
     if (isBinaryFrame(event.payload)) {
+      hostHeardAt = now();
       onBinary(event.payload);
       return;
     }
     const frame = decodeFrame<E, I>(event.payload, label);
     if (frame === null) return;
+    hostHeardAt = now();
     if (frame.k === 'q') {
       clock.add(frame.t0, frame.t1, frame.t2, now());
       return;
@@ -711,11 +742,15 @@ export function joinNetcode<E, I>(options: JoinNetcodeOptions<E, I>): NetcodeCli
       const seq = inputs.seq;
       const seen = (hostNow() ?? now()) - delay;
       inputs.pending.push({ seq, seen, data });
+      // Only the newest MAX_INPUT_BACKLOG are ever sent again, so older
+      // ones are dropped rather than held (and replayed) until an ack.
+      if (inputs.pending.length > MAX_INPUT_BACKLOG) inputs.pending.splice(0, inputs.pending.length - MAX_INPUT_BACKLOG);
       if (options.local && predicted !== null) {
         predicted = options.local.predict(predicted, data);
         if (correcting !== null) correcting = { ...correcting, from: options.local.predict(correcting.from, data) };
       }
-      sendInputs();
+      // A silent host gets the backlog from the ping timer, not per input.
+      if (!hostSilent()) sendInputs();
     },
     view() {
       const at = hostNow();

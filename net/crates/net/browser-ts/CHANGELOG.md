@@ -14,6 +14,26 @@ missing method at the call site rather than at install time. Unlike
 `@net-mesh/sdk`, this package never depends on `@net-mesh/core` — see
 the README on why it is a sibling package rather than a sub-path.
 
+## 0.45.1 — a closed stream keeps hearing its peer
+
+- **Closing a stream no longer silences its peer.** After `close()`, frames
+  the peer still sends on that label reach `node.onEvent` as `stream_data`,
+  exactly as for a stream the page never opened. Before, the node dropped
+  them (counted `drops.stream_closed`) until the page reopened the stream,
+  so closing a stream was worse than never opening it. `stream_closed` is
+  no longer counted and reads 0.
+- **A timed-out netcode player can rejoin.** `hostNetcode` closes a
+  player's stream when it times the player out, and only learns about a
+  player from its frames, so the change above was what locked a timed-out
+  player out for good. It is now re-admitted when heard again and carries
+  on from where it was applied.
+- **A player cut off from its host stays quiet.** `joinNetcode` keeps at
+  most the newest 64 unacknowledged inputs (older ones were never sent
+  again anyway), keeps every input frame under one event (8,000 bytes) so
+  it never rides as fragments, and while the host has said nothing for a
+  second repeats its inputs only at the ping rate instead of with every
+  input. A cut-off player used to upload about 700 kB/s.
+
 ## 0.44.0 — sharded matches, compact snapshots
 
 - **`joinShards` merges a match split across several hosts** (topology A:

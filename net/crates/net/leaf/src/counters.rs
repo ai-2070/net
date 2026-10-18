@@ -93,12 +93,12 @@ pub enum DropReason {
     /// A reliable stream whose retransmits were exhausted, or that
     /// the peer reset. Terminal for that stream.
     StreamFailed,
-    /// A record for a stream whose consumer called `close`. The
-    /// receive cursor stays live for the rest of the session — the
-    /// peer's transmit sequence was never rewound, so a reopen has
-    /// to resume where the peer actually is — but there is no
-    /// consumer to deliver to, so the bytes are counted here rather
-    /// than queued for one that may never come back.
+    /// **No longer counted (since 0.45.1).** It counted records
+    /// that arrived on a stream this leaf had closed; those are now
+    /// delivered exactly as for a stream it never opened (see
+    /// `LeafNode::close_stream`). The reason keeps its slot so a
+    /// snapshot's `stream_closed` key stays where readers expect it,
+    /// and reads 0.
     StreamClosed,
     /// A frame offered on a **provisional** establishment — one
     /// whose initiator has not yet proved, over this handshake's

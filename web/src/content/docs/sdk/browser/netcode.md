@@ -65,7 +65,9 @@ const net = hostNetcode<Ship, Move>({
   tick: the player carries them over from the previous snapshot rather than
   losing the whole frame.
 - **Players come and go.** A player silent for `playerTimeoutMs` (default 5000)
-  is dropped; `authorize` (default: everyone) admits new ones.
+  is dropped; `authorize` (default: everyone) admits new ones. A dropped player
+  that is heard again is admitted again and carries on from where it was
+  applied.
 
 | Option | Default | |
 |---|---|---|
@@ -127,10 +129,16 @@ function frame() {
 
 `stats()` reports `clock` (`offsetMs`, `rttMs`, `jitterMs`, `samples`),
 `snapshots`, `lateSnapshots` (reordered by the carrier), `pendingInputs`
-(dropped once the host acknowledges them, whether or not the client predicts),
+(dropped once the host acknowledges them, whether or not the client predicts;
+at most the newest 64 are kept),
 `corrections`, `partialSnapshots` (chunked snapshots completed with carried-over
 entities), `binaryFrames` and `unnamedEntities` (compact snapshots, below). `hostNow()` is the host clock as estimated, and `close()` stops the
 player.
+
+An input frame always fits in one event, so it never rides as fragments: a
+backlog too big for one frame sends its newest inputs. While the host has said
+nothing for a second, the player repeats its inputs only at `pingRate` instead
+of with every input, so a player cut off from its host stays quiet.
 
 The building blocks are exported too: `ClockEstimator` (NTP-style, trusting the
 lowest-RTT samples), `SnapshotBuffer`, `lerpNumbers`, and `lerpAngle` (an
