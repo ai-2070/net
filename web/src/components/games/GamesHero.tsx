@@ -333,14 +333,18 @@ function subscribeReducedMotion(onChange: () => void): () => void {
   return () => mq.removeEventListener("change", onChange);
 }
 
-export function GamesHero() {
-  // The server snapshot says "reduce", so the reel is never in the server
-  // render and only mounts once the client has seen the visitor's setting.
-  const reduceMotion = useSyncExternalStore(
+// The server snapshot says "reduce", so a background video is never in the
+// server render and only mounts once the client has seen the visitor's setting.
+export function usePrefersReducedMotion(): boolean {
+  return useSyncExternalStore(
     subscribeReducedMotion,
     () => window.matchMedia(REDUCED_MOTION).matches,
     () => true,
   );
+}
+
+export function GamesHero() {
+  const reduceMotion = usePrefersReducedMotion();
   const reelOn = HERO_REEL_SRC !== null && !reduceMotion;
   const [reelReady, setReelReady] = useState(false);
   // Set once the reel has fully faded in. The canvas underneath is hidden for
