@@ -80,10 +80,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
 
 export function ComponentsSection() {
   return (
-    <section
-      id="components"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="components" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§09 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
@@ -103,14 +100,14 @@ export function ComponentsSection() {
             <h3 className="font-display font-bold text-[25px] leading-[1.05] text-ink mb-2 tracking-[-0.015em]">
               {c.name}
             </h3>
-            <div className="text-[10px] text-ink-dim mb-4 tracking-[0.05em]">
+            <div className="text-[12px] text-ink-dim mb-4 tracking-[0.05em]">
               {c.tagline}
             </div>
-            <p className="text-[14px] text-ink-dim leading-[1.6] mb-4 flex-1 max-w-[36em]">
+            <p className="text-[16px] text-ink-dim leading-[1.55] mb-4 flex-1 max-w-[36em]">
               {c.body}
             </p>
             <div className="flex items-end justify-between gap-4 border-t border-line pt-4">
-              <span className="font-mono text-[10.5px] text-ink-dim tracking-[0.04em]">
+              <span className="font-mono text-[13px] text-ink-dim tracking-[0.04em]">
                 {c.stats}
               </span>
               <span className="stencil shrink-0 normal-case">{c.num}</span>

@@ -168,9 +168,12 @@ export function DatafortsConsole() {
   const totalBar = renderBar(totalFill, 36);
 
   return (
-    <div className="slab overflow-hidden font-mono text-[12px] leading-[1.75]">
+    <div
+      data-ui
+      className="slab overflow-hidden font-mono text-[13px] leading-[1.75]"
+    >
       {/* terminal title bar */}
-      <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
+      <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[12px] tracking-[0.14em] text-ink-dim uppercase">
         <span className="flex items-center gap-3">
           <span className="inline-flex gap-1">
             <span className="frame-dot-r w-[7px] h-[7px] rounded-full" />
@@ -280,7 +283,7 @@ export function DatafortsConsole() {
         </div>
         <div className="text-ink-dim mt-1">└─ end of stream</div>
 
-        <div className="mt-4 text-ink-faint text-[10px] tracking-[0.04em]">
+        <div className="mt-4 text-ink-faint text-[12px] tracking-[0.04em]">
           ▸ press <span className="text-accent">^C</span> to detach · gravity
           recalc every <span className="text-accent">1.4s</span> · watermark
           high <span className="text-accent">·85</span> / low{" "}

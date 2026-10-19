@@ -59,7 +59,7 @@ export function InstallSection() {
   return (
     <section
       id="install"
-      className="bg-bg-2 border-y border-line relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+      className="bg-bg-2 border-y border-line relative px-6 lg:px-12 py-24 lg:py-32"
     >
       <SectionLabel>§10 / install</SectionLabel>
       <DisplayHeading>
@@ -85,11 +85,11 @@ export function InstallSection() {
               className="slab slab-lift text-left p-6 cursor-pointer focus:outline-none"
             >
               <div className="flex items-center justify-between mb-4">
-                <span className="text-[11px] text-ink tracking-[0.15em] uppercase font-semibold">
+                <span className="text-[13px] text-ink tracking-[0.15em] uppercase font-semibold">
                   {c.lang}
                 </span>
                 <span
-                  className={`text-[10px] px-1.5 py-0.5 transition-colors ${
+                  className={`text-[12px] px-1.5 py-0.5 transition-colors ${
                     isCopied
                       ? "text-bg bg-accent border border-accent font-semibold"
                       : "text-accent border border-accent-dim"
@@ -98,16 +98,16 @@ export function InstallSection() {
                   {isCopied ? "✓ COPIED" : c.ext}
                 </span>
               </div>
-              <pre className="bg-black/40 p-3.5 text-[12px] text-accent overflow-x-auto font-mono leading-[1.5] shadow-[inset_0_2px_6px_rgba(0,0,0,0.6)]">
+              <pre className="bg-black/40 p-3.5 text-[13px] text-accent overflow-x-auto font-mono leading-[1.5] shadow-[inset_0_2px_6px_rgba(0,0,0,0.6)]">
                 {c.cmd}
               </pre>
-              <div className="text-ink-dim text-[10px] mt-2.5">{c.meta}</div>
+              <div className="text-ink-dim text-[12px] mt-2.5">{c.meta}</div>
             </button>
           );
         })}
       </div>
 
-      <p className="mt-12 text-[13px] leading-[1.7] text-ink-dim max-w-[64em]">
+      <p className="mt-12 text-[15px] leading-[1.65] text-ink-dim max-w-[64em]">
         <a
           href="https://github.com/ai-2070/net/tree/master/net/crates/net/include"
           target="_blank"
@@ -135,7 +135,7 @@ export function InstallSection() {
           {copied === "ffi-build" ? (
             <span
               aria-hidden
-              className="slide-up-fade absolute left-0 -top-1 text-[10px] text-accent font-mono whitespace-nowrap"
+              className="slide-up-fade absolute left-0 -top-1 text-[12px] text-accent font-mono whitespace-nowrap"
             >
               ✓ copied
             </span>

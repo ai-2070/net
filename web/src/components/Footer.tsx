@@ -1,5 +1,6 @@
 import { FooterColumn } from "./FooterColumn";
 import globals from "@/lib/globals";
+import fieldCredits from "@/lib/field-credits.json";
 
 const FOOTER_SPEC: ReadonlyArray<{
   href: string;
@@ -98,7 +99,7 @@ export function Footer({ world }: { world?: "field" } = {}) {
         <div>
           <div className="logo-mark font-display text-[22px] text-ink tracking-[0.1em] flex items-baseline gap-2.5 mb-4">
             net{" "}
-            <span className="font-mono text-[9px] tracking-[0.15em] font-semibold">
+            <span className="font-mono text-[11px] tracking-[0.15em] font-semibold">
               // AI 2070
             </span>
           </div>
@@ -112,7 +113,7 @@ export function Footer({ world }: { world?: "field" } = {}) {
         <FooterColumn title="Resources" items={FOOTER_RESOURCES} />
       </div>
 
-      <div className="border-t border-line pt-6 flex justify-between text-[10px] text-ink-dim tracking-[0.1em] flex-wrap gap-4">
+      <div className="border-t border-line pt-6 flex justify-between text-[11px] text-ink-dim tracking-[0.1em] flex-wrap gap-4">
         <span>© {ET_YEAR} — NET // PROTOCOL.0x4E45·54</span>
         <span>
           <span className="text-accent">▸</span> NET status:{" "}
@@ -128,19 +129,15 @@ export function Footer({ world }: { world?: "field" } = {}) {
 // the directory cast into it.
 function FieldFooter() {
   return (
-    <footer className="relative px-6 lg:px-10 pt-10 pb-8">
-      <div
-        aria-hidden
-        className="slab h-[18px] -mx-6 lg:-mx-10 mb-16"
-        style={{ boxShadow: "0 30px 40px -24px rgba(0,0,0,0.9)" }}
-      />
+    <footer className="relative px-6 lg:px-12 pt-10 pb-8">
+      <div aria-hidden className="h-px bg-line -mx-6 lg:-mx-12 mb-16" />
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr] gap-10 mb-16">
         <div>
           <div className="flex items-baseline gap-3 mb-5">
             <span className="font-display font-bold uppercase text-[40px] leading-none tracking-[-0.03em] text-ink">
               net
             </span>
-            <span className="font-mono text-[9px] tracking-[0.18em] font-semibold text-ink-dim">
+            <span className="font-mono text-[11px] tracking-[0.18em] font-semibold text-ink-dim">
               {"// AI 2070"}
             </span>
           </div>
@@ -157,6 +154,24 @@ function FieldFooter() {
           world="field"
         />
       </div>
+
+      <p className="text-[13px] leading-[1.6] text-ink-dim mb-8">
+        Pictures:{" "}
+        {fieldCredits.map((c, i) => (
+          <span key={c.file}>
+            <a
+              href={c.page}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-ink transition-colors"
+            >
+              {c.title}
+            </a>
+            {c.creator ? ` by ${c.creator}` : ""}, {c.license}
+            {i < fieldCredits.length - 1 ? "; " : "."}
+          </span>
+        ))}
+      </p>
 
       <div className="border-t border-line pt-6 flex justify-between stencil flex-wrap gap-4">
         <span>© {ET_YEAR} — NET // PROTOCOL.0x4E45·54</span>

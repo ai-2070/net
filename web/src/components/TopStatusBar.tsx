@@ -33,7 +33,7 @@ export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
     <div
       className={`fixed top-0 left-0 right-0 h-7 bg-bg border-b border-line flex items-center text-[10px] text-ink-dim z-[100] ${
         field
-          ? "world-field px-6 lg:px-10 font-mono tracking-[0.12em]"
+          ? "world-field px-6 lg:px-12 font-mono tracking-[0.12em]"
           : "px-4 tracking-[0.05em]"
       }`}
     >

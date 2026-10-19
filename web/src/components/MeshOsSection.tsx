@@ -755,8 +755,8 @@ function MeshAutoform() {
   }, []);
 
   return (
-    <div className="slab overflow-hidden font-mono">
-      <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
+    <div data-ui className="slab overflow-hidden font-mono">
+      <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[12px] tracking-[0.14em] text-ink-dim uppercase">
         <span className="flex items-center gap-3">
           <span className="inline-flex gap-1">
             <span className="frame-dot-r w-[7px] h-[7px] rounded-full" />
@@ -805,8 +805,8 @@ function MeshAutoform() {
       </div>
 
       {/* terminal event feed */}
-      <div className="border-t border-line bg-bg-2 px-4 py-3 text-[11px] leading-[1.75] min-h-[170px]">
-        <div className="text-ink-faint text-[10px] tracking-[0.12em] uppercase mb-1.5 flex items-center justify-between">
+      <div className="border-t border-line bg-bg-2 px-4 py-3 text-[13px] leading-[1.75] min-h-[170px]">
+        <div className="text-ink-faint text-[12px] tracking-[0.12em] uppercase mb-1.5 flex items-center justify-between">
           <span>
             <span className="text-accent">▸</span> mesh.events
           </span>
@@ -838,7 +838,7 @@ function MeshAutoform() {
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-x-5 gap-y-2 border-t border-line px-4 py-3 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
+      <div className="flex flex-wrap gap-x-5 gap-y-2 border-t border-line px-4 py-3 text-[12px] tracking-[0.12em] text-ink-dim uppercase">
         <span className="flex items-center gap-2">
           <span className="font-mono" style={{ color: "rgb(230, 232, 224)" }}>
             ◈
@@ -909,7 +909,7 @@ export function MeshOsSection() {
   return (
     <section
       id="meshos"
-      className="relative overflow-hidden pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+      className="relative overflow-hidden px-6 lg:px-12 py-24 lg:py-32"
     >
       <SectionLabel>§08 / cluster os // new</SectionLabel>
       <DisplayHeading>
@@ -944,12 +944,12 @@ export function MeshOsSection() {
             <h3 className="font-display font-bold text-[20px] leading-[1.1] text-ink mb-2 tracking-[-0.01em] flex items-center gap-3">
               {c.name}
               {c.isNew ? (
-                <span className="bg-accent text-bg px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-[0.18em]">
+                <span className="bg-accent text-bg px-1.5 py-0.5 font-mono text-[12px] font-bold tracking-[0.18em]">
                   NEW
                 </span>
               ) : null}
             </h3>
-            <p className="text-[14px] text-ink-dim leading-[1.55]">{c.body}</p>
+            <p className="text-[16px] text-ink-dim leading-[1.55]">{c.body}</p>
             <div className="stencil mt-4 normal-case">▸ {c.num}</div>
           </div>
         ))}

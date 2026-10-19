@@ -36,10 +36,7 @@ const BLACKWALL_ITEMS: readonly BlackwallItem[] = [
 
 export function BlackwallSection() {
   return (
-    <section
-      id="wall"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="wall" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§12 / the blackwall</SectionLabel>
       <DisplayHeading>
         safety isn&apos;t declared.
@@ -65,10 +62,10 @@ export function BlackwallSection() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-x-10 gap-y-10 mt-10">
         {BLACKWALL_ITEMS.map((item) => (
           <div key={item.tag} className="border-t border-line pt-5">
-            <h4 className="text-[11px] text-ink uppercase tracking-[0.16em] mb-3">
+            <h4 className="text-[13px] text-ink uppercase tracking-[0.16em] mb-3">
               {item.tag}
             </h4>
-            <p className="text-ink-dim text-[14px] leading-[1.6]">
+            <p className="text-ink-dim text-[16px] leading-[1.55]">
               {item.body}
             </p>
           </div>

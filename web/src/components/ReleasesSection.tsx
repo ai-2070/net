@@ -8,10 +8,7 @@ export function ReleasesSection() {
   if (releases.length === 0) return null;
 
   return (
-    <section
-      id="releases"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="releases" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§13 / releases</SectionLabel>
       <DisplayHeading>net releases.</DisplayHeading>
 
@@ -48,7 +45,7 @@ export function ReleasesSection() {
                   </span>
                 ) : null}
                 {r.prerelease ? (
-                  <span className="text-[10px] text-warn uppercase tracking-[0.15em] border border-warn px-1.5 py-0.5">
+                  <span className="text-[12px] text-warn uppercase tracking-[0.15em] border border-warn px-1.5 py-0.5">
                     pre-release
                   </span>
                 ) : null}
@@ -57,19 +54,19 @@ export function ReleasesSection() {
                 href={r.htmlUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-[10px] text-ink-dim font-mono tracking-[0.05em] hover:text-accent transition-colors"
+                className="text-[12px] text-ink-dim font-mono tracking-[0.05em] hover:text-accent transition-colors"
               >
                 {formatReleaseDate(r.publishedAt)} ↗
               </a>
             </header>
             {r.bodyHtml ? (
               <div
-                className="font-sans prose prose-invert prose-sm max-w-none prose-pre:font-mono prose-li:font-sans prose-headings:text-ink prose-headings:font-semibold prose-headings:tracking-tight prose-h1:text-[18px] prose-h2:text-[15px] prose-h3:text-[13px] prose-p:text-ink-dim prose-strong:text-ink prose-strong:font-medium prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:text-accent prose-code:font-mono prose-code:before:content-none prose-code:after:content-none prose-code:bg-bg prose-code:px-1 prose-code:py-0.5 prose-pre:bg-bg prose-pre:border prose-pre:border-line prose-ul:list-[square] prose-li:text-ink-dim prose-ul:marker:text-line prose-ol:text-ink-dim prose-hr:border-line prose-code:rounded-none"
+                className="font-sans prose prose-invert max-w-none break-words [&_code]:break-all [&_pre]:whitespace-pre-wrap [&_li]:max-w-[70ch] prose-pre:font-mono prose-li:font-sans prose-headings:text-ink prose-headings:font-semibold prose-headings:tracking-tight prose-h1:text-[18px] prose-h2:text-[15px] prose-h3:text-[13px] prose-p:text-ink-dim prose-strong:text-ink prose-strong:font-medium prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:text-accent prose-code:font-mono prose-code:before:content-none prose-code:after:content-none prose-code:bg-bg prose-code:px-1 prose-code:py-0.5 prose-pre:bg-bg prose-pre:border prose-pre:border-line prose-ul:list-[square] prose-li:text-ink-dim prose-ul:marker:text-line prose-ol:text-ink-dim prose-hr:border-line prose-code:rounded-none"
                 // Trusted: bodies come from repo maintainers' release notes via GitHub API.
                 dangerouslySetInnerHTML={{ __html: r.bodyHtml }}
               />
             ) : (
-              <p className="font-mono text-[12px] text-ink-faint italic">
+              <p className="font-mono text-[13px] text-ink-faint italic">
                 no notes
               </p>
             )}

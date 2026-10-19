@@ -244,16 +244,16 @@ export function GroupCards() {
           <h3 className="font-display font-bold text-[25px] leading-[1.05] text-ink mb-2 tracking-[-0.015em]">
             {g.name}
           </h3>
-          <div className="text-[10px] text-ink-dim mb-4 tracking-[0.05em]">
+          <div className="text-[12px] text-ink-dim mb-4 tracking-[0.05em]">
             {g.meta}
           </div>
-          <pre className="font-mono text-[10px] text-ink-dim leading-[1.5] bg-black/35 p-3.5 mb-5 shadow-[inset_0_2px_6px_rgba(0,0,0,0.55)] whitespace-pre overflow-x-auto">
+          <pre className="font-mono text-[12px] text-ink-dim leading-[1.5] bg-black/35 p-3.5 mb-5 shadow-[inset_0_2px_6px_rgba(0,0,0,0.55)] whitespace-pre-wrap lg:whitespace-pre overflow-x-auto">
             {g.ascii}
           </pre>
-          <p className="text-[14px] text-ink-dim leading-[1.6] mb-4">
+          <p className="text-[16px] text-ink-dim leading-[1.55] mb-4">
             {g.body}
           </p>
-          <div className="border-t border-line pt-3.5 grid grid-cols-2 gap-2.5 text-[10px]">
+          <div className="border-t border-line pt-3.5 grid grid-cols-2 gap-2.5 text-[12px]">
             {g.spec.map(([k, v]) => (
               <span key={k} className="contents">
                 <span className="text-ink-dim uppercase tracking-[0.1em]">

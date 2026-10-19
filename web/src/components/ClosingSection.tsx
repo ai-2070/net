@@ -9,7 +9,7 @@ export function ClosingSection() {
   return (
     <section
       id="post-cloud"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 pt-24 lg:pt-32 pb-0"
+      className="relative px-6 lg:px-12 pt-24 lg:pt-32 pb-0"
     >
       <SectionLabel>§14 / post-cloud</SectionLabel>
       <DisplayHeading>
@@ -20,14 +20,14 @@ export function ClosingSection() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-14 gap-y-1 mt-8">
         <div>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             Cloud infrastructure solves the wrong problem. It moves compute
             closer to a central provider.{" "}
             <strong className="text-ink font-medium">
               NET decouples storage and compute from hardware and location.
             </strong>
           </p>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             Cloud adds a trusted intermediary by definition.{" "}
             <strong className="text-ink font-medium">
               NET has no intermediaries.
@@ -37,7 +37,7 @@ export function ClosingSection() {
           </p>
         </div>
         <div>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             <strong className="text-ink font-medium">
               Cloud was the right answer when compute was scarce and hardware
               was expensive.
@@ -45,7 +45,7 @@ export function ClosingSection() {
             Compute is abundant. Hardware is cheap. The coordination layer
             should reflect that.
           </p>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             A manufacturing plant running on NET doesn&apos;t route sensor data
             to AWS us-east-1 and back. The sensor talks directly to the decision
             system on the factory floor.{" "}
@@ -56,7 +56,7 @@ export function ClosingSection() {
         </div>
       </div>
 
-      <div className="relative mt-28 -ml-6 -mr-12 lg:-ml-10 lg:-mr-24 text-center py-28 md:py-36 overflow-hidden">
+      <div className="relative mt-28 -mx-6 lg:-mx-12 text-center py-28 md:py-36 overflow-hidden">
         <div className="absolute inset-0">
           <FieldCanvas variant="closing" />
         </div>

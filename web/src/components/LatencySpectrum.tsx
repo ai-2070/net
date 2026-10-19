@@ -54,7 +54,7 @@ const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
 export function LatencySpectrum() {
   return (
     <div className="slab mt-24 px-8 py-8 hidden md:block">
-      <div className="text-[10px] tracking-[0.18em] uppercase text-ink-dim mb-4 flex items-center justify-between flex-wrap gap-2">
+      <div className="text-[12px] tracking-[0.18em] uppercase text-ink-dim mb-4 flex items-center justify-between flex-wrap gap-2">
         <span>// latency spectrum · log scale</span>
         <span className="text-ink-faint">10⁻⁹ → 10⁻³</span>
       </div>
@@ -63,7 +63,7 @@ export function LatencySpectrum() {
         <svg
           viewBox="0 0 1200 108"
           className="w-full"
-          style={{ minWidth: 720 }}
+          style={{ minWidth: 600 }}
           preserveAspectRatio="xMidYMid meet"
         >
           {SPECTRUM_MARKERS.map((m) => (
@@ -207,7 +207,7 @@ export function LatencySpectrum() {
         </svg>
       </div>
 
-      <p className="text-[10px] text-ink-faint mt-4 leading-[1.6] tracking-[0.04em] font-mono">
+      <p className="text-[12px] text-ink-faint mt-4 leading-[1.6] tracking-[0.04em] font-mono">
         * forward 0.20 ns · cap check 44 ns · pingwave 0.69 ns · header
         serialize 1.21 ns (i9-14900K)
         <br />† real-time guarantees only on dedicated hardware. NET hits the

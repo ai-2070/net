@@ -313,8 +313,8 @@ export function DaemonCaseBlock() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-10 lg:gap-14 my-16 items-start">
-      <div className="slab overflow-hidden">
-        <div className="bg-black/30 border-b border-line px-4 py-2.5 text-[10px] text-ink-dim tracking-[0.12em] uppercase flex justify-between items-center">
+      <div data-ui className="slab overflow-hidden">
+        <div className="bg-black/30 border-b border-line px-4 py-2.5 text-[12px] text-ink-dim tracking-[0.12em] uppercase flex justify-between items-center">
           <span key={`title-${idx}`} className="daemon-fade">
             <span className="text-accent font-semibold">CASE</span> ·{" "}
             {current.subtitle}
@@ -338,7 +338,7 @@ export function DaemonCaseBlock() {
             ))}
           </span>
         </div>
-        <pre className="px-5 py-4 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono min-h-[260px]">
+        <pre className="px-5 py-4 text-[13px] leading-[1.7] text-ink overflow-x-auto font-mono min-h-[260px]">
           {renderTypedTokens(tokens, limit)}
           <span
             className={isTyping ? "text-accent" : "cursor-blink"}
@@ -350,32 +350,32 @@ export function DaemonCaseBlock() {
       </div>
 
       <div>
-        <h3 className="text-ink font-mono text-[12px] font-semibold tracking-[0.16em] uppercase mb-4">
+        <h3 className="text-ink font-mono text-[13px] font-semibold tracking-[0.16em] uppercase mb-4">
           // what is a daemon
         </h3>
-        <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+        <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
           Stateful programs that live on the mesh, not on a machine. It holds
           working state, snapshots periodically, and exposes five trait methods.
           Everything else — placement, migration, durability — is the runtime.
         </p>
         <ul className="daemon-list list-none mt-4">
-          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[14px] leading-[1.5] relative font-sans">
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[16px] leading-[1.5] relative font-sans">
             <b className="text-ink font-medium">cryptographic identity</b> —
             origin_hash from ed25519. survives moves.
           </li>
-          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[14px] leading-[1.5] relative font-sans">
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[16px] leading-[1.5] relative font-sans">
             <b className="text-ink font-medium">causal chain</b> — every event
             signed, links to parent. self-authenticating.
           </li>
-          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[14px] leading-[1.5] relative font-sans">
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[16px] leading-[1.5] relative font-sans">
             <b className="text-ink font-medium">capability requirements</b> —
             daemon declares needs. mesh finds matching node.
           </li>
-          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[14px] leading-[1.5] relative font-sans">
+          <li className="py-2.5 pl-5 border-b border-line text-ink-dim text-[16px] leading-[1.5] relative font-sans">
             <b className="text-ink font-medium">snapshot + replay</b> — state
             captured periodically. gap replayed on restore.
           </li>
-          <li className="py-2.5 pl-5 text-ink-dim text-[14px] leading-[1.5] relative font-sans">
+          <li className="py-2.5 pl-5 text-ink-dim text-[16px] leading-[1.5] relative font-sans">
             <b className="text-ink font-medium">opaque to mesh</b> — what the
             daemon does is its business. mesh just hosts.
           </li>

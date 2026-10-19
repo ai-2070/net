@@ -1,38 +1,57 @@
 "use client";
 
-import { Children, isValidElement, type ReactNode } from "react";
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { useFieldHold } from "./useFieldHold";
 
-// Splits the heading at its top-level <br />s so each line is lifted into
-// place on its own beat. The words themselves are untouched.
-function toLines(children: ReactNode): ReactNode[][] {
-  const lines: ReactNode[][] = [[]];
-  Children.toArray(children).forEach((child) => {
-    if (isValidElement(child) && child.type === "br") {
-      lines.push([]);
-    } else {
-      lines[lines.length - 1]?.push(child);
+// The copy carries hard <br />s from the old stacked titles. The words stay;
+// the breaks become spaces so a title flows onto at most two lines. Each
+// top-level phrase still lifts into place on its own beat.
+function unbreak(node: ReactNode): ReactNode {
+  return Children.map(node, (child) => {
+    if (isValidElement(child)) {
+      if (child.type === "br") return " ";
+      const el = child as ReactElement<{ children?: ReactNode }>;
+      if (el.props.children !== undefined) {
+        return cloneElement(el, undefined, unbreak(el.props.children));
+      }
     }
+    return child;
   });
-  return lines.filter((l) => l.length > 0);
+}
+
+function toPhrases(children: ReactNode): ReactNode[][] {
+  const phrases: ReactNode[][] = [[]];
+  Children.toArray(children).forEach((child) => {
+    if (isValidElement(child) && child.type === "br") phrases.push([]);
+    else phrases[phrases.length - 1]?.push(unbreak(child));
+  });
+  return phrases.filter((p) => p.length > 0);
 }
 
 export function FieldHeading({ children }: { children: ReactNode }) {
   const ref = useFieldHold<HTMLHeadingElement>();
-  const lines = toLines(children);
+  const phrases = toPhrases(children);
   return (
     <h2
       ref={ref}
-      className="font-display font-bold uppercase leading-[0.92] tracking-[-0.03em] text-ink mb-10 max-w-[15em]"
-      style={{ fontSize: "clamp(40px, 5.6vw, 88px)" }}
+      className="font-display font-bold uppercase leading-[0.95] tracking-[-0.03em] text-ink mb-10 max-w-[19em] text-balance"
+      style={{ fontSize: "clamp(30px, 5.2vw, 80px)" }}
     >
-      {lines.map((line, i) => (
-        <span
-          key={i}
-          className="lift-line"
-          style={{ transitionDelay: `${i * 110}ms` }}
-        >
-          {line}
+      {phrases.map((phrase, i) => (
+        <span key={i}>
+          <span
+            className="lift-line !inline-block"
+            style={{ transitionDelay: `${i * 110}ms` }}
+          >
+            {phrase}
+          </span>
+          {i < phrases.length - 1 ? " " : null}
         </span>
       ))}
     </h2>

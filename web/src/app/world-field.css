@@ -28,13 +28,6 @@
   --font-sans: var(--font-archivo), "Helvetica Neue", Arial, sans-serif;
 
   --ease-field: cubic-bezier(0.16, 1, 0.3, 1);
-  --shadow-float:
-    inset 0 1px 0 rgba(238, 241, 232, 0.13),
-    0 28px 36px -26px rgba(0, 0, 0, 0.95), 0 70px 90px -50px rgba(0, 0, 0, 0.75);
-  --shadow-lifted:
-    inset 0 1px 0 rgba(238, 241, 232, 0.18),
-    0 44px 44px -30px rgba(0, 0, 0, 0.95),
-    0 100px 110px -54px rgba(0, 0, 0, 0.8);
 
   /* Raw cast concrete: fine aggregate grain, large pour stains, and the
      sparse air-void pits every cast slab carries. Procedural, tiled. */
@@ -67,16 +60,6 @@
   }
 }
 
-/* concrete surface (texture only; colour comes from the element) */
-@utility concrete {
-  background-image: var(--tex-pits), var(--tex-grain), var(--tex-stain);
-  background-size:
-    300px 300px,
-    260px 260px,
-    900px 900px;
-  background-blend-mode: normal, overlay, soft-light;
-}
-
 /* Panels are the cyberpunk terminal surface, held in the field: near-black
    phosphor glass, a hairline border, faint scanlines, and green corner
    ticks. They still float (cast shadow) because the composition is the
@@ -85,21 +68,12 @@
   position: relative;
   --color-ink-faint: #7f8479;
   background-color: var(--color-slab);
-  background-image:
-    linear-gradient(
-      180deg,
-      rgba(196, 255, 61, 0.035) 0%,
-      rgba(196, 255, 61, 0) 22%
-    ),
-    repeating-linear-gradient(
-      0deg,
-      rgba(0, 0, 0, 0) 0 2px,
-      rgba(0, 0, 0, 0.22) 2px 3px
-    );
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0) 0 2px,
+    rgba(0, 0, 0, 0.22) 2px 3px
+  );
   border: 1px solid #222a21;
-  box-shadow:
-    inset 0 1px 0 rgba(196, 255, 61, 0.05),
-    0 22px 28px -24px rgba(0, 0, 0, 0.9);
   transition:
     transform 0.6s var(--ease-field),
     box-shadow 0.6s var(--ease-field),
@@ -122,24 +96,6 @@
       linear-gradient(#c4ff3d, #c4ff3d) bottom left / 1px 10px no-repeat,
       linear-gradient(#c4ff3d, #c4ff3d) bottom right / 10px 1px no-repeat,
       linear-gradient(#c4ff3d, #c4ff3d) bottom right / 1px 10px no-repeat;
-  }
-}
-
-/* kept as no-ops so older markup stays valid: panels no longer vary in depth */
-@utility slab-near {
-  z-index: auto;
-}
-@utility slab-far {
-  z-index: auto;
-}
-
-/* A slab that runs off the left edge of the page (lg+): the hall is wider
-   than the screen. Text keeps its inset; only the concrete is cropped. */
-@utility bleed-left {
-  @media (width >= 64rem) {
-    --bleed: calc(2.5rem + 72px + max(0px, (100vw - 1440px) / 2));
-    margin-left: calc(-1 * var(--bleed)) !important;
-    padding-left: calc(var(--bleed) + 1.75rem) !important;
   }
 }
 
@@ -207,26 +163,11 @@
 /* Stencilled marking cast into a pillar: section labels. */
 @utility stencil {
   font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.32em;
+  font-size: 12px;
+  letter-spacing: 0.28em;
   text-transform: uppercase;
   color: var(--color-ink-dim);
   white-space: nowrap;
-}
-
-/* One cold volumetric shaft falling into a section from above. */
-@utility light-shaft {
-  position: absolute;
-  pointer-events: none;
-  background: linear-gradient(
-    180deg,
-    rgba(238, 241, 232, 0.1) 0%,
-    rgba(238, 241, 232, 0.045) 45%,
-    rgba(238, 241, 232, 0) 100%
-  );
-  clip-path: polygon(40% 0, 60% 0, 100% 100%, 0 100%);
-  filter: blur(12px);
-  mix-blend-mode: screen;
 }
 
 /* Field displacement: a line of a title is pushed up into place and held.
@@ -239,9 +180,9 @@
     opacity 1.1s var(--ease-field),
     filter 1.1s var(--ease-field);
   [data-armed="true"] & {
-    transform: translateY(0.5em);
-    opacity: 0;
-    filter: blur(8px);
+    transform: translateY(0.35em);
+    opacity: 0.55;
+    filter: blur(6px);
   }
   [data-armed="true"][data-held="true"] & {
     transform: none;
@@ -251,45 +192,6 @@
   @media (prefers-reduced-motion: reduce) {
     transition: none;
   }
-}
-
-/* Slow suspended bob for held objects. */
-@keyframes field-bob {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0) rotate(var(--bob-r, 0deg));
-  }
-  50% {
-    transform: translate3d(0, var(--bob-y, -10px), 0)
-      rotate(calc(var(--bob-r, 0deg) * -1));
-  }
-}
-@utility field-bob {
-  animation: field-bob var(--bob-t, 9s) ease-in-out infinite;
-  animation-delay: var(--bob-d, 0s);
-  @media (prefers-reduced-motion: reduce) {
-    animation: none;
-  }
-}
-
-/* board-formed seams for wide concrete bands */
-@utility formwork {
-  background-image:
-    repeating-linear-gradient(
-      180deg,
-      transparent 0,
-      transparent 143px,
-      rgba(0, 0, 0, 0.35) 143px,
-      rgba(255, 255, 255, 0.025) 144px,
-      transparent 145px
-    ),
-    var(--tex-pits), var(--tex-grain), var(--tex-stain);
-  background-size:
-    100% 100%,
-    300px 300px,
-    260px 260px,
-    900px 900px;
-  background-blend-mode: normal, normal, overlay, soft-light;
 }
 
 /* film grain over the whole landing (replaces the CRT scanlines) */
@@ -334,9 +236,6 @@
   font-weight: 700;
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.45),
-    0 22px 30px -22px rgba(0, 0, 0, 0.9);
   transition:
     transform 0.6s var(--ease-field),
     box-shadow 0.6s var(--ease-field);
@@ -688,6 +587,79 @@
 @utility field-sync {
   animation: field-sync 9s ease-in-out infinite;
   @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+
+/* Only panels that actually float cast a shadow: the wave set, the shared
+   rhythm, and whatever the pointer has lifted. */
+.field-wave > .slab,
+.field-sync.slab,
+.field-sync .slab {
+  box-shadow: 0 22px 28px -24px rgba(0, 0, 0, 0.9);
+}
+/* prose keeps a readable measure */
+@layer base {
+  .world-field p {
+    max-width: 70ch;
+  }
+}
+
+/* ── Mikoshi migration: one daemon, six phases, one rail ─────────────
+   The marker crosses the rail in 6s; each phase lights while the marker
+   is over it (its sixth of the loop), then returns to rest. */
+@keyframes migration-marker {
+  0% {
+    left: 0%;
+    opacity: 0;
+  }
+  4% {
+    opacity: 1;
+  }
+  92% {
+    opacity: 1;
+  }
+  100% {
+    left: calc(100% - 7px);
+    opacity: 0;
+  }
+}
+@keyframes migration-lit {
+  0%,
+  17% {
+    border-color: #7a9a2c;
+  }
+  24%,
+  100% {
+    border-color: #222a21;
+  }
+}
+@keyframes migration-num {
+  0%,
+  17% {
+    color: #c4ff3d;
+  }
+  24%,
+  100% {
+    color: var(--color-ink-dim);
+  }
+}
+.migration-marker {
+  animation: migration-marker 6s linear infinite;
+  box-shadow: 0 0 0 3px rgba(196, 255, 61, 0.15);
+}
+.migration-phase {
+  animation: migration-lit 6s linear infinite;
+  animation-delay: calc(var(--i, 0) * 1s);
+}
+.migration-phase .migration-num {
+  animation: migration-num 6s linear infinite;
+  animation-delay: calc(var(--i, 0) * 1s);
+}
+@media (prefers-reduced-motion: reduce) {
+  .migration-marker,
+  .migration-phase,
+  .migration-phase .migration-num {
     animation: none;
   }
 }

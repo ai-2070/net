@@ -4,10 +4,7 @@ import { MikoshiTransit } from "./field/MikoshiTransit";
 
 export function MikoshiSection() {
   return (
-    <section
-      id="mikoshi"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="mikoshi" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§05 / mikoshi // engram transit</SectionLabel>
       <DisplayHeading>
         state moves.
@@ -17,7 +14,7 @@ export function MikoshiSection() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-14 gap-y-1 mt-8">
         <div>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             <strong className="text-ink font-medium">
               In Cyberpunk, Mikoshi is Arasaka&apos;s construct for storing
               engrams
@@ -25,7 +22,7 @@ export function MikoshiSection() {
             — consciousness held in digital space, minds persisting outside
             their original hardware.
           </p>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             <strong className="text-ink font-medium">
               Mikoshi in NET lets a deamon hop between machines.
             </strong>{" "}
@@ -37,14 +34,14 @@ export function MikoshiSection() {
           </p>
         </div>
         <div>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             <strong className="text-ink font-medium">
               The daemon doesn&apos;t know it moved.
             </strong>{" "}
             Neither does anything talking to it. The hardware shifted; the
             stream didn't notice.
           </p>
-          <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
+          <p className="text-ink text-[17px] leading-[1.6] mb-5 max-w-[38em]">
             A factory controller hops from a dying edge box to a healthy one
             mid-shift. A trading agent migrates to a node closer to the exchange{" "}
             <strong className="text-ink font-medium">

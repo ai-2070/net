@@ -107,10 +107,7 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
 
 export function BenchmarksSection() {
   return (
-    <section
-      id="bench"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="bench" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§04 / measured numbers</SectionLabel>
       <DisplayHeading>existence proofs.</DisplayHeading>
 
@@ -122,16 +119,16 @@ export function BenchmarksSection() {
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">
         <div className="slab overflow-x-auto">
-          <table className="w-full border-collapse text-[12px]">
+          <table className="w-full border-collapse text-[13px]">
             <thead>
               <tr>
-                <th className="text-left px-4 py-3 text-ink-dim text-[10px] tracking-[0.16em] uppercase font-medium border-b border-line">
+                <th className="text-left px-4 py-3 text-ink-dim text-[12px] tracking-[0.16em] uppercase font-medium border-b border-line">
                   operation
                 </th>
-                <th className="text-right px-4 py-3 text-ink-dim text-[10px] tracking-[0.16em] uppercase font-medium border-b border-line">
+                <th className="text-right px-4 py-3 text-ink-dim text-[12px] tracking-[0.16em] uppercase font-medium border-b border-line">
                   M1 Max
                 </th>
-                <th className="text-right px-4 py-3 text-ink-dim text-[10px] tracking-[0.16em] uppercase font-medium border-b border-line">
+                <th className="text-right px-4 py-3 text-ink-dim text-[12px] tracking-[0.16em] uppercase font-medium border-b border-line">
                   i9-14900K
                 </th>
               </tr>
@@ -170,10 +167,10 @@ export function BenchmarksSection() {
             note='Python via PyO3 batch ingest. The "slow" binding language hits nine and a half million events per second.'
           />
           <hr className="border-0 border-t border-line my-5" />
-          <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase mb-4 font-medium">
+          <h4 className="text-[12px] tracking-[0.15em] text-ink-dim uppercase mb-4 font-medium">
             // test systems
           </h4>
-          <p className="text-[10px] text-ink-dim leading-[1.8] tracking-[0.05em]">
+          <p className="text-[12px] text-ink-dim leading-[1.8] tracking-[0.05em]">
             <b className="text-ink font-medium">► M1 Max</b> macOS, aarch64
             <br />
             <b className="text-ink font-medium">► i9-14900K</b> @5GHz, Win11
@@ -188,7 +185,7 @@ export function BenchmarksSection() {
             href="https://github.com/ai-2070/net/blob/master/net/crates/net/BENCHMARKS.md"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 text-[11px] font-mono text-accent tracking-[0.05em] hover:text-ink transition-colors"
+            className="inline-flex items-center gap-1.5 text-[13px] font-mono text-accent tracking-[0.05em] hover:text-ink transition-colors"
           >
             ▸ BENCHMARKS.md
             <span className="text-ink-faint">↗</span>
@@ -211,7 +208,7 @@ function BenchTableGroup({
       <tr>
         <td
           colSpan={3}
-          className="text-ink-dim font-mono text-[10px] tracking-[0.2em] uppercase px-4 pt-7 pb-2 font-semibold"
+          className="text-ink-dim font-mono text-[12px] tracking-[0.2em] uppercase px-4 pt-7 pb-2 font-semibold"
         >
           {group.group}
         </td>
@@ -256,10 +253,10 @@ function BenchKpi({
           {unit}
         </span>
       </div>
-      <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase font-medium">
+      <h4 className="text-[12px] tracking-[0.15em] text-ink-dim uppercase font-medium">
         {label}
       </h4>
-      <p className="text-ink-dim text-[11px] leading-[1.6] mt-3 mb-6">{note}</p>
+      <p className="text-ink-dim text-[13px] leading-[1.6] mt-3 mb-6">{note}</p>
     </>
   );
 }

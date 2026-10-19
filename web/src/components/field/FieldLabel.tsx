@@ -1,14 +1,17 @@
 import type { ReactNode } from "react";
 
 /**
- * A sector marking stencilled down the section's right-hand pillar, at
- * every width, so it never sits above a heading. The parent section must
- * be `relative` and keep its right padding clear for it.
+ * A sector marking. On wide screens it is stencilled vertically down the
+ * section's right margin; on phones and tablets it sits flat at the
+ * section's foot, never above a heading. The parent must be `relative`.
  */
 export function FieldLabel({ children }: { children: ReactNode }) {
   return (
-    <div className="stencil absolute right-3 top-24 lg:right-6 lg:top-32 flex items-center gap-3 [writing-mode:vertical-rl]">
-      <span aria-hidden className="inline-block h-6 w-px bg-ink-faint" />
+    <div className="stencil absolute left-6 right-6 bottom-9 !whitespace-normal lg:!whitespace-nowrap lg:left-auto lg:bottom-auto lg:right-4 lg:top-32 flex items-center gap-3 lg:[writing-mode:vertical-rl]">
+      <span
+        aria-hidden
+        className="inline-block h-px w-6 lg:h-6 lg:w-px bg-ink-faint"
+      />
       {children}
     </div>
   );

@@ -48,10 +48,7 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
 
 export function TopologyClassesSection() {
   return (
-    <section
-      id="topology"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="topology" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§02 / topology classes</SectionLabel>
       <DisplayHeading>a new class of system.</DisplayHeading>
 
@@ -76,10 +73,10 @@ export function TopologyClassesSection() {
             >
               {c.title}
             </div>
-            <p className="text-ink-dim text-[14px] leading-[1.6] flex-1">
+            <p className="text-ink-dim text-[16px] leading-[1.55] flex-1">
               {c.body}
             </p>
-            <div className="mt-6 font-mono text-[11px] text-ink-dim space-y-1.5">
+            <div className="mt-6 font-mono text-[13px] text-ink-dim space-y-1.5">
               <div>
                 latency floor:{" "}
                 <b
@@ -98,7 +95,7 @@ export function TopologyClassesSection() {
               </div>
             </div>
             <div
-              className={`${c.headerColor === "accent" ? "text-accent" : "text-ink-dim"} font-mono text-[10px] tracking-[0.18em] uppercase pt-4 mt-5 border-t border-line`}
+              className={`${c.headerColor === "accent" ? "text-accent" : "text-ink-dim"} font-mono text-[12px] tracking-[0.18em] uppercase pt-4 mt-5 border-t border-line`}
             >
               {c.header}
             </div>

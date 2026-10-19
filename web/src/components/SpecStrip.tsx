@@ -42,11 +42,11 @@ export function SpecStrip() {
         <div key={s.label} className="border-t border-line pt-5">
           <div className="font-display font-bold text-[48px] tracking-[-0.035em] text-ink leading-none mb-3 tabular-nums">
             {s.value}
-            <span className="font-mono font-normal text-[12px] tracking-[0.04em] text-ink-dim ml-1.5">
+            <span className="font-mono font-normal text-[13px] tracking-[0.04em] text-ink-dim ml-1.5">
               {s.unit}
             </span>
           </div>
-          <div className="text-[12px] text-ink-dim leading-[1.5] mb-3">
+          <div className="text-[15px] text-ink-dim leading-[1.5] mb-3">
             {s.body}
           </div>
           <div className="stencil normal-case">{s.label}</div>

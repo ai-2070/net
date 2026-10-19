@@ -69,7 +69,7 @@ export function NavBar({ world }: { world?: "field" } = {}) {
 
   if (world === "field") {
     return (
-      <nav className="fixed top-7 left-0 right-0 h-[56px] bg-[rgba(11,12,11,0.86)] backdrop-blur-md border-b border-line flex items-center px-6 lg:px-10 z-[99]">
+      <nav className="fixed top-7 left-0 right-0 h-[56px] bg-[rgba(11,12,11,0.86)] backdrop-blur-md border-b border-line flex items-center px-6 lg:px-12 z-[99]">
         <Link
           href="/"
           className="flex items-baseline gap-3 no-underline"

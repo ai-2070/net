@@ -12,8 +12,8 @@ import globals from "@/lib/globals";
 // field itself: the graph is the shards and threads behind the title.
 function ProximitySlab() {
   return (
-    <div className="slab p-5">
-      <div className="flex justify-between items-center border-b border-line pb-2.5 mb-4 text-[10px] tracking-[0.16em] text-ink-dim uppercase font-mono">
+    <div data-ui className="slab p-5">
+      <div className="flex justify-between items-center border-b border-line pb-2.5 mb-4 text-[12px] tracking-[0.16em] text-ink-dim uppercase font-mono">
         <span className="text-ink">mesh.proximity</span>
         <span className="flex items-center gap-1.5">
           <span className="w-1.5 h-1.5 bg-accent inline-block" />
@@ -41,12 +41,12 @@ function MeshStat({
 }) {
   return (
     <div>
-      <div className="text-ink-dim text-[9.5px] tracking-[0.14em] uppercase mb-1.5 font-mono">
+      <div className="text-ink-dim text-[12px] tracking-[0.14em] uppercase mb-1.5 font-mono">
         {label}
       </div>
       <div className="font-display font-bold text-ink text-[26px] leading-none tabular-nums">
         {value}
-        <span className="font-mono font-normal text-ink-dim text-[10px] ml-1.5 tracking-[0.06em]">
+        <span className="font-mono font-normal text-ink-dim text-[12px] ml-1.5 tracking-[0.06em]">
           {unit}
         </span>
       </div>
@@ -299,15 +299,15 @@ function MeshEventLog() {
   }, []);
 
   return (
-    <div className="slab p-5">
-      <div className="flex justify-between items-center border-b border-line pb-2.5 mb-3.5 text-[10px] tracking-[0.16em] text-ink-dim uppercase font-mono">
+    <div data-ui className="slab p-5">
+      <div className="flex justify-between items-center border-b border-line pb-2.5 mb-3.5 text-[12px] tracking-[0.16em] text-ink-dim uppercase font-mono">
         <span className="text-ink">event.tail</span>
         <span className="flex items-center gap-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
           SIMULATED
         </span>
       </div>
-      <div className="font-mono text-[10.5px] leading-[1.6] overflow-hidden min-h-[136px] -mx-5">
+      <div className="font-mono text-[13px] leading-[1.6] overflow-hidden min-h-[136px] -mx-5">
         {events.map((e) => {
           const bg =
             e.highlight === "accent"
@@ -340,7 +340,7 @@ function MeshEventLog() {
           );
         })}
       </div>
-      <div className="border-t border-line mt-3 pt-2.5 flex justify-between text-[9px] text-ink-dim tracking-[0.14em] uppercase font-mono">
+      <div className="border-t border-line mt-3 pt-2.5 flex justify-between text-[12px] text-ink-dim tracking-[0.14em] uppercase font-mono">
         <span>● 450ms tick</span>
       </div>
     </div>
@@ -357,7 +357,9 @@ export function HeroSection() {
       id="hero"
       className="relative overflow-hidden min-h-[calc(100svh-80px)] flex flex-col"
     >
-      <div className="absolute inset-0">
+      {/* past the content width the field fades out rather than ending
+          on a hard edge */}
+      <div className="absolute inset-0 min-[1500px]:[mask-image:linear-gradient(90deg,transparent,#000_7%,#000_93%,transparent)]">
         <FieldCanvas />
       </div>
       {/* the text side of the hall stays dark enough to read */}
@@ -380,82 +382,94 @@ export function HeroSection() {
         }}
       />
 
-      <div className="relative flex-1 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-12 px-6 lg:px-10 pt-12 lg:pt-14 pb-12">
+      <div className="relative flex-1 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-12 px-6 lg:px-12 pt-12 lg:pt-14 pb-12">
         <div className="flex flex-col">
-          <h1
-            className="font-display font-bold uppercase leading-[0.86] tracking-[-0.04em] text-ink"
-            style={{ fontSize: "clamp(60px, 8.3vw, 132px)" }}
-          >
-            <span className="field-rise" style={{ animationDelay: "0.1s" }}>
-              net.
-            </span>
-            <span
-              className="field-rise text-accent"
-              style={{ animationDelay: "0.24s" }}
+          {/* title, lede and actions sit centred in the hall; the reference
+              line stays on the floor */}
+          <div className="my-auto">
+            <h1
+              className="font-display font-bold uppercase leading-[0.86] tracking-[-0.04em] text-ink"
+              style={{ fontSize: "clamp(50px, 8.3vw, 132px)" }}
             >
-              moves
-            </span>
-            <span className="field-rise" style={{ animationDelay: "0.38s" }}>
-              at light.
-            </span>
-          </h1>
+              <span className="block">
+                <span
+                  className="field-rise !inline-block"
+                  style={{ animationDelay: "0.1s" }}
+                >
+                  net.
+                </span>{" "}
+                <span
+                  className="field-rise !inline-block text-accent"
+                  style={{ animationDelay: "0.24s" }}
+                >
+                  moves
+                </span>
+              </span>
+              <span className="field-rise" style={{ animationDelay: "0.38s" }}>
+                at light.
+              </span>
+            </h1>
 
-          <div className="field-fade" style={{ animationDelay: "0.7s" }}>
-            <p className="text-[20px] md:text-[22px] text-ink mt-9 max-w-[30em] leading-[1.45] font-light">
-              A latency-first encrypted mesh where every computer, app and
-              device is a first-class node. Existing networks operate in
-              milliseconds{" "}
-              <em className="not-italic font-mono text-[0.82em] text-ink-dim">
-                (10⁻³)
-              </em>
-              . NET operates in nanoseconds{" "}
-              <em className="not-italic font-mono text-[0.82em] text-accent">
-                (10⁻⁹)
-              </em>
-              .
-            </p>
+            <div className="field-fade" style={{ animationDelay: "0.7s" }}>
+              <p className="text-[20px] md:text-[22px] text-ink mt-9 max-w-[30em] leading-[1.45] font-light">
+                A latency-first encrypted mesh where every computer, app and
+                device is a first-class node. Existing networks operate in
+                milliseconds{" "}
+                <em className="not-italic font-mono text-[0.82em] text-ink-dim">
+                  (10⁻³)
+                </em>
+                . NET operates in nanoseconds{" "}
+                <em className="not-italic font-mono text-[0.82em] text-accent">
+                  (10⁻⁹)
+                </em>
+                .
+              </p>
 
-            <p className="text-[15px] text-ink-dim mt-6 max-w-[36em] leading-[1.6]">
-              No clients. No servers. No coordinators. The mesh propagates
-              state, not connections.
-            </p>
+              <p className="text-[17px] text-ink mt-6 max-w-[36em] leading-[1.6]">
+                No clients. No servers. No coordinators. The mesh propagates
+                state, not connections.
+              </p>
 
-            <p className="text-[15px] text-ink-dim mt-2 max-w-[36em] leading-[1.6]">
-              Flagship use:{" "}
-              <Link href="/docs/worldview/agentic-mesh" className="link-field">
-                agentic capability federation
-              </Link>{" "}
-              — agents discovering, invoking, and recovering work across a
-              trusted mesh.
-            </p>
+              <p className="text-[17px] text-ink mt-2 max-w-[36em] leading-[1.6]">
+                Flagship use:{" "}
+                <Link
+                  href="/docs/worldview/agentic-mesh"
+                  className="link-field"
+                >
+                  agentic capability federation
+                </Link>{" "}
+                — agents discovering, invoking, and recovering work across a
+                trusted mesh.
+              </p>
 
-            <div className="mt-9 flex gap-4 flex-wrap items-center">
-              <Link href={globals.links.install} className="btn-field">
-                <ArrowDown size={14} weight="bold" aria-hidden />
-                Install NET
-                <ArrowRight size={14} weight="bold" aria-hidden />
-              </Link>
-              <a href="#bench" className="btn-ghost-field">
-                Read benchmarks
-              </a>
-              <a
-                href="#properties"
-                className="inline-flex items-center gap-2 py-3 font-mono text-[11px] tracking-[0.16em] uppercase text-ink-dim hover:text-accent transition-colors"
-              >
-                {"// view spec"}
-                <ArrowDownRight size={13} weight="bold" aria-hidden />
-              </a>
+              <div className="mt-9 flex gap-4 flex-wrap items-center">
+                <Link href={globals.links.install} className="btn-field">
+                  <ArrowDown size={14} weight="bold" aria-hidden />
+                  Install NET
+                  <ArrowRight size={14} weight="bold" aria-hidden />
+                </Link>
+                <a href="#bench" className="btn-ghost-field">
+                  Read benchmarks
+                </a>
+                <a
+                  href="#properties"
+                  className="inline-flex items-center gap-2 py-3 font-mono text-[13px] tracking-[0.16em] uppercase text-ink-dim hover:text-accent transition-colors"
+                >
+                  {"// view spec"}
+                  <ArrowDownRight size={13} weight="bold" aria-hidden />
+                </a>
+              </div>
             </div>
           </div>
 
-          <div className="mt-auto pt-16 stencil flex flex-wrap gap-x-6 gap-y-2 items-center">
+          <div className="pt-12 stencil flex flex-wrap gap-x-6 gap-y-2 items-center">
             <span className="text-ink">RFC-NET-001</span>
             <span>PROTOCOL.0x4E45·54</span>
             <span>REV {rev}</span>
           </div>
         </div>
 
-        <div className="hidden lg:flex flex-col gap-12 self-end pb-2 field-sync">
+        <div className="hidden lg:flex flex-col gap-12 self-center field-sync">
           <div>
             <ProximitySlab />
           </div>

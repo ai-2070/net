@@ -35,7 +35,7 @@ export function DatafortsSection() {
   return (
     <section
       id="dataforts"
-      className="relative overflow-hidden pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+      className="relative overflow-hidden px-6 lg:px-12 py-24 lg:py-32"
     >
       <SectionLabel>§07 / storage // new</SectionLabel>
       <DisplayHeading>
@@ -70,12 +70,12 @@ export function DatafortsSection() {
             <h3 className="font-display font-bold text-[20px] leading-[1.1] text-ink mb-2 tracking-[-0.01em] flex items-center gap-3">
               {c.name}
               {c.isNew ? (
-                <span className="bg-accent text-bg px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-[0.18em]">
+                <span className="bg-accent text-bg px-1.5 py-0.5 font-mono text-[12px] font-bold tracking-[0.18em]">
                   NEW
                 </span>
               ) : null}
             </h3>
-            <p className="text-[14px] text-ink-dim leading-[1.55]">{c.body}</p>
+            <p className="text-[16px] text-ink-dim leading-[1.55]">{c.body}</p>
             <div className="stencil mt-4 normal-case">▸ {c.num}</div>
           </div>
         ))}

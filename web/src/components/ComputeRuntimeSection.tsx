@@ -7,10 +7,7 @@ import { SpecStrip } from "./SpecStrip";
 
 export function ComputeRuntimeSection() {
   return (
-    <section
-      id="runtime"
-      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
-    >
+    <section id="runtime" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§06 / daemon runtime // new</SectionLabel>
       <DisplayHeading>
         compute
@@ -43,7 +40,7 @@ export function ComputeRuntimeSection() {
       <GroupCards />
       <SpecStrip />
 
-      {/*<p className="mt-8 text-[11px] text-ink-dim text-center tracking-[0.05em]">
+      {/*<p className="mt-8 text-[13px] text-ink-dim text-center tracking-[0.05em]">
         // see <span className="text-accent">compute/daemon.rs</span> ·{" "}
         <span className="text-accent">compute/orchestrator.rs</span> ·{" "}
         <span className="text-accent">
