@@ -1,6 +1,7 @@
 import { BlackwallViz } from "./BlackwallViz";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 
 interface BlackwallItem {
   tag: string;
@@ -46,13 +47,13 @@ export function BlackwallSection() {
 
       <BlackwallViz />
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         In Cyberpunk, the Blackwall isn&apos;t a wall around the threats —
         it&apos;s a wall around the safe zone. NET works the same way. The
         &quot;safe mesh&quot; is the part you can observe: nodes that respond
         within heartbeat intervals, honor their capability announcements,
         don&apos;t flood, respect TTL.
-      </p>
+      </Lede>
 
       <p className="text-[19px] md:text-[21px] text-accent max-w-[34em] leading-[1.5] font-light -mt-6 mb-14">
         The wall isn&apos;t one mechanism. It&apos;s the emergent effect of

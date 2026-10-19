@@ -40,7 +40,7 @@ export function FieldHeading({ children }: { children: ReactNode }) {
   return (
     <h2
       ref={ref}
-      className="font-display font-bold uppercase leading-[0.95] tracking-[-0.03em] text-ink mb-10 max-w-[19em] text-balance"
+      className="field-title font-display font-bold uppercase leading-[0.95] tracking-[-0.03em] text-ink mb-10 max-w-[19em] text-balance"
       style={{ fontSize: "clamp(30px, 5.2vw, 80px)" }}
     >
       {phrases.map((phrase, i) => (

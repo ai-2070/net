@@ -1,4 +1,5 @@
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 
 interface BenchRow {
@@ -111,11 +112,11 @@ export function BenchmarksSection() {
       <SectionLabel>§04 / measured numbers</SectionLabel>
       <DisplayHeading>existence proofs.</DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         All numbers measure packet scheduling — the time to process, route,
         encrypt, and queue a packet for transmission. They do not include NIC
         transfer or wire latency.
-      </p>
+      </Lede>
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">
         <div className="slab overflow-x-auto">

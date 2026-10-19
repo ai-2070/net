@@ -1,5 +1,6 @@
 import { DaemonCaseBlock } from "./DaemonCaseBlock";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { GroupCards } from "./GroupCards";
 import { MigrationPipeline } from "./MigrationPipeline";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
@@ -19,7 +20,7 @@ export function ComputeRuntimeSection() {
         </span>
       </DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         A program on NET is called a{" "}
         <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>
         . Its identity is a public key — an{" "}
@@ -33,7 +34,7 @@ export function ComputeRuntimeSection() {
         <strong className="text-ink font-medium">
           When that location goes away, the daemon doesn&apos;t.
         </strong>
-      </p>
+      </Lede>
 
       <DaemonCaseBlock />
       <MigrationPipeline />

@@ -1,5 +1,6 @@
 import { ScarcityMesh } from "./field/ScarcityMesh";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 
 export function WhyNotBestEffortSection() {
@@ -16,11 +17,11 @@ export function WhyNotBestEffortSection() {
           <span className="text-accent">net assumes abundance.</span>
         </DisplayHeading>
 
-        <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+        <Lede>
           TCP was designed when nuclear war was a real possibility. Packets were
           precious. The network had to guarantee delivery because the next
           packet might not get through.
-        </p>
+        </Lede>
 
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-16 gap-y-12 mt-8">
           <div>

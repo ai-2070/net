@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 
 // =========================================================================
 // MeshOS — Atomic Playboys. Self-organizing cluster behavior.
@@ -922,7 +923,7 @@ export function MeshOsSection() {
         </span>
       </DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         Programs move between machines without stopping. Storage autobalances.
         Daemons migrate seamlessly across the mesh while maintaining full state.
         <br />
@@ -934,7 +935,7 @@ export function MeshOsSection() {
         nodes, and drift detection triggers automatic rebalancing. No central
         orchestrator. No single point of failure. Just self-organizing
         coordination at nanosecond scale.
-      </p>
+      </Lede>
 
       <MeshAutoform />
 

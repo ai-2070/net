@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { ArrowDown } from "@phosphor-icons/react";
 import globals from "@/lib/globals";
+import { useHomePath } from "./field/WorldVariant";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/#hero", label: "HOME" },
@@ -24,15 +25,18 @@ const SECTION_IDS: ReadonlyArray<string> = NAV_LINKS.flatMap((l) =>
   l.href.startsWith("/#") ? [l.href.slice(2)] : [],
 );
 
-export function NavBar({ world }: { world?: "field" } = {}) {
+export function NavBar({ world }: { world?: "field" | "v2" } = {}) {
   const pathname = usePathname();
+  const home = useHomePath();
+  const homeHref = (href: string): string =>
+    home !== "/" && href.startsWith("/#") ? `${home}${href.slice(1)}` : href;
   const [activeSection, setActiveSection] = useState<string | null>(null);
 
   // Scroll-spy: track which section is in view, but only on the home page
   // where the hash links resolve. A thin band near the top of the viewport
   // decides the "current" section as the user scrolls.
   useEffect(() => {
-    if (pathname !== "/") {
+    if (pathname !== home) {
       setActiveSection(null);
       return;
     }
@@ -55,17 +59,89 @@ export function NavBar({ world }: { world?: "field" } = {}) {
     );
     sections.forEach((s) => observer.observe(s));
     return () => observer.disconnect();
-  }, [pathname]);
+  }, [pathname, home]);
 
   const isActive = (href: string): boolean => {
     if (href === "/docs") {
       return pathname === "/docs" || pathname.startsWith("/docs/");
     }
     if (href.startsWith("/#")) {
-      return pathname === "/" && activeSection === href.slice(2);
+      return pathname === home && activeSection === href.slice(2);
     }
     return pathname === href;
   };
+
+  if (world === "v2") {
+    return (
+      <nav className="fixed top-7 left-0 right-0 h-[56px] bg-[rgba(11,12,11,0.92)] border-b border-line flex items-center px-6 lg:px-12 z-[99]">
+        <Link
+          href={home}
+          className="flex items-baseline gap-3 no-underline"
+          aria-label="NET home"
+        >
+          <span className="font-display font-bold uppercase text-[24px] leading-none tracking-[-0.02em] text-ink">
+            net
+          </span>
+          <span className="font-mono text-[9px] text-ink-dim tracking-[0.18em] font-semibold">
+            {"// AI 2070"}
+          </span>
+        </Link>
+        <ul className="hidden xl:flex list-none ml-10 items-stretch h-[30px] border border-line divide-x divide-line">
+          {NAV_LINKS.slice(0, 8).map((l, i) => {
+            const active = isActive(l.href);
+            return (
+              <li key={l.href} className="flex">
+                <Link
+                  href={homeHref(l.href)}
+                  aria-current={active ? "page" : undefined}
+                  className={`flex items-center gap-2.5 px-3 font-mono text-[10.5px] tracking-[0.14em] uppercase transition-colors ${
+                    active
+                      ? "bg-ink text-bg"
+                      : "text-ink-dim hover:text-ink hover:bg-[#151915]"
+                  }`}
+                >
+                  {l.label}
+                  <span
+                    className={`tabular-nums ${active ? "text-bg/60" : "text-ink-faint"}`}
+                  >
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                </Link>
+              </li>
+            );
+          })}
+        </ul>
+        <ul className="hidden lg:flex list-none gap-5 ml-auto items-center">
+          {NAV_LINKS.slice(8).map((l) => (
+            <li key={l.href}>
+              <Link
+                href={l.href}
+                className="font-mono text-[10.5px] tracking-[0.16em] uppercase text-ink-dim hover:text-ink transition-colors"
+              >
+                {l.label}
+              </Link>
+            </li>
+          ))}
+          <li>
+            <Link
+              href={globals.links.install}
+              className="btn-field !py-2 !px-3.5 !text-[10.5px]"
+            >
+              <ArrowDown size={12} weight="bold" aria-hidden />
+              INSTALL
+            </Link>
+          </li>
+        </ul>
+        <Link
+          href={globals.links.install}
+          className="lg:hidden ml-auto btn-field !py-2.5 !px-4 !text-[10.5px]"
+        >
+          <ArrowDown size={12} weight="bold" aria-hidden />
+          INSTALL
+        </Link>
+      </nav>
+    );
+  }
 
   if (world === "field") {
     return (

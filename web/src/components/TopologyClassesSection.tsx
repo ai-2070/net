@@ -1,4 +1,5 @@
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { LatencySpectrum } from "./LatencySpectrum";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 
@@ -52,11 +53,11 @@ export function TopologyClassesSection() {
       <SectionLabel>§02 / topology classes</SectionLabel>
       <DisplayHeading>a new class of system.</DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         Existing networking falls into two categories. NET is neither.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 lg:gap-6 lg:items-end lg:pt-6 lg:border-b lg:border-line">
+      <div className="topology-grid grid grid-cols-1 lg:grid-cols-3 gap-5 lg:gap-6 lg:items-end lg:pt-6 lg:border-b lg:border-line">
         {TOPOLOGY_CLASSES.map((c, i) => (
           <div
             key={c.title}

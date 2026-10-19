@@ -1,6 +1,7 @@
 import { useRepoInfo } from "./RepoInfoProvider";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { formatReleaseDate } from "@/lib/utils";
 
 export function ReleasesSection() {
@@ -12,7 +13,7 @@ export function ReleasesSection() {
       <SectionLabel>§13 / releases</SectionLabel>
       <DisplayHeading>net releases.</DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         Every tagged release pulled directly from{" "}
         <a
           href="https://github.com/ai-2070/net/releases"
@@ -23,7 +24,7 @@ export function ReleasesSection() {
           ai-2070/net
         </a>
         .
-      </p>
+      </Lede>
 
       <div className="slab max-h-[640px] overflow-y-auto [mask-image:linear-gradient(180deg,#000_0,#000_calc(100%-88px),transparent_100%)]">
         {releases.map((r, i) => (

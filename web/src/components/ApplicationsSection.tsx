@@ -2,6 +2,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 
 interface AppCard {
   tag: string;
@@ -82,10 +83,10 @@ export function ApplicationsSection() {
         can&apos;t wait.
       </DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         Anywhere latency matters. Anywhere the cloud round-trip is too slow.
         Anywhere there&apos;s no central infrastructure to route through.
-      </p>
+      </Lede>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-5 lg:gap-6">
         {APPS.map((a) => {

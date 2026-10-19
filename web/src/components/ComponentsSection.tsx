@@ -1,5 +1,10 @@
+"use client";
+
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
+import { IsoDiagram, type IsoFigure } from "./field/IsoDiagram";
+import { useWorldVariant } from "./field/WorldVariant";
 
 interface ComponentSpec {
   num: string;
@@ -78,7 +83,15 @@ const COMPONENTS: readonly ComponentSpec[] = [
   },
 ];
 
+const COMPONENT_FIGURES: ReadonlyArray<IsoFigure> = [
+  "nrpc",
+  "redex",
+  "cortex",
+  "netdb",
+];
+
 export function ComponentsSection() {
+  const variant = useWorldVariant();
   return (
     <section id="components" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§09 / components on the mesh</SectionLabel>
@@ -88,15 +101,21 @@ export function ComponentsSection() {
         one mesh.
       </DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         The mesh moves bytes. Everything above is a thin, optional layer —
         local-first, feature-flagged, opt-in. Light up the ones you need; the
         wire doesn&apos;t care which.
-      </p>
+      </Lede>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6">
-        {COMPONENTS.map((c) => (
+        {COMPONENTS.map((c, i) => (
           <div key={c.name} className="slab slab-lift p-7 flex flex-col">
+            {variant !== "v1" && COMPONENT_FIGURES[i] ? (
+              <IsoDiagram
+                figure={COMPONENT_FIGURES[i]}
+                className="-mx-2 mb-6"
+              />
+            ) : null}
             <h3 className="font-display font-bold text-[25px] leading-[1.05] text-ink mb-2 tracking-[-0.015em]">
               {c.name}
             </h3>

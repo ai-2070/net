@@ -1,6 +1,7 @@
 import { FooterColumn } from "./FooterColumn";
 import globals from "@/lib/globals";
 import fieldCredits from "@/lib/field-credits.json";
+import { useHomeHref } from "./field/WorldVariant";
 
 const FOOTER_SPEC: ReadonlyArray<{
   href: string;
@@ -128,6 +129,8 @@ export function Footer({ world }: { world?: "field" } = {}) {
 // Landing-page footer: the floor of the hall. A long monolith edge, then
 // the directory cast into it.
 function FieldFooter() {
+  const homeHref = useHomeHref();
+  const spec = FOOTER_SPEC.map((it) => ({ ...it, href: homeHref(it.href) }));
   return (
     <footer className="relative px-6 lg:px-12 pt-10 pb-8">
       <div aria-hidden className="h-px bg-line -mx-6 lg:-mx-12 mb-16" />
@@ -146,7 +149,7 @@ function FieldFooter() {
             compute.
           </p>
         </div>
-        <FooterColumn title="Spec" items={FOOTER_SPEC} world="field" />
+        <FooterColumn title="Spec" items={spec} world="field" />
         <FooterColumn title="Docs" items={FOOTER_DOCS} world="field" />
         <FooterColumn
           title="Resources"

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 
 interface InstallCard {
   lang: string;
@@ -68,10 +69,10 @@ export function InstallSection() {
         one engine.
       </DisplayHeading>
 
-      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+      <Lede>
         All SDKs wrap the same Rust core. The SDK is the developer experience,
         the engine is Rust.
-      </p>
+      </Lede>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6 mt-5">
         {INSTALL_CARDS.map((c) => {
