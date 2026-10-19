@@ -77,7 +77,7 @@ No API changes. One behaviour change in `@net-mesh/browser`: after a stream's `c
 
 ---
 
-Released 2026-10-18.
+Released 2026-10-19.
 
 ## License
 
