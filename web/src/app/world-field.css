@@ -665,62 +665,62 @@
 }
 
 /* ════════════════════════════════════════════════════════════════════
-   V2: LAB NOTEBOOK (/v2)
+   LAB NOTEBOOK
    The same world set as a technical paper: the page is a ruled frame,
    panels are cells sharing hairlines, every cell carries a figure label,
-   and nothing floats. Scoped to `.world-v2`.
+   and nothing floats. Scoped to `.world-notebook`.
    ════════════════════════════════════════════════════════════════════ */
-.world-v2 {
+.world-notebook {
   counter-reset: fig;
 }
 /* every section is its own ruled box, separated from the next by open
    ground, aligned to the nav's content edges */
-.world-v2 main > section {
+.world-notebook main > section {
   border: 1px solid var(--color-line);
   margin-inline: 12px;
 }
-.world-v2 main > section + section,
-.world-v2 main > section + footer {
+.world-notebook main > section + section,
+.world-notebook main > section + footer {
   margin-top: 72px;
 }
 /* the hero is not a box either: it is the open hall the page opens on */
-.world-v2 main > section#hero {
+.world-notebook main > section#hero {
   border: 0;
   margin-inline: 0 !important;
 }
 /* the footer is not a box: a full-bleed band of its own tone, set apart
    from the last section by open ground */
-.world-v2 main > footer {
+.world-notebook main > footer {
   background: #121412;
   box-shadow: 0 0 0 100vmax #121412;
   clip-path: inset(0 -100vmax -100vmax);
   padding-top: 80px !important;
 }
-.world-v2 main > footer > div[aria-hidden]:first-child {
+.world-notebook main > footer > div[aria-hidden]:first-child {
   display: none;
 }
 @media (width >= 64rem) {
-  .world-v2 main > section {
+  .world-notebook main > section {
     margin-inline: 24px;
   }
-  .world-v2 main > section + section,
-  .world-v2 main > section + footer {
+  .world-notebook main > section + section,
+  .world-notebook main > section + footer {
     margin-top: 120px;
   }
 }
 
 /* titles: the lead phrase bright, the continuation grey, at paper scale */
-.world-v2 h2.field-title {
+.world-notebook h2.field-title {
   font-size: clamp(30px, 3.9vw, 58px) !important;
 }
-.world-v2 h2.field-title .text-accent {
+.world-notebook h2.field-title .text-accent {
   color: var(--color-ink-dim);
 }
 
 /* cells: grids of panels share hairlines instead of floating apart */
 /* only grids made entirely of panels become cells; a grid that mixes a
    panel with plain text (the daemon explainer) stays open */
-.world-v2
+.world-notebook
   :is(.grid, ol):has(> .slab, > .field-wave > .slab):not(
     :has(> :not(.slab, .field-wave))
   ) {
@@ -728,28 +728,28 @@
   background-color: var(--color-line);
   border: 1px solid var(--color-line);
 }
-.world-v2
+.world-notebook
   :is(.grid, ol):has(> .slab, > .field-wave > .slab):not(
     :has(> :not(.slab, .field-wave))
   )
   > .slab,
-.world-v2 :is(.grid, ol) > .field-wave > .slab {
+.world-notebook :is(.grid, ol) > .field-wave > .slab {
   border: 0;
   box-shadow: none;
   height: 100%;
 }
-.world-v2 .slab {
+.world-notebook .slab {
   box-shadow: none !important;
   background-image: none;
 }
 
 /* figure labels replace the corner ticks: FIG. 1, FIG. 2 … in reading
    order (interface fragments keep their own header instead) */
-.world-v2 .slab:not([data-ui]) {
+.world-notebook .slab:not([data-ui]) {
   counter-increment: fig;
   padding-top: 2.75rem !important;
 }
-.world-v2 .slab:not([data-ui])::before {
+.world-notebook .slab:not([data-ui])::before {
   content: "FIG. " counter(fig);
   inset: auto;
   top: 14px;
@@ -761,68 +761,37 @@
   letter-spacing: 0.18em;
   color: var(--color-ink-faint);
 }
-.world-v2 .slab[data-ui]::before {
+.world-notebook .slab[data-ui]::before {
   display: none;
 }
 
 /* nothing floats in the notebook: altitude and waves are retired here,
    hover is a tone step */
-.world-v2 .field-wave,
-.world-v2 .field-sync {
+.world-notebook .field-wave,
+.world-notebook .field-sync {
   animation: none !important;
 }
-.world-v2 .topology-grid {
+.world-notebook .topology-grid {
   align-items: stretch !important;
   padding-top: 0 !important;
   border-bottom: 0 !important;
 }
-.world-v2 .topology-grid > * {
+.world-notebook .topology-grid > * {
   margin-bottom: 0 !important;
 }
-.world-v2 .slab-lift:hover,
-.world-v2 .slab-lift:focus-within {
+.world-notebook .slab-lift:hover,
+.world-notebook .slab-lift:focus-within {
   transform: none !important;
   box-shadow: none !important;
   background-color: #121612;
 }
-.world-v2 .slab-lift::after {
+.world-notebook .slab-lift::after {
   left: 0;
   right: 0;
 }
 
 /* migration in the notebook: the phases are cells, and the rail runs
    along their top edge instead of floating above them */
-.world-v2 ol.list-none:has(> .migration-phase) {
+.world-notebook ol.list-none:has(> .migration-phase) {
   padding-top: 0 !important;
-}
-
-/* ════════════════════════════════════════════════════════════════════
-   V3 (/v3): the /v2 notebook in the master homepage's type. Titles in
-   Major Mono Display as written (natural case, its single weight), and
-   every other line in JetBrains Mono.
-   ════════════════════════════════════════════════════════════════════ */
-.world-v3 {
-  --font-display: var(--font-major-mono-display), "JetBrains Mono", monospace;
-  --font-head: var(--font-major-mono-display), "JetBrains Mono", monospace;
-  --font-sans:
-    var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.world-v3 .font-display,
-.world-v3 .font-head {
-  font-weight: 400 !important;
-  text-transform: none !important;
-  letter-spacing: -0.01em !important;
-}
-/* card and figure titles were lower-case on master (section titles and
-   the hero keep their written case) */
-.world-v3 .font-display:not(h1, h2, h1 *, h2 *) {
-  text-transform: lowercase !important;
-}
-.world-v3 #hero h1 {
-  font-size: clamp(44px, 6.6vw, 104px) !important;
-  line-height: 0.95 !important;
-}
-.world-v3 h2.field-title {
-  font-size: clamp(28px, 3.4vw, 50px) !important;
-  line-height: 1.05 !important;
 }

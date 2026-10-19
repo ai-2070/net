@@ -4,7 +4,6 @@ import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 import { Lede } from "./field/Lede";
 import { IsoDiagram, type IsoFigure } from "./field/IsoDiagram";
-import { useWorldVariant } from "./field/WorldVariant";
 import { DatafortsConsole } from "./DatafortsConsole";
 
 const CAPABILITY_STRIP: ReadonlyArray<{
@@ -44,7 +43,6 @@ const STORAGE_FIGURES: ReadonlyArray<IsoFigure> = [
 ];
 
 export function DatafortsSection() {
-  const variant = useWorldVariant();
   return (
     <section
       id="dataforts"
@@ -80,7 +78,7 @@ export function DatafortsSection() {
       <div className="mt-20 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-10">
         {CAPABILITY_STRIP.map((c, i) => (
           <div key={c.name} className="border-t border-line pt-5">
-            {variant !== "v1" && STORAGE_FIGURES[i] ? (
+            {STORAGE_FIGURES[i] ? (
               <IsoDiagram figure={STORAGE_FIGURES[i]} className="mb-5" />
             ) : null}
             <h3 className="font-display font-bold text-[20px] leading-[1.1] text-ink mb-2 tracking-[-0.01em] flex items-center gap-3">

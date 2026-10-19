@@ -3,8 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { SectionLabel } from "../SectionLabel";
-import { HudCorners, usePrefersReducedMotion } from "./GamesHero";
+import { usePrefersReducedMotion } from "./GamesHero";
 
 // Where Rose & Blade is served. NEXT_PUBLIC_DEMO_URL overrides it at build
 // time, e.g. to try a local copy of the game.
@@ -47,7 +46,7 @@ export function GamesDemoSection() {
   return (
     <section
       id="demo"
-      className="relative overflow-hidden border-b border-line min-h-[calc(100svh-80px)] flex flex-col bg-[#0b0907] scroll-mt-20"
+      className="relative overflow-hidden min-h-[calc(100svh-80px)] flex flex-col bg-[#0b0907] scroll-mt-28"
     >
       <DemoAttract />
     </section>
@@ -180,8 +179,7 @@ function useTouchOnly(): boolean {
   );
 }
 
-const PRIMARY_BTN =
-  "btn-primary game-btn inline-flex items-center gap-2.5 px-8 py-4 text-[13px] tracking-[0.16em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all";
+const PRIMARY_BTN = "btn-field";
 
 // On a computer: open the game. On a phone, where it can't run: send the
 // link on (the share sheet, or the clipboard) to open later on a computer.
@@ -236,12 +234,11 @@ function DemoAttract() {
   return (
     <>
       <DemoBackdrop />
-      <HudCorners className="inset-6" />
 
       {/* top HUD */}
-      <div className="relative flex justify-between items-start w-full max-w-[1440px] mx-auto px-10 pt-10 text-[10px] tracking-[0.16em] uppercase">
+      <div className="relative flex justify-between items-start w-full px-6 lg:px-12 pt-10 stencil">
         <div>
-          <SectionLabel>§02 / play it</SectionLabel>
+          <div className="text-ink mb-1.5">§02 / play it</div>
           <div className="text-ink-dim">demo // co-op + pvp</div>
         </div>
         <div className="text-right text-ink-dim hidden sm:block">
@@ -255,7 +252,7 @@ function DemoAttract() {
       </div>
 
       {/* about the game, in the game's own type */}
-      <div className="relative flex-1 flex flex-col items-center justify-center text-center px-6 pt-4 pb-12 w-full max-w-[1440px] mx-auto [text-shadow:0_1px_12px_rgba(0,0,0,0.85)]">
+      <div className="relative flex-1 flex flex-col items-center justify-center text-center px-6 pt-4 pb-12 w-full [text-shadow:0_1px_12px_rgba(0,0,0,0.85)]">
         <Image
           src="/games/rose-and-blade-emblem.webp"
           alt=""
@@ -300,7 +297,7 @@ function DemoAttract() {
               className="border border-[#3b3122] bg-[#14110c]/80 backdrop-blur-sm p-5 transition-colors hover:border-[#c9a54e]/60"
             >
               <div
-                className={`${RB_DISPLAY} text-[11px] tracking-[0.18em] uppercase text-[#c9a54e] mb-2`}
+                className={`${RB_DISPLAY} text-[12px] tracking-[0.18em] uppercase text-[#c9a54e] mb-2`}
               >
                 {m.tag}
               </div>
@@ -320,14 +317,11 @@ function DemoAttract() {
 
         <div className="flex gap-3 flex-wrap justify-center">
           <PlayButton />
-          <Link
-            href="/docs/sdk/browser/quickstart"
-            className="btn-ghost inline-flex items-center gap-2.5 px-8 py-4 text-[13px] tracking-[0.16em] uppercase font-semibold no-underline border border-ink-faint text-ink bg-bg/40 transition-all"
-          >
+          <Link href="/docs/sdk/browser/quickstart" className="btn-ghost-field">
             Build your own <span className="text-sm">→</span>
           </Link>
         </div>
-        <p className="mt-5 text-[11px] tracking-[0.1em] text-ink-dim">
+        <p className="mt-6 text-[13px] leading-[1.6] tracking-[0.04em] text-ink-dim max-w-[52em]">
           Plays on a computer or laptop, with a mouse and keyboard or a
           controller (not on phones). For multiplayer, open it in two browsers
           or send it to a friend.
@@ -336,25 +330,25 @@ function DemoAttract() {
 
       {/* bottom HUD: what NET does in it */}
       <div className="relative border-t border-line bg-bg/80 backdrop-blur-md">
-        <div className="max-w-[1440px] mx-auto px-6 pt-3 text-[10px] tracking-[0.16em] uppercase text-accent">
+        <div className="px-6 lg:px-12 pt-4 stencil !text-accent">
           ▸ the multiplayer // net
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 max-w-[1440px] mx-auto">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:px-6">
           {NET_FACTS.map((f) => (
             <div
               key={f.label}
               className="px-6 py-4 border-r border-line last:border-r-0 [&:nth-child(2)]:max-md:border-r-0 max-md:[&:nth-child(-n+2)]:border-b"
             >
-              <div className="font-sans text-accent text-[22px] font-semibold leading-none">
+              <div className="font-display font-bold text-accent text-[26px] tracking-[-0.02em] leading-none">
                 {f.value}
               </div>
-              <div className="text-[10px] tracking-[0.12em] uppercase text-ink-dim mt-1.5">
+              <div className="text-[12px] tracking-[0.12em] uppercase text-ink-dim mt-1.5">
                 {f.label}
               </div>
             </div>
           ))}
         </div>
-        <div className="max-w-[1440px] mx-auto px-6 py-2 border-t border-line text-[10px] tracking-[0.14em] uppercase text-ink-dim hidden md:flex justify-between">
+        <div className="px-6 lg:px-12 py-3 border-t border-line font-mono text-[12px] tracking-[0.14em] uppercase text-ink-dim hidden md:flex justify-between gap-6">
           <span>
             wasd move · hold a mouse button + drag to swing · scroll to thrust ·
             esc pause

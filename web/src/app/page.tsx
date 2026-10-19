@@ -23,7 +23,7 @@ import { PageContainer } from "@/components/PageContainer";
 
 export default function Home(): JSX.Element {
   return (
-    <PageContainer className="world-field field-grain">
+    <PageContainer className="world-field world-notebook field-grain">
       <NavBar world="field" />
       <main className="pt-[84px] max-w-[1440px] mx-auto">
         {/*<SeedBanner />*/}

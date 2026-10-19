@@ -3,7 +3,6 @@ import { Cinzel, EB_Garamond } from "next/font/google";
 import { JSX } from "react";
 import { NavBar } from "@/components/NavBar";
 import { PageContainer } from "@/components/PageContainer";
-import { FooterDivider } from "@/components/FooterDivider";
 import { Footer } from "@/components/Footer";
 import { GamesHero } from "@/components/games/GamesHero";
 import { GamesDemoSection } from "@/components/games/GamesDemo";
@@ -42,28 +41,25 @@ export const metadata: Metadata = {
 
 export default function GamesPage(): JSX.Element {
   return (
-    <PageContainer>
-      <NavBar />
-      {/* Hero and demo run edge to edge; everything else keeps the site's
-          1440px column (their inner content aligns to the same column). */}
-      <main className={`pt-20 ${rbDisplay.variable} ${rbBody.variable}`}>
+    <PageContainer className="world-field world-notebook field-grain">
+      <NavBar world="field" />
+      {/* The same notebook as the landing page: each section is its own
+          ruled box, the hero is the open hall, the footer its own band. */}
+      <main
+        className={`pt-[84px] max-w-[1440px] mx-auto ${rbDisplay.variable} ${rbBody.variable}`}
+      >
         <GamesHero />
-        <div className="max-w-[1440px] mx-auto">
-          <GamesSpeedSection />
-        </div>
+        <GamesSpeedSection />
         <GamesDemoSection />
-        <div className="max-w-[1440px] mx-auto">
-          <GamesStarterSection />
-          <GamesModesSection />
-          <GamesShardsSection />
-          <GamesCodeSection />
-          <GamesEnginesSection />
-          <GamesAiSection />
-          <GamesPropsSection />
-          <GamesOpenSection />
-          <FooterDivider />
-          <Footer />
-        </div>
+        <GamesStarterSection />
+        <GamesModesSection />
+        <GamesShardsSection />
+        <GamesCodeSection />
+        <GamesEnginesSection />
+        <GamesAiSection />
+        <GamesPropsSection />
+        <GamesOpenSection />
+        <Footer world="field" />
       </main>
     </PageContainer>
   );

@@ -1,20 +1,16 @@
 "use client";
 
 import { Children, Fragment, type ReactNode } from "react";
-import { useWorldVariant } from "./WorldVariant";
 
 const LEDE =
   "text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14";
 
 /**
- * A section's opening paragraph. In v2 its first sentence is set bright and
+ * A section's opening paragraph. Its first sentence is set bright and
  * medium, and the rest continues in grey ("Compute. Find reliable…"). The
  * words are never changed; only the weight and colour of the lead differ.
  */
 export function Lede({ children }: { children: ReactNode }) {
-  const variant = useWorldVariant();
-  if (variant === "v1") return <p className={LEDE}>{children}</p>;
-
   const lead: ReactNode[] = [];
   const rest: ReactNode[] = [];
   let split = false;

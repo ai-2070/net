@@ -355,10 +355,14 @@ export function GamesHero() {
   return (
     <section
       id="hero"
-      className="relative overflow-hidden border-b border-line min-h-[calc(100svh-80px)] flex flex-col"
+      className="relative min-h-[calc(100svh-80px)] flex flex-col"
     >
-      {/* background reel */}
-      <div className="absolute inset-0" aria-hidden>
+      {/* background reel: a small networked match across the full width of
+          the window, wider than the content column it sits behind */}
+      <div
+        className="absolute inset-y-0 left-1/2 w-screen -translate-x-1/2 overflow-hidden"
+        aria-hidden
+      >
         {reelOn && reelShown ? null : <ReelCanvas />}
         {reelOn ? (
           <video
@@ -379,79 +383,91 @@ export function GamesHero() {
             }}
           />
         ) : null}
-        {/* legibility: darken left + bottom, keep the action visible on the right */}
-        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(10,12,10,0.94)_0%,rgba(10,12,10,0.78)_38%,rgba(10,12,10,0.25)_75%,rgba(10,12,10,0.4)_100%)]" />
-        <div className="absolute inset-x-0 bottom-0 h-40 bg-[linear-gradient(0deg,#0a0c0a,transparent)]" />
-        <div className="absolute inset-0 hero-scanlines pointer-events-none" />
       </div>
+      {/* the text side of the hall stays dark enough to read. The shade is
+          anchored to the content column's left edge (L), so on wide windows
+          the text keeps the same backing while the match runs to both sides */}
+      <div
+        aria-hidden
+        className="absolute inset-y-0 left-1/2 w-screen -translate-x-1/2 pointer-events-none"
+        style={{
+          background:
+            "linear-gradient(90deg, rgba(11,12,11,0.9) 0%, rgba(11,12,11,0.94) max(0px, 50% - 720px), rgba(11,12,11,0.82) calc(max(0px, 50% - 720px) + min(30%, 432px)), rgba(11,12,11,0.2) calc(max(0px, 50% - 720px) + min(58%, 835px)), rgba(11,12,11,0) calc(max(0px, 50% - 720px) + min(72%, 1037px))), linear-gradient(0deg, rgba(11,12,11,1) 0%, rgba(11,12,11,0) 22%)",
+        }}
+      />
+      {/* phones: the match sits behind every line of text, so dim it more */}
+      <div
+        aria-hidden
+        className="absolute inset-y-0 left-1/2 w-screen -translate-x-1/2 pointer-events-none lg:hidden"
+        style={{
+          background:
+            "linear-gradient(180deg, rgba(11,12,11,0.15) 0%, rgba(11,12,11,0.72) 34%, rgba(11,12,11,0.8) 100%)",
+        }}
+      />
 
-      {/* HUD corners */}
-      <HudCorners />
+      <div className="relative flex-1 flex flex-col px-6 lg:px-12 pt-12 lg:pt-14 pb-12">
+        <div className="my-auto">
+          <div
+            className="field-fade font-mono text-[12px] tracking-[0.16em] mb-8 flex flex-wrap gap-3 items-center"
+            style={{ animationDelay: "0.05s" }}
+          >
+            <span className="text-bg bg-accent px-2 py-1 font-bold">NEW</span>
+            <span className="text-accent border border-accent-dim px-2 py-1">
+              PLUG AND PLAY FOR THREE.JS
+            </span>
+          </div>
 
-      <div className="relative flex-1 flex flex-col justify-center w-full max-w-[1440px] mx-auto px-6 pt-12 pb-10">
-        <div className="text-[10px] tracking-[0.15em] mb-7 flex flex-wrap gap-3 items-center">
-          <span className="text-bg bg-accent px-2 py-[3px] font-semibold">
-            NEW
-          </span>
-          <span className="text-accent border border-accent-dim px-2 py-[3px]">
-            PLUG AND PLAY FOR THREE.JS
-          </span>
+          <h1
+            className="font-display font-bold uppercase leading-[0.86] tracking-[-0.04em] text-ink"
+            style={{ fontSize: "clamp(50px, 8.3vw, 132px)" }}
+          >
+            <span
+              className="field-rise block"
+              style={{ animationDelay: "0.1s" }}
+            >
+              your game.
+            </span>
+            <span
+              className="field-rise block text-accent"
+              style={{ animationDelay: "0.24s" }}
+            >
+              no server.
+            </span>
+          </h1>
+
+          <div className="field-fade" style={{ animationDelay: "0.6s" }}>
+            <p className="text-[20px] md:text-[22px] text-ink mt-9 max-w-[30em] leading-[1.45] font-light">
+              Plug and play support for Three.js: turn any Three.js game into a
+              multiplayer game, a co-op game, or an MMO.
+            </p>
+
+            <p className="text-[17px] text-ink-dim mt-6 max-w-[36em] leading-[1.6]">
+              Players connect straight to each other whenever the network
+              allows. There is no game server running the match. Free and open
+              source.
+            </p>
+
+            <div className="mt-9 flex gap-4 flex-wrap items-center">
+              <a href="#demo" className="btn-field">
+                ▶ See the demos
+              </a>
+              <Link
+                href="/docs/sdk/browser/quickstart"
+                className="btn-ghost-field"
+              >
+                Start building <span className="text-sm">→</span>
+              </Link>
+            </div>
+          </div>
         </div>
 
-        <h1
-          className="font-display leading-[0.9] tracking-[-0.02em] text-ink mb-6"
-          style={{ fontSize: "clamp(48px, 7.4vw, 112px)" }}
-        >
-          your game.
-          <br />
-          <span className="text-accent game-glow">no server.</span>
-        </h1>
-
-        <p className="font-sans text-[20px] md:text-[22px] text-ink max-w-[620px] leading-[1.45]">
-          Plug and play support for Three.js: turn any Three.js game into a
-          multiplayer game, a co-op game, or an MMO.
-        </p>
-
-        <p className="font-sans text-[15px] text-ink-dim mt-4 max-w-[580px] leading-[1.6]">
-          Players connect straight to each other whenever the network allows.
-          There is no game server running the match. Free and open source.
-        </p>
-
-        <div className="mt-8 flex gap-3 flex-wrap items-center">
-          <a
-            href="#demo"
-            className="btn-primary game-btn inline-flex items-center gap-2.5 px-6 py-3.5 text-[12px] tracking-[0.14em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
-          >
-            ▶ See the demos
-          </a>
-          <Link
-            href="/docs/sdk/browser/quickstart"
-            className="btn-ghost inline-flex items-center gap-2.5 px-6 py-3.5 text-[12px] tracking-[0.14em] uppercase font-semibold no-underline border border-ink-faint bg-bg/60 backdrop-blur-sm text-ink transition-all"
-          >
-            Start building <span className="text-sm">→</span>
-          </Link>
+        <div className="pt-12 stencil flex flex-wrap gap-x-6 gap-y-2 items-center">
+          <span className="flex items-center gap-2">
+            <span className="w-1.5 h-1.5 bg-accent inline-block animate-pulse-dot" />
+            {showReel ? "gameplay reel" : "preview render"}
+          </span>
         </div>
-      </div>
-
-      <div className="absolute top-5 right-6 hidden md:flex items-center gap-2 text-[10px] tracking-[0.14em] uppercase text-ink-dim">
-        <span className="w-1.5 h-1.5 rounded-full bg-warn inline-block animate-pulse-dot" />
-        {showReel ? "gameplay reel" : "preview render"}
       </div>
     </section>
-  );
-}
-
-export function HudCorners({ className = "" }: { className?: string }) {
-  const c = "absolute w-5 h-5 border-accent pointer-events-none";
-  return (
-    <div
-      className={`absolute inset-3 pointer-events-none ${className}`}
-      aria-hidden
-    >
-      <span className={`${c} top-0 left-0 border-t-2 border-l-2`} />
-      <span className={`${c} top-0 right-0 border-t-2 border-r-2`} />
-      <span className={`${c} bottom-0 left-0 border-b-2 border-l-2`} />
-      <span className={`${c} bottom-0 right-0 border-b-2 border-r-2`} />
-    </div>
   );
 }

@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { SectionLabel } from "../SectionLabel";
-import { DisplayHeading } from "../DisplayHeading";
+import { FieldLabel as SectionLabel } from "../field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "../field/FieldHeading";
+import { Lede } from "../field/Lede";
 import { CopyButton } from "../CopyButton";
 import globals from "@/lib/globals";
 
@@ -39,7 +40,7 @@ const SPEED: ReadonlyArray<SpeedStat> = [
 
 export function GamesSpeedSection() {
   return (
-    <section id="speed" className="border-b border-line px-6 py-20">
+    <section id="speed" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§01 / speed</SectionLabel>
       <DisplayHeading>
         natively fast.
@@ -47,31 +48,26 @@ export function GamesSpeedSection() {
         <span className="text-accent">forget the network.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
+      <Lede>
         Most online games send every move to a server somewhere and wait for the
         answer. With NET, you see your own moves right away, and players link
         directly to each other whenever the network allows. No game server runs
         the match.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 lg:gap-6">
         {SPEED.map((s) => (
-          <div
-            key={s.title}
-            className="game-card relative border border-line bg-bg-2 p-7 transition-colors hover:border-accent-dim group"
-          >
-            <div className="font-sans text-accent font-semibold leading-none tabular-nums text-[56px] group-hover:game-glow">
+          <div key={s.title} className="slab slab-lift p-7">
+            <div className="font-display font-bold text-accent leading-none tabular-nums text-[56px] tracking-[-0.035em]">
               {s.value}
-              <span className="text-ink-dim text-[14px] font-mono font-normal ml-2 uppercase tracking-[0.1em]">
+              <span className="text-ink-dim text-[13px] font-mono font-normal ml-2 uppercase tracking-[0.1em]">
                 {s.unit}
               </span>
             </div>
-            <div className="text-[11px] tracking-[0.16em] uppercase text-ink mt-4 mb-2 font-semibold">
+            <div className="text-[12px] tracking-[0.16em] uppercase text-ink mt-4 mb-2 font-semibold">
               {s.title}
             </div>
-            <p className="font-sans text-ink-dim text-[14px] leading-[1.55]">
-              {s.body}
-            </p>
+            <p className="text-ink-dim text-[15px] leading-[1.6]">{s.body}</p>
           </div>
         ))}
       </div>
@@ -119,7 +115,10 @@ const MODES: ReadonlyArray<Mode> = [
 
 export function GamesModesSection() {
   return (
-    <section id="modes" className="bg-bg-2 border-b border-line px-6 py-20">
+    <section
+      id="modes"
+      className="bg-bg-2 relative px-6 lg:px-12 py-24 lg:py-32"
+    >
       <SectionLabel>§04 / game modes</SectionLabel>
       <DisplayHeading>
         couch co-op
@@ -127,35 +126,32 @@ export function GamesModesSection() {
         to <span className="text-accent">open world.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
+      <Lede>
         One package covers all three. Pick a mode and bring your own gameplay.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 lg:gap-6">
         {MODES.map((m) => (
-          <div
-            key={m.title}
-            className="game-card relative border border-line p-8 bg-bg transition-colors hover:border-accent-dim flex flex-col"
-          >
+          <div key={m.title} className="slab slab-lift p-8 flex flex-col">
             <div className="flex items-baseline justify-between mb-6">
-              <span className="font-display text-[44px] leading-none text-ink-faint">
+              <span className="font-display font-bold text-[44px] leading-none text-ink-faint tabular-nums">
                 {m.tag}
               </span>
-              <span className="text-[10px] tracking-[0.14em] uppercase text-bg bg-accent px-2 py-1 font-semibold">
+              <span className="text-[12px] tracking-[0.14em] uppercase text-bg bg-accent px-2 py-1 font-semibold">
                 {m.players}
               </span>
             </div>
-            <h3 className="font-sans text-[28px] font-semibold leading-tight mb-3 text-ink">
+            <h3 className="font-display font-bold tracking-[-0.015em] text-[28px] leading-[1.05] mb-3 text-ink">
               {m.title}
             </h3>
-            <p className="font-sans text-ink-dim text-[15px] leading-[1.6] mb-6 flex-1">
+            <p className="text-ink-dim text-[15px] leading-[1.6] mb-6 flex-1">
               {m.body}
             </p>
             <div className="flex flex-wrap gap-1.5 mb-6">
               {m.apis.map((a) => (
                 <span
                   key={a}
-                  className="text-[10px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono"
+                  className="text-[12px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono"
                 >
                   {a}
                 </span>
@@ -163,7 +159,7 @@ export function GamesModesSection() {
             </div>
             <Link
               href={m.href}
-              className="text-[11px] tracking-[0.12em] uppercase text-ink hover:text-accent transition-colors"
+              className="self-start font-mono text-[12px] tracking-[0.16em] uppercase text-ink hover:text-accent transition-colors"
             >
               how it works →
             </Link>
@@ -203,7 +199,7 @@ const SHARD_STATS: ReadonlyArray<{ value: string; label: string }> = [
 
 export function GamesShardsSection() {
   return (
-    <section id="hosts" className="border-b border-line px-6 py-20">
+    <section id="hosts" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§05 / many hosts</SectionLabel>
       <DisplayHeading>
         one match.
@@ -211,16 +207,16 @@ export function GamesShardsSection() {
         <span className="text-accent">many hosts.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[760px] leading-[1.55] mb-12">
+      <Lede>
         One player doesn&apos;t have to carry the whole match. NET can split it
         across several hosts in the same game, each running its own part, so no
         single page does all the work.
-      </p>
+      </Lede>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_1fr] gap-10 items-start">
-        <figure className="game-card border border-line bg-[#050706] p-5 m-0">
+        <figure className="slab p-5 m-0">
           <ShardDiagram />
-          <figcaption className="font-sans text-[14px] text-ink-dim leading-[1.6] mt-4 border-t border-line pt-4">
+          <figcaption className="font-sans text-[15px] text-ink-dim leading-[1.6] mt-4 border-t border-line pt-4">
             You fight three enemies. Another player fights three more, 50 m
             away. Each of you hosts your own fight and runs its AI. Your page
             doesn&apos;t run the far fight: it just draws what the other host
@@ -231,14 +227,14 @@ export function GamesShardsSection() {
         <div className="flex flex-col gap-6">
           {SHARD_POINTS.map((p, i) => (
             <div key={p.title} className="flex gap-5">
-              <span className="font-display text-[28px] text-accent leading-none w-8 shrink-0">
+              <span className="font-display font-bold text-[28px] text-accent leading-none w-8 shrink-0 tabular-nums">
                 {i + 1}
               </span>
               <div>
-                <h3 className="font-sans text-[18px] font-semibold text-ink mb-1.5">
+                <h3 className="font-display font-bold tracking-[-0.015em] text-[21px] leading-[1.15] text-ink mb-1.5">
                   {p.title}
                 </h3>
-                <p className="font-sans text-ink-dim text-[15px] leading-[1.6]">
+                <p className="text-ink-dim text-[15px] leading-[1.6]">
                   {p.body}
                 </p>
               </div>
@@ -248,7 +244,7 @@ export function GamesShardsSection() {
             {["joinShards", "hostNetcode", "sampleAt"].map((a) => (
               <span
                 key={a}
-                className="text-[10px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono"
+                className="text-[12px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono"
               >
                 {a}
               </span>
@@ -256,7 +252,7 @@ export function GamesShardsSection() {
           </div>
           <Link
             href="/docs/sdk/browser/netcode#several-hosts-a-sharded-match"
-            className="text-[11px] tracking-[0.12em] uppercase text-ink hover:text-accent transition-colors"
+            className="self-start font-mono text-[12px] tracking-[0.16em] uppercase text-ink hover:text-accent transition-colors"
           >
             how sharding works →
           </Link>
@@ -267,12 +263,12 @@ export function GamesShardsSection() {
         {SHARD_STATS.map((s) => (
           <div
             key={s.label}
-            className="border-r border-b border-line px-6 py-5"
+            className="border-r border-b border-line px-6 py-6"
           >
-            <div className="font-sans text-accent text-[34px] font-semibold leading-none tabular-nums">
+            <div className="font-display font-bold text-accent text-[38px] tracking-[-0.03em] leading-none tabular-nums">
               {s.value}
             </div>
-            <div className="text-[10px] tracking-[0.14em] uppercase text-ink-dim mt-2">
+            <div className="text-[12px] tracking-[0.14em] uppercase text-ink-dim mt-2">
               {s.label}
             </div>
           </div>
@@ -521,7 +517,7 @@ export function GamesCodeSection() {
   const snippet = SNIPPETS.find((s) => s.key === active) ?? SNIPPETS[0];
 
   return (
-    <section id="code" className="border-b border-line px-6 py-20">
+    <section id="code" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§06 / add it to your game</SectionLabel>
       <DisplayHeading>
         five steps.
@@ -529,12 +525,12 @@ export function GamesCodeSection() {
         <span className="text-accent">then you&apos;re online.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
+      <Lede>
         Connect, open a room, share the game state, draw it, move. A few lines
         each, and this is the real API.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[240px_1fr] border border-line">
+      <div data-ui className="slab grid grid-cols-1 lg:grid-cols-[240px_1fr]">
         <div className="flex lg:flex-col overflow-x-auto border-b lg:border-b-0 lg:border-r border-line">
           {SNIPPETS.map((s) => {
             const on = s.key === snippet?.key;
@@ -544,7 +540,7 @@ export function GamesCodeSection() {
                 type="button"
                 onClick={() => setActive(s.key)}
                 aria-pressed={on}
-                className={`text-left px-5 py-4 text-[11px] tracking-[0.12em] uppercase whitespace-nowrap border-l-2 transition-colors cursor-pointer ${
+                className={`text-left px-5 py-4 text-[12px] tracking-[0.12em] uppercase whitespace-nowrap border-l-2 transition-colors cursor-pointer ${
                   on
                     ? "border-accent text-accent bg-accent/[0.05] font-semibold"
                     : "border-transparent text-ink-dim hover:text-ink hover:bg-bg-2"
@@ -557,17 +553,17 @@ export function GamesCodeSection() {
         </div>
 
         {snippet ? (
-          <div className="min-w-0 bg-[#050706]">
+          <div className="min-w-0 bg-black/30">
             <div className="flex items-center justify-between border-b border-line px-4 py-2 bg-bg-2/60">
-              <span className="font-mono text-[10px] tracking-[0.14em] uppercase text-accent-dim">
+              <span className="font-mono text-[12px] tracking-[0.14em] uppercase text-accent-dim">
                 <span className="text-accent">▸</span> {snippet.file}
               </span>
               <CopyButton text={snippet.code} />
             </div>
-            <pre className="p-5 text-[12px] leading-[1.6] text-ink overflow-x-auto font-mono min-h-[340px]">
+            <pre className="p-5 text-[13px] leading-[1.65] text-ink overflow-x-auto font-mono min-h-[360px]">
               {snippet.code}
             </pre>
-            <div className="border-t border-line px-5 py-4 font-sans text-[14px] text-ink-dim leading-[1.6]">
+            <div className="border-t border-line px-5 py-4 font-sans text-[15px] text-ink-dim leading-[1.6]">
               <span className="text-accent font-mono">{"//"}</span>{" "}
               {snippet.note}
             </div>
@@ -620,7 +616,7 @@ const ENGINE_TIERS: ReadonlyArray<EngineTier> = [
 
 export function GamesEnginesSection() {
   return (
-    <section id="engines" className="border-b border-line px-6 py-20">
+    <section id="engines" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§07 / any engine</SectionLabel>
       <DisplayHeading>
         a protocol,
@@ -628,24 +624,22 @@ export function GamesEnginesSection() {
         <span className="text-accent">not a plugin.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
+      <Lede>
         NET works with any game engine, because it is a network protocol. How
         much comes ready-made depends on your engine. Three.js gets the full kit
         today.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 lg:gap-6">
         {ENGINE_TIERS.map((t) => (
           <div
             key={t.title}
-            className={`game-card relative border p-8 flex flex-col transition-colors ${
-              t.highlight
-                ? "border-accent-dim bg-accent/[0.04] hover:border-accent"
-                : "border-line bg-bg-2 hover:border-accent-dim"
+            className={`slab p-8 flex flex-col ${
+              t.highlight ? "slab-held" : "slab-lift"
             }`}
           >
             <span
-              className={`self-start text-[10px] tracking-[0.14em] uppercase px-2 py-1 font-semibold mb-6 ${
+              className={`self-start text-[12px] tracking-[0.14em] uppercase px-2 py-1 font-semibold mb-6 ${
                 t.highlight
                   ? "text-bg bg-accent"
                   : "text-accent border border-accent-dim"
@@ -653,16 +647,16 @@ export function GamesEnginesSection() {
             >
               {t.level}
             </span>
-            <h3 className="font-sans text-[26px] font-semibold leading-tight mb-1 text-ink">
+            <h3 className="font-display font-bold tracking-[-0.015em] text-[28px] leading-[1.05] mb-1.5 text-ink">
               {t.title}
             </h3>
-            <div className="text-[11px] tracking-[0.06em] text-ink-dim mb-4">
+            <div className="text-[12px] tracking-[0.06em] text-ink-dim mb-4">
               {t.examples}
             </div>
-            <p className="font-sans text-ink-dim text-[15px] leading-[1.6] mb-6 flex-1">
+            <p className="text-ink-dim text-[15px] leading-[1.6] mb-6 flex-1">
               {t.body}
             </p>
-            <ul className="flex flex-col gap-1.5 mb-6 text-[11px] tracking-[0.1em] uppercase">
+            <ul className="flex flex-col gap-1.5 mb-6 text-[12px] tracking-[0.1em] uppercase">
               {t.gets.map((g) => (
                 <li key={g} className="text-ink">
                   <span className="text-accent mr-2">✓</span>
@@ -672,7 +666,7 @@ export function GamesEnginesSection() {
             </ul>
             <Link
               href={t.href}
-              className="text-[11px] tracking-[0.12em] uppercase text-ink hover:text-accent transition-colors"
+              className="self-start font-mono text-[12px] tracking-[0.16em] uppercase text-ink hover:text-accent transition-colors"
             >
               read the docs →
             </Link>
@@ -707,7 +701,7 @@ const AI_POINTS: ReadonlyArray<{ title: string; body: string }> = [
 
 export function GamesAiSection() {
   return (
-    <section id="ai" className="bg-bg-2 border-b border-line px-6 py-20">
+    <section id="ai" className="bg-bg-2 relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§08 / made for ai-built games</SectionLabel>
       <DisplayHeading>
         prompt the game.
@@ -719,14 +713,14 @@ export function GamesAiSection() {
         <div className="flex flex-col gap-6">
           {AI_POINTS.map((p, i) => (
             <div key={p.title} className="flex gap-5">
-              <span className="font-display text-[28px] text-accent leading-none w-8 shrink-0">
+              <span className="font-display font-bold text-[28px] text-accent leading-none w-8 shrink-0 tabular-nums">
                 {i + 1}
               </span>
               <div>
-                <h3 className="font-sans text-[18px] font-semibold text-ink mb-1.5">
+                <h3 className="font-display font-bold tracking-[-0.015em] text-[21px] leading-[1.15] text-ink mb-1.5">
                   {p.title}
                 </h3>
-                <p className="font-sans text-ink-dim text-[15px] leading-[1.6]">
+                <p className="text-ink-dim text-[15px] leading-[1.6]">
                   {p.body}
                 </p>
               </div>
@@ -734,14 +728,14 @@ export function GamesAiSection() {
           ))}
         </div>
 
-        <div className="relative border border-line bg-bg self-start">
+        <div data-ui className="slab self-start">
           <div className="flex items-center justify-between border-b border-line px-4 py-2 bg-bg-2/60">
-            <span className="font-mono text-[10px] tracking-[0.14em] uppercase text-accent-dim">
+            <span className="font-mono text-[12px] tracking-[0.14em] uppercase text-accent-dim">
               <span className="text-accent">▸</span> paste this into your ai
             </span>
             <CopyButton text={PROMPT} />
           </div>
-          <pre className="p-5 text-[12px] leading-[1.7] text-ink whitespace-pre-wrap font-mono">
+          <pre className="p-5 text-[14px] leading-[1.7] text-ink whitespace-pre-wrap font-mono">
             <span className="text-accent">&gt; </span>
             {PROMPT}
           </pre>
@@ -788,7 +782,7 @@ const PROPS: ReadonlyArray<{ k: string; title: string; body: string }> = [
 
 export function GamesPropsSection() {
   return (
-    <section id="properties" className="border-b border-line px-6 py-20">
+    <section id="properties" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§09 / built in</SectionLabel>
       <DisplayHeading>
         the hard parts,
@@ -796,21 +790,13 @@ export function GamesPropsSection() {
         <span className="text-accent">already done.</span>
       </DisplayHeading>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 border-t border-l border-line mt-12">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 lg:gap-6 mt-12">
         {PROPS.map((p) => (
-          <div
-            key={p.k}
-            className="border-r border-b border-line p-7 transition-colors hover:bg-bg-2"
-          >
-            <div className="text-[10px] tracking-[0.15em] text-accent-dim mb-3 font-mono">
-              [{p.k}]
-            </div>
-            <h3 className="font-sans text-[20px] font-semibold leading-tight mb-2 text-ink">
+          <div key={p.k} className="slab slab-lift p-7">
+            <h3 className="font-display font-bold tracking-[-0.015em] text-[22px] leading-[1.1] mb-2 text-ink">
               {p.title}
             </h3>
-            <p className="font-sans text-ink-dim text-[14px] leading-[1.6]">
-              {p.body}
-            </p>
+            <p className="text-ink-dim text-[15px] leading-[1.6]">{p.body}</p>
           </div>
         ))}
       </div>
@@ -825,7 +811,10 @@ export function GamesOpenSection() {
   const cmd = "npm install @net-mesh/browser";
 
   return (
-    <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
+    <section
+      id="install"
+      className="bg-bg-2 relative px-6 lg:px-12 py-24 lg:py-32"
+    >
       <SectionLabel>§10 / open source</SectionLabel>
       <DisplayHeading>
         free to use.
@@ -833,13 +822,13 @@ export function GamesOpenSection() {
         <span className="text-accent">free to ship.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[700px] leading-[1.55] mb-12">
+      <Lede>
         NET is an open protocol, licensed MIT or Apache-2.0. Use it in a game
         jam, a weekend project or a commercial release. No sign-up, no keys, no
         per-player pricing.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-5 lg:gap-6">
         <button
           type="button"
           onClick={async () => {
@@ -852,14 +841,14 @@ export function GamesOpenSection() {
             }
           }}
           aria-label="Copy install command"
-          className="game-card text-left border border-line p-6 bg-bg transition-colors hover:border-accent-dim cursor-pointer focus:outline-none focus:border-accent md:col-span-2"
+          className="slab slab-lift text-left p-6 cursor-pointer focus:outline-none md:col-span-2"
         >
           <div className="flex items-center justify-between mb-4">
-            <span className="text-[11px] text-ink tracking-[0.15em] uppercase font-semibold">
+            <span className="text-[12px] text-ink tracking-[0.15em] uppercase font-semibold">
               Install
             </span>
             <span
-              className={`text-[10px] px-1.5 py-0.5 transition-colors ${
+              className={`text-[12px] px-1.5 py-0.5 transition-colors ${
                 copied
                   ? "text-bg bg-accent border border-accent font-semibold"
                   : "text-accent border border-accent-dim"
@@ -868,23 +857,23 @@ export function GamesOpenSection() {
               {copied ? "✓ COPIED" : "CLICK TO COPY"}
             </span>
           </div>
-          <pre className="bg-bg-2 p-4 text-[14px] text-accent border-l-2 border-accent overflow-x-auto font-mono leading-[1.5]">
+          <pre className="bg-black/40 p-4 text-[15px] text-accent overflow-x-auto font-mono leading-[1.5] shadow-[inset_0_2px_6px_rgba(0,0,0,0.6)]">
             $ {cmd}
           </pre>
-          <div className="font-sans text-ink-dim text-[13px] mt-3">
+          <div className="font-sans text-ink-dim text-[15px] leading-[1.6] mt-3">
             Players get their pass from NET&apos;s public anchor,{" "}
-            <span className="text-ink font-mono text-[12px]">
+            <span className="text-ink font-mono text-[14px]">
               anchor.ai2070.net
             </span>
             , with no setup. Or run your own with{" "}
-            <span className="text-ink font-mono text-[12px]">
+            <span className="text-ink font-mono text-[14px]">
               net-mesh anchor serve
             </span>
             . An anchor holds no game state, and one serves many games.
           </div>
         </button>
 
-        <div className="border border-line p-6 bg-bg flex flex-col gap-3.5 text-[11px] tracking-[0.1em] uppercase">
+        <div className="slab p-6 flex flex-col gap-4 font-mono text-[12px] tracking-[0.14em] uppercase">
           <Link
             href="/docs/sdk/browser/quickstart"
             className="text-ink hover:text-accent transition-colors"
@@ -920,17 +909,14 @@ export function GamesOpenSection() {
         </div>
       </div>
 
-      <div className="relative mt-16 text-center py-16 border-t border-b border-accent-dim bg-accent/[0.02]">
+      <div className="relative mt-24 -mx-6 lg:-mx-12 -mb-24 lg:-mb-32 text-center px-6 py-24 md:py-32 border-t border-line">
         <div
-          className="font-display text-ink leading-[1.1] mb-5"
-          style={{ fontSize: "clamp(28px, 4vw, 48px)" }}
+          className="font-display font-bold uppercase tracking-[-0.03em] text-ink leading-[0.95] mb-5"
+          style={{ fontSize: "clamp(34px, 5.4vw, 80px)" }}
         >
-          player two has <span className="text-accent game-glow">joined.</span>
+          player two has <span className="text-accent">joined.</span>
         </div>
-        <Link
-          href="/docs/sdk/browser/quickstart"
-          className="btn-primary game-btn inline-flex items-center gap-2.5 px-6 py-3.5 text-[12px] tracking-[0.14em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all mt-5"
-        >
+        <Link href="/docs/sdk/browser/quickstart" className="btn-field mt-5">
           ▶ Start building
         </Link>
       </div>

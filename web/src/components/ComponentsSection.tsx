@@ -4,7 +4,6 @@ import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 import { Lede } from "./field/Lede";
 import { IsoDiagram, type IsoFigure } from "./field/IsoDiagram";
-import { useWorldVariant } from "./field/WorldVariant";
 
 interface ComponentSpec {
   num: string;
@@ -91,7 +90,6 @@ const COMPONENT_FIGURES: ReadonlyArray<IsoFigure> = [
 ];
 
 export function ComponentsSection() {
-  const variant = useWorldVariant();
   return (
     <section id="components" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§09 / components on the mesh</SectionLabel>
@@ -110,7 +108,7 @@ export function ComponentsSection() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6">
         {COMPONENTS.map((c, i) => (
           <div key={c.name} className="slab slab-lift p-7 flex flex-col">
-            {variant !== "v1" && COMPONENT_FIGURES[i] ? (
+            {COMPONENT_FIGURES[i] ? (
               <IsoDiagram
                 figure={COMPONENT_FIGURES[i]}
                 className="-mx-2 mb-6"

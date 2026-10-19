@@ -6,7 +6,7 @@ import type { RepoInfo } from "@/lib/repo-info";
 
 export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
   const pathname = usePathname();
-  const field = pathname === "/" || pathname === "/v2" || pathname === "/v3";
+  const field = pathname === "/" || pathname === "/games";
   const [evt, setEvt] = useState<string>("8.4M");
   const [p50, setP50] = useState<string>("38ns");
 
