@@ -2949,6 +2949,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "mac_address"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3266,7 +3275,7 @@ dependencies = [
  "igd-next",
  "libc",
  "loom",
- "lru 0.18.5",
+ "lru 0.19.0",
  "net-mesh-wire",
  "parking_lot 0.12.5",
  "postcard",
