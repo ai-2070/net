@@ -1,0 +1,31 @@
+net/crates/net/examples/browser-demo/host/Cargo.lock
+  s_035236866cfea0::t_62a126c33c58b9 1534,1536,1626
+net/crates/net/fuzz/Cargo.lock
+  s_035236866cfea0::t_b99005ea37147c 1080,1082,1136
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_035236866cfea0::t_5a8b0592957d6b 766,768,811
+net/crates/net/guards/org_api_probe/Cargo.lock
+  s_035236866cfea0::t_b07e175ed57874 806,808,851
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_035236866cfea0::t_7d2a31cfd0fa5d 1157,1159,1208
+net/crates/net/tests/natsim/browser/Cargo.lock
+  s_035236866cfea0::t_768eb1640a2478 1534,1536,1625
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  s_035236866cfea0::t_3ecf1f105dd9cf 1572,1574,1644
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1bdc55d7ac819573beccf1ab1f3041729f0e0272",
+  "prompts": {},
+  "sessions": {
+    "s_035236866cfea0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "74b334d0-fd26-46a2-b26b-d4003c7dc7c8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
