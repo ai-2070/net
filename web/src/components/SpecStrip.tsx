@@ -37,20 +37,19 @@ const SPEC_STRIP: ReadonlyArray<{
 
 export function SpecStrip() {
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border border-line mt-10">
-      {SPEC_STRIP.map((s, i) => (
-        <div
-          key={s.label}
-          className={`px-6 py-5 bg-bg-2 ${i < SPEC_STRIP.length - 1 ? "border-b lg:border-b-0 lg:border-r border-line" : ""}`}
-        >
-          <div className="text-[10px] text-ink-dim tracking-[0.12em] uppercase mb-2">
-            {s.label}
-          </div>
-          <div className="font-display text-[22px] text-accent leading-[1.1] mb-1">
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-10 mt-20">
+      {SPEC_STRIP.map((s) => (
+        <div key={s.label} className="border-t border-line pt-5">
+          <div className="font-display font-bold text-[48px] tracking-[-0.035em] text-ink leading-none mb-3 tabular-nums">
             {s.value}
-            <span className="text-[13px] text-ink-dim ml-1">{s.unit}</span>
+            <span className="font-mono font-normal text-[13px] tracking-[0.04em] text-ink-dim ml-1.5">
+              {s.unit}
+            </span>
           </div>
-          <div className="text-[10px] text-ink-dim leading-[1.4]">{s.body}</div>
+          <div className="text-[15px] text-ink-dim leading-[1.5] mb-3">
+            {s.body}
+          </div>
+          <div className="stencil normal-case">{s.label}</div>
         </div>
       ))}
     </div>

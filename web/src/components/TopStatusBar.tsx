@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 import type { RepoInfo } from "@/lib/repo-info";
 
 export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
+  const pathname = usePathname();
+  const field = pathname === "/" || pathname === "/games";
   const [evt, setEvt] = useState<string>("8.4M");
   const [p50, setP50] = useState<string>("38ns");
 
@@ -28,7 +31,13 @@ export function TopStatusBar({ version, codename, buildDate, sha }: RepoInfo) {
   }, []);
 
   return (
-    <div className="fixed top-0 left-0 right-0 h-7 bg-bg border-b border-line flex items-center px-4 text-[10px] text-ink-dim z-[100] tracking-[0.05em]">
+    <div
+      className={`fixed top-0 left-0 right-0 h-7 bg-bg border-b border-line flex items-center text-[10px] text-ink-dim z-[100] ${
+        field
+          ? "world-field px-6 lg:px-12 font-mono tracking-[0.12em]"
+          : "px-4 tracking-[0.05em]"
+      }`}
+    >
       <span className="live-dot inline-flex items-center gap-1.5 text-accent">
         MESH ONLINE
       </span>

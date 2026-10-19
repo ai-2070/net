@@ -1,6 +1,7 @@
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { LatencySpectrum } from "./LatencySpectrum";
-import { SectionLabel } from "./SectionLabel";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 
 interface TopologyClass {
   header: string;
@@ -48,37 +49,35 @@ const TOPOLOGY_CLASSES: readonly TopologyClass[] = [
 
 export function TopologyClassesSection() {
   return (
-    <section id="topology" className="border-b border-line px-6 py-20">
+    <section id="topology" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§02 / topology classes</SectionLabel>
       <DisplayHeading>a new class of system.</DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <Lede>
         Existing networking falls into two categories. NET is neither.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 border border-line border-b-0">
+      <div className="topology-grid grid grid-cols-1 lg:grid-cols-3 gap-5 lg:gap-6 lg:items-end lg:pt-6 lg:border-b lg:border-line">
         {TOPOLOGY_CLASSES.map((c, i) => (
           <div
             key={c.title}
-            className={`bg-bg-2 ${c.headerColor === "accent" ? "text-accent" : "text-ink-dim"} text-[10px] tracking-[0.18em] uppercase px-6 py-3 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
-          >
-            {c.header}
-          </div>
-        ))}
-        {TOPOLOGY_CLASSES.map((c, i) => (
-          <div
-            key={c.title + "-body"}
-            className={`flex flex-col px-6 py-7 border-b border-line ${i < 2 ? "lg:border-r" : ""}`}
+            className={`slab flex flex-col px-7 pt-6 pb-7 ${
+              i === 0
+                ? "slab-held field-sync lg:mb-24"
+                : i === 1
+                  ? "lg:mb-10"
+                  : ""
+            }`}
           >
             <div
-              className={`font-head text-[18px] leading-tight ${c.titleColor === "accent" ? "text-accent" : "text-ink"} mb-3.5 tracking-[0.04em] lowercase`}
+              className={`font-display font-bold text-[24px] leading-[1.08] tracking-[-0.015em] ${c.titleColor === "accent" ? "text-accent" : "text-ink"} mb-4`}
             >
               {c.title}
             </div>
-            <div className="text-ink-dim text-[12px] leading-[1.6] flex-1">
+            <p className="text-ink-dim text-[16px] leading-[1.55] flex-1">
               {c.body}
-            </div>
-            <div className="mt-4 text-[11px] text-ink-dim border-t border-dashed border-ink-faint pt-3 space-y-1">
+            </p>
+            <div className="mt-6 font-mono text-[13px] text-ink-dim space-y-1.5">
               <div>
                 latency floor:{" "}
                 <b
@@ -95,6 +94,11 @@ export function TopologyClassesSection() {
                   {c.throughput}
                 </b>
               </div>
+            </div>
+            <div
+              className={`${c.headerColor === "accent" ? "text-accent" : "text-ink-dim"} font-mono text-[12px] tracking-[0.18em] uppercase pt-4 mt-5 border-t border-line`}
+            >
+              {c.header}
             </div>
           </div>
         ))}

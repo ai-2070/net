@@ -2,8 +2,9 @@
 
 import Image from "next/image";
 import { useRef, useState } from "react";
-import { SectionLabel } from "../SectionLabel";
-import { DisplayHeading } from "../DisplayHeading";
+import { FieldLabel as SectionLabel } from "../field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "../field/FieldHeading";
+import { Lede } from "../field/Lede";
 import { CopyButton } from "../CopyButton";
 
 // Net Shooter: a small three.js FPS, open source under MIT, so it is the
@@ -76,7 +77,7 @@ export function GamesStarterSection() {
   const close = (): void => dialogRef.current?.close();
 
   return (
-    <section id="fps" className="border-b border-line px-6 py-20">
+    <section id="fps" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§03 / take it apart</SectionLabel>
       <DisplayHeading>
         a shooter
@@ -84,20 +85,17 @@ export function GamesStarterSection() {
         <span className="text-accent">to learn from.</span>
       </DisplayHeading>
 
-      <p className="font-sans text-[18px] text-ink max-w-[760px] leading-[1.55] mb-12">
+      <Lede>
         Net Shooter is a small, open-source three.js FPS with NET built in: a
         server browser, hosting, and joining as a client. Play it, fork it, ship
         it (MIT), or read how each piece maps to NET. All of the networking is
         in one file,{" "}
         <span className="font-mono text-[15px] text-accent">js/net.js</span>.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5 lg:gap-6 mb-6">
         {SHOTS.map((s) => (
-          <figure
-            key={s.src}
-            className="game-card border border-line bg-bg-2 m-0 overflow-hidden"
-          >
+          <figure key={s.src} className="slab m-0 overflow-hidden">
             <button
               type="button"
               onClick={() => open(s)}
@@ -112,11 +110,11 @@ export function GamesStarterSection() {
                 sizes="(min-width: 1440px) 700px, (min-width: 768px) 50vw, 100vw"
                 className="w-full h-auto aspect-[1600/842] object-cover transition-opacity group-hover:opacity-90"
               />
-              <span className="absolute bottom-3 right-3 text-[10px] tracking-[0.14em] uppercase text-ink bg-bg/80 border border-line px-2 py-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+              <span className="absolute bottom-3 right-3 text-[12px] tracking-[0.14em] uppercase text-ink bg-bg/80 border border-line px-2 py-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
                 ⤢ enlarge
               </span>
             </button>
-            <figcaption className="flex items-center justify-between gap-3 border-t border-line px-4 py-2.5 text-[10px] tracking-[0.14em] uppercase text-ink-dim">
+            <figcaption className="flex items-center justify-between gap-3 border-t border-line px-4 py-2.5 text-[12px] tracking-[0.14em] uppercase text-ink-dim">
               <span>{s.caption}</span>
               <span className="text-accent font-mono normal-case tracking-normal">
                 {s.api}
@@ -144,12 +142,12 @@ export function GamesStarterSection() {
               unoptimized
               className="block w-auto h-auto max-w-[96vw] max-h-[calc(94vh-42px)]"
             />
-            <figcaption className="flex items-center justify-between gap-3 border-t border-line px-4 py-2.5 text-[10px] tracking-[0.14em] uppercase text-ink-dim">
+            <figcaption className="flex items-center justify-between gap-3 border-t border-line px-4 py-2.5 text-[12px] tracking-[0.14em] uppercase text-ink-dim">
               <span>{shown.caption}</span>
               <button
                 type="button"
                 onClick={close}
-                className="text-ink hover:text-accent cursor-pointer bg-transparent border-0 p-0 text-[10px] tracking-[0.14em] uppercase"
+                className="text-ink hover:text-accent cursor-pointer bg-transparent border-0 p-0 text-[12px] tracking-[0.14em] uppercase"
               >
                 close ✕
               </button>
@@ -158,40 +156,35 @@ export function GamesStarterSection() {
         ) : null}
       </dialog>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-6 items-start">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-5 lg:gap-6 items-start">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 lg:gap-6">
           {PIECES.map((p) => (
-            <div
-              key={p.title}
-              className="game-card border border-line bg-bg-2 p-6 transition-colors hover:border-accent-dim"
-            >
-              <span className="text-[10px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono">
+            <div key={p.title} className="slab slab-lift p-6">
+              <span className="text-[12px] text-accent border border-accent-dim px-1.5 py-0.5 font-mono">
                 {p.api}
               </span>
-              <h3 className="font-sans text-[18px] font-semibold text-ink mt-4 mb-1.5">
+              <h3 className="font-display font-bold tracking-[-0.015em] text-[21px] leading-[1.15] text-ink mt-4 mb-1.5">
                 {p.title}
               </h3>
-              <p className="font-sans text-ink-dim text-[14px] leading-[1.55]">
-                {p.body}
-              </p>
+              <p className="text-ink-dim text-[15px] leading-[1.6]">{p.body}</p>
             </div>
           ))}
         </div>
 
-        <div className="border border-line bg-[#050706]">
+        <div data-ui className="slab">
           <div className="flex items-center justify-between border-b border-line px-4 py-2 bg-bg-2/60">
-            <span className="font-mono text-[10px] tracking-[0.14em] uppercase text-accent-dim">
+            <span className="font-mono text-[12px] tracking-[0.14em] uppercase text-accent-dim">
               <span className="text-accent">▸</span> run it yourself
             </span>
             <CopyButton text={RUN} />
           </div>
-          <pre className="p-5 text-[12px] leading-[1.7] text-ink overflow-x-auto font-mono">
+          <pre className="p-5 text-[14px] leading-[1.7] text-ink overflow-x-auto font-mono bg-black/30">
             {RUN}
           </pre>
-          <div className="border-t border-line px-5 py-4 font-sans text-[13px] text-ink-dim leading-[1.6]">
+          <div className="border-t border-line px-5 py-4 font-sans text-[15px] text-ink-dim leading-[1.6]">
             Co-op for 2–4 players, over NET&apos;s public anchor, so there is no
             server to run. The first{" "}
-            <span className="font-mono text-[12px] text-ink">npm start</span>{" "}
+            <span className="font-mono text-[14px] text-ink">npm start</span>{" "}
             needs mkcert for local HTTPS; the README has the steps.
           </div>
           <div className="flex flex-col sm:flex-row gap-3 p-5 pt-0">
@@ -199,7 +192,7 @@ export function GamesStarterSection() {
               href={FPS_PLAY_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="btn-primary game-btn inline-flex flex-1 justify-center items-center gap-2.5 px-5 py-3.5 text-[12px] tracking-[0.14em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
+              className="btn-field flex-1 justify-center"
             >
               ▶ Play it ↗
             </a>
@@ -207,7 +200,7 @@ export function GamesStarterSection() {
               href={FPS_REPO_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="btn-ghost inline-flex flex-1 justify-center items-center gap-2.5 px-5 py-3.5 text-[12px] tracking-[0.14em] uppercase font-semibold no-underline border border-ink-faint text-ink transition-all"
+              className="btn-ghost-field flex-1 justify-center"
             >
               Source ↗
             </a>

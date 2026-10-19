@@ -4,13 +4,22 @@ import Link from "next/link";
 export function FooterColumn({
   title,
   items,
+  world,
 }: {
   title: string;
   items: ReadonlyArray<{ href: string; label: string; class?: string }>;
+  world?: "field";
 }) {
+  const field = world === "field";
   return (
     <div>
-      <h5 className="text-[10px] tracking-[0.18em] text-ink-dim uppercase mb-4 font-medium">
+      <h5
+        className={
+          field
+            ? "stencil mb-5"
+            : "text-[10px] tracking-[0.18em] text-ink-dim uppercase mb-4 font-medium"
+        }
+      >
         {title}
       </h5>
       <ul className="list-none space-y-2">
@@ -24,7 +33,9 @@ export function FooterColumn({
                   ? { target: "_blank", rel: "noopener noreferrer" }
                   : {})}
                 className={cn(
-                  "text-ink no-underline text-[12px] hover:text-accent transition-colors",
+                  field
+                    ? "text-ink no-underline text-[14px] font-sans hover:text-accent transition-colors"
+                    : "text-ink no-underline text-[12px] hover:text-accent transition-colors",
                   it.class,
                 )}
               >

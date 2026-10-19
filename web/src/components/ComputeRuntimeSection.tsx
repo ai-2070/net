@@ -1,16 +1,14 @@
 import { DaemonCaseBlock } from "./DaemonCaseBlock";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
 import { GroupCards } from "./GroupCards";
 import { MigrationPipeline } from "./MigrationPipeline";
-import { SectionLabel } from "./SectionLabel";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { SpecStrip } from "./SpecStrip";
 
 export function ComputeRuntimeSection() {
   return (
-    <section
-      id="runtime"
-      className="compute-bg border-b border-line px-6 py-20"
-    >
+    <section id="runtime" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§06 / daemon runtime // new</SectionLabel>
       <DisplayHeading>
         compute
@@ -22,7 +20,7 @@ export function ComputeRuntimeSection() {
         </span>
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <Lede>
         A program on NET is called a{" "}
         <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>
         . Its identity is a public key — an{" "}
@@ -36,14 +34,14 @@ export function ComputeRuntimeSection() {
         <strong className="text-ink font-medium">
           When that location goes away, the daemon doesn&apos;t.
         </strong>
-      </p>
+      </Lede>
 
       <DaemonCaseBlock />
       <MigrationPipeline />
       <GroupCards />
       <SpecStrip />
 
-      {/*<p className="mt-8 text-[11px] text-ink-dim text-center tracking-[0.05em]">
+      {/*<p className="mt-8 text-[13px] text-ink-dim text-center tracking-[0.05em]">
         // see <span className="text-accent">compute/daemon.rs</span> ·{" "}
         <span className="text-accent">compute/orchestrator.rs</span> ·{" "}
         <span className="text-accent">

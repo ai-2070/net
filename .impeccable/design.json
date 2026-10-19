@@ -1,0 +1,585 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-19T21:00:00Z",
+  "title": "Design System: NET",
+  "scope": "Suspended Field is the target system, applied today only to the landing page `/` via `.world-field` (web/src/app/world-field.css). /docs and /games still run the legacy root @theme in web/src/app/globals.css until a planned second pass; do not extend the legacy theme.",
+  "extensions": {
+    "colorMeta": {
+      "field-green": {
+        "role": "primary",
+        "displayName": "Field Green",
+        "canonical": "#c4ff3d",
+        "tonalRamp": [
+          "#001100",
+          "#0b2e00",
+          "#264d00",
+          "#426d00",
+          "#608f00",
+          "#80b200",
+          "#a5d921",
+          "#ceff5e"
+        ]
+      },
+      "field-green-hover": {
+        "role": "primary",
+        "displayName": "Field Green, Lit",
+        "canonical": "#d4ff6e",
+        "tonalRamp": [
+          "#021000",
+          "#152c00",
+          "#2e4b00",
+          "#4a6b00",
+          "#698c00",
+          "#89af00",
+          "#add641",
+          "#d7ff71"
+        ]
+      },
+      "field-green-dim": {
+        "role": "primary",
+        "displayName": "Field Green, Dim",
+        "canonical": "#7a9a2c",
+        "tonalRamp": [
+          "#021000",
+          "#162c00",
+          "#304a00",
+          "#4d6900",
+          "#6b8a16",
+          "#8cad41",
+          "#b0d369",
+          "#daff93"
+        ]
+      },
+      "cast-black": {
+        "role": "neutral",
+        "displayName": "Cast Black",
+        "canonical": "#0b0c0b",
+        "tonalRamp": [
+          "#0a0b0a",
+          "#232423",
+          "#3f403f",
+          "#5d5e5d",
+          "#7c7e7c",
+          "#9d9f9d",
+          "#c3c4c3",
+          "#edefed"
+        ]
+      },
+      "hall-floor": {
+        "role": "neutral",
+        "displayName": "Hall Floor",
+        "canonical": "#121311",
+        "tonalRamp": [
+          "#0b0b0a",
+          "#232422",
+          "#3f403e",
+          "#5d5e5b",
+          "#7c7e7b",
+          "#9d9f9c",
+          "#c3c5c2",
+          "#edefec"
+        ]
+      },
+      "panel-black": {
+        "role": "neutral",
+        "displayName": "Panel Black",
+        "canonical": "#0d100d",
+        "tonalRamp": [
+          "#090c09",
+          "#222522",
+          "#3d413d",
+          "#5b5f5b",
+          "#7a7e7a",
+          "#9ba09b",
+          "#c1c5c1",
+          "#ebf0eb"
+        ]
+      },
+      "panel-black-hover": {
+        "role": "neutral",
+        "displayName": "Panel Black, Attended",
+        "canonical": "#111611",
+        "tonalRamp": [
+          "#080d08",
+          "#202620",
+          "#3c423c",
+          "#596059",
+          "#797f79",
+          "#9aa19a",
+          "#bfc6bf",
+          "#e9f1e9"
+        ]
+      },
+      "panel-border": {
+        "role": "neutral",
+        "displayName": "Panel Border",
+        "canonical": "#222a21",
+        "tonalRamp": [
+          "#070d06",
+          "#1f271e",
+          "#3a4339",
+          "#576156",
+          "#778076",
+          "#98a296",
+          "#bdc8bc",
+          "#e7f2e6"
+        ]
+      },
+      "ghost-border": {
+        "role": "neutral",
+        "displayName": "Ghost Border",
+        "canonical": "#3a4537",
+        "tonalRamp": [
+          "#060e04",
+          "#1d271a",
+          "#384335",
+          "#566253",
+          "#758172",
+          "#96a393",
+          "#bbc9b8",
+          "#e6f3e2"
+        ]
+      },
+      "astral-ink": {
+        "role": "neutral",
+        "displayName": "Astral Ink",
+        "canonical": "#e6e8e0",
+        "tonalRamp": [
+          "#0b0c07",
+          "#23251f",
+          "#3f413a",
+          "#5d5e58",
+          "#7c7e77",
+          "#9e9f98",
+          "#c3c5bd",
+          "#eef0e7"
+        ]
+      },
+      "ink-dim": {
+        "role": "neutral",
+        "displayName": "Ink Dim",
+        "canonical": "#969a91",
+        "tonalRamp": [
+          "#0a0c06",
+          "#22251e",
+          "#3e4139",
+          "#5b5f57",
+          "#7b7f76",
+          "#9ca097",
+          "#c2c6bc",
+          "#ecf0e7"
+        ]
+      },
+      "ink-faint": {
+        "role": "neutral",
+        "displayName": "Ink Faint (ground)",
+        "canonical": "#555850",
+        "tonalRamp": [
+          "#0a0c06",
+          "#23251e",
+          "#3e4139",
+          "#5c5f57",
+          "#7b7f76",
+          "#9da097",
+          "#c2c6bc",
+          "#ecf0e7"
+        ]
+      },
+      "ink-faint-on-panel": {
+        "role": "neutral",
+        "displayName": "Ink Faint on Panel",
+        "canonical": "#7f8479",
+        "tonalRamp": [
+          "#090d05",
+          "#22261d",
+          "#3d4238",
+          "#5b6055",
+          "#7a7f74",
+          "#9ba195",
+          "#c1c6ba",
+          "#ebf1e5"
+        ],
+        "note": "Re-declared as --color-ink-faint inside the slab utility; --color-ink-dim is not overridden on panels."
+      },
+      "form-seam": {
+        "role": "neutral",
+        "displayName": "Form Seam",
+        "canonical": "#252723",
+        "tonalRamp": [
+          "#0a0c08",
+          "#232521",
+          "#3e413c",
+          "#5c5e5a",
+          "#7c7e79",
+          "#9d9f9a",
+          "#c2c5c0",
+          "#edefea"
+        ]
+      },
+      "shaft-light": {
+        "role": "neutral",
+        "displayName": "Shaft Light",
+        "canonical": "#eef1e8",
+        "tonalRamp": [
+          "#0a0c07",
+          "#23251e",
+          "#3f413a",
+          "#5c5f57",
+          "#7c7e76",
+          "#9da097",
+          "#c3c5bd",
+          "#edf0e7"
+        ]
+      },
+      "telemetry-amber": {
+        "role": "tertiary",
+        "displayName": "Telemetry Amber",
+        "canonical": "#f0b04a",
+        "tonalRamp": [
+          "#270000",
+          "#470e00",
+          "#672f00",
+          "#894e00",
+          "#ab6f00",
+          "#cf9121",
+          "#f7b751",
+          "#ffe17e"
+        ]
+      },
+      "telemetry-ice": {
+        "role": "tertiary",
+        "displayName": "Telemetry Ice",
+        "canonical": "#a9d3e2",
+        "tonalRamp": [
+          "#000f19",
+          "#002935",
+          "#1f4652",
+          "#3d6471",
+          "#5d8492",
+          "#7da6b4",
+          "#a2ccdb",
+          "#ccf7ff"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Hero area title only; uppercase; exactly two lines."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Every section title; uppercase, max 19em, balanced, at most two lines; each phrase pulled into focus on scroll."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Headings inside panels."
+      },
+      "lede": {
+        "displayName": "Lede",
+        "purpose": "Opening paragraph of the hero and of a section, in astral ink."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Running prose, 17px in astral ink, capped at 70ch. All <p> in the world default to Archivo."
+      },
+      "panel-body": {
+        "displayName": "Panel Body",
+        "purpose": "Prose inside panels, 16px in ink-dim."
+      },
+      "numeral": {
+        "displayName": "Numeral",
+        "purpose": "Measured figures in stat panels, with a 10px mono unit beside them."
+      },
+      "label": {
+        "displayName": "Stencil",
+        "purpose": "Section markers (vertical in the right margin at 1024px+, flat at the section foot below), panel IDs, document refs, footer meta."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Event tails, code, ASCII diagrams; smallest data steps are 12-13px."
+      },
+      "control": {
+        "displayName": "Control",
+        "purpose": "Buttons (11px) and nav items (10.5px)."
+      }
+    },
+    "shadows": [
+      {
+        "name": "floating",
+        "value": "0 22px 28px -24px rgba(0,0,0,0.9)",
+        "purpose": "Only panels that float: the axiom wave and the shared-rhythm panels. Panels at rest cast none."
+      },
+      {
+        "name": "attended",
+        "value": "inset 0 1px 0 rgba(196,255,61,0.08), 0 34px 34px -26px rgba(0,0,0,0.95)",
+        "purpose": "Panel lifted on hover/focus, with a 5px rise."
+      },
+      {
+        "name": "seam-glow",
+        "value": "0 8px 18px 1px rgba(196,255,61,0.22)",
+        "purpose": "Spill under the seam of an attended panel."
+      },
+      {
+        "name": "held-seam-glow",
+        "value": "0 10px 22px 1px rgba(196,255,61,0.2)",
+        "purpose": "Spill under the seam of a held panel."
+      },
+      {
+        "name": "blackwall-wordmark",
+        "value": "text-shadow: 0 2px 0 rgba(0,0,0,0.8), 0 0 40px rgba(11,12,11,0.9)",
+        "purpose": "Legibility of the BLACKWALL wordmark over its concrete pillars. That element only."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-field",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "The one easing for displacement and hold."
+      },
+      {
+        "name": "attend",
+        "value": "translateY(-5px) 0.6s; border, face, ticks 0.35s; seam scaleX(0.3 -> 1) 0.7s",
+        "purpose": "Hover/focus lift: the field picks up what you attend to."
+      },
+      {
+        "name": "altitude-rank",
+        "value": "static offsets above a shared floor hairline: 0 / 40px / 96px",
+        "purpose": "Topology classes: altitude = speed."
+      },
+      {
+        "name": "migration-rail",
+        "value": "7px marker crosses the rail in 6s linear; phase i lights (border #7a9a2c, number #c4ff3d) for its sixth, delay = i x 1s",
+        "purpose": "Progress shown along a rail, not by height; flat panels on one baseline."
+      },
+      {
+        "name": "scarcity-mesh",
+        "value": "scroll-linked growth from the four 1969 nodes to a flat lattice; pingwave rings every ~1.4s over 1.6s once full",
+        "purpose": "§01 argument: four hosts become a mesh with no centre. Reduced motion: one still of the full mesh."
+      },
+      {
+        "name": "field-wave",
+        "value": "translateY(-9px) peaking at 18%, 7s, delay = index x 0.28s",
+        "purpose": "Nine axioms: one wave in reading order, like a pingwave."
+      },
+      {
+        "name": "field-sync",
+        "value": "translateY(-8px), 9s ease-in-out infinite, shared phase",
+        "purpose": "Panels that are one live system (hero telemetry, the NET topology panel)."
+      },
+      {
+        "name": "focus-pull",
+        "value": "armed: translateY(0.35em), opacity 0.55, blur(6px) -> none; 1.3s transform, 1.1s opacity/filter; 110ms per phrase",
+        "purpose": "Section titles pulled into focus on scroll; never invisible, sharp without script."
+      },
+      {
+        "name": "field-rise",
+        "value": "translateY(0.42em) + blur(12px) -> none, 1.6s, ~140ms stagger",
+        "purpose": "Hero title entrance, once."
+      },
+      {
+        "name": "picture-attend",
+        "value": "grayscale(1) contrast(1.1) brightness(0.7) -> grayscale(0) brightness(0.9), 0.5s",
+        "purpose": "Application panel photos regain colour on hover (and on focus for the linked games card)."
+      },
+      {
+        "name": "scenery",
+        "value": "Mikoshi plinths (Monolith) sway +/- 7deg over 14s with a 14px bob; Blackwall pillars bob",
+        "purpose": "Concrete scenery only; it carries no data, so it is exempt from the float rule."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "prefers-reduced-motion: reduce",
+        "purpose": "All float, wave, sync, focus pull, rise, lift and scenery loops drop to static."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "760px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      },
+      {
+        "name": "xl",
+        "value": "1280px"
+      },
+      {
+        "name": "2xl",
+        "value": "1440px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Field Button",
+      "kind": "button",
+      "refersTo": "button-field",
+      "description": "The one primary action (Install NET): a block of field light. It does not move; it lightens on hover and a green line lights below.",
+      "html": "<a class=\"ds-btn-field\" href=\"#\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 256 256\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M208.5 152.5l-72 72a12 12 0 0 1-17 0l-72-72a12 12 0 0 1 17-17L116 187V40a12 12 0 0 1 24 0v147l51.5-51.5a12 12 0 0 1 17 17z\"/></svg>Install NET</a>",
+      "css": ".ds-btn-field{position:relative;display:inline-flex;align-items:center;gap:12px;padding:15px 22px;background:#c4ff3d;color:#0b0c0b;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;text-decoration:none;border-radius:0;border:0;transition:background .3s cubic-bezier(.16,1,.3,1)}.ds-btn-field::after{content:'';position:absolute;left:10%;right:10%;bottom:-12px;height:1px;background:#c4ff3d;opacity:0;transform:scaleX(.4);transition:opacity .5s cubic-bezier(.16,1,.3,1),transform .6s cubic-bezier(.16,1,.3,1)}.ds-btn-field:hover{background:#d4ff6e}.ds-btn-field:hover::after{opacity:.9;transform:scaleX(1)}.ds-btn-field:focus-visible{outline:1px solid #c4ff3d;outline-offset:4px}"
+    },
+    {
+      "name": "Ghost Field Button",
+      "kind": "button",
+      "refersTo": "button-ghost-field",
+      "description": "Secondary action: a transparent terminal ghost whose border and label turn field green on hover.",
+      "html": "<a class=\"ds-btn-ghost\" href=\"#\">Read benchmarks</a>",
+      "css": ".ds-btn-ghost{position:relative;display:inline-flex;align-items:center;gap:12px;padding:14px 22px;color:#e6e8e0;background:rgba(13,16,13,.6);border:1px solid #3a4537;border-radius:0;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;text-decoration:none;transition:color .3s cubic-bezier(.16,1,.3,1),border-color .3s cubic-bezier(.16,1,.3,1)}.ds-btn-ghost:hover{color:#c4ff3d;border-color:#c4ff3d}.ds-btn-ghost:focus-visible{outline:1px solid #c4ff3d;outline-offset:4px}"
+    },
+    {
+      "name": "Field Link",
+      "kind": "custom",
+      "refersTo": "link-field",
+      "description": "Inline link in prose: ink text over a half-strength green underline that fills on hover.",
+      "html": "<p class=\"ds-prose\">Flagship use: <a class=\"ds-link-field\" href=\"#\">agentic capability federation</a> across a trusted mesh.</p>",
+      "css": ".ds-prose{font-family:Archivo,'Helvetica Neue',Arial,sans-serif;font-size:17px;line-height:1.6;max-width:70ch;color:#e6e8e0;background:#0b0c0b;padding:16px}.ds-link-field{color:#e6e8e0;text-decoration:underline;text-decoration-color:rgba(196,255,61,.55);text-decoration-thickness:1px;text-underline-offset:4px;transition:color .3s cubic-bezier(.16,1,.3,1),text-decoration-color .3s cubic-bezier(.16,1,.3,1)}.ds-link-field:hover{color:#c4ff3d;text-decoration-color:#c4ff3d}.ds-link-field:focus-visible{outline:1px solid #c4ff3d;outline-offset:4px}"
+    },
+    {
+      "name": "Lifting Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "The terminal panel held in the field: corner ticks, scanlines, hairline border. Attention lifts it 5px, dims the border green and lights the seam.",
+      "html": "<div class=\"ds-stage\"><article class=\"ds-panel ds-lift\" tabindex=\"0\"><h3 class=\"ds-panel-title\">Drop, don't queue</h3><p class=\"ds-panel-body\">Backpressure sheds load at the edge instead of building latency in the middle.</p><div class=\"ds-panel-foot\"><span class=\"ds-stencil\">AX-04</span></div></article></div>",
+      "css": ".ds-stage{background:#0b0c0b;padding:40px 32px 64px}.ds-panel{position:relative;max-width:360px;padding:28px;color:#e6e8e0;background-color:#0d100d;background-image:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.22) 2px 3px);border:1px solid #222a21;border-radius:0;transition:transform .6s cubic-bezier(.16,1,.3,1),box-shadow .6s cubic-bezier(.16,1,.3,1),border-color .35s cubic-bezier(.16,1,.3,1),background-color .35s cubic-bezier(.16,1,.3,1);outline:none}.ds-panel::before{content:'';position:absolute;inset:-1px;pointer-events:none;opacity:.6;transition:opacity .35s cubic-bezier(.16,1,.3,1);background:linear-gradient(#c4ff3d,#c4ff3d) top left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/1px 10px no-repeat}.ds-lift::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1px;background:#c4ff3d;opacity:0;transform:scaleX(.3);box-shadow:0 8px 18px 1px rgba(196,255,61,.22);transition:opacity .5s cubic-bezier(.16,1,.3,1),transform .7s cubic-bezier(.16,1,.3,1);pointer-events:none}.ds-lift:hover,.ds-lift:focus-visible{transform:translateY(-5px);background-color:#111611;border-color:#7a9a2c;box-shadow:inset 0 1px 0 rgba(196,255,61,.08),0 34px 34px -26px rgba(0,0,0,.95)}.ds-lift:hover::before,.ds-lift:focus-visible::before{opacity:1}.ds-lift:hover::after,.ds-lift:focus-visible::after{opacity:.85;transform:scaleX(1)}@media (prefers-reduced-motion:reduce){.ds-lift:hover,.ds-lift:focus-visible{transform:none}}.ds-panel-title{margin:0 0 12px;font-family:'TeX Gyre Adventor','Avant Garde','Century Gothic',sans-serif;font-weight:700;font-size:23px;line-height:1.08;letter-spacing:-.015em}.ds-panel-body{margin:0;font-family:Archivo,'Helvetica Neue',Arial,sans-serif;font-size:16px;line-height:1.55;color:#969a91}.ds-panel-foot{margin-top:24px;padding-top:16px;border-top:1px solid #252723;display:flex;justify-content:flex-end}.ds-stencil{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;letter-spacing:.28em;text-transform:uppercase;color:#969a91}"
+    },
+    {
+      "name": "Altitude Set",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "Meaningful float: three panels on a shared floor hairline where altitude encodes speed. The highest is held and rides the shared rhythm.",
+      "html": "<div class=\"ds-stage\"><div class=\"ds-alt\"><div class=\"ds-panel ds-held ds-sync\" style=\"margin-bottom:96px\"><b class=\"ds-alt-t ds-g\">NET</b><span>latency floor: ns</span></div><div class=\"ds-panel\" style=\"margin-bottom:40px\"><b class=\"ds-alt-t\">Real-time</b><span>latency floor: µs</span></div><div class=\"ds-panel\"><b class=\"ds-alt-t\">Best-effort</b><span>latency floor: ms</span></div></div></div>",
+      "css": ".ds-stage{background:#0b0c0b;padding:40px 32px 64px}.ds-panel{position:relative;max-width:360px;padding:28px;color:#e6e8e0;background-color:#0d100d;background-image:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.22) 2px 3px);border:1px solid #222a21;border-radius:0;transition:transform .6s cubic-bezier(.16,1,.3,1),box-shadow .6s cubic-bezier(.16,1,.3,1),border-color .35s cubic-bezier(.16,1,.3,1),background-color .35s cubic-bezier(.16,1,.3,1);outline:none}.ds-panel::before{content:'';position:absolute;inset:-1px;pointer-events:none;opacity:.6;transition:opacity .35s cubic-bezier(.16,1,.3,1);background:linear-gradient(#c4ff3d,#c4ff3d) top left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/1px 10px no-repeat}.ds-alt{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;align-items:end;border-bottom:1px solid #252723;padding-top:24px}.ds-alt .ds-panel{padding:20px;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:#969a91;display:flex;flex-direction:column;gap:12px}.ds-alt-t{font-family:'TeX Gyre Adventor','Avant Garde','Century Gothic',sans-serif;font-size:20px;color:#e6e8e0}.ds-g{color:#c4ff3d}.ds-alt .ds-sync{box-shadow:0 22px 28px -24px rgba(0,0,0,.9)}.ds-held::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1px;background:#c4ff3d;opacity:.85;box-shadow:0 10px 22px 1px rgba(196,255,61,.2)}@keyframes ds-sync{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}.ds-sync{animation:ds-sync 9s ease-in-out infinite}@media (prefers-reduced-motion:reduce){.ds-sync{animation:none}}"
+    },
+    {
+      "name": "Picture Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "Application panel with a sourced 16:7 photo across its head: grayscale and darkened at rest, full colour when attended. Credited in the footer, never presented as Net's own.",
+      "html": "<div class=\"ds-stage\"><article class=\"ds-panel ds-lift ds-pic\" tabindex=\"0\"><div class=\"ds-pic-img\" role=\"img\" aria-label=\"Stand-in for a sourced photograph: a quadcopter drone in flight against the sky.\"></div><h3 class=\"ds-panel-title\">Drones &amp; Swarms</h3><p class=\"ds-panel-body\">Every unit is a peer; the swarm keeps flying when any one of them drops.</p></article></div>",
+      "css": ".ds-stage{background:#0b0c0b;padding:40px 32px 64px}.ds-panel{position:relative;max-width:360px;padding:28px;color:#e6e8e0;background-color:#0d100d;background-image:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.22) 2px 3px);border:1px solid #222a21;border-radius:0;transition:transform .6s cubic-bezier(.16,1,.3,1),box-shadow .6s cubic-bezier(.16,1,.3,1),border-color .35s cubic-bezier(.16,1,.3,1),background-color .35s cubic-bezier(.16,1,.3,1);outline:none}.ds-panel::before{content:'';position:absolute;inset:-1px;pointer-events:none;opacity:.6;transition:opacity .35s cubic-bezier(.16,1,.3,1);background:linear-gradient(#c4ff3d,#c4ff3d) top left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/1px 10px no-repeat}.ds-lift::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1px;background:#c4ff3d;opacity:0;transform:scaleX(.3);box-shadow:0 8px 18px 1px rgba(196,255,61,.22);transition:opacity .5s cubic-bezier(.16,1,.3,1),transform .7s cubic-bezier(.16,1,.3,1);pointer-events:none}.ds-lift:hover,.ds-lift:focus-visible{transform:translateY(-5px);background-color:#111611;border-color:#7a9a2c;box-shadow:inset 0 1px 0 rgba(196,255,61,.08),0 34px 34px -26px rgba(0,0,0,.95)}.ds-lift:hover::before,.ds-lift:focus-visible::before{opacity:1}.ds-lift:hover::after,.ds-lift:focus-visible::after{opacity:.85;transform:scaleX(1)}@media (prefers-reduced-motion:reduce){.ds-lift:hover,.ds-lift:focus-visible{transform:none}}.ds-pic{padding:32px}.ds-pic-img{margin:-32px -32px 28px;aspect-ratio:16/7;background:linear-gradient(160deg,#6f8ea3 0%,#c9d4da 55%,#4b5a3c 100%);filter:grayscale(1) contrast(1.1) brightness(.7);transition:filter .5s}.ds-pic:hover .ds-pic-img{filter:grayscale(0) brightness(.9)}.ds-panel-title{margin:0 0 12px;font-family:'TeX Gyre Adventor','Avant Garde','Century Gothic',sans-serif;font-weight:700;font-size:24px;line-height:1.05;letter-spacing:-.015em}.ds-panel-body{margin:0;font-family:Archivo,'Helvetica Neue',Arial,sans-serif;font-size:16px;line-height:1.55;color:#969a91}"
+    },
+    {
+      "name": "Telemetry Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "A live readout: mono header bar with status, Adventor numerals with mono units.",
+      "html": "<div class=\"ds-stage\"><div class=\"ds-panel ds-tp\"><div class=\"ds-tp-head\"><span class=\"ds-tp-name\">mesh.proximity</span><span class=\"ds-tp-live\"><i></i>OBSERVABLE</span></div><div class=\"ds-tp-grid\"><div><div class=\"ds-tp-label\">forward / hop</div><div class=\"ds-tp-num\">0.57<span>ns</span></div></div><div><div class=\"ds-tp-label\">recovery cycle</div><div class=\"ds-tp-num\">291<span>ns</span></div></div></div></div></div>",
+      "css": ".ds-stage{background:#0b0c0b;padding:40px 32px 64px}.ds-panel{position:relative;max-width:360px;padding:28px;color:#e6e8e0;background-color:#0d100d;background-image:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.22) 2px 3px);border:1px solid #222a21;border-radius:0;transition:transform .6s cubic-bezier(.16,1,.3,1),box-shadow .6s cubic-bezier(.16,1,.3,1),border-color .35s cubic-bezier(.16,1,.3,1),background-color .35s cubic-bezier(.16,1,.3,1);outline:none}.ds-panel::before{content:'';position:absolute;inset:-1px;pointer-events:none;opacity:.6;transition:opacity .35s cubic-bezier(.16,1,.3,1);background:linear-gradient(#c4ff3d,#c4ff3d) top left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) top right/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom left/1px 10px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/10px 1px no-repeat,linear-gradient(#c4ff3d,#c4ff3d) bottom right/1px 10px no-repeat}.ds-tp{padding:20px;font-family:'JetBrains Mono',ui-monospace,monospace}.ds-tp-head{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #252723;padding-bottom:10px;margin-bottom:16px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#969a91}.ds-tp-name{color:#e6e8e0}.ds-tp-live{display:flex;align-items:center;gap:6px}.ds-tp-live i{width:6px;height:6px;background:#c4ff3d;display:inline-block}.ds-tp-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 24px}.ds-tp-label{font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#969a91;margin-bottom:6px}.ds-tp-num{font-family:'TeX Gyre Adventor','Avant Garde','Century Gothic',sans-serif;font-weight:700;font-size:26px;line-height:1;color:#e6e8e0;font-variant-numeric:tabular-nums}.ds-tp-num span{font-family:'JetBrains Mono',ui-monospace,monospace;font-weight:400;font-size:10px;letter-spacing:.06em;color:#969a91;margin-left:6px}"
+    },
+    {
+      "name": "Field Navigation",
+      "kind": "nav",
+      "refersTo": "nav-field",
+      "description": "Fixed 56px bar: Adventor wordmark, mono caps items, active item with a green underline grown from center, compact field button.",
+      "html": "<nav class=\"ds-nav\"><a class=\"ds-nav-mark\" href=\"#\">NET<span>// AI 2070</span></a><ul><li><a class=\"is-active\" href=\"#\">Home</a></li><li><a href=\"#\">Bench</a></li><li><a href=\"#\">Docs</a></li></ul><a class=\"ds-nav-cta\" href=\"#\">Install</a></nav>",
+      "css": ".ds-nav{height:56px;display:flex;align-items:center;padding:0 48px;background:rgba(11,12,11,.86);backdrop-filter:blur(12px);border-bottom:1px solid #252723}.ds-nav-mark{display:flex;align-items:baseline;gap:12px;text-decoration:none;font-family:'TeX Gyre Adventor','Avant Garde','Century Gothic',sans-serif;font-weight:700;font-size:24px;line-height:1;letter-spacing:-.02em;text-transform:uppercase;color:#e6e8e0}.ds-nav-mark span{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;font-weight:600;letter-spacing:.18em;color:#969a91}.ds-nav ul{display:flex;gap:24px;list-style:none;margin:0 0 0 auto;padding:0}.ds-nav ul a{position:relative;display:block;padding:8px 0;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;text-decoration:none;color:#969a91;transition:color .3s}.ds-nav ul a:hover,.ds-nav ul a.is-active{color:#e6e8e0}.ds-nav ul a::after{content:'';position:absolute;left:0;right:0;bottom:-3px;height:1px;background:#c4ff3d;opacity:0;transform:scaleX(.3);transition:opacity .5s,transform .5s}.ds-nav ul a.is-active::after{opacity:1;transform:scaleX(1)}.ds-nav ul a:focus-visible,.ds-nav-cta:focus-visible{outline:1px solid #c4ff3d;outline-offset:4px}.ds-nav-cta{margin-left:24px;padding:10px 16px;background:#c4ff3d;color:#0b0c0b;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10.5px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;text-decoration:none}"
+    },
+    {
+      "name": "Section Title with Pillar Stencil",
+      "kind": "custom",
+      "refersTo": "stencil-label",
+      "description": "Uppercase headline on at most two lines; the section label sits vertical in the right margin at 1024px+, flat at the section foot below, never above the heading.",
+      "html": "<section class=\"ds-section\"><div class=\"ds-pillar\"><i></i>§03 / protocol properties</div><h2 class=\"ds-headline\">Nine axioms. One runtime.</h2></section>",
+      "css": ".ds-section{position:relative;background:#0b0c0b;padding:64px 48px 96px}.ds-pillar{position:absolute;left:24px;right:24px;bottom:36px;display:flex;align-items:center;gap:12px;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;letter-spacing:.28em;text-transform:uppercase;color:#969a91}@media (min-width:1024px){.ds-pillar{left:auto;bottom:auto;right:16px;top:64px;writing-mode:vertical-rl;white-space:nowrap}.ds-pillar i{width:1px;height:24px}}.ds-pillar i{display:inline-block;width:24px;height:1px;background:#555850}.ds-headline{margin:0;max-width:19em;font-family:'TeX Gyre Adventor','Avant Garde','Century Gothic',sans-serif;font-weight:700;text-transform:uppercase;font-size:clamp(30px,5.2vw,80px);line-height:.95;letter-spacing:-.03em;text-wrap:balance;color:#e6e8e0}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Suspended Field",
+    "overview": "The mesh is a force field. The landing is a dark, raw-concrete brutalist hall, held up by nothing visible: concrete shards turn in one cold light shaft in the hero, Mikoshi's plinths and the Blackwall's pillars hang in it. Inside that hall the information sits on **terminal panels**: near-black phosphor glass with a hairline border, faint scanlines and green corner ticks, the project's cyberpunk HUD surface. Where the subject has a real world (the machines and places Net is meant to run in), it is shown with **real photographs** from open collections, held in the panels like evidence. Where the argument is a shape (1969's four hosts becoming a mesh with no centre), it is **drawn live** inside a terminal panel.\n\nFloat carries meaning. Panels sit flat and still on aligned grids by default; sequence is shown by a marker travelling a rail, not by height. A panel leaves the floor only when its height says something: altitude encodes speed (NET above real-time above best-effort), a travelling wave encodes propagation (the nine axioms, like a pingwave), a shared rhythm encodes one live system (the hero telemetry). Hovering a panel lifts it a few pixels and lights its seam: the field picks up what you attend to. Titles come into focus rather than appearing: each phrase is pulled from a soft blur into place, never hidden.\n\nThe world is cyber-led and keeps the project's terminal telemetry, mono data and acid green, and refuses the dark-neon dev-tool page where every card floats, glows and differs for no reason.",
+    "keyCharacteristics": [
+      "Three materials: procedural cast concrete for scenery, terminal glass for every text-bearing panel and live diagram, real pictures for the subject's world.",
+      "Acid green carries one meaning: the field (live, held, attended, Net's side of a contrast, or the one primary action).",
+      "Monumental geometric caps (TeX Gyre Adventor, Avant Garde lineage) for titles; Archivo for prose; JetBrains Mono for data, code, telemetry, labels and controls.",
+      "Square corners, equal page margins, aligned equal grids; height above the floor is data, never ornament."
+    ],
+    "rules": [
+      {
+        "name": "The One Meaning Rule",
+        "body": "Field Green means the field: live, held, attended, Net's side of a contrast in the copy (\"net assumes abundance.\", \"MOVES\", \"post-cloud.\"), or the one primary action. On a panel it appears only as the corner ticks (60% at rest, full when attended), the dim border when attended, and the seam. It is never a panel fill, a section background or a bright border at rest.",
+        "section": "colors"
+      },
+      {
+        "name": "The Panel Ink Rule",
+        "body": "Inside a panel, only the faint ink is raised (`ink-faint-on-panel`); dim and primary ink keep their ground values. Get it by putting text inside the `slab` utility, not by hand-picking a grey.",
+        "section": "colors"
+      },
+      {
+        "name": "The No Red Rule",
+        "body": "The palette has no red. Warnings are amber. Inherited terminal window dots are neutralised to grey and dim green inside the world.",
+        "section": "colors"
+      },
+      {
+        "name": "The Three Voices Rule",
+        "body": "Adventor for structure, Archivo for sentences, JetBrains Mono for anything a machine would print. Never set prose in mono, never set a number readout in Archivo.",
+        "section": "typography"
+      },
+      {
+        "name": "The Two Line Rule",
+        "body": "A section title runs on one or two lines, never a stack. The hero title is exactly two.",
+        "section": "typography"
+      },
+      {
+        "name": "The Focus Pull Rule",
+        "body": "A title is never invisible. Below the fold it waits slightly soft and low (0.35em down, 55% opacity, 6px blur) and is pulled into focus phrase by phrase as it enters view; without script it is simply sharp.",
+        "section": "typography"
+      },
+      {
+        "name": "The Meaningful Float Rule",
+        "body": "A panel leaves the floor only when its height encodes something: rank, propagation, shared state, or the visitor's attention. Sequence and progress travel along a rail instead. If you can't say what the height means, the panel rests. No random bobs, no per-card offsets, no idle drift on panels. All of it stops under `prefers-reduced-motion`.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Shadow Follows Height Rule",
+        "body": "A panel on the floor casts no shadow. Shadow is the evidence of altitude, so it appears exactly where a panel floats and nowhere else; the primary button is flat.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Seam Rule",
+        "body": "The field shows itself on a panel as a single 1px green line along its bottom edge: grown from 30% width when attended, or always lit when held. Held is reserved for the statement panel of a section.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Held Not Hung Rule",
+        "body": "Panels are never wired to each other, railed or framed together; a panel's relationship to the page is its grid position. The only lines that join things are field threads between mesh nodes (the hero canvas, the Mikoshi route), and they are green because they are the field.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Three Materials Rule",
+        "body": "Concrete is for scenery (canvas shards, Mikoshi plinths, Blackwall pillars). Terminal glass is for anything that carries words or numbers. Real pictures are for the subject's world (places, machines). Live diagrams are drawn on canvas inside a terminal panel. Never put text on concrete, never make scenery out of panels.",
+        "section": "shapes"
+      },
+      {
+        "name": "The Witness Rule",
+        "body": "Sourced pictures show the world Net lives in, never Net itself. A sourced photo is never presented as Net's product, customer, deployment or team, and it never appears without its credit and licence. The only image of Net's own product is the Rose & Blade frame on the Multiplayer Games card, which is the project's own footage and links to /games.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "**Do** scope new landing-world work under `.world-field` and build every text-bearing container from the `slab` utility, so the terminal face, corner ticks and raised faint ink (`#7f8479`) come with it.",
+      "**Do** keep every band on the shared margins (24px / 48px at ≥1024px), prose at or under 70ch, and panels on aligned, equal grids.",
+      "**Do** give a panel altitude, and its shadow, only to encode rank, propagation, shared state or attention; show sequence with a marker on a rail.",
+      "**Do** show the subject's real world with sourced, licensed pictures, credit each one in `field-credits.json`, and give each an alt text that says what it is.",
+      "**Do** move on the field ease (`cubic-bezier(0.16, 1, 0.3, 1)`), and keep every float, wave, sync, focus pull and lift behind `prefers-reduced-motion`.",
+      "**Do** label simulated telemetry as SIMULATED and mark real interface fragments with `data-ui`.",
+      "**Do** keep the brand's deliberate terminal vocabulary, even where generic taste rules advise against it: mono telemetry, tracked uppercase labels, hairline borders and outlined panels with corner ticks, scanline texture, the frozen 01–06 / P.0n / § labels and panel IDs that the copy already carries, and green accent phrases in titles."
+    ],
+    "donts": [
+      "**Don't** extend the legacy root theme (Major Mono Display, Space Grotesk, CRT scanlines, `#3df0ff` cyan, `#ff5e3d` warn) on any new surface; it survives only until /docs and /games migrate.",
+      "**Don't** float, offset, stagger or shadow a panel for variety; a panel on the floor is flat.",
+      "**Don't** present a picture as Net's product, customer or deployment, caption it with invented claims, or ship one without its source and licence.",
+      "**Don't** stack a title over three or more lines, or hide a title entirely before it lifts.",
+      "**Don't** put text on concrete or build panels out of concrete.",
+      "**Don't** use Field Green as a panel fill, section background or bright resting border.",
+      "**Don't** invent new numbered labels or kickers; the § / 01–06 / P.0n markers are frozen copy, carried, not a pattern to extend.",
+      "**Don't** round corners, use red, redaction bars, or `<<text>>` Board-style treatments.",
+      "**Don't** set prose in mono or titles in Archivo."
+    ]
+  }
+}

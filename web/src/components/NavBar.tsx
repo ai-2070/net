@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import { ArrowDown } from "@phosphor-icons/react";
 import globals from "@/lib/globals";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
@@ -23,7 +24,7 @@ const SECTION_IDS: ReadonlyArray<string> = NAV_LINKS.flatMap((l) =>
   l.href.startsWith("/#") ? [l.href.slice(2)] : [],
 );
 
-export function NavBar() {
+export function NavBar({ world }: { world?: "field" } = {}) {
   const pathname = usePathname();
   const [activeSection, setActiveSection] = useState<string | null>(null);
 
@@ -65,6 +66,90 @@ export function NavBar() {
     }
     return pathname === href;
   };
+
+  if (world === "field") {
+    return (
+      <nav className="fixed top-7 left-0 right-0 h-[56px] bg-[rgba(11,12,11,0.92)] border-b border-line flex items-center px-6 lg:px-12 z-[99]">
+        <Link
+          href="/"
+          className="flex items-baseline gap-3 no-underline"
+          aria-label="NET home"
+        >
+          <span className="font-display font-bold uppercase text-[24px] leading-none tracking-[-0.02em] text-ink">
+            net
+          </span>
+          <span className="font-mono text-[9px] text-ink-dim tracking-[0.18em] font-semibold">
+            {"// AI 2070"}
+          </span>
+        </Link>
+        <ul className="hidden xl:flex list-none ml-10 items-stretch h-[30px] border border-line divide-x divide-line">
+          {NAV_LINKS.slice(0, 8).map((l, i) => {
+            const active = isActive(l.href);
+            return (
+              <li key={l.href} className="flex">
+                <Link
+                  href={l.href}
+                  aria-current={active ? "page" : undefined}
+                  className={`flex items-center gap-2.5 px-3 font-mono text-[10.5px] tracking-[0.14em] uppercase transition-colors ${
+                    active
+                      ? "bg-ink text-bg"
+                      : "text-ink-dim hover:text-ink hover:bg-[#151915]"
+                  }`}
+                >
+                  {l.label}
+                  <span
+                    className={`tabular-nums ${active ? "text-bg/60" : "text-ink-faint"}`}
+                  >
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                </Link>
+              </li>
+            );
+          })}
+        </ul>
+        <ul className="hidden lg:flex list-none gap-5 ml-auto items-center">
+          {NAV_LINKS.slice(8).map((l) => {
+            const active = isActive(l.href);
+            return (
+              <li key={l.href}>
+                <Link
+                  href={l.href}
+                  aria-current={active ? "page" : undefined}
+                  className={`relative block py-1 font-mono text-[10.5px] tracking-[0.16em] uppercase transition-colors hover:text-ink ${
+                    active ? "text-ink" : "text-ink-dim"
+                  }`}
+                >
+                  {l.label}
+                  {active ? (
+                    <span
+                      aria-hidden
+                      className="absolute left-0 right-0 -bottom-[3px] h-px bg-accent"
+                    />
+                  ) : null}
+                </Link>
+              </li>
+            );
+          })}
+          <li>
+            <Link
+              href={globals.links.install}
+              className="btn-field !py-2 !px-3.5 !text-[10.5px]"
+            >
+              <ArrowDown size={12} weight="bold" aria-hidden />
+              INSTALL
+            </Link>
+          </li>
+        </ul>
+        <Link
+          href={globals.links.install}
+          className="lg:hidden ml-auto btn-field !py-2.5 !px-4 !text-[10.5px]"
+        >
+          <ArrowDown size={12} weight="bold" aria-hidden />
+          INSTALL
+        </Link>
+      </nav>
+    );
+  }
 
   return (
     <nav className="fixed top-7 left-0 right-0 h-[52px] nav-glass border-b border-line flex items-center px-6 z-[99]">

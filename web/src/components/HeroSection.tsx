@@ -1,361 +1,26 @@
 "use client";
 
-import { PacketRain } from "./PacketRain";
+import Link from "next/link";
+import { ArrowDown, ArrowRight, ArrowDownRight } from "@phosphor-icons/react";
+import { useState, useEffect } from "react";
+import { FieldCanvas } from "./field/FieldCanvas";
 import { useRepoInfo } from "./RepoInfoProvider";
 import { buildQuarter } from "@/lib/utils";
-import { useState, useEffect, useRef, useMemo } from "react";
-import Link from "next/link";
 import globals from "@/lib/globals";
 
-interface Node3D {
-  x: number;
-  y: number;
-  z: number;
-  hasLabel?: boolean;
-}
-
-const NODES_3D: Record<string, Node3D> = {
-  N0: { x: -0.85, y: -0.18, z: 0.3, hasLabel: true },
-  N1: { x: -0.55, y: 0.4, z: -0.25, hasLabel: true },
-  N2: { x: -0.15, y: -0.55, z: 0.55 },
-  N3: { x: 0.05, y: -0.05, z: 0.1, hasLabel: true },
-  N4: { x: 0.2, y: 0.55, z: -0.4 },
-  N5: { x: 0.5, y: -0.3, z: 0.6, hasLabel: true },
-  N6: { x: 0.85, y: 0.2, z: 0.15, hasLabel: true },
-  N7: { x: 0.7, y: -0.55, z: -0.3 },
-  N8: { x: -0.4, y: -0.65, z: -0.2 },
-  N9: { x: -0.05, y: 0.65, z: 0.4, hasLabel: true },
-  N10: { x: 0.5, y: 0.55, z: 0.2 },
-  N11: { x: -0.75, y: 0.1, z: -0.55, hasLabel: true },
-};
-
-const NODE_IDS_3D: ReadonlyArray<string> = Object.keys(NODES_3D);
-
-const ADJ_3D: Record<string, ReadonlyArray<string>> = {
-  N0: ["N1", "N2", "N11"],
-  N1: ["N0", "N3", "N9", "N11"],
-  N2: ["N0", "N3", "N5", "N8"],
-  N3: ["N1", "N2", "N4", "N6", "N9"],
-  N4: ["N3", "N9", "N10"],
-  N5: ["N2", "N6", "N7"],
-  N6: ["N3", "N5", "N7", "N10"],
-  N7: ["N5", "N6", "N8", "N11"],
-  N8: ["N2", "N7", "N11"],
-  N9: ["N1", "N3", "N4"],
-  N10: ["N4", "N6"],
-  N11: ["N0", "N1", "N7", "N8"],
-};
-
-function edgeKey3D(a: string, b: string): string {
-  return a < b ? `${a}|${b}` : `${b}|${a}`;
-}
-
-const EDGES_3D: ReadonlyArray<readonly [string, string]> = (() => {
-  const seen = new Set<string>();
-  const out: Array<readonly [string, string]> = [];
-  for (const [a, neighbors] of Object.entries(ADJ_3D)) {
-    for (const b of neighbors) {
-      const key = edgeKey3D(a, b);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push([a, b] as const);
-    }
-  }
-  return out;
-})();
-
-const ENDPOINT_POOL_3D: ReadonlyArray<string> = [
-  "N0",
-  "N5",
-  "N6",
-  "N7",
-  "N9",
-  "N10",
-  "N11",
-];
-
-function shortestPath3D(from: string, to: string): string[] {
-  const queue: string[][] = [[from]];
-  const seen = new Set<string>([from]);
-  while (queue.length > 0) {
-    const path = queue.shift();
-    if (!path) break;
-    const last = path[path.length - 1];
-    if (!last) continue;
-    if (last === to) return path;
-    const adj = ADJ_3D[last];
-    if (!adj) continue;
-    for (const n of adj) {
-      if (!seen.has(n)) {
-        seen.add(n);
-        queue.push([...path, n]);
-      }
-    }
-  }
-  return [from, to];
-}
-
-interface Projected {
-  sx: number;
-  sy: number;
-  depth: number;
-}
-
-const VIEW_W = 320;
-const VIEW_H = 220;
-const CENTER_X = VIEW_W / 2;
-const CENTER_Y = VIEW_H / 2;
-const CAMERA_DIST = 2.1;
-const PROJECT_SCALE = 280;
-const TILT = 0.18;
-
-function project3D(n: Node3D, angle: number): Projected {
-  const cosA = Math.cos(angle);
-  const sinA = Math.sin(angle);
-  let x = n.x * cosA + n.z * sinA;
-  let z = -n.x * sinA + n.z * cosA;
-  let y = n.y;
-
-  const cosT = Math.cos(TILT);
-  const sinT = Math.sin(TILT);
-  const yT = y * cosT - z * sinT;
-  const zT = y * sinT + z * cosT;
-  y = yT;
-  z = zT;
-
-  const persp = 1 / (CAMERA_DIST + z);
-  return {
-    sx: CENTER_X + x * persp * PROJECT_SCALE,
-    sy: CENTER_Y + y * persp * PROJECT_SCALE,
-    depth: z,
-  };
-}
-
-function MeshViz() {
-  const [angle, setAngle] = useState(0);
-  const [packetT, setPacketT] = useState(0);
-  const [activePath, setActivePath] = useState<string[]>(["N0", "N6"]);
-  const [labels, setLabels] = useState<Record<string, string>>({});
-  const pausedRef = useRef(false);
-
-  useEffect(() => {
-    const hex = (): string =>
-      Math.floor(Math.random() * 256)
-        .toString(16)
-        .padStart(2, "0");
-    const map: Record<string, string> = {};
-    for (const id of NODE_IDS_3D) {
-      map[id] = "node.0x" + hex() + hex();
-    }
-    setLabels(map);
-  }, []);
-
-  useEffect(() => {
-    let rafId = 0;
-    let last = performance.now();
-    const loop = (now: number): void => {
-      const dt = (now - last) / 1000;
-      last = now;
-      if (!pausedRef.current) {
-        setAngle((a) => a + dt * 0.08);
-        setPacketT((t) => {
-          const next = t + dt * 0.45;
-          return next >= 1 ? next - 1 : next;
-        });
-      }
-      rafId = requestAnimationFrame(loop);
-    };
-    rafId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafId);
-  }, []);
-
-  useEffect(() => {
-    const pickPath = (): void => {
-      const i = Math.floor(Math.random() * ENDPOINT_POOL_3D.length);
-      let j = Math.floor(Math.random() * ENDPOINT_POOL_3D.length);
-      while (j === i) {
-        j = Math.floor(Math.random() * ENDPOINT_POOL_3D.length);
-      }
-      const src = ENDPOINT_POOL_3D[i];
-      const dst = ENDPOINT_POOL_3D[j];
-      if (!src || !dst) return;
-      setActivePath(shortestPath3D(src, dst));
-      setPacketT(0);
-    };
-    pickPath();
-    const id = window.setInterval(pickPath, 2800);
-    return () => window.clearInterval(id);
-  }, []);
-
-  const projected = useMemo(() => {
-    const map: Record<string, Projected> = {};
-    for (const id of NODE_IDS_3D) {
-      const n = NODES_3D[id];
-      if (!n) continue;
-      map[id] = project3D(n, angle);
-    }
-    return map;
-  }, [angle]);
-
-  const activeEdgeSet = useMemo(() => {
-    const s = new Set<string>();
-    for (let i = 0; i < activePath.length - 1; i++) {
-      const a = activePath[i];
-      const b = activePath[i + 1];
-      if (!a || !b) continue;
-      s.add(edgeKey3D(a, b));
-    }
-    return s;
-  }, [activePath]);
-
-  const packetPos = useMemo(() => {
-    const path = activePath;
-    if (path.length < 2) return { sx: CENTER_X, sy: CENTER_Y };
-    const segCount = path.length - 1;
-    const segIdx = Math.min(Math.floor(packetT * segCount), segCount - 1);
-    const segT = packetT * segCount - segIdx;
-    const a = projected[path[segIdx] ?? ""];
-    const b = projected[path[segIdx + 1] ?? ""];
-    if (!a || !b) return { sx: CENTER_X, sy: CENTER_Y };
-    return {
-      sx: a.sx + (b.sx - a.sx) * segT,
-      sy: a.sy + (b.sy - a.sy) * segT,
-    };
-  }, [packetT, activePath, projected]);
-
-  const orderedNodes = useMemo(() => {
-    return [...NODE_IDS_3D].sort((a, b) => {
-      const da = projected[a]?.depth ?? 0;
-      const db = projected[b]?.depth ?? 0;
-      return db - da;
-    });
-  }, [projected]);
-
+// The proximity readout that used to sit beside a small graph now names the
+// field itself: the graph is the shards and threads behind the title.
+function ProximitySlab() {
   return (
-    <div
-      className="border border-line bg-bg-2 p-4"
-      onMouseEnter={() => {
-        pausedRef.current = true;
-      }}
-      onMouseLeave={() => {
-        pausedRef.current = false;
-      }}
-    >
-      <div className="flex justify-between items-center border-b border-line pb-2 mb-3.5 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
-        <span>
-          <span className="text-accent">▸</span> mesh.proximity
+    <div data-ui className="slab p-5">
+      <div className="flex justify-between items-center border-b border-line pb-2.5 mb-4 text-[12px] tracking-[0.16em] text-ink-dim uppercase font-mono">
+        <span className="text-ink">mesh.proximity</span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 bg-accent inline-block" />
+          OBSERVABLE
         </span>
-        <span>OBSERVABLE</span>
       </div>
-
-      <svg
-        className="mesh-svg w-full aspect-[320/220] block"
-        viewBox="0 0 320 220"
-        preserveAspectRatio="xMidYMid meet"
-      >
-        <defs>
-          <pattern
-            id="grid"
-            width="20"
-            height="20"
-            patternUnits="userSpaceOnUse"
-          >
-            <path
-              d="M 20 0 L 0 0 0 20"
-              fill="none"
-              stroke="#1a1f1a"
-              strokeWidth="0.3"
-            />
-          </pattern>
-        </defs>
-        <rect width={VIEW_W} height={VIEW_H} fill="url(#grid)" />
-
-        {EDGES_3D.map(([a, b]) => {
-          const pa = projected[a];
-          const pb = projected[b];
-          if (!pa || !pb) return null;
-          const key = edgeKey3D(a, b);
-          const isActive = activeEdgeSet.has(key);
-          if (isActive) {
-            return (
-              <line
-                key={key}
-                className="link link-active"
-                x1={pa.sx}
-                y1={pa.sy}
-                x2={pb.sx}
-                y2={pb.sy}
-              />
-            );
-          }
-          const avgDepth = (pa.depth + pb.depth) / 2;
-          const fade = Math.max(0, Math.min(1, (1 - avgDepth) / 2));
-          return (
-            <line
-              key={key}
-              x1={pa.sx}
-              y1={pa.sy}
-              x2={pb.sx}
-              y2={pb.sy}
-              stroke="#c4ff3d"
-              strokeOpacity={0.08 + fade * 0.18}
-              strokeWidth={0.4 + fade * 0.4}
-            />
-          );
-        })}
-
-        {orderedNodes.map((id) => {
-          const p = projected[id];
-          if (!p) return null;
-          const fade = Math.max(0.2, Math.min(1, (1 - p.depth) / 2));
-          const r = 2.4 + fade * 3.2;
-          const showLabel = NODES_3D[id]?.hasLabel === true;
-          const labelText = labels[id] ?? "";
-          return (
-            <g key={id}>
-              <circle
-                cx={p.sx}
-                cy={p.sy}
-                r={r * 1.9}
-                fill="none"
-                stroke="#c4ff3d"
-                strokeOpacity={0.08 + fade * 0.15}
-                strokeWidth="0.4"
-              />
-              <circle
-                cx={p.sx}
-                cy={p.sy}
-                r={r}
-                fill="#c4ff3d"
-                fillOpacity={0.4 + fade * 0.55}
-              />
-              {showLabel && labelText ? (
-                <text
-                  x={p.sx + r + 3}
-                  y={p.sy + 2}
-                  fontFamily="JetBrains Mono"
-                  fontSize="5.5"
-                  fill="#c4ff3d"
-                  fillOpacity={0.35 + fade * 0.4}
-                  letterSpacing="0.2"
-                >
-                  {labelText}
-                </text>
-              ) : null}
-            </g>
-          );
-        })}
-
-        <circle
-          cx={packetPos.sx}
-          cy={packetPos.sy}
-          r="2.6"
-          fill="#c4ff3d"
-          opacity="0.95"
-        />
-      </svg>
-
-      <div className="grid grid-cols-2 gap-3 mt-3.5 pt-3.5 border-t border-line">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-4">
         <MeshStat label="forward / hop" value="0.57" unit="ns" />
         <MeshStat label="recovery cycle" value="291" unit="ns" />
         <MeshStat label="cdylib size (base)" value="2.60" unit="mb" />
@@ -375,13 +40,15 @@ function MeshStat({
   unit: string;
 }) {
   return (
-    <div className="text-[10px]">
-      <div className="text-ink-dim tracking-[0.1em] uppercase mb-1">
+    <div>
+      <div className="text-ink-dim text-[12px] tracking-[0.14em] uppercase mb-1.5 font-mono">
         {label}
       </div>
-      <div className="text-accent text-[18px] font-semibold font-mono">
+      <div className="font-display font-bold text-ink text-[26px] leading-none tabular-nums">
         {value}
-        <span className="text-ink-dim text-[10px] ml-[3px]">{unit}</span>
+        <span className="font-mono font-normal text-ink-dim text-[12px] ml-1.5 tracking-[0.06em]">
+          {unit}
+        </span>
       </div>
     </div>
   );
@@ -632,17 +299,15 @@ function MeshEventLog() {
   }, []);
 
   return (
-    <div className="border border-line bg-bg-2 p-4">
-      <div className="flex justify-between items-center border-b border-line pb-2 mb-3.5 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
-        <span>
-          <span className="text-accent">▸</span> event.tail
-        </span>
+    <div data-ui className="slab p-5">
+      <div className="flex justify-between items-center border-b border-line pb-2.5 mb-3.5 text-[12px] tracking-[0.16em] text-ink-dim uppercase font-mono">
+        <span className="text-ink">event.tail</span>
         <span className="flex items-center gap-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block animate-pulse-dot" />
           SIMULATED
         </span>
       </div>
-      <div className="font-mono text-[10px] leading-[1.55] overflow-hidden min-h-[126px] -mx-4">
+      <div className="font-mono text-[13px] leading-[1.6] overflow-hidden min-h-[136px] -mx-5">
         {events.map((e) => {
           const bg =
             e.highlight === "accent"
@@ -655,7 +320,7 @@ function MeshEventLog() {
           return (
             <div
               key={e.id}
-              className={`event-line-in flex items-baseline gap-2 whitespace-nowrap overflow-hidden px-4 ${bg}`}
+              className={`event-line-in flex items-baseline gap-2 whitespace-nowrap overflow-hidden px-5 ${bg}`}
             >
               <span
                 className="text-ink-faint shrink-0"
@@ -669,14 +334,13 @@ function MeshEventLog() {
               >
                 {e.type}
               </span>
-              <span className="text-ink-faint shrink-0">▸</span>
               <span className="text-ink-dim flex-1 truncate">{e.body}</span>
               <span className={`${e.metricColor} shrink-0`}>{e.metric}</span>
             </div>
           );
         })}
       </div>
-      <div className="border-t border-line mt-3 pt-2 flex justify-between text-[9px] text-ink-faint tracking-[0.1em] uppercase font-mono">
+      <div className="border-t border-line mt-3 pt-2.5 flex justify-between text-[12px] text-ink-dim tracking-[0.14em] uppercase font-mono">
         <span>● 450ms tick</span>
       </div>
     </div>
@@ -691,81 +355,127 @@ export function HeroSection() {
   return (
     <section
       id="hero"
-      className="hero relative overflow-hidden border-b border-line px-6 pt-[60px] pb-20"
+      className="relative overflow-hidden min-h-[calc(100svh-80px)] flex flex-col"
     >
-      <PacketRain />
-      <div className="relative grid grid-cols-1 lg:grid-cols-[1fr_520px] gap-12">
-        <div>
-          <div className="text-[10px] text-ink-dim tracking-[0.15em] mb-7 flex flex-wrap gap-[18px] items-center">
-            <span className="text-accent border border-accent-dim px-2 py-[3px]">
-              RFC-NET-001
-            </span>
-            <span className="text-ink-faint font-mono">PROTOCOL.0x4E45·54</span>
-            <span className="text-ink-dim">REV {rev}</span>
+      {/* past the content width the field fades out rather than ending
+          on a hard edge */}
+      <div className="absolute inset-0 min-[1500px]:[mask-image:linear-gradient(90deg,transparent,#000_7%,#000_93%,transparent)]">
+        <FieldCanvas />
+      </div>
+      {/* the text side of the hall stays dark enough to read */}
+      <div
+        aria-hidden
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          background:
+            "linear-gradient(90deg, rgba(11,12,11,0.94) 0%, rgba(11,12,11,0.82) 30%, rgba(11,12,11,0.2) 58%, rgba(11,12,11,0) 72%), linear-gradient(0deg, rgba(11,12,11,1) 0%, rgba(11,12,11,0) 22%)",
+        }}
+      />
+
+      {/* phones: the field sits behind every line of text, so dim it more */}
+      <div
+        aria-hidden
+        className="absolute inset-0 pointer-events-none lg:hidden"
+        style={{
+          background:
+            "linear-gradient(180deg, rgba(11,12,11,0.15) 0%, rgba(11,12,11,0.72) 34%, rgba(11,12,11,0.8) 100%)",
+        }}
+      />
+
+      <div className="relative flex-1 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-12 px-6 lg:px-12 pt-12 lg:pt-14 pb-12">
+        <div className="flex flex-col">
+          {/* title, lede and actions sit centred in the hall; the reference
+              line stays on the floor */}
+          <div className="my-auto">
+            <h1
+              className="font-display font-bold uppercase leading-[0.86] tracking-[-0.04em] text-ink"
+              style={{ fontSize: "clamp(50px, 8.3vw, 132px)" }}
+            >
+              <span className="block">
+                <span
+                  className="field-rise !inline-block"
+                  style={{ animationDelay: "0.1s" }}
+                >
+                  net.
+                </span>{" "}
+                <span
+                  className="field-rise !inline-block text-accent"
+                  style={{ animationDelay: "0.24s" }}
+                >
+                  moves
+                </span>
+              </span>
+              <span className="field-rise" style={{ animationDelay: "0.38s" }}>
+                at light.
+              </span>
+            </h1>
+
+            <div className="field-fade" style={{ animationDelay: "0.7s" }}>
+              <p className="text-[20px] md:text-[22px] text-ink mt-9 max-w-[30em] leading-[1.45] font-light">
+                A latency-first encrypted mesh where every computer, app and
+                device is a first-class node. Existing networks operate in
+                milliseconds{" "}
+                <em className="not-italic font-mono text-[0.82em] text-ink-dim">
+                  (10⁻³)
+                </em>
+                . NET operates in nanoseconds{" "}
+                <em className="not-italic font-mono text-[0.82em] text-accent">
+                  (10⁻⁹)
+                </em>
+                .
+              </p>
+
+              <p className="text-[17px] text-ink mt-6 max-w-[36em] leading-[1.6]">
+                No clients. No servers. No coordinators. The mesh propagates
+                state, not connections.
+              </p>
+
+              <p className="text-[17px] text-ink mt-2 max-w-[36em] leading-[1.6]">
+                Flagship use:{" "}
+                <Link
+                  href="/docs/worldview/agentic-mesh"
+                  className="link-field"
+                >
+                  agentic capability federation
+                </Link>{" "}
+                — agents discovering, invoking, and recovering work across a
+                trusted mesh.
+              </p>
+
+              <div className="mt-9 flex gap-4 flex-wrap items-center">
+                <Link href={globals.links.install} className="btn-field">
+                  <ArrowDown size={14} weight="bold" aria-hidden />
+                  Install NET
+                  <ArrowRight size={14} weight="bold" aria-hidden />
+                </Link>
+                <a href="#bench" className="btn-ghost-field">
+                  Read benchmarks
+                </a>
+                <a
+                  href="#properties"
+                  className="inline-flex items-center gap-2 py-3 font-mono text-[13px] tracking-[0.16em] uppercase text-ink-dim hover:text-accent transition-colors"
+                >
+                  {"// view spec"}
+                  <ArrowDownRight size={13} weight="bold" aria-hidden />
+                </a>
+              </div>
+            </div>
           </div>
 
-          <h1
-            className="font-display leading-[0.88] tracking-[-0.02em] text-ink mb-5"
-            style={{ fontSize: "clamp(56px, 10vw, 128px)" }}
-          >
-            net.
-            <br />
-            <span className="text-accent">moves</span>
-            <br />
-            at light.
-          </h1>
-
-          <p className="text-[18px] text-ink mt-8 max-w-[580px] leading-[1.5] font-light">
-            A latency-first encrypted mesh where every computer, app and device
-            is a first-class node. Existing networks operate in milliseconds{" "}
-            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻³)</em>
-            . NET operates in nanoseconds{" "}
-            <em className="not-italic text-accent bg-accent/10 px-1">(10⁻⁹)</em>
-            .
-          </p>
-
-          <p className="text-[13px] text-ink-dim mt-[18px] max-w-[580px] leading-[1.65]">
-            No clients. No servers. No coordinators. The mesh propagates state,
-            not connections.
-          </p>
-
-          <p className="text-[13px] text-ink-dim mt-3 max-w-[580px] leading-[1.65]">
-            Flagship use:{" "}
-            <Link
-              href="/docs/worldview/agentic-mesh"
-              className="text-accent no-underline hover:underline"
-            >
-              agentic capability federation
-            </Link>{" "}
-            — agents discovering, invoking, and recovering work across a trusted
-            mesh.
-          </p>
-
-          <div className="mt-11 flex gap-3 flex-wrap items-center">
-            <Link
-              href={globals.links.install}
-              className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
-            >
-              ↓ Install NET <span className="text-sm">→</span>
-            </Link>
-            <a
-              href="#bench"
-              className="btn-ghost inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-ink-faint text-ink transition-all"
-            >
-              Read benchmarks
-            </a>
-            <a
-              href="#properties"
-              className="btn-ghost inline-flex items-center gap-2.5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline text-ink transition-all"
-            >
-              // view spec ↘
-            </a>
+          <div className="pt-12 stencil flex flex-wrap gap-x-6 gap-y-2 items-center">
+            <span className="text-ink">RFC-NET-001</span>
+            <span>PROTOCOL.0x4E45·54</span>
+            <span>REV {rev}</span>
           </div>
         </div>
 
-        <div className="hidden lg:flex flex-col gap-4 self-start">
-          <MeshViz />
-          <MeshEventLog />
+        <div className="hidden lg:flex flex-col gap-12 self-center field-sync">
+          <div>
+            <ProximitySlab />
+          </div>
+          <div>
+            <MeshEventLog />
+          </div>
         </div>
       </div>
     </section>

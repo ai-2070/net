@@ -1,5 +1,9 @@
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+"use client";
+
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { Lede } from "./field/Lede";
+import { IsoDiagram, type IsoFigure } from "./field/IsoDiagram";
 
 interface ComponentSpec {
   num: string;
@@ -78,9 +82,16 @@ const COMPONENTS: readonly ComponentSpec[] = [
   },
 ];
 
+const COMPONENT_FIGURES: ReadonlyArray<IsoFigure> = [
+  "nrpc",
+  "redex",
+  "cortex",
+  "netdb",
+];
+
 export function ComponentsSection() {
   return (
-    <section id="components" className="border-b border-line px-6 py-20">
+    <section id="components" className="relative px-6 lg:px-12 py-24 lg:py-32">
       <SectionLabel>§09 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
@@ -88,32 +99,35 @@ export function ComponentsSection() {
         one mesh.
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <Lede>
         The mesh moves bytes. Everything above is a thin, optional layer —
         local-first, feature-flagged, opt-in. Light up the ones you need; the
         wire doesn&apos;t care which.
-      </p>
+      </Lede>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-px bg-line border border-line">
-        {COMPONENTS.map((c) => (
-          <div
-            key={c.name}
-            className="bg-bg p-7 transition-colors hover:bg-bg-2 flex flex-col"
-          >
-            <div className="text-[10px] text-accent tracking-[0.18em] mb-2.5">
-              {c.num}
-            </div>
-            <h3 className="font-head text-[22px] leading-tight text-ink mb-1.5 tracking-[0.04em] lowercase">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6">
+        {COMPONENTS.map((c, i) => (
+          <div key={c.name} className="slab slab-lift p-7 flex flex-col">
+            {COMPONENT_FIGURES[i] ? (
+              <IsoDiagram
+                figure={COMPONENT_FIGURES[i]}
+                className="-mx-2 mb-6"
+              />
+            ) : null}
+            <h3 className="font-display font-bold text-[25px] leading-[1.05] text-ink mb-2 tracking-[-0.015em]">
               {c.name}
             </h3>
-            <div className="text-[10px] text-ink-dim mb-4 tracking-[0.05em]">
+            <div className="text-[12px] text-ink-dim mb-4 tracking-[0.05em]">
               {c.tagline}
             </div>
-            <p className="text-[12px] text-ink-dim leading-[1.6] mb-4 flex-1">
+            <p className="text-[16px] text-ink-dim leading-[1.55] mb-4 flex-1 max-w-[36em]">
               {c.body}
             </p>
-            <div className="border-t border-dashed border-line pt-3 font-mono text-[10px] text-ink-dim tracking-[0.04em]">
-              {c.stats}
+            <div className="flex items-end justify-between gap-4 border-t border-line pt-4">
+              <span className="font-mono text-[13px] text-ink-dim tracking-[0.04em]">
+                {c.stats}
+              </span>
+              <span className="stencil shrink-0 normal-case">{c.num}</span>
             </div>
           </div>
         ))}

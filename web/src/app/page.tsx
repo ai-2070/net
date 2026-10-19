@@ -11,7 +11,6 @@ import { InstallSection } from "@/components/InstallSection";
 import { ApplicationsSection } from "@/components/ApplicationsSection";
 import { ReleasesSection } from "@/components/ReleasesSection";
 import { ClosingSection } from "@/components/ClosingSection";
-import { FooterDivider } from "@/components/FooterDivider";
 import { Footer } from "@/components/Footer";
 import { NavBar } from "@/components/NavBar";
 import { BlackwallSection } from "@/components/BlackwallSection";
@@ -24,9 +23,9 @@ import { PageContainer } from "@/components/PageContainer";
 
 export default function Home(): JSX.Element {
   return (
-    <PageContainer>
-      <NavBar />
-      <main className="pt-20 max-w-[1440px] mx-auto">
+    <PageContainer className="world-field world-notebook field-grain">
+      <NavBar world="field" />
+      <main className="pt-[84px] max-w-[1440px] mx-auto">
         {/*<SeedBanner />*/}
         <HeroSection />
         <WhyNotBestEffortSection />
@@ -43,8 +42,7 @@ export default function Home(): JSX.Element {
         <BlackwallSection />
         <ReleasesSection />
         <ClosingSection />
-        <FooterDivider />
-        <Footer />
+        <Footer world="field" />
       </main>
     </PageContainer>
   );

@@ -220,12 +220,11 @@ const GROUP_CARDS: readonly GroupCard[] = [
     ascii: <AsciiCycle phases={STANDBY_PHASES} intervalMs={3500} />,
     body: (
       <>
-        For stateful services that need failover without running duplicate copies.{" "}
-        <b className="text-ink font-medium">One active daemon runs;</b>{" "}
-        warm standbys stay synced. If it fails, the most-recent standby takes over and catches up.{" "}
-        <b className="text-ink font-medium">
-          Zero duplicate compute.
-        </b>
+        For stateful services that need failover without running duplicate
+        copies. <b className="text-ink font-medium">One active daemon runs;</b>{" "}
+        warm standbys stay synced. If it fails, the most-recent standby takes
+        over and catches up.{" "}
+        <b className="text-ink font-medium">Zero duplicate compute.</b>
       </>
     ),
     spec: [
@@ -239,28 +238,22 @@ const GROUP_CARDS: readonly GroupCard[] = [
 
 export function GroupCards() {
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-accent-dim mt-8 border border-accent-dim">
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-5 lg:gap-6 mt-16">
       {GROUP_CARDS.map((g) => (
-        <div
-          key={g.id}
-          className="bg-bg p-7 transition-colors hover:bg-bg-2 relative"
-        >
-          <div className="text-[10px] text-accent tracking-[0.18em] mb-1.5">
-            {g.id}
-          </div>
-          <h3 className="font-head text-[22px] leading-tight text-ink mb-1.5 tracking-[0.04em] lowercase">
+        <div key={g.id} className="slab slab-lift p-7 relative">
+          <h3 className="font-display font-bold text-[25px] leading-[1.05] text-ink mb-2 tracking-[-0.015em]">
             {g.name}
           </h3>
-          <div className="text-[10px] text-ink-dim mb-4 tracking-[0.05em]">
+          <div className="text-[12px] text-ink-dim mb-4 tracking-[0.05em]">
             {g.meta}
           </div>
-          <pre className="font-mono text-[10px] text-ink-dim leading-[1.5] bg-bg-2 p-3.5 border-l-2 border-accent mb-4 whitespace-pre overflow-x-auto">
+          <pre className="font-mono text-[12px] text-ink-dim leading-[1.5] bg-black/35 p-3.5 mb-5 shadow-[inset_0_2px_6px_rgba(0,0,0,0.55)] whitespace-pre-wrap lg:whitespace-pre overflow-x-auto">
             {g.ascii}
           </pre>
-          <p className="text-[12px] text-ink-dim leading-[1.6] mb-4">
+          <p className="text-[16px] text-ink-dim leading-[1.55] mb-4">
             {g.body}
           </p>
-          <div className="border-t border-line pt-3.5 grid grid-cols-2 gap-2.5 text-[10px]">
+          <div className="border-t border-line pt-3.5 grid grid-cols-2 gap-2.5 text-[12px]">
             {g.spec.map(([k, v]) => (
               <span key={k} className="contents">
                 <span className="text-ink-dim uppercase tracking-[0.1em]">
@@ -270,6 +263,7 @@ export function GroupCards() {
               </span>
             ))}
           </div>
+          <div className="stencil mt-5 normal-case">{g.id}</div>
         </div>
       ))}
     </div>
