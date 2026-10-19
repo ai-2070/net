@@ -1,0 +1,21 @@
+net/crates/net/Cargo.toml
+  s_035236866cfea0::t_4b44599c13c738 371
+net/crates/net/Cargo.lock
+  s_035236866cfea0::t_15bb57d1ee1cc0 2951-2959,3278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cd36f332f7e61ff6aaff27cce331f3229c2c396d",
+  "prompts": {},
+  "sessions": {
+    "s_035236866cfea0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "74b334d0-fd26-46a2-b26b-d4003c7dc7c8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
