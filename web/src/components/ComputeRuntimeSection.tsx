@@ -1,15 +1,15 @@
 import { DaemonCaseBlock } from "./DaemonCaseBlock";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 import { GroupCards } from "./GroupCards";
 import { MigrationPipeline } from "./MigrationPipeline";
-import { SectionLabel } from "./SectionLabel";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { SpecStrip } from "./SpecStrip";
 
 export function ComputeRuntimeSection() {
   return (
     <section
       id="runtime"
-      className="compute-bg border-b border-line px-6 py-20"
+      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
     >
       <SectionLabel>§06 / daemon runtime // new</SectionLabel>
       <DisplayHeading>
@@ -22,7 +22,7 @@ export function ComputeRuntimeSection() {
         </span>
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         A program on NET is called a{" "}
         <em className="not-italic text-accent bg-accent/[0.08] px-1">daemon</em>
         . Its identity is a public key — an{" "}

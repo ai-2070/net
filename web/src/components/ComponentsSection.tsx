@@ -1,5 +1,5 @@
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 
 interface ComponentSpec {
   num: string;
@@ -80,7 +80,10 @@ const COMPONENTS: readonly ComponentSpec[] = [
 
 export function ComponentsSection() {
   return (
-    <section id="components" className="border-b border-line px-6 py-20">
+    <section
+      id="components"
+      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+    >
       <SectionLabel>§09 / components on the mesh</SectionLabel>
       <DisplayHeading>
         four primitives.
@@ -88,32 +91,29 @@ export function ComponentsSection() {
         one mesh.
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         The mesh moves bytes. Everything above is a thin, optional layer —
         local-first, feature-flagged, opt-in. Light up the ones you need; the
         wire doesn&apos;t care which.
       </p>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-px bg-line border border-line">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6">
         {COMPONENTS.map((c) => (
-          <div
-            key={c.name}
-            className="bg-bg p-7 transition-colors hover:bg-bg-2 flex flex-col"
-          >
-            <div className="text-[10px] text-accent tracking-[0.18em] mb-2.5">
-              {c.num}
-            </div>
-            <h3 className="font-head text-[22px] leading-tight text-ink mb-1.5 tracking-[0.04em] lowercase">
+          <div key={c.name} className="slab slab-lift p-7 flex flex-col">
+            <h3 className="font-display font-bold text-[25px] leading-[1.05] text-ink mb-2 tracking-[-0.015em]">
               {c.name}
             </h3>
             <div className="text-[10px] text-ink-dim mb-4 tracking-[0.05em]">
               {c.tagline}
             </div>
-            <p className="text-[12px] text-ink-dim leading-[1.6] mb-4 flex-1">
+            <p className="text-[14px] text-ink-dim leading-[1.6] mb-4 flex-1 max-w-[36em]">
               {c.body}
             </p>
-            <div className="border-t border-dashed border-line pt-3 font-mono text-[10px] text-ink-dim tracking-[0.04em]">
-              {c.stats}
+            <div className="flex items-end justify-between gap-4 border-t border-line pt-4">
+              <span className="font-mono text-[10.5px] text-ink-dim tracking-[0.04em]">
+                {c.stats}
+              </span>
+              <span className="stencil shrink-0 normal-case">{c.num}</span>
             </div>
           </div>
         ))}

@@ -30,30 +30,30 @@ const SPECTRUM_MARKERS: ReadonlyArray<SpectrumMarker> = [
     label: "NET*",
     sub: "mesh transport",
     color: "#c4ff3d",
-    faint: "#6b8a1e",
+    faint: "#7a9a2c",
     glow: true,
   },
   {
     x: 687,
     label: "REAL-TIME†",
     sub: "CAN · EtherCAT · TSN",
-    color: "#d4dcd0",
-    faint: "#6b7568",
+    color: "#e6e8e0",
+    faint: "#969a91",
     slower: "~1,000× slower",
   },
   {
     x: 1120,
     label: "BEST-EFFORT",
     sub: "cloud · TCP · gRPC",
-    color: "#6b7568",
-    faint: "#4a5249",
+    color: "#969a91",
+    faint: "#5d6058",
     slower: "~1,000,000× slower",
   },
 ];
 
 export function LatencySpectrum() {
   return (
-    <div className="mt-10 border border-line bg-bg-2 px-6 py-7 hidden md:block">
+    <div className="slab mt-24 px-8 py-8 hidden md:block">
       <div className="text-[10px] tracking-[0.18em] uppercase text-ink-dim mb-4 flex items-center justify-between flex-wrap gap-2">
         <span>// latency spectrum · log scale</span>
         <span className="text-ink-faint">10⁻⁹ → 10⁻³</span>
@@ -87,7 +87,7 @@ export function LatencySpectrum() {
                     y={18}
                     width={m.slower.length * 5.5 + 12}
                     height={13}
-                    fill="#0a0c0a"
+                    fill="#171816"
                     rx="2"
                   />
                   <text
@@ -138,7 +138,7 @@ export function LatencySpectrum() {
             y1="70"
             x2="1120"
             y2="70"
-            stroke="#2d352c"
+            stroke="#3a3c37"
             strokeWidth="1"
           />
 
@@ -149,7 +149,7 @@ export function LatencySpectrum() {
                 y1="66"
                 x2={t.x}
                 y2="74"
-                stroke="#6b7568"
+                stroke="#969a91"
                 strokeWidth="0.7"
               />
               <text
@@ -157,7 +157,7 @@ export function LatencySpectrum() {
                 y="86"
                 fontFamily="JetBrains Mono"
                 fontSize="10"
-                fill="#6b7568"
+                fill="#969a91"
                 textAnchor="middle"
               >
                 10
@@ -170,7 +170,7 @@ export function LatencySpectrum() {
                 y="100"
                 fontFamily="JetBrains Mono"
                 fontSize="8"
-                fill="#4a5249"
+                fill="#5d6058"
                 textAnchor="middle"
                 letterSpacing="0.4"
               >

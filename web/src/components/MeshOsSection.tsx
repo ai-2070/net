@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { SectionLabel } from "@/components/SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 
 // =========================================================================
 // MeshOS — Atomic Playboys. Self-organizing cluster behavior.
@@ -10,7 +10,7 @@ import { DisplayHeading } from "./DisplayHeading";
 // Nodes spawn from the edges, edges form via flowing dot-streams, daemons
 // (mikoshi) hop between hosts trailing char-ghosts, data nodes pull
 // workloads via gravity wells, drift correction nudges the formation
-// toward a new equilibrium. Faint matrix rain falls behind everything.
+// toward a new equilibrium.
 // =========================================================================
 
 type MeshCapability = "device" | "compute" | "storage" | "daemon" | "datafort";
@@ -106,15 +106,15 @@ function pickCapability(): MeshCapability {
 function capabilityRgb(cap: MeshCapability): string {
   switch (cap) {
     case "device":
-      return "196, 255, 61";
+      return "230, 232, 224";
     case "compute":
-      return "107, 138, 30";
+      return "150, 154, 145";
     case "storage":
-      return "61, 240, 255";
+      return "196, 199, 190";
     case "daemon":
-      return "212, 220, 208";
+      return "122, 126, 118";
     case "datafort":
-      return "255, 255, 255";
+      return "238, 241, 232";
   }
 }
 
@@ -388,9 +388,11 @@ function MeshAutoform() {
       }
     };
 
-    const frame = (): void => {
+    // `forced` steps the simulation by a fixed dt without scheduling the
+    // next frame: used to fast-forward to a settled still.
+    const frame = (forced?: number): void => {
       const now = performance.now();
-      const dt = Math.min(0.05, (now - lastT) / 1000);
+      const dt = forced ?? Math.min(0.05, (now - lastT) / 1000);
       lastT = now;
 
       // ---- update physics + feed events ----
@@ -440,7 +442,7 @@ function MeshAutoform() {
         if (touched.length > 0) {
           pushFeed(
             "⤴",
-            "rgb(212, 220, 208)",
+            "rgb(230, 232, 224)",
             <>
               drift_correct nodes({touched.length}){" "}
               <span className="text-ink-faint">{touched.join(" ")}</span> reflow
@@ -486,7 +488,7 @@ function MeshAutoform() {
           const isGravity = toCap === "datafort";
           pushFeed(
             isGravity ? "⤵" : "↗",
-            "rgb(61, 240, 255)",
+            "rgb(196, 255, 61)",
             <>
               {isGravity ? "gravity_pull " : "mikoshi      "}
               daemon.0x{d.hex}
@@ -509,7 +511,7 @@ function MeshAutoform() {
           const tags = pickAdTags();
           pushFeed(
             "▸",
-            "rgb(107, 138, 30)",
+            "rgb(122, 154, 44)",
             <>
               cap.announce 0x{n.hex}{" "}
               <span style={{ color: `rgb(${capabilityRgb(n.cap)})` }}>
@@ -537,41 +539,8 @@ function MeshAutoform() {
 
       // ============== RENDER ==============
       // matrix-style trail-decay fade
-      ctx.fillStyle = "rgba(10, 12, 10, 0.32)";
+      ctx.fillStyle = "rgba(11, 12, 11, 0.32)";
       ctx.fillRect(0, 0, W, H);
-
-      // ---- background matrix rain (very faint) ----
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      ctx.font = `${RAIN_FONT_PX}px ${AUTOMESH_MONO_FONT}`;
-      for (const c of rain) {
-        c.y += c.speed;
-        c.tick++;
-        if (c.tick % 7 === 0) {
-          c.tokens[Math.floor(Math.random() * c.tokens.length)] =
-            pickMatrixGlyph();
-        }
-        const trailLen = 16;
-        for (let i = 0; i < trailLen; i++) {
-          const drawY = c.y - i * c.gap;
-          if (drawY < -RAIN_FONT_PX || drawY > H) continue;
-          const headIdx = Math.floor(c.y / c.gap);
-          const idx = headIdx - i;
-          if (idx < 0) continue;
-          const tok = c.tokens[idx % c.tokens.length] ?? "·";
-          if (i === 0) {
-            ctx.fillStyle = "rgba(220, 255, 200, 0.30)";
-          } else {
-            const a = Math.max(0, 1 - i / trailLen);
-            ctx.fillStyle = `rgba(196, 255, 61, ${a * 0.12})`;
-          }
-          ctx.fillText(tok, c.x, drawY);
-        }
-        if (c.y - trailLen * c.gap > H + 40) {
-          c.y = -Math.random() * H * 0.5;
-          c.speed = 0.25 + Math.random() * 0.7;
-        }
-      }
 
       // ---- gravity wells (concentric character rings) ----
       ctx.textBaseline = "middle";
@@ -687,7 +656,7 @@ function MeshAutoform() {
           t.age += dt;
           const a = Math.max(0, 0.75 - t.age * 2.4);
           if (a <= 0) continue;
-          ctx.fillStyle = `rgba(61, 240, 255, ${a})`;
+          ctx.fillStyle = `rgba(196, 255, 61, ${a})`;
           ctx.fillText(t.ch, t.x, t.y);
         }
         d.trail = d.trail.filter((t) => t.age < 0.5);
@@ -695,13 +664,13 @@ function MeshAutoform() {
 
       // Migrating daemons render individually (positions diverge).
       for (const { d, x, y } of migratingPositions) {
-        ctx.fillStyle = "rgba(61, 240, 255, 0.45)";
+        ctx.fillStyle = "rgba(196, 255, 61, 0.45)";
         ctx.font = `bold 22px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText("◆", x, y);
-        ctx.fillStyle = "rgba(255, 255, 255, 0.98)";
+        ctx.fillStyle = "rgba(238, 241, 232, 0.98)";
         ctx.font = `bold 15px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText("◆", x, y);
-        ctx.fillStyle = "rgba(61, 240, 255, 0.7)";
+        ctx.fillStyle = "rgba(196, 255, 61, 0.7)";
         ctx.font = `${LABEL_FONT_PX - 1}px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText(`d.${d.hex}`, x, y - 14);
       }
@@ -714,10 +683,10 @@ function MeshAutoform() {
         const y = host.y - 18;
         // halo intensifies subtly when stacked
         const stackBoost = Math.min(0.25, (group.length - 1) * 0.12);
-        ctx.fillStyle = `rgba(61, 240, 255, ${0.45 + stackBoost})`;
+        ctx.fillStyle = `rgba(196, 255, 61, ${0.45 + stackBoost})`;
         ctx.font = `bold 22px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText("◆", x, y);
-        ctx.fillStyle = "rgba(255, 255, 255, 0.98)";
+        ctx.fillStyle = "rgba(238, 241, 232, 0.98)";
         ctx.font = `bold 15px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText("◆", x, y);
         const parts = group.map((d) => `d.${d.hex}`);
@@ -725,29 +694,68 @@ function MeshAutoform() {
           parts.length <= 3
             ? parts.join("+")
             : `${parts.slice(0, 2).join("+")}+${parts.length - 2}`;
-        ctx.fillStyle = "rgba(61, 240, 255, 0.7)";
+        ctx.fillStyle = "rgba(196, 255, 61, 0.7)";
         ctx.font = `${LABEL_FONT_PX - 1}px ${AUTOMESH_MONO_FONT}`;
         ctx.fillText(label, x, y - 14);
       });
 
-      rafId = requestAnimationFrame(frame);
+      if (forced !== undefined) return;
+      if (!onScreen) {
+        running = false;
+        return;
+      }
+      rafId = requestAnimationFrame(() => frame());
     };
 
-    const onResize = (): void => resize();
+    const reduceMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    let onScreen = true;
+    let running = false;
+    // Reduced motion: no loop at all, one still of the mesh after ~14s of
+    // simulated settling.
+    const settle = (): void => {
+      for (let i = 0; i < 420; i++) frame(1 / 30);
+    };
+    const start = (): void => {
+      if (reduceMotion) return;
+      if (running) return;
+      running = true;
+      lastT = performance.now();
+      rafId = requestAnimationFrame(() => frame());
+    };
+
+    const onResize = (): void => {
+      resize();
+      ctx.fillStyle = "#171816";
+      ctx.fillRect(0, 0, W, H);
+      if (reduceMotion) settle();
+      else start();
+    };
 
     resize();
-    ctx.fillStyle = "#0a0c0a";
+    ctx.fillStyle = "#171816";
     ctx.fillRect(0, 0, W, H);
-    rafId = requestAnimationFrame(frame);
+    if (reduceMotion) settle();
+    else start();
+    const io = new IntersectionObserver(
+      ([e]) => {
+        onScreen = Boolean(e?.isIntersecting);
+        if (onScreen) start();
+      },
+      { rootMargin: "120px" },
+    );
+    io.observe(canvas);
     window.addEventListener("resize", onResize);
     return () => {
       cancelAnimationFrame(rafId);
+      io.disconnect();
       window.removeEventListener("resize", onResize);
     };
   }, []);
 
   return (
-    <div className="relative border border-line bg-bg overflow-hidden font-mono">
+    <div className="slab overflow-hidden font-mono">
       <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
         <span className="flex items-center gap-3">
           <span className="inline-flex gap-1">
@@ -832,25 +840,25 @@ function MeshAutoform() {
 
       <div className="flex flex-wrap gap-x-5 gap-y-2 border-t border-line px-4 py-3 text-[10px] tracking-[0.12em] text-ink-dim uppercase">
         <span className="flex items-center gap-2">
-          <span className="font-mono" style={{ color: "rgb(196, 255, 61)" }}>
+          <span className="font-mono" style={{ color: "rgb(230, 232, 224)" }}>
             ◈
           </span>
           device
         </span>
         <span className="flex items-center gap-2">
-          <span className="font-mono" style={{ color: "rgb(107, 138, 30)" }}>
+          <span className="font-mono" style={{ color: "rgb(150, 154, 145)" }}>
             ▣
           </span>
           compute
         </span>
         <span className="flex items-center gap-2">
-          <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
+          <span className="font-mono" style={{ color: "rgb(196, 199, 190)" }}>
             ◉
           </span>
           storage
         </span>
         <span className="flex items-center gap-2">
-          <span className="font-mono" style={{ color: "rgb(212, 220, 208)" }}>
+          <span className="font-mono" style={{ color: "rgb(122, 126, 118)" }}>
             ◇
           </span>
           replica
@@ -859,7 +867,7 @@ function MeshAutoform() {
           <span className="font-mono text-ink">■</span> datafort · gravity well
         </span>
         <span className="flex items-center gap-2 sm:ml-auto">
-          <span className="font-mono" style={{ color: "rgb(61, 240, 255)" }}>
+          <span className="font-mono" style={{ color: "rgb(196, 255, 61)" }}>
             ◆
           </span>
           daemon / mikoshi · in transit
@@ -901,7 +909,7 @@ export function MeshOsSection() {
   return (
     <section
       id="meshos"
-      className="relative overflow-hidden border-b border-line px-6 py-20"
+      className="relative overflow-hidden pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
     >
       <SectionLabel>§08 / cluster os // new</SectionLabel>
       <DisplayHeading>
@@ -914,9 +922,9 @@ export function MeshOsSection() {
         </span>
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
-        Programs move between machines without stopping. Storage autobalances. Daemons migrate
-        seamlessly across the mesh while maintaining full state.
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
+        Programs move between machines without stopping. Storage autobalances.
+        Daemons migrate seamlessly across the mesh while maintaining full state.
         <br />
         <br />
         <strong className="text-accent font-medium">
@@ -930,32 +938,25 @@ export function MeshOsSection() {
 
       <MeshAutoform />
 
-      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
+      <div className="mt-20 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-10">
         {MESH_OS_CAPABILITY_STRIP.map((c) => (
-          <div
-            key={c.name}
-            className="border-r border-b border-line bg-bg-2/40 p-5"
-          >
-            <div className="flex items-baseline justify-between mb-2">
-              <span className="font-mono text-[10px] text-accent tracking-[0.14em]">
-                ▸ {c.num}
-              </span>
+          <div key={c.name} className="border-t border-line pt-5">
+            <h3 className="font-display font-bold text-[20px] leading-[1.1] text-ink mb-2 tracking-[-0.01em] flex items-center gap-3">
+              {c.name}
               {c.isNew ? (
-                <span className="bg-accent text-bg px-1.5 py-0.5 text-[9px] font-bold tracking-[0.18em]">
+                <span className="bg-accent text-bg px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-[0.18em]">
                   NEW
                 </span>
               ) : null}
-            </div>
-            <h3 className="font-head text-[16px] leading-tight text-ink mb-2 tracking-[0.04em] lowercase">
-              {c.name}
             </h3>
-            <p className="text-[11px] text-ink-dim leading-[1.55]">{c.body}</p>
+            <p className="text-[14px] text-ink-dim leading-[1.55]">{c.body}</p>
+            <div className="stencil mt-4 normal-case">▸ {c.num}</div>
           </div>
         ))}
       </div>
 
-      <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] mt-12 max-w-[900px]">
-        <p className="text-[18px] text-ink leading-[1.5] font-light">
+      <div className="slab slab-held px-8 md:px-12 py-10 md:py-12 mt-24 max-w-[960px]">
+        <p className="text-[22px] md:text-[28px] text-ink leading-[1.3] font-light tracking-[-0.01em]">
           <strong className="text-accent font-medium">
             MeshOS turns your mesh into a living system.
           </strong>{" "}

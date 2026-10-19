@@ -1,5 +1,5 @@
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 
 interface AppCard {
   tag: string;
@@ -52,7 +52,10 @@ const APPS: readonly AppCard[] = [
 
 export function ApplicationsSection() {
   return (
-    <section id="apps" className="border-b border-line px-6 py-20">
+    <section
+      id="apps"
+      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+    >
       <SectionLabel>§11 / target applications</SectionLabel>
       <DisplayHeading>
         everything that
@@ -60,24 +63,23 @@ export function ApplicationsSection() {
         can&apos;t wait.
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         Anywhere latency matters. Anywhere the cloud round-trip is too slow.
         Anywhere there&apos;s no central infrastructure to route through.
       </p>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 border-t border-l border-line">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5 lg:gap-6">
         {APPS.map((a) => (
-          <div
-            key={a.title}
-            className="border-r border-b border-line p-7 transition-colors hover:bg-bg-2 relative"
-          >
-            <div className="text-accent text-[10px] tracking-[0.15em] mb-2">
-              {a.tag}
-            </div>
-            <h3 className="font-head text-[20px] leading-tight mb-2.5 tracking-[0.04em] text-ink lowercase">
+          <div key={a.title} className="slab slab-lift p-8 flex flex-col">
+            <h3 className="font-display font-bold text-[24px] leading-[1.05] mb-3 tracking-[-0.015em] text-ink">
               {a.title}
             </h3>
-            <p className="text-ink-dim text-[12px] leading-[1.6]">{a.body}</p>
+            <p className="text-ink-dim text-[14px] leading-[1.6] max-w-[38em] mb-6">
+              {a.body}
+            </p>
+            <div className="stencil mt-auto pt-4 border-t border-line normal-case tracking-[0.16em]">
+              {a.tag}
+            </div>
           </div>
         ))}
       </div>

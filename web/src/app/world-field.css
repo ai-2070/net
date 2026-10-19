@@ -1,0 +1,693 @@
+/* ════════════════════════════════════════════════════════════════════
+   WORLD: SUSPENDED FIELD (landing page)
+   Cast-concrete hall, one cold light shaft, objects held weightless by
+   an invisible field. Acid green means one thing only: the field (live,
+   held, active). Scoped to `.world-field` so /docs and /games keep the
+   previous world until they are migrated.
+   ════════════════════════════════════════════════════════════════════ */
+
+.world-field {
+  --color-bg: #0b0c0b;
+  --color-bg-2: #121311;
+  --color-slab: #0d100d;
+  --color-slab-hi: #111611;
+  --color-ink: #e6e8e0;
+  --color-ink-dim: #969a91;
+  --color-ink-faint: #555850;
+  --color-line: #252723;
+  --color-accent: #c4ff3d;
+  --color-accent-dim: #7a9a2c;
+  --color-warn: #f0b04a;
+  --color-cyan: #a9d3e2;
+  --color-shaft: #eef1e8;
+
+  --font-display:
+    var(--font-adventor), "Avant Garde", "Century Gothic", sans-serif;
+  --font-head:
+    var(--font-adventor), "Avant Garde", "Century Gothic", sans-serif;
+  --font-sans: var(--font-archivo), "Helvetica Neue", Arial, sans-serif;
+
+  --ease-field: cubic-bezier(0.16, 1, 0.3, 1);
+  --shadow-float:
+    inset 0 1px 0 rgba(238, 241, 232, 0.13),
+    0 28px 36px -26px rgba(0, 0, 0, 0.95), 0 70px 90px -50px rgba(0, 0, 0, 0.75);
+  --shadow-lifted:
+    inset 0 1px 0 rgba(238, 241, 232, 0.18),
+    0 44px 44px -30px rgba(0, 0, 0, 0.95),
+    0 100px 110px -54px rgba(0, 0, 0, 0.8);
+
+  /* Raw cast concrete: fine aggregate grain, large pour stains, and the
+     sparse air-void pits every cast slab carries. Procedural, tiled. */
+  --tex-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='260'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.6 0 0 0 0 0.6 0 0 0 0 0.59 0 0 0 1.3 -0.56'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+  --tex-stain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='900' height='900'%3E%3Cfilter id='s'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.006 0.011' numOctaves='4' seed='7' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.55 0 0 0 0 0.55 0 0 0 0 0.54 0 0 0 1 -0.36'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23s)'/%3E%3C/svg%3E");
+  --tex-pits: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='p'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.55' numOctaves='2' seed='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 26 0 0 0 -16.8'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23p)' opacity='0.55'/%3E%3C/svg%3E");
+}
+
+@layer base {
+  .world-field {
+    background: var(--color-bg);
+    color: var(--color-ink);
+  }
+  /* Prose reads in the grotesque; mono stays for data, code, telemetry. */
+  .world-field p {
+    font-family: var(--font-sans);
+  }
+  .world-field ::selection {
+    background: #c4ff3d;
+    color: #0b0c0b;
+  }
+  .world-field a:focus-visible,
+  .world-field button:focus-visible {
+    outline: 1px solid #c4ff3d;
+    outline-offset: 4px;
+  }
+  .world-field code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+  }
+}
+
+/* concrete surface (texture only; colour comes from the element) */
+@utility concrete {
+  background-image: var(--tex-pits), var(--tex-grain), var(--tex-stain);
+  background-size:
+    300px 300px,
+    260px 260px,
+    900px 900px;
+  background-blend-mode: normal, overlay, soft-light;
+}
+
+/* Panels are the cyberpunk terminal surface, held in the field: near-black
+   phosphor glass, a hairline border, faint scanlines, and green corner
+   ticks. They still float (cast shadow) because the composition is the
+   field's; only the material is the terminal's. */
+@utility slab {
+  position: relative;
+  --color-ink-faint: #7f8479;
+  background-color: var(--color-slab);
+  background-image:
+    linear-gradient(
+      180deg,
+      rgba(196, 255, 61, 0.035) 0%,
+      rgba(196, 255, 61, 0) 22%
+    ),
+    repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0) 0 2px,
+      rgba(0, 0, 0, 0.22) 2px 3px
+    );
+  border: 1px solid #222a21;
+  box-shadow:
+    inset 0 1px 0 rgba(196, 255, 61, 0.05),
+    0 22px 28px -24px rgba(0, 0, 0, 0.9);
+  transition:
+    transform 0.6s var(--ease-field),
+    box-shadow 0.6s var(--ease-field),
+    border-color 0.35s var(--ease-field),
+    background-color 0.35s var(--ease-field);
+  /* corner ticks: the old HUD bracket, on every panel */
+  &::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    pointer-events: none;
+    opacity: 0.6;
+    transition: opacity 0.35s var(--ease-field);
+    background:
+      linear-gradient(#c4ff3d, #c4ff3d) top left / 10px 1px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) top left / 1px 10px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) top right / 10px 1px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) top right / 1px 10px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) bottom left / 10px 1px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) bottom left / 1px 10px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) bottom right / 10px 1px no-repeat,
+      linear-gradient(#c4ff3d, #c4ff3d) bottom right / 1px 10px no-repeat;
+  }
+}
+
+/* kept as no-ops so older markup stays valid: panels no longer vary in depth */
+@utility slab-near {
+  z-index: auto;
+}
+@utility slab-far {
+  z-index: auto;
+}
+
+/* A slab that runs off the left edge of the page (lg+): the hall is wider
+   than the screen. Text keeps its inset; only the concrete is cropped. */
+@utility bleed-left {
+  @media (width >= 64rem) {
+    --bleed: calc(2.5rem + 72px + max(0px, (100vw - 1440px) / 2));
+    margin-left: calc(-1 * var(--bleed)) !important;
+    padding-left: calc(var(--bleed) + 1.75rem) !important;
+  }
+}
+
+/* Lifted on hover (the field takes it), held on focus: the green seam is
+   the field plane the slab rests on. */
+@utility slab-lift {
+  &::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    background: #c4ff3d;
+    opacity: 0;
+    transform: scaleX(0.3);
+    box-shadow: 0 8px 18px 1px rgba(196, 255, 61, 0.22);
+    transition:
+      opacity 0.5s var(--ease-field),
+      transform 0.7s var(--ease-field);
+    pointer-events: none;
+  }
+  &:hover,
+  &:focus-within {
+    transform: translateY(-5px);
+    box-shadow:
+      inset 0 1px 0 rgba(196, 255, 61, 0.08),
+      0 34px 34px -26px rgba(0, 0, 0, 0.95);
+    background-color: var(--color-slab-hi);
+    border-color: #7a9a2c;
+  }
+  &:hover::before,
+  &:focus-within::before {
+    opacity: 1;
+  }
+  &:hover::after,
+  &:focus-within::after {
+    opacity: 0.85;
+    transform: scaleX(1);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    &:hover,
+    &:focus-within {
+      transform: none;
+    }
+  }
+}
+
+/* Permanently held: a statement slab with its field seam always lit. */
+@utility slab-held {
+  &::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    background: #c4ff3d;
+    opacity: 0.85;
+    box-shadow: 0 10px 22px 1px rgba(196, 255, 61, 0.2);
+    pointer-events: none;
+  }
+}
+
+/* Stencilled marking cast into a pillar: section labels. */
+@utility stencil {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: var(--color-ink-dim);
+  white-space: nowrap;
+}
+
+/* One cold volumetric shaft falling into a section from above. */
+@utility light-shaft {
+  position: absolute;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(238, 241, 232, 0.1) 0%,
+    rgba(238, 241, 232, 0.045) 45%,
+    rgba(238, 241, 232, 0) 100%
+  );
+  clip-path: polygon(40% 0, 60% 0, 100% 100%, 0 100%);
+  filter: blur(12px);
+  mix-blend-mode: screen;
+}
+
+/* Field displacement: a line of a title is pushed up into place and held.
+   Default is visible; `data-armed` lowers it only once JS has confirmed
+   it is below the fold, so nothing is hidden without script. */
+@utility lift-line {
+  display: block;
+  transition:
+    transform 1.3s var(--ease-field),
+    opacity 1.1s var(--ease-field),
+    filter 1.1s var(--ease-field);
+  [data-armed="true"] & {
+    transform: translateY(0.5em);
+    opacity: 0;
+    filter: blur(8px);
+  }
+  [data-armed="true"][data-held="true"] & {
+    transform: none;
+    opacity: 1;
+    filter: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+  }
+}
+
+/* Slow suspended bob for held objects. */
+@keyframes field-bob {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(var(--bob-r, 0deg));
+  }
+  50% {
+    transform: translate3d(0, var(--bob-y, -10px), 0)
+      rotate(calc(var(--bob-r, 0deg) * -1));
+  }
+}
+@utility field-bob {
+  animation: field-bob var(--bob-t, 9s) ease-in-out infinite;
+  animation-delay: var(--bob-d, 0s);
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+
+/* board-formed seams for wide concrete bands */
+@utility formwork {
+  background-image:
+    repeating-linear-gradient(
+      180deg,
+      transparent 0,
+      transparent 143px,
+      rgba(0, 0, 0, 0.35) 143px,
+      rgba(255, 255, 255, 0.025) 144px,
+      transparent 145px
+    ),
+    var(--tex-pits), var(--tex-grain), var(--tex-stain);
+  background-size:
+    100% 100%,
+    300px 300px,
+    260px 260px,
+    900px 900px;
+  background-blend-mode: normal, normal, overlay, soft-light;
+}
+
+/* film grain over the whole landing (replaces the CRT scanlines) */
+@utility field-grain {
+  &::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: var(--tex-grain);
+    background-size: 260px 260px;
+    opacity: 0.2;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    z-index: 1000;
+  }
+}
+
+.world-field ::-webkit-scrollbar-track,
+.world-field::-webkit-scrollbar-track {
+  background: #0b0c0b;
+}
+.world-field ::-webkit-scrollbar-thumb {
+  background: #2a2c28;
+}
+.world-field ::-webkit-scrollbar-thumb:hover {
+  background: #7a9a2c;
+}
+
+/* ── Controls ─────────────────────────────────────────────────────── */
+
+/* Primary: a block of field light. Lifts on hover, seam lights below. */
+@utility btn-field {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 22px;
+  background: #c4ff3d;
+  color: #0b0c0b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    0 22px 30px -22px rgba(0, 0, 0, 0.9);
+  transition:
+    transform 0.6s var(--ease-field),
+    box-shadow 0.6s var(--ease-field);
+  &::after {
+    content: "";
+    position: absolute;
+    left: 10%;
+    right: 10%;
+    bottom: -12px;
+    height: 1px;
+    background: #c4ff3d;
+    opacity: 0;
+    transform: scaleX(0.4);
+    transition:
+      opacity 0.5s var(--ease-field),
+      transform 0.6s var(--ease-field);
+  }
+  &:hover {
+    background: #d4ff6e;
+  }
+  &:hover::after {
+    opacity: 0.9;
+    transform: scaleX(1);
+  }
+}
+
+/* Secondary: a terminal ghost button. */
+@utility btn-ghost-field {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 22px;
+  color: var(--color-ink);
+  background: rgba(13, 16, 13, 0.6);
+  border: 1px solid #3a4537;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  transition:
+    transform 0.6s var(--ease-field),
+    color 0.3s var(--ease-field),
+    border-color 0.3s var(--ease-field);
+  &:hover {
+    color: #c4ff3d;
+    border-color: #c4ff3d;
+  }
+}
+
+/* text link in the field vocabulary */
+@utility link-field {
+  color: var(--color-ink);
+  text-decoration: underline;
+  text-decoration-color: rgba(196, 255, 61, 0.55);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+  transition:
+    color 0.3s var(--ease-field),
+    text-decoration-color 0.3s var(--ease-field);
+  &:hover {
+    color: #c4ff3d;
+    text-decoration-color: #c4ff3d;
+  }
+}
+
+/* ── The area title: the hero's one authored entrance ─────────────── */
+@keyframes field-rise {
+  from {
+    transform: translateY(0.42em);
+    opacity: 0;
+    filter: blur(12px);
+    letter-spacing: 0.04em;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+    filter: none;
+  }
+}
+@utility field-rise {
+  display: block;
+  animation: field-rise 1.6s var(--ease-field) both;
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+@keyframes field-fade {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@utility field-fade {
+  animation: field-fade 1.4s var(--ease-field) both;
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+
+/* ── Monoliths: CSS 3D concrete blocks held in the field ──────────── */
+@keyframes monolith-sway {
+  0%,
+  100% {
+    transform: rotateX(var(--m-rx)) rotateY(calc(var(--m-ry) - var(--m-sway)))
+      rotateZ(var(--m-rz));
+  }
+  50% {
+    transform: rotateX(var(--m-rx)) rotateY(calc(var(--m-ry) + var(--m-sway)))
+      rotateZ(var(--m-rz));
+  }
+}
+@keyframes monolith-bob {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -14px, 0);
+  }
+}
+@keyframes monolith-shadow {
+  0%,
+  100% {
+    transform: scaleX(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scaleX(0.82);
+    opacity: 0.55;
+  }
+}
+.monolith-sway {
+  transform: rotateX(var(--m-rx)) rotateY(var(--m-ry)) rotateZ(var(--m-rz));
+  animation: monolith-sway var(--m-period) ease-in-out infinite;
+  animation-delay: var(--m-delay);
+}
+.monolith-bob {
+  animation: monolith-bob calc(var(--m-period) * 0.7) ease-in-out infinite;
+  animation-delay: var(--m-delay);
+}
+.monolith-shadow {
+  height: 22px;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 0, 0, 0.85),
+    rgba(0, 0, 0, 0) 70%
+  );
+  filter: blur(4px);
+  animation: monolith-shadow calc(var(--m-period) * 0.7) ease-in-out infinite;
+  animation-delay: var(--m-delay);
+}
+
+/* ── Mikoshi transit: the daemon held, on both nodes, collapsed ───── */
+@keyframes mikoshi-a {
+  0%,
+  15% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  25%,
+  37% {
+    opacity: 1;
+    transform: translateY(-26px) scale(1);
+  }
+  47% {
+    opacity: 0;
+    transform: translateY(-26px) scale(0.12);
+  }
+  72% {
+    opacity: 0;
+    transform: translateY(-26px) scale(0.6);
+  }
+  80%,
+  90% {
+    opacity: 1;
+    transform: translateY(-26px) scale(1);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes mikoshi-b {
+  0%,
+  25% {
+    opacity: 0;
+    transform: translateY(-26px) scale(0.6);
+  }
+  33%,
+  47% {
+    opacity: 1;
+    transform: translateY(-26px) scale(1);
+  }
+  55%,
+  65% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  72%,
+  82% {
+    opacity: 1;
+    transform: translateY(-26px) scale(1);
+  }
+  90% {
+    opacity: 0;
+    transform: translateY(-26px) scale(0.12);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-26px) scale(0.6);
+  }
+}
+@keyframes mikoshi-route {
+  0%,
+  22%,
+  50%,
+  70%,
+  92%,
+  100% {
+    opacity: 0;
+    transform: scaleX(0.2);
+  }
+  30%,
+  42%,
+  78%,
+  86% {
+    opacity: 0.85;
+    transform: scaleX(1);
+  }
+}
+@keyframes mikoshi-spin {
+  from {
+    transform: rotateX(-24deg) rotateY(0deg);
+  }
+  to {
+    transform: rotateX(-24deg) rotateY(360deg);
+  }
+}
+.mikoshi-a {
+  animation: mikoshi-a 12s var(--ease-field) infinite;
+}
+.mikoshi-b {
+  animation: mikoshi-b 12s var(--ease-field) infinite;
+}
+.mikoshi-route {
+  animation: mikoshi-route 12s ease-in-out infinite;
+  box-shadow: 0 6px 14px 1px rgba(196, 255, 61, 0.25);
+}
+.mikoshi-cube-inner {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  transform-style: preserve-3d;
+  animation: mikoshi-spin 9s linear infinite;
+}
+.mikoshi-face {
+  position: absolute;
+  inset: 0;
+  background: rgba(20, 22, 18, 0.92);
+  border: 1px solid #c4ff3d;
+  background-image: linear-gradient(
+    180deg,
+    rgba(196, 255, 61, 0.16),
+    rgba(196, 255, 61, 0.02)
+  );
+}
+
+/* the field behind the Blackwall breathes */
+@keyframes blackwall-breathe {
+  0%,
+  100% {
+    opacity: 0.72;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.blackwall-glow {
+  animation: blackwall-breathe 7s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .monolith-sway,
+  .monolith-bob,
+  .monolith-shadow,
+  .mikoshi-route,
+  .mikoshi-cube-inner,
+  .blackwall-glow {
+    animation: none;
+  }
+  .mikoshi-a,
+  .mikoshi-b {
+    animation: none;
+  }
+  .mikoshi-b {
+    opacity: 0.35;
+  }
+}
+
+/* terminal window dots from the old world: no red in the field */
+.world-field .frame-dot-r,
+.world-field .frame-dot-y {
+  background: #3a3c37;
+}
+.world-field .frame-dot-g {
+  background: #7a9a2c;
+}
+
+/* ── Meaningful float ─────────────────────────────────────────────
+   Panels only leave the floor when the height says something.
+   field-wave: one wave travels through a set in reading order, the way a
+   pingwave propagates through the mesh (--i = position in the set).
+   field-sync: several panels held on one shared rhythm.
+   field-float-*: a fixed altitude that encodes rank (higher = faster). */
+@keyframes field-wave {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  18% {
+    transform: translateY(-9px);
+  }
+  40% {
+    transform: translateY(0);
+  }
+}
+@utility field-wave {
+  animation: field-wave 7s var(--ease-field) infinite;
+  animation-delay: calc(var(--i, 0) * 0.28s);
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+@keyframes field-sync {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+@utility field-sync {
+  animation: field-sync 9s ease-in-out infinite;
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}

@@ -1,31 +1,42 @@
 import { ArpanetMapBg } from "./ArpanetMapBg";
-import { DisplayHeading } from "./DisplayHeading";
-import { SectionLabel } from "./SectionLabel";
+import { Monolith } from "./field/Monolith";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 
 export function WhyNotBestEffortSection() {
   return (
     <section
       id="what"
-      className="relative overflow-hidden border-b border-line px-6 py-20"
+      className="relative overflow-hidden pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
     >
       <ArpanetMapBg />
+      <Monolith
+        w={210}
+        h={400}
+        d={150}
+        rx={-10}
+        ry={30}
+        rz={3}
+        period={16}
+        className="hidden xl:block absolute -right-[80px] bottom-[70px]"
+      />
+      <SectionLabel>§01 / why not best-effort</SectionLabel>
       <div className="relative">
-        <SectionLabel>§01 / why not best-effort</SectionLabel>
         <DisplayHeading>
           arpanet assumed scarcity.
           <br />
           <span className="text-accent">net assumes abundance.</span>
         </DisplayHeading>
 
-        <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+        <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
           TCP was designed when nuclear war was a real possibility. Packets were
           precious. The network had to guarantee delivery because the next
           packet might not get through.
         </p>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-x-14 gap-y-1 mt-8">
           <div>
-            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
               <strong className="text-ink font-medium">
                 That was the right design for 1969.
               </strong>{" "}
@@ -33,7 +44,7 @@ export function WhyNotBestEffortSection() {
               streams don&apos;t wait. Market feeds don&apos;t care that your
               queue is full. The firehose doesn&apos;t have a pause button.
             </p>
-            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
               In a world of abundance, guaranteeing delivery is a threat —
               you&apos;re promising to deliver data that will bury the receiver.
               The bottleneck isn&apos;t delivery. It&apos;s processing. Arrival
@@ -41,14 +52,14 @@ export function WhyNotBestEffortSection() {
             </p>
           </div>
           <div>
-            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
               <strong className="text-ink font-medium">
                 NET inverts the default.
               </strong>{" "}
               TCP starts with trust and detects abuse. NET starts with zero
               assumptions and lets trust emerge from consistent behavior.
             </p>
-            <p className="text-ink-dim text-[13px] leading-[1.7] mb-4">
+            <p className="text-ink-dim text-[15px] leading-[1.65] mb-5 max-w-[38em]">
               Nodes reject work they can&apos;t process within a time window.
               Dropping a packet and re-requesting from a faster node costs
               nanoseconds. Waiting for a congested node&apos;s guaranteed
@@ -61,8 +72,8 @@ export function WhyNotBestEffortSection() {
           </div>
         </div>
 
-        <div className="border-l-2 border-accent pl-8 pr-8 py-6 bg-accent/[0.02] my-12 max-w-[900px]">
-          <p className="text-[18px] text-ink leading-[1.5] font-light">
+        <div className="slab slab-held px-8 md:px-12 py-10 md:py-12 my-24 max-w-[960px]">
+          <p className="text-[22px] md:text-[28px] text-ink leading-[1.3] font-light tracking-[-0.01em]">
             The remaining latency is physics: NIC, wire, speed of light.{" "}
             <span className="text-accent">
               The software got out of the way.

@@ -1,5 +1,5 @@
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 import { DatafortsConsole } from "./DatafortsConsole";
 
 const CAPABILITY_STRIP: ReadonlyArray<{
@@ -35,7 +35,7 @@ export function DatafortsSection() {
   return (
     <section
       id="dataforts"
-      className="relative overflow-hidden border-b border-line px-6 py-20"
+      className="relative overflow-hidden pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
     >
       <SectionLabel>§07 / storage // new</SectionLabel>
       <DisplayHeading>
@@ -47,7 +47,7 @@ export function DatafortsSection() {
         </span>
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.7] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         For 60 years, files were objects nailed to a location — a disk in a box.
         Traditional storage treats files like permanent objects locked to a
         single machine.
@@ -56,34 +56,27 @@ export function DatafortsSection() {
         <strong className="text-accent font-medium">
           Dataforts treats storage as flow and data as fluid.
         </strong>{" "}
-        When a device approaches capacity, it overflows onto the mesh. The capacity is the mesh. The
-        folder stays local. Reads create gravity. Hot
+        When a device approaches capacity, it overflows onto the mesh. The
+        capacity is the mesh. The folder stays local. Reads create gravity. Hot
         data moves closer. Everything is in motion.
       </p>
 
       <DatafortsConsole />
 
       {/* Capability strip — compact horizontal list */}
-      <div className="mt-12 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 border-t border-l border-line">
+      <div className="mt-20 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-10 gap-y-10">
         {CAPABILITY_STRIP.map((c) => (
-          <div
-            key={c.name}
-            className="border-r border-b border-line bg-bg-2/40 p-5"
-          >
-            <div className="flex items-baseline justify-between mb-2">
-              <span className="font-mono text-[10px] text-accent tracking-[0.14em]">
-                ▸ {c.num}
-              </span>
+          <div key={c.name} className="border-t border-line pt-5">
+            <h3 className="font-display font-bold text-[20px] leading-[1.1] text-ink mb-2 tracking-[-0.01em] flex items-center gap-3">
+              {c.name}
               {c.isNew ? (
-                <span className="bg-accent text-bg px-1.5 py-0.5 text-[9px] font-bold tracking-[0.18em]">
+                <span className="bg-accent text-bg px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-[0.18em]">
                   NEW
                 </span>
               ) : null}
-            </div>
-            <h3 className="font-head text-[16px] leading-tight text-ink mb-2 tracking-[0.04em] lowercase">
-              {c.name}
             </h3>
-            <p className="text-[11px] text-ink-dim leading-[1.55]">{c.body}</p>
+            <p className="text-[14px] text-ink-dim leading-[1.55]">{c.body}</p>
+            <div className="stencil mt-4 normal-case">▸ {c.num}</div>
           </div>
         ))}
       </div>

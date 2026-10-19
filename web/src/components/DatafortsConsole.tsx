@@ -147,7 +147,10 @@ export function DatafortsConsole() {
         if (node && node.fill < 0.5) {
           const freePct = Math.round((1 - node.fill) * 100);
           evs.push(
-            makeEvent("absorb", `${node.id.slice(-6)} · free ${freePct}% · open`),
+            makeEvent(
+              "absorb",
+              `${node.id.slice(-6)} · free ${freePct}% · open`,
+            ),
           );
         }
       }
@@ -165,7 +168,7 @@ export function DatafortsConsole() {
   const totalBar = renderBar(totalFill, 36);
 
   return (
-    <div className="border border-line bg-bg-2 overflow-hidden font-mono text-[12px] leading-[1.75]">
+    <div className="slab overflow-hidden font-mono text-[12px] leading-[1.75]">
       {/* terminal title bar */}
       <div className="flex items-center justify-between border-b border-line px-4 py-2 text-[10px] tracking-[0.14em] text-ink-dim uppercase">
         <span className="flex items-center gap-3">

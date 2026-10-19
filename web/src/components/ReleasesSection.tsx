@@ -1,6 +1,6 @@
 import { useRepoInfo } from "./RepoInfoProvider";
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 import { formatReleaseDate } from "@/lib/utils";
 
 export function ReleasesSection() {
@@ -8,11 +8,14 @@ export function ReleasesSection() {
   if (releases.length === 0) return null;
 
   return (
-    <section id="releases" className="border-b border-line px-6 py-20">
+    <section
+      id="releases"
+      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+    >
       <SectionLabel>§13 / releases</SectionLabel>
       <DisplayHeading>net releases.</DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         Every tagged release pulled directly from{" "}
         <a
           href="https://github.com/ai-2070/net/releases"
@@ -25,12 +28,12 @@ export function ReleasesSection() {
         .
       </p>
 
-      <div className="border border-line bg-bg-2 max-h-[640px] overflow-y-auto">
+      <div className="slab max-h-[640px] overflow-y-auto [mask-image:linear-gradient(180deg,#000_0,#000_calc(100%-88px),transparent_100%)]">
         {releases.map((r, i) => (
           <article
             key={r.tag}
             className={
-              i % 2 ? "px-6 py-6 border-t border-line bg-black" : "px-6 py-6"
+              i % 2 ? "px-7 py-7 border-t border-line bg-black/25" : "px-7 py-7"
             }
           >
             <header className="flex items-baseline justify-between gap-4 mb-3 flex-wrap">
@@ -61,7 +64,7 @@ export function ReleasesSection() {
             </header>
             {r.bodyHtml ? (
               <div
-                className="prose prose-invert prose-sm max-w-none prose-headings:text-ink prose-headings:font-semibold prose-headings:tracking-tight prose-h1:text-[18px] prose-h2:text-[15px] prose-h3:text-[13px] prose-p:text-ink-dim prose-strong:text-ink prose-strong:font-medium prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:text-accent prose-code:font-mono prose-code:before:content-none prose-code:after:content-none prose-code:bg-bg prose-code:px-1 prose-code:py-0.5 prose-pre:bg-bg prose-pre:border prose-pre:border-line prose-ul:list-[square] prose-li:text-ink-dim prose-ul:marker:text-line prose-ol:text-ink-dim prose-hr:border-line prose-code:rounded-none"
+                className="font-sans prose prose-invert prose-sm max-w-none prose-pre:font-mono prose-li:font-sans prose-headings:text-ink prose-headings:font-semibold prose-headings:tracking-tight prose-h1:text-[18px] prose-h2:text-[15px] prose-h3:text-[13px] prose-p:text-ink-dim prose-strong:text-ink prose-strong:font-medium prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:text-accent prose-code:font-mono prose-code:before:content-none prose-code:after:content-none prose-code:bg-bg prose-code:px-1 prose-code:py-0.5 prose-pre:bg-bg prose-pre:border prose-pre:border-line prose-ul:list-[square] prose-li:text-ink-dim prose-ul:marker:text-line prose-ol:text-ink-dim prose-hr:border-line prose-code:rounded-none"
                 // Trusted: bodies come from repo maintainers' release notes via GitHub API.
                 dangerouslySetInnerHTML={{ __html: r.bodyHtml }}
               />
@@ -72,6 +75,7 @@ export function ReleasesSection() {
             )}
           </article>
         ))}
+        <div aria-hidden className="h-20" />
       </div>
     </section>
   );

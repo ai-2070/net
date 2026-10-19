@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { SectionLabel } from "./SectionLabel";
-import { DisplayHeading } from "./DisplayHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
 
 interface InstallCard {
   lang: string;
@@ -57,7 +57,10 @@ export function InstallSection() {
   };
 
   return (
-    <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
+    <section
+      id="install"
+      className="bg-bg-2 border-y border-line relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+    >
       <SectionLabel>§10 / install</SectionLabel>
       <DisplayHeading>
         five languages.
@@ -65,12 +68,12 @@ export function InstallSection() {
         one engine.
       </DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         All SDKs wrap the same Rust core. The SDK is the developer experience,
         the engine is Rust.
       </p>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6 mt-5">
         {INSTALL_CARDS.map((c) => {
           const isCopied = copied === c.lang;
           return (
@@ -79,7 +82,7 @@ export function InstallSection() {
               type="button"
               onClick={() => handleCopy(c.lang, c.copy)}
               aria-label={`Copy ${c.lang} install command`}
-              className="text-left border border-line p-5 bg-bg transition-colors hover:border-accent-dim cursor-pointer focus:outline-none focus:border-accent"
+              className="slab slab-lift text-left p-6 cursor-pointer focus:outline-none"
             >
               <div className="flex items-center justify-between mb-4">
                 <span className="text-[11px] text-ink tracking-[0.15em] uppercase font-semibold">
@@ -95,7 +98,7 @@ export function InstallSection() {
                   {isCopied ? "✓ COPIED" : c.ext}
                 </span>
               </div>
-              <pre className="bg-bg-2 p-3 text-[11px] text-accent border-l-2 border-accent overflow-x-auto font-mono leading-[1.5]">
+              <pre className="bg-black/40 p-3.5 text-[12px] text-accent overflow-x-auto font-mono leading-[1.5] shadow-[inset_0_2px_6px_rgba(0,0,0,0.6)]">
                 {c.cmd}
               </pre>
               <div className="text-ink-dim text-[10px] mt-2.5">{c.meta}</div>
@@ -104,7 +107,7 @@ export function InstallSection() {
         })}
       </div>
 
-      <p className="mt-7 text-[11px] text-ink-dim">
+      <p className="mt-12 text-[13px] leading-[1.7] text-ink-dim max-w-[64em]">
         <a
           href="https://github.com/ai-2070/net/tree/master/net/crates/net/include"
           target="_blank"

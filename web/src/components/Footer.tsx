@@ -90,7 +90,8 @@ const ET_YEAR = new Date().toLocaleString("en-US", {
   year: "numeric",
 });
 
-export function Footer() {
+export function Footer({ world }: { world?: "field" } = {}) {
+  if (world === "field") return <FieldFooter />;
   return (
     <footer className="px-6 pt-16 pb-7 border-t border-accent-dim">
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr] gap-8 mb-12">
@@ -118,6 +119,52 @@ export function Footer() {
           <span className="text-accent">ONLINE</span>
         </span>
         <span className="shimmer-2070">// AI 2070</span>
+      </div>
+    </footer>
+  );
+}
+
+// Landing-page footer: the floor of the hall. A long monolith edge, then
+// the directory cast into it.
+function FieldFooter() {
+  return (
+    <footer className="relative px-6 lg:px-10 pt-10 pb-8">
+      <div
+        aria-hidden
+        className="slab h-[18px] -mx-6 lg:-mx-10 mb-16"
+        style={{ boxShadow: "0 30px 40px -24px rgba(0,0,0,0.9)" }}
+      />
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr] gap-10 mb-16">
+        <div>
+          <div className="flex items-baseline gap-3 mb-5">
+            <span className="font-display font-bold uppercase text-[40px] leading-none tracking-[-0.03em] text-ink">
+              net
+            </span>
+            <span className="font-mono text-[9px] tracking-[0.18em] font-semibold text-ink-dim">
+              {"// AI 2070"}
+            </span>
+          </div>
+          <p className="text-ink-dim text-[15px] leading-[1.6] max-w-[24em]">
+            Network Event Transport. A latency-first encrypted protocol for
+            compute.
+          </p>
+        </div>
+        <FooterColumn title="Spec" items={FOOTER_SPEC} world="field" />
+        <FooterColumn title="Docs" items={FOOTER_DOCS} world="field" />
+        <FooterColumn
+          title="Resources"
+          items={FOOTER_RESOURCES}
+          world="field"
+        />
+      </div>
+
+      <div className="border-t border-line pt-6 flex justify-between stencil flex-wrap gap-4">
+        <span>© {ET_YEAR} — NET // PROTOCOL.0x4E45·54</span>
+        <span className="flex items-center gap-2">
+          <span aria-hidden className="w-1.5 h-1.5 bg-accent inline-block" />
+          NET status: <span className="text-accent">ONLINE</span>
+        </span>
+        <span className="text-ink">{"// AI 2070"}</span>
       </div>
     </footer>
   );

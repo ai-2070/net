@@ -149,7 +149,7 @@ export function ArpanetMapBg() {
         </g>
 
         {/* compass — top right */}
-        <g transform="translate(905,100)">
+        <g transform="translate(905,470)">
           <circle
             cx="0"
             cy="0"

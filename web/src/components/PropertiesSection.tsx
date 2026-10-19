@@ -1,7 +1,7 @@
 "use client";
 
-import { DisplayHeading } from "./DisplayHeading";
-import { SectionLabel } from "./SectionLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 import { useEffect, useState } from "react";
 
 interface AxiomCard {
@@ -246,7 +246,10 @@ const AXIOMS: readonly AxiomCard[] = [
 
 export function PropertiesSection() {
   return (
-    <section id="properties" className="border-b border-line px-6 py-20">
+    <section
+      id="properties"
+      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+    >
       <SectionLabel>§03 / protocol properties</SectionLabel>
       <DisplayHeading>
         nine axioms.
@@ -254,19 +257,27 @@ export function PropertiesSection() {
         one runtime.
       </DisplayHeading>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-line border border-line">
-        {AXIOMS.map((p) => (
-          <div key={p.id} className="bg-bg p-7 transition-colors hover:bg-bg-2">
-            <div className="text-[10px] text-accent tracking-[0.15em] mb-4">
-              {p.id}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 lg:gap-6">
+        {AXIOMS.map((p, i) => (
+          <div
+            key={p.id}
+            className="field-wave"
+            style={{ "--i": i } as React.CSSProperties}
+          >
+            <div className="slab slab-lift p-7 flex flex-col h-full">
+              <h3 className="font-display font-bold text-[23px] leading-[1.08] tracking-[-0.015em] text-ink mb-3">
+                {p.title}
+              </h3>
+              <p className="text-ink-dim text-[14px] leading-[1.6] mb-6">
+                {p.body}
+              </p>
+              <div className="flex items-end justify-between gap-4 mt-auto pt-4 border-t border-line">
+                <pre className="font-mono text-accent-dim text-[11px] leading-[1.35] whitespace-pre">
+                  {p.ascii}
+                </pre>
+                <span className="stencil shrink-0">{p.id}</span>
+              </div>
             </div>
-            <h3 className="font-mono text-[14px] font-semibold tracking-[0.05em] text-ink mb-3 uppercase">
-              {p.title}
-            </h3>
-            <p className="text-ink-dim text-[12px] leading-[1.65]">{p.body}</p>
-            <pre className="text-accent-dim text-[10px] mt-4 leading-[1.2] whitespace-pre opacity-70">
-              {p.ascii}
-            </pre>
           </div>
         ))}
       </div>

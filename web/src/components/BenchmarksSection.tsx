@@ -1,5 +1,5 @@
-import { DisplayHeading } from "./DisplayHeading";
-import { SectionLabel } from "./SectionLabel";
+import { FieldHeading as DisplayHeading } from "./field/FieldHeading";
+import { FieldLabel as SectionLabel } from "./field/FieldLabel";
 
 interface BenchRow {
   op: string;
@@ -107,28 +107,31 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
 
 export function BenchmarksSection() {
   return (
-    <section id="bench" className="border-b border-line px-6 py-20">
+    <section
+      id="bench"
+      className="relative pl-6 pr-12 lg:pl-10 lg:pr-24 py-24 lg:py-32"
+    >
       <SectionLabel>§04 / measured numbers</SectionLabel>
       <DisplayHeading>existence proofs.</DisplayHeading>
 
-      <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
+      <p className="text-[19px] md:text-[21px] text-ink max-w-[34em] leading-[1.5] font-light mb-14">
         All numbers measure packet scheduling — the time to process, route,
         encrypt, and queue a packet for transmission. They do not include NIC
         transfer or wire latency.
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">
-        <div className="border border-line bg-bg-2">
+        <div className="slab overflow-x-auto">
           <table className="w-full border-collapse text-[12px]">
             <thead>
               <tr>
-                <th className="text-left px-4 py-3 bg-bg text-ink-dim text-[10px] tracking-[0.12em] uppercase font-medium border-b border-line">
+                <th className="text-left px-4 py-3 text-ink-dim text-[10px] tracking-[0.16em] uppercase font-medium border-b border-line">
                   operation
                 </th>
-                <th className="text-right px-4 py-3 bg-bg text-ink-dim text-[10px] tracking-[0.12em] uppercase font-medium border-b border-line">
+                <th className="text-right px-4 py-3 text-ink-dim text-[10px] tracking-[0.16em] uppercase font-medium border-b border-line">
                   M1 Max
                 </th>
-                <th className="text-right px-4 py-3 bg-bg text-ink-dim text-[10px] tracking-[0.12em] uppercase font-medium border-b border-line">
+                <th className="text-right px-4 py-3 text-ink-dim text-[10px] tracking-[0.16em] uppercase font-medium border-b border-line">
                   i9-14900K
                 </th>
               </tr>
@@ -145,7 +148,7 @@ export function BenchmarksSection() {
           </table>
         </div>
 
-        <div className="border border-line p-6 bg-bg-2">
+        <div className="slab slab-held p-7">
           <BenchKpi
             label="// scheduling floor"
             value="0.20"
@@ -208,7 +211,7 @@ function BenchTableGroup({
       <tr>
         <td
           colSpan={3}
-          className="bg-bg text-accent text-[10px] tracking-[0.15em] uppercase px-4 py-2.5 font-semibold"
+          className="text-ink-dim font-mono text-[10px] tracking-[0.2em] uppercase px-4 pt-7 pb-2 font-semibold"
         >
           {group.group}
         </td>
@@ -221,11 +224,11 @@ function BenchTableGroup({
             <td className={`px-4 py-3.5 ${borderClass} text-ink`}>{r.op}</td>
             <td className={`px-4 py-3.5 ${borderClass} text-right`}>
               <span className="text-ink-dim mr-2">{r.m1.ns}</span>
-              <span className="text-accent font-semibold">{r.m1.rate}</span>
+              <span className="text-ink font-semibold">{r.m1.rate}</span>
             </td>
             <td className={`px-4 py-3.5 ${borderClass} text-right`}>
               <span className="text-ink-dim mr-2">{r.i9.ns}</span>
-              <span className="text-accent font-semibold">{r.i9.rate}</span>
+              <span className="text-ink font-semibold">{r.i9.rate}</span>
             </td>
           </tr>
         );
@@ -247,13 +250,15 @@ function BenchKpi({
 }) {
   return (
     <>
-      <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase mb-4 font-medium">
+      <div className="font-display font-bold text-[64px] tracking-[-0.035em] text-accent leading-none mb-3 tabular-nums">
+        {value}
+        <span className="font-mono font-normal text-[15px] tracking-[0.04em] text-ink-dim ml-2">
+          {unit}
+        </span>
+      </div>
+      <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase font-medium">
         {label}
       </h4>
-      <div className="font-display text-[56px] text-accent leading-none mb-1.5">
-        {value}
-        <span className="text-[22px] text-ink-dim">{unit}</span>
-      </div>
       <p className="text-ink-dim text-[11px] leading-[1.6] mt-3 mb-6">{note}</p>
     </>
   );
