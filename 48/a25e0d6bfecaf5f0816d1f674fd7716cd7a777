@@ -1,0 +1,19 @@
+net/crates/net/tests/rtc_repairs.rs
+  s_4dc6b230b12e72::t_581ac608d8d895 1896-1902,1906
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "48a25e0d6bfecaf5f0816d1f674fd7716cd7a777",
+  "prompts": {},
+  "sessions": {
+    "s_4dc6b230b12e72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9c14426-91a0-48f9-b23b-23405907267b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
