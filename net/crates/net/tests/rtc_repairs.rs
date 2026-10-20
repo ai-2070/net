@@ -1893,9 +1893,17 @@ async fn a_connection_reset_is_swallowed_by_the_production_arm_with_siblings_int
 /// this fixture does not have.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_busy_peer_cannot_starve_a_sibling_or_the_socket() {
+    // The advisory is off for A so the producer is bounded only by
+    // the reserved queue. With it on, admission is refused whenever
+    // SCTP's `buffered_amount` is over the threshold, and once SCTP
+    // drains fast enough (sctp-proto 0.10.7 roughly tripled loopback
+    // throughput) the queue empties between refills and the backlog
+    // precondition below measures nothing. The advisory has its own
+    // witnesses; this one is about the driver's per-peer quantum.
     let big = RtcConfig {
         send_queue_packets: 4096,
         send_queue_bytes: 8 << 20,
+        buffered_amount_advisory: usize::MAX,
         ..rtc_config()
     };
     let a = node(Some(big)).await;
