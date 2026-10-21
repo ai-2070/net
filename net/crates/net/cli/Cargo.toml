@@ -115,7 +115,7 @@ tracing = "0.1"
 blake3 = "1"
 getrandom = "0.4"
 # The SDK enrollment ledger handle (`SharedLedger`) is a parking_lot mutex.
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # XDG paths + TOML for the config + identity stores.
 dirs = "7"

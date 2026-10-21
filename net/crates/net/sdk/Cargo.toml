@@ -34,7 +34,7 @@ fs2 = "0.4"
 # the CLI, the shim, and SDK clients converge on one machine-shared file.
 dirs = "7"
 futures = "0.3"
-parking_lot = "0.12"
+parking_lot = "0.13"
 # `fs` powers the pin store's atomic temp+rename persistence.
 tokio = { version = "1", features = ["rt", "time", "sync", "fs"] }
 pin-project-lite = "0.2"
@@ -200,7 +200,7 @@ time = "0.3"
 toml = "1.0"
 # Workspace lock discipline (clippy disallows std::sync::Mutex::lock);
 # the paid-tool serve test's scripted gate records under a lock.
-parking_lot = "0.12"
+parking_lot = "0.13"
 criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
 postcard = { version = "1", features = ["use-std"] }

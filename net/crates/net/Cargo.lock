@@ -1334,7 +1334,7 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
  "parking_lot_core 0.9.12",
 ]
@@ -2912,6 +2912,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3157,7 +3166,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "portable-pty",
  "postcard",
  "predicates",
@@ -3182,7 +3191,7 @@ dependencies = [
  "libc",
  "net-mesh",
  "net-mesh-sdk",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "tokio",
@@ -3201,7 +3210,7 @@ dependencies = [
  "getrandom 0.4.3",
  "net-mesh",
  "net-mesh-sdk",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "ratatui",
  "serde",
  "tokio",
@@ -3214,7 +3223,7 @@ version = "0.45.1"
 dependencies = [
  "futures",
  "net-mesh",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde_json",
  "tokio",
  "zeroize",
@@ -3241,7 +3250,7 @@ version = "0.45.1"
 dependencies = [
  "net-mesh-mcp",
  "net-mesh-sdk",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -3277,7 +3286,7 @@ dependencies = [
  "loom",
  "lru 0.19.0",
  "net-mesh-wire",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "postcard",
  "quanta",
  "rand 0.10.3",
@@ -3320,7 +3329,7 @@ dependencies = [
  "keyring-core",
  "linux-keyutils-keyring-store",
  "net-mesh-sdk",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -3355,7 +3364,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-sdk-macros",
  "notify",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "postcard",
  "rand 0.10.3",
@@ -3401,7 +3410,7 @@ dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.3",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "ring",
  "serde",
  "serde_json",
@@ -3420,7 +3429,7 @@ version = "0.45.1"
 dependencies = [
  "futures",
  "net-mesh",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "postcard",
  "serde_json",
  "tokio",
@@ -3432,7 +3441,7 @@ version = "0.45.1"
 dependencies = [
  "bytes",
  "net-mesh",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde_json",
  "tokio",
 ]
@@ -3455,7 +3464,7 @@ dependencies = [
  "net-mesh-mcp",
  "net-mesh-sdk",
  "net-payments",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "postcard",
  "serde_json",
  "tokio",
@@ -3472,7 +3481,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-sdk",
  "net-rpc-ffi",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde_json",
  "tokio",
 ]
@@ -3495,7 +3504,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "reqwest",
  "rustls",
  "schemars",
@@ -3527,7 +3536,7 @@ dependencies = [
  "net-mesh-mcp",
  "net-mesh-sdk",
  "net-payments",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "postcard",
  "pyo3",
  "pyo3-async-runtimes",
@@ -3547,7 +3556,7 @@ dependencies = [
  "futures",
  "libc",
  "net-mesh",
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "serde_json",
  "tokio",
 ]
@@ -3894,7 +3903,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d17b78036a60663b797adeaee46f5c9dfebb86948d1255007a1d6be0271ff99"
 dependencies = [
  "instant",
- "lock_api",
+ "lock_api 0.4.14",
  "parking_lot_core 0.8.6",
 ]
 
@@ -3904,8 +3913,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
  "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -3931,6 +3950,18 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -4675,6 +4706,15 @@ name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -5447,7 +5487,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]

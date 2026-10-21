@@ -34,7 +34,7 @@ async-trait = "0.1"
 bytes = "1"
 # The repo disallows `std::sync::Mutex::lock` (clippy.toml): parking_lot's
 # guards are infallible, so the panic-on-poison surface never appears.
-parking_lot = "0.12"
+parking_lot = "0.13"
 # The local CA + leaf for `https://localhost`, so the page reaches the
 # real HTTPS bootstrap listener rather than a weakened one.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }

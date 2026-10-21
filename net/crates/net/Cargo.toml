@@ -271,7 +271,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 
 # High-performance primitives
 crossbeam-utils = "0.8"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -250,7 +250,7 @@ net-mcp = { package = "net-mesh-mcp", version = "0.45.1", path = "../../adapters
 # engine the gateway's payment gate clears paid capabilities through.
 net-payments = { version = "0.45.1", path = "../../payments", optional = true, features = ["mcp-gate", "mesh"] }
 dashmap = { version = "6", optional = true }
-parking_lot = "0.12"
+parking_lot = "0.13"
 arc-swap = { version = "1.7", optional = true }
 # `extension-module` is NOT hardcoded here — see the feature of the
 # same name above.

@@ -67,7 +67,7 @@ net-sdk = { package = "net-mesh-sdk", version = "0.45.1", path = "../../../sdk",
 net-rpc-ffi = { version = "0.45.1", path = "../rpc-ffi" }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 # `libc::free` for the Go-allocated handler-response buffers the
 # dispatcher hands us. Go side allocates via `C.malloc`; we release
 # via the matching `free` (mirrors rpc-ffi / compute-ffi).

@@ -41,7 +41,7 @@ tool = ["net/tool"]
 net = { package = "net-mesh", version = "0.45.1", path = "../../..", features = ["net", "netdb", "redex-disk"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 async-trait = "0.1"
 # `libc::free` for any cross-FFI buffers that need releasing
 # through the C runtime allocator (matches compute-ffi).
