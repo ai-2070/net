@@ -798,11 +798,16 @@ impl PyMeshOsDaemonHandle {
                 let Some(h) = guard.as_mut() else {
                     return Err(());
                 };
-                Ok(runtime.block_on(async {
+                let ev = runtime.block_on(async {
                     tokio::time::timeout(slice, h.next_control())
                         .await
                         .unwrap_or_default()
-                }))
+                });
+                // Hand the lock to any waiter: a plain drop lets the next
+                // slice barge straight back in and starve other ops on the
+                // handle (parking_lot 0.13 has no eventual fairness).
+                parking_lot::MutexGuard::unlock_fair(guard);
+                Ok(ev)
             });
             match got {
                 Err(()) if first => return Err(already_shutdown(py)),

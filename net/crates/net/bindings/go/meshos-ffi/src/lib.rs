@@ -670,7 +670,7 @@ pub struct NetMeshOsHandle {
 // thread in the common case. parking_lot::Mutex matches the rest of
 // the workspace's lock convention and has no poison concept.
 mod parking_lot_or_std {
-    pub use parking_lot::Mutex;
+    pub use parking_lot::{Mutex, MutexGuard};
 }
 
 // =========================================================================
@@ -1195,7 +1195,12 @@ pub extern "C" fn net_meshos_next_control(
             match runtime().block_on(async { tokio::time::timeout(slice, h.next_control()).await })
             {
                 Ok(ev) => break ev,
-                Err(_) => continue, // slice elapsed: release the lock, go again
+                // Slice elapsed: hand the lock to any waiter before going
+                // again. A plain drop lets this thread barge straight back
+                // in and starve every other op on the handle — parking_lot
+                // 0.13 removed the eventual fairness that used to break the
+                // tie, so the handoff must be explicit.
+                Err(_) => parking_lot_or_std::MutexGuard::unlock_fair(guard),
             }
         };
         unsafe {

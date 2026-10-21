@@ -2153,7 +2153,13 @@ impl StreamInbox {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        self.rx.lock().recv_timeout(timeout).ok()
+        let rx = self.rx.lock();
+        let ev = rx.recv_timeout(timeout).ok();
+        // Callers loop on this with short timeouts; a plain drop would let
+        // the looping thread barge straight back in and starve any other
+        // receiver (parking_lot 0.13 has no eventual fairness).
+        parking_lot::MutexGuard::unlock_fair(rx);
+        ev
     }
 
     /// The next event if one is waiting; never blocks.
