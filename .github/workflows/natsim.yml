@@ -43,7 +43,11 @@ concurrency:
 jobs:
   natsim:
     name: netns NAT scenario matrix
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: Playwright cannot install its browsers on
+    # ubuntu-26.04 ("Playwright does not support chromium on ubuntu26.04-x64"),
+    # and ubuntu-latest rolled to 26.04 in 2026-10. Unpin once Playwright ships
+    # 26.04 support.
+    runs-on: ubuntu-24.04
     env:
       # The browser drivers run as ROOT inside the namespaces (netns and
       # nft need root), so Playwright would otherwise look under root's
