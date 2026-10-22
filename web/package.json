@@ -2,7 +2,7 @@
   "name": "compute",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "bun@1.4.3",
+  "packageManager": "bun@1.4.4",
   "scripts": {
     "build": "next build",
     "build:vercel": "timeout 15m bun run build",
