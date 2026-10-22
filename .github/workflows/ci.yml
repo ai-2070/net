@@ -7849,7 +7849,7 @@ jobs:
     # ubuntu-26.04 ("Playwright does not support chromium on ubuntu26.04-x64"),
     # and ubuntu-latest rolled to 26.04 in 2026-10. Unpin once Playwright ships
     # 26.04 support.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # The job budget is the SUM of its steps, not less. The four engine legs
     # carry 20+20+20+15 = 75 minutes of step caps on top of the
     # browser/toolchain/build preamble and the evidence steps; at 45 one slow
@@ -8339,7 +8339,7 @@ jobs:
     # ubuntu-26.04 ("Playwright does not support chromium on ubuntu26.04-x64"),
     # and ubuntu-latest rolled to 26.04 in 2026-10. Unpin once Playwright ships
     # 26.04 support.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -8484,7 +8484,7 @@ jobs:
     # ubuntu-26.04 ("Playwright does not support chromium on ubuntu26.04-x64"),
     # and ubuntu-latest rolled to 26.04 in 2026-10. Unpin once Playwright ships
     # 26.04 support.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
