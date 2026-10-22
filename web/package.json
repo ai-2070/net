@@ -114,7 +114,7 @@
     "ws": "8.22.0",
     "xmlbuilder2": "4.0.3",
     "zod": "4.6.7",
-    "zustand": "5.0.15"
+    "zustand": "5.0.16"
   },
   "devDependencies": {
     "@next/bundle-analyzer": "16.4.2",
