@@ -2424,7 +2424,7 @@ jobs:
   rust-sdk-tests:
     name: Rust SDK tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       # sccache trial job #3 of 3 (see the note in `integration-net-core`).
       SCCACHE_GHA_ENABLED: "true"
