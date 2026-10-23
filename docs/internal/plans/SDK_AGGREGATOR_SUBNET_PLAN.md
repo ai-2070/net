@@ -21,7 +21,35 @@ Mirrors `SDK_GROUPS_SURFACE_PLAN.md`'s shape. The substrate landed across two br
 
 ---
 
-## Current state
+## Current state (re-checked 2026-10-23)
+
+*Amended by `AGGREGATOR_MULTI_HOST_PLAN.md` P0-1. The table below replaces the
+one this plan was written against, which is kept after it for the record.
+Checked by reading each binding's exports at `541cc0078`: `sdk/src/aggregator.rs`,
+`sdk/src/subnets.rs`, `bindings/node/src/aggregator.rs` with
+`sdk-ts/src/aggregator.ts`, `bindings/python/src/aggregator.rs`, `go/aggregator.go`,
+and `include/net.h`.*
+
+| Surface | Rust SDK | Node/TS | Python | Go | C ABI |
+|---|---|---|---|---|---|
+| `RegistryClient` list / spawn / unregister | ✓ | ✓ | ✓ (sync + async) | ✓ | ✓ (`net_registry_client_*`) |
+| `RegistryClient` scale | ✓ (`scale`, `aggregator.rs:368`) | ✗ | ✗ | ✗ | ✗ |
+| `FoldQueryClient` latest / summarize-now / cache control | ✓ | ✓ | ✓ (sync + async) | ✓ | ✓ (`net_fold_query_client_*`) |
+| Typed client errors (kind discrimination) | ✓ | ✓ (`RegistryErrorKind`, `FoldQueryErrorKind`) | ✓ | ✓ | ✓ (`*_last_error_detail`) |
+| Wire types (`RegistryRequest`, `RegistryGroupSummary`, …) | ✓ (re-export) | as JS objects | as Python objects | as Go structs | as JSON strings |
+| `Visibility` on channel config | ✓ (re-export) | ✓ (string on `register_channel`) | ✓ (string) | ✓ (string field) | ✓ (`NET_VISIBILITY_*`) |
+| `SubnetId` / `SubnetPolicy` / `SubnetRule` | ✓ | ✓ (POJO) | ✓ (dict) | ✓ | ✗ |
+| `SubnetGateway` | ✓ (re-export) | gateway credentials only | gateway credentials only | gateway credentials only | gateway credentials only (`net_subnet.h`) |
+| Daemon-author surfaces (`AggregatorConfig`, `AggregatorDaemon`, `AggregatorRegistry`, `LifecycleGroup`, `HealthMonitor`, `Summarizer`) | ✓ (re-export) | ✗ by design | ✗ by design | ✗ by design | ✗ by design |
+| Service installers (`install_aggregator_registry_service*`, `install_fold_query_service`) | ✓ | ✗ by design | ✗ by design | ✗ by design | ✗ by design |
+| `AggregatorSnapshot` / `AggregatorRegistrySnapshot` | ✓ (via `deck`) | not found by name | not found by name | not found by name | not found by name |
+
+"✗ by design" is this plan's decision 1: daemon-author surfaces are Rust-only.
+The open gap is `scale` outside Rust. The `fold.query.v2` group selector and
+`aggregator.registry.v2` work in `AGGREGATOR_MULTI_HOST_PLAN.md` add to these
+surfaces.
+
+## State when this plan was written (historical)
 
 | Surface                                  | Rust SDK    | Node/TS | Python | Go    | C ABI |
 |------------------------------------------|-------------|---------|--------|-------|-------|

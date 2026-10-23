@@ -674,6 +674,19 @@ were wrong. Sizes are rough working days.
 
 *Proof:* docs only. Run `bun run check` in `web/` if a mirrored page changes.
 
+**Done 2026-10-23.**
+
+- **P0-1, deferred plan:** a dated correction under "Remaining gap" in
+  `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+- **P0-1, SDK plan:** a re-checked "Current state" table in
+  `SDK_AGGREGATOR_SUBNET_PLAN.md`, built from each binding's exports. The
+  original table is kept as history. Re-checking found one more gap: `scale`
+  exists only in the Rust SDK. Node, Python, Go and C have list / spawn /
+  unregister only.
+- **P0-2:** a status note at the top of `SCALING_SUBNET_SPEC.md` and 11 inline
+  **Superseded** callouts, with the original text left in place.
+- **No web sync needed:** none of the three files is mirrored under `web/`.
+
 ### Phase 1 — Relay through a real daemon (G4, 1–2 days)
 
 - **R1. Daemon-hub relay witnesses** in `aggregator-daemon/tests/` (run by

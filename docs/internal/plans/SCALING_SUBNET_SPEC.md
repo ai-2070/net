@@ -1,5 +1,33 @@
 # Subnet-Aware Scaling: Aggregators on top of existing primitives
 
+> **Status (2026-10-23): partly superseded.**
+>
+> The parts on hierarchical subnets, `SubnetGateway`, channel `Visibility` and
+> `SubnetPolicy` describe the substrate as it is. The **aggregator deployment
+> model does not**. AL-1 (`AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`) made
+> `AggregatorDaemon` a `LifecycleDaemon`, not a `MeshDaemon`, and aggregators
+> are never deployed through `ReplicaGroup`. None of the following exists for
+> aggregators:
+>
+> - replica identity that survives re-placement (replica keypairs are derived
+>   but authorize nothing, and every replica shares its daemon's node);
+> - placement onto other nodes, `route_event` routing, or `on_node_failure`
+>   re-spawn;
+> - term/epoch fencing;
+> - `role:aggregator` discovery;
+> - "generation comparison picks the latest" across replicas.
+>
+> The current design is `AGGREGATOR_MULTI_HOST_PLAN.md`:
+>
+> - members on distinct hosts, started by daemon-to-daemon spawn (D1, D2);
+> - an idempotent, incarnation-tagged member protocol that accepts temporary
+>   over-replication instead of fencing (D7);
+> - per-stream ordering and receiver freshness (D3, D8);
+> - one source subnet per daemon (D0).
+>
+> Callouts marked **Superseded** below point at the decision that replaces each
+> claim. The original text is left in place.
+
 ## Substrate Work Needed for Beyond-100K-Node Scale
 
 This document specifies the substrate-level changes required to scale Net meshes past ~100K nodes using the **existing** subnet, channel, and replica-group primitives more deliberately. The bulk of what's needed is already in the substrate; the remaining work is aggregator daemons (built on `ReplicaGroup` of `MeshDaemon`), CLI ergonomics, and the fold framework that consumes these primitives.
@@ -81,6 +109,8 @@ Defined in `crates/net/src/adapter/net/compute/replica_group.rs`:
 
 This is the HA primitive aggregators will use.
 
+> **Superseded:** aggregators do not use `ReplicaGroup` (AL-1). See the status note at the top and `AGGREGATOR_MULTI_HOST_PLAN.md` D1, D2.
+
 ---
 
 ## What this means for scale
@@ -117,6 +147,8 @@ That's the work. Three pieces, not six. The substrate has been thought through m
 
 3. **Aggregator role as a `MeshDaemon` deployed via `ReplicaGroup`.** No new HA mechanism; the existing replica-group infrastructure handles placement, failover, identity continuity.
 
+   > **Superseded:** aggregators are `LifecycleDaemon`s and do not use `ReplicaGroup`. Multi-host deployment is `AGGREGATOR_MULTI_HOST_PLAN.md` D1, D2, D7.
+
 4. **Operator-controlled topology.** Operators express their deployment hierarchy via subnet policy (`SubnetPolicy`) and channel visibility (`ChannelConfig::visibility`). The substrate accommodates any topology; it doesn't impose one.
 
 5. **Backward compatibility.** Existing flat-mesh deployments and existing subnet-aware deployments both continue working. The fold framework and aggregator daemons are additions, not replacements.
@@ -128,6 +160,8 @@ That's the work. Three pieces, not six. The substrate has been thought through m
 - **Inventing a new subnet system.** The substrate already has 4-level hierarchical subnets with gateway enforcement. We use it; we don't replace it.
 - **Inventing a new channel scoping mechanism.** `ChannelConfig::visibility` is the mechanism. We configure folds' channels appropriately; we don't create parallel naming conventions.
 - **Inventing a new HA mechanism.** `ReplicaGroup` is the mechanism. Aggregators are `MeshDaemon` impls deployed via it.
+
+  > **Superseded:** a small member protocol between daemons (D7 of `AGGREGATOR_MULTI_HOST_PLAN.md`) is needed, because `ReplicaGroup` does not host `LifecycleDaemon`s.
 - **Cross-mesh federation.** Each mesh is independent; multi-mesh federation is a separate concern past where subnet scaling reaches.
 - **Strong consistency across subnets.** Summaries lag detail; aggregation is eventually consistent. Applications that need strong consistency do direct RPC to the source subnet's aggregator.
 - **Automatic subnet topology discovery.** Operators define topology via `SubnetPolicy`; the substrate doesn't infer it.
@@ -139,6 +173,8 @@ That's the work. Three pieces, not six. The substrate has been thought through m
 Three pieces of work, in dependency order:
 
 ### 1. Aggregator daemon (`AggregatorDaemon` deployed via `ReplicaGroup`)
+
+> **Superseded (deployment model):** the summarization role described here is accurate. The `MeshDaemon`/`ReplicaGroup` deployment, identity continuity across re-placement, term/epoch fencing and `on_node_failure` claims in this section were never built (AL-1). See `AGGREGATOR_MULTI_HOST_PLAN.md` D1, D2, D7.
 
 **Problem:** to bridge tiers (rack subnets → DC summaries → region summaries → global summaries), some node in each subnet needs to maintain a detailed view of fold state and republish summaries to channels visible at a parent or peer tier. This is the missing piece: the substrate has the routing/visibility machinery, but no daemon that actually does the summarization work.
 
@@ -288,6 +324,8 @@ Idempotent: re-running the same spawn command produces the same group identity (
 
 #### Summary publication: all replicas publish
 
+> **Superseded:** a replica's `generation` starts at 0 and is not comparable across replicas or restarts. Ordering is per stream by `(boot_epoch, stream_seq, generation)` and freshness by bounded refresh plus expiry (`AGGREGATOR_MULTI_HOST_PLAN.md` D3, D8). Replicas on one host today read the same fold and publish duplicates (F4).
+
 All 3 replicas publish summaries independently. Each runs its own summarizer on its own (eventually consistent) view of the source fold, publishes its summary at the configured interval. Subscribers see three summary announcements per cycle and use the fold framework's generation comparison to pick the latest.
 
 Reasons:
@@ -300,6 +338,8 @@ Reasons:
 Operator can `scale_to(1)` to reduce summary traffic at cost of availability.
 
 #### Built-in summarizers per fold
+
+> **As shipped:** the built-in summarizers count entries by state only, across the node's whole fold, not per class and not per subnet (F3 in `AGGREGATOR_MULTI_HOST_PLAN.md`). D4 adds subnet classification; per-class rollups remain custom summarizers.
 
 - **CapabilityFold:** count by (class, state), aggregate hardware capacity, distribution across sub-subnets. Summary entry per class.
 - **RoutingFold:** typically not summarized — routing usually wants full detail or none. Built-in summarizer omitted; can be added if a use case emerges.
@@ -350,6 +390,8 @@ pub trait FoldQueryService {
 The aggregator daemon implements this service automatically. The querier uses the existing RPC machinery and routes through the substrate's normal gateway (which forwards based on `ChannelConfig::visibility` and `subnet_id` header). No new wire protocol; no special-case routing.
 
 **Discovery:** the querier finds the aggregator group via the capability index — replicas are tagged with `role:aggregator` and their source subnet is in their identity. Once a replica is identified, RPC is routed to it. Since aggregators are deployed as `ReplicaGroup`, the group's `route_event` naturally picks the closest healthy replica.
+
+> **Superseded:** there is no `role:aggregator` tag and no `route_event` for aggregators. Clients address a daemon's node id. `AGGREGATOR_MULTI_HOST_PLAN.md` M1 adds `aggregator-host` announcements, and Q2 adds the `fold.query.v2` group selector.
 
 **Caching:** the RPC client caches recent query results with a short TTL (configurable, default 5s). Repeated queries for the same data don't re-hit the aggregator.
 
@@ -483,6 +525,8 @@ The pitch story:
 
 **"Aggregation is a daemon role, not specialized infrastructure."** Aggregators are `MeshDaemon` deployed via `ReplicaGroup`. Failover, placement, identity continuity all from existing primitives. New tier services (market matchers, settlement bridges, reputation oracles) follow the same pattern.
 
+> **Superseded:** see the status note at the top.
+
 **"Scale by subdivision and summarization, both using primitives already in the substrate."** This is the architectural story, and it's true: the substrate scales because the substrate was built with scale in mind.
 
 ---
@@ -496,6 +540,8 @@ Mitigation: subnet assignment via `SubnetPolicy` is deterministic from capabilit
 **Risk: aggregator failures cause summary gaps.**
 
 Mitigation: aggregators are deployed via `ReplicaGroup` with N replicas (typically 3) spread across failure domains within the source subnet. All replicas publish summaries independently; subscribers see continuous output as long as ≥1 replica is healthy. Node failure triggers `ReplicaGroup::on_node_failure`, which re-spawns the failed slot on a different node with the same derived identity. New replica rebuilds fold state from source channels within one TTL cycle (~30-60s); other replicas continue publishing during rebuild.
+
+> **Superseded:** see `AGGREGATOR_MULTI_HOST_PLAN.md` D2 (one member per host), D7 (re-placement with temporary over-replication, no fencing) and D8 (receiver freshness). There is no `on_node_failure` path for aggregators.
 
 **Risk: summary staleness causes scheduling decisions on stale data.**
 
@@ -521,6 +567,8 @@ A few honest limits:
 
 **Per-aggregator capacity.** A single aggregator can handle ~10K detailed entries comfortably; past that, per-subnet aggregators may need sharding by fold kind or by class hash. Not addressed here; expected to be a concern past several million nodes per mesh.
 
+> **Superseded figure:** the ~10K estimate predates the fold-scale work. On v0.42 the fold alone holds 1M entries in about 1.9 GB (`net/crates/net/docs/releases/RELEASE_v0.42_BACK_IN_BLACK.md`). A whole-aggregator figure, including ingest and signature verification, comes from `AGGREGATOR_MULTI_HOST_PLAN.md` S2 and replaces this paragraph in S3.
+
 **Cross-mesh federation.** Multiple meshes don't share subnets. If you operate multiple meshes (perhaps for organizational reasons), they're independent. Federation across meshes is a separate concern.
 
 **Strongly consistent cross-subnet operations.** A scheduler wanting "atomically reserve one GPU in any of these regions" doesn't get strong consistency from this design. Same model as the multi-fold reservation pattern. Sufficient for most workloads; insufficient for some.
@@ -542,5 +590,7 @@ None of this is new architecture. All of it is more deliberate use of what exist
 This composes with the Multi-Fold Plan: folds operate on channels; channels have visibility; visibility is enforced by gateways. The fold framework doesn't need to know about subnets at all. Each layer does one thing.
 
 The architectural pattern that emerges is worth naming explicitly: **any role in the substrate that needs replication is a `ReplicaGroup` of `MeshDaemon` instances.** Aggregators are the first application of this pattern; future tier services (market matchers, settlement bridges, reputation oracles, gateway services) will use the same primitive. One HA mechanism, many daemon types.
+
+> **Superseded:** aggregators did not become a `ReplicaGroup` of `MeshDaemon`s. See the status note at the top.
 
 Buildable, well-aligned with the existing codebase, and stronger as a scaling story than building specialized hierarchical infrastructure would have been — because the hierarchical infrastructure is already there.
