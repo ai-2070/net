@@ -184,10 +184,17 @@ const (
 	FoldQueryErrKindCodec       FoldQueryErrorKind = "codec"
 	FoldQueryErrKindUnknownKind FoldQueryErrorKind = "unknown-kind"
 	FoldQueryErrKindInvalidArgs FoldQueryErrorKind = "invalid-args"
+	// A daemon refused the caller: outside its summary visibility and
+	// not an operator. From the v1 and v2 calls.
+	FoldQueryErrKindUnauthorized FoldQueryErrorKind = "unauthorized"
 	// From the fold.query.v2 calls (QueryGroupLatest /
 	// QueryGroupSummarizeNow).
 	FoldQueryErrKindUnknownGroup FoldQueryErrorKind = "unknown-group"
-	FoldQueryErrKindUnauthorized FoldQueryErrorKind = "unauthorized"
+	// The target answered NotFound for fold.query.v2. Only a node
+	// without a channel registry does, typically an aggregator daemon
+	// from before v2, which serves no v1 fold.query either: not a cue
+	// to retry v1. A node with a registry that lacks v2 fails as
+	// FoldQueryErrKindTransport.
 	FoldQueryErrKindServerTooOld FoldQueryErrorKind = "server-too-old"
 )
 
@@ -637,8 +644,9 @@ func (c *FoldQueryClient) QuerySummarizeNow(
 
 // QueryGroupLatest is fold.query.v2: the latest summaries for `kind`
 // from `group`, or from every group on the target daemon aggregating
-// it when `group` is "". Cached like QueryLatest. A target without v2
-// returns a *FoldQueryClientError with Kind FoldQueryErrKindServerTooOld.
+// it when `group` is "". Cached like QueryLatest. A registry-less target
+// without v2 returns a *FoldQueryClientError with Kind
+// FoldQueryErrKindServerTooOld (see that constant).
 func (c *FoldQueryClient) QueryGroupLatest(
 	ctx context.Context,
 	targetNodeID uint64,

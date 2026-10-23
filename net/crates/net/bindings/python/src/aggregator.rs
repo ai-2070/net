@@ -24,7 +24,7 @@ use pyo3::types::{PyDict, PyList};
 
 use net_sdk::aggregator::{
     FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError as SdkFoldQueryClientError,
-    FoldQueryError, FoldQueryV2ClientError, FoldQueryV2Error, RegistryClient as SdkRegistryClient,
+    FoldQueryErrorKind, FoldQueryV2ClientError, RegistryClient as SdkRegistryClient,
     RegistryClientError as SdkRegistryClientError, RegistryGroupSummary, RegistryReplicaSummary,
     RegistryRpcError, SummaryAnnouncement, SummaryRecord,
 };
@@ -77,9 +77,10 @@ create_exception!(
     FoldQueryClientError,
     PyException,
     "Fold-query RPC failure. `.kind` is one of `transport` | `codec` | \
-     `unknown-kind`, plus from the fold.query.v2 calls `unknown-group` | \
-     `unauthorized` | `server-too-old`. `.server_detail` carries the \
-     long-form text."
+     `unknown-kind` | `unauthorized` (a daemon refused the caller: outside \
+     its summary visibility and not an operator), plus from the \
+     fold.query.v2 calls `unknown-group` | `server-too-old`. \
+     `.server_detail` carries the long-form text."
 );
 create_exception!(
     _net,
@@ -92,7 +93,10 @@ create_exception!(
     FoldQueryServerTooOld,
     FoldQueryClientError,
     "The target does not serve fold.query.v2 (it answered NotFound for the \
-     service). Use query_latest / query_summarize_now (v1) against it."
+     service). Only a node without a channel registry answers that way, \
+     typically an aggregator daemon from before v2, which serves no v1 \
+     fold.query either: this is not a cue to retry v1. A node with a \
+     registry that lacks v2 fails as `transport` instead."
 );
 
 fn set_err_attrs<T: Into<PyErr>>(py: Python<'_>, err: T, kind: &str, detail: &str) -> PyErr {
@@ -138,49 +142,29 @@ fn registry_err(py: Python<'_>, e: SdkRegistryClientError) -> PyErr {
     set_err_attrs(py, py_err, kind, &detail)
 }
 
+/// `fold.query` (v1) errors. Kind and detail come from core
+/// (`error_kind` / `detail`), the one mapping every binding shares.
 fn fold_query_err(py: Python<'_>, e: SdkFoldQueryClientError) -> PyErr {
-    let (kind, detail): (&str, String) = match &e {
-        SdkFoldQueryClientError::Transport(t) => ("transport", t.to_string()),
-        SdkFoldQueryClientError::Codec(c) => ("codec", c.to_string()),
-        SdkFoldQueryClientError::Server(srv) => match srv {
-            FoldQueryError::UnknownKind { kind } => ("unknown-kind", format!("0x{kind:04x}")),
-            FoldQueryError::DecodeFailed(s) => ("codec", format!("server-decode: {s}")),
-        },
-    };
-    let message = format!("agg:{kind}: {detail}");
-    let py_err = match kind {
-        "unknown-kind" => UnknownFoldKind::new_err(message),
-        _ => FoldQueryClientError::new_err(message),
-    };
-    set_err_attrs(py, py_err, kind, &detail)
+    fold_query_py_err(py, e.error_kind(), e.detail())
 }
 
-/// `fold.query.v2` errors. Same `.kind` strings as the Node binding.
+/// `fold.query.v2` errors, mapped the same way.
 fn fold_query_v2_err(py: Python<'_>, e: FoldQueryV2ClientError) -> PyErr {
-    let (kind, detail): (&str, String) = match &e {
-        FoldQueryV2ClientError::ServerTooOld => (
-            "server-too-old",
-            "the target does not serve fold.query.v2".to_string(),
-        ),
-        FoldQueryV2ClientError::Transport(t) => ("transport", t.to_string()),
-        FoldQueryV2ClientError::Codec(c) => ("codec", c.to_string()),
-        FoldQueryV2ClientError::Server(srv) => match srv {
-            FoldQueryV2Error::UnknownKind { kind } => ("unknown-kind", format!("0x{kind:04x}")),
-            FoldQueryV2Error::UnknownGroup(g) => ("unknown-group", g.clone()),
-            FoldQueryV2Error::NotAuthorized => (
-                "unauthorized",
-                "caller is outside the daemon's summary visibility and not an operator".to_string(),
-            ),
-            FoldQueryV2Error::DecodeFailed(s) => ("codec", format!("server-decode: {s}")),
-        },
-    };
-    let message = format!("agg:{kind}: {detail}");
+    fold_query_py_err(py, e.error_kind(), e.detail())
+}
+
+fn fold_query_py_err(py: Python<'_>, kind: FoldQueryErrorKind, detail: String) -> PyErr {
+    let kind_str = kind.as_str();
+    let message = format!("agg:{kind_str}: {detail}");
     let py_err = match kind {
-        "unknown-kind" => UnknownFoldKind::new_err(message),
-        "server-too-old" => FoldQueryServerTooOld::new_err(message),
-        _ => FoldQueryClientError::new_err(message),
+        FoldQueryErrorKind::UnknownKind => UnknownFoldKind::new_err(message),
+        FoldQueryErrorKind::ServerTooOld => FoldQueryServerTooOld::new_err(message),
+        FoldQueryErrorKind::Transport
+        | FoldQueryErrorKind::Codec
+        | FoldQueryErrorKind::UnknownGroup
+        | FoldQueryErrorKind::Unauthorized => FoldQueryClientError::new_err(message),
     };
-    set_err_attrs(py, py_err, kind, &detail)
+    set_err_attrs(py, py_err, kind_str, &detail)
 }
 
 // =========================================================================

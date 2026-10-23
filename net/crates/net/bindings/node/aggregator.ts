@@ -28,11 +28,16 @@ export type FoldQueryErrorKind =
   | 'codec'
   | 'unknown-kind'
   | 'invalid-args'
-  // fold.query.v2 (queryGroupLatest / queryGroupSummarizeNow).
-  // `unknown-group` and `unauthorized` share their strings with the
-  // registry surface; pass the 'fold-query' hint to route them here.
-  | 'unknown-group'
+  // A daemon refused the caller (outside its summary visibility and not
+  // an operator), from v1 and v2. Shares its string with the registry
+  // surface; pass the 'fold-query' hint to route it here.
   | 'unauthorized'
+  // fold.query.v2 (queryGroupLatest / queryGroupSummarizeNow).
+  // `unknown-group` is shared with the registry the same way.
+  | 'unknown-group'
+  // The target answered NotFound for v2. Only a registry-less node does,
+  // typically a daemon from before v2, which serves no v1 either: not a
+  // cue to retry v1. A node with a registry that lacks v2 is `transport`.
   | 'server-too-old'
 
 export class RegistryClientError extends Error {

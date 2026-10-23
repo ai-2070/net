@@ -18,10 +18,9 @@ use napi_derive::napi;
 use parking_lot::RwLock as ParkingRwLock;
 
 use net_sdk::aggregator::{
-    FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError, FoldQueryError,
-    FoldQueryV2ClientError, FoldQueryV2Error, RegistryClient as SdkRegistryClient,
-    RegistryClientError, RegistryGroupSummary, RegistryReplicaSummary, RegistryRpcError,
-    SummaryRecord,
+    FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError, FoldQueryV2ClientError,
+    RegistryClient as SdkRegistryClient, RegistryClientError, RegistryGroupSummary,
+    RegistryReplicaSummary, RegistryRpcError, SummaryRecord,
 };
 
 // ============================================================================
@@ -67,42 +66,20 @@ fn registry_err(e: RegistryClientError) -> Error {
     }
 }
 
+/// `fold.query` (v1) errors. Kind and detail come from core
+/// (`error_kind` / `detail`), the one mapping every binding shares.
+/// `unauthorized` is a daemon refusing the caller (outside its summary
+/// visibility and not an operator).
 fn fold_query_err(e: FoldQueryClientError) -> Error {
-    match e {
-        FoldQueryClientError::Transport(t) => agg_err("transport", t),
-        FoldQueryClientError::Codec(c) => agg_err("codec", c),
-        FoldQueryClientError::Server(srv) => match srv {
-            FoldQueryError::UnknownKind { kind } => {
-                agg_err("unknown-kind", format!("0x{kind:04x}"))
-            }
-            FoldQueryError::DecodeFailed(s) => agg_err("codec", format!("server-decode: {s}")),
-        },
-    }
+    agg_err(e.error_kind().as_str(), e.detail())
 }
 
-/// `fold.query.v2` errors. `server-too-old` is the target answering
-/// `NotFound` for the v2 service; `unknown-group` and `unauthorized` share
-/// their strings with the registry surface, so `aggregator.ts` routes them by
-/// the caller's `'fold-query'` hint.
+/// `fold.query.v2` errors, mapped the same way. `server-too-old` is the
+/// target answering `NotFound` for the v2 service; `unknown-group` and
+/// `unauthorized` share their strings with the registry surface, so
+/// `aggregator.ts` routes them by the caller's `'fold-query'` hint.
 fn fold_query_v2_err(e: FoldQueryV2ClientError) -> Error {
-    match e {
-        FoldQueryV2ClientError::ServerTooOld => {
-            agg_err("server-too-old", "the target does not serve fold.query.v2")
-        }
-        FoldQueryV2ClientError::Transport(t) => agg_err("transport", t),
-        FoldQueryV2ClientError::Codec(c) => agg_err("codec", c),
-        FoldQueryV2ClientError::Server(srv) => match srv {
-            FoldQueryV2Error::UnknownKind { kind } => {
-                agg_err("unknown-kind", format!("0x{kind:04x}"))
-            }
-            FoldQueryV2Error::UnknownGroup(g) => agg_err("unknown-group", g),
-            FoldQueryV2Error::NotAuthorized => agg_err(
-                "unauthorized",
-                "caller is outside the daemon's summary visibility and not an operator",
-            ),
-            FoldQueryV2Error::DecodeFailed(s) => agg_err("codec", format!("server-decode: {s}")),
-        },
-    }
+    agg_err(e.error_kind().as_str(), e.detail())
 }
 
 // ============================================================================

@@ -23,8 +23,8 @@ use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use super::handle_guard::{BeginFree, HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 
 use crate::adapter::net::behavior::aggregator::{
-    FoldQueryClient, FoldQueryClientError, FoldQueryError, FoldQueryV2ClientError,
-    FoldQueryV2Error, RegistryClient, RegistryClientError, RegistryGroupSummary, RegistryRpcError,
+    FoldQueryClient, FoldQueryClientError, FoldQueryErrorKind, FoldQueryV2ClientError,
+    RegistryClient, RegistryClientError, RegistryGroupSummary, RegistryRpcError,
     SummaryAnnouncement, SummaryRecord, DEFAULT_QUERY_DEADLINE, DEFAULT_REGISTRY_DEADLINE,
 };
 use crate::adapter::net::{ChannelConfig, ChannelId, ChannelName, Visibility};
@@ -68,11 +68,18 @@ pub const NET_REGISTRY_ERR_SCALE_REJECTED: i32 = 9;
 /// installed).
 pub const NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED: i32 = 10;
 /// Server refused: the caller is not an operator of the target
-/// daemon's aggregator registry. See `RegistryAdminPolicy`.
+/// daemon's aggregator registry (see `RegistryAdminPolicy`), or, from the
+/// fold-query calls, the caller is outside the daemon's summary visibility
+/// and not an operator.
 pub const NET_REGISTRY_ERR_UNAUTHORIZED: i32 = 11;
 /// The target does not serve `fold.query.v2`: it answered `NotFound` for
 /// the service. Only emitted by `net_fold_query_client_query_group_*`.
-/// Fall back to the v1 `net_fold_query_client_query_*` calls.
+///
+/// Only a node without a channel registry answers that way, typically an
+/// aggregator daemon from before v2. Such a daemon serves no v1
+/// `fold.query` either, so this is not a cue to retry the v1 calls. A node
+/// with a registry that lacks v2 fails as `NET_REGISTRY_ERR_TRANSPORT`
+/// instead, and so does one too old to answer at all (a timeout).
 pub const NET_REGISTRY_ERR_SERVER_TOO_OLD: i32 = 12;
 /// Caller-side error: a string argument wasn't valid UTF-8 or
 /// a pointer was null where one was required.
@@ -629,6 +636,11 @@ pub unsafe extern "C" fn net_fold_query_client_set_deadline(
 /// response, and returns. Returns a JSON-encoded
 /// `[SummaryAnnouncementJson]` string the caller frees via
 /// `net_free_string`.
+///
+/// On failure returns NULL and writes `NET_REGISTRY_ERR_UNKNOWN_KIND`,
+/// `NET_REGISTRY_ERR_UNAUTHORIZED` (a daemon refused the caller: outside
+/// its summary visibility and not an operator), `TRANSPORT`, `CODEC` or
+/// `INVALID_ARGS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_query_latest(
     handle: *mut FoldQueryClientHandle,
@@ -647,7 +659,8 @@ pub unsafe extern "C" fn net_fold_query_client_query_latest(
     }
 }
 
-/// Force a fresh `SummarizeNow` query — never cached.
+/// Force a fresh `SummarizeNow` query — never cached. Same error kinds as
+/// [`net_fold_query_client_query_latest`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_query_summarize_now(
     handle: *mut FoldQueryClientHandle,
@@ -677,7 +690,9 @@ pub unsafe extern "C" fn net_fold_query_client_query_summarize_now(
 /// [`net_fold_query_client_query_latest`] returns and the last three are
 /// `null` until the daemon fills them in. On failure returns NULL and
 /// writes the kind:
-/// - `NET_REGISTRY_ERR_SERVER_TOO_OLD`: the target has no v2 service;
+/// - `NET_REGISTRY_ERR_SERVER_TOO_OLD`: the target answered `NotFound` for
+///   v2 (a registry-less node without v2; not a cue to retry v1, see the
+///   constant);
 /// - `NET_REGISTRY_ERR_UNKNOWN_GROUP`: `group` names no group there;
 /// - `NET_REGISTRY_ERR_UNKNOWN_KIND`: no queried group aggregates `kind`;
 /// - `NET_REGISTRY_ERR_UNAUTHORIZED`: the caller is outside the daemon's
@@ -848,44 +863,26 @@ where
     }
 }
 
-fn classify_fold_query(err: &FoldQueryClientError) -> (i32, String) {
-    match err {
-        FoldQueryClientError::Transport(e) => (NET_REGISTRY_ERR_TRANSPORT, format!("{e}")),
-        FoldQueryClientError::Codec(c) => (NET_REGISTRY_ERR_CODEC, c.clone()),
-        FoldQueryClientError::Server(FoldQueryError::UnknownKind { kind }) => (
-            NET_REGISTRY_ERR_UNKNOWN_KIND,
-            format!("unknown fold kind: 0x{kind:04x}"),
-        ),
-        FoldQueryClientError::Server(FoldQueryError::DecodeFailed(s)) => {
-            (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
-        }
+/// The `NET_REGISTRY_ERR_*` code for a fold-query error kind. The kind and
+/// detail come from core (`error_kind` / `detail`), the same mapping Node,
+/// Python and Go use, so the bindings cannot drift apart.
+fn fold_query_code(kind: FoldQueryErrorKind) -> i32 {
+    match kind {
+        FoldQueryErrorKind::Transport => NET_REGISTRY_ERR_TRANSPORT,
+        FoldQueryErrorKind::Codec => NET_REGISTRY_ERR_CODEC,
+        FoldQueryErrorKind::UnknownKind => NET_REGISTRY_ERR_UNKNOWN_KIND,
+        FoldQueryErrorKind::UnknownGroup => NET_REGISTRY_ERR_UNKNOWN_GROUP,
+        FoldQueryErrorKind::Unauthorized => NET_REGISTRY_ERR_UNAUTHORIZED,
+        FoldQueryErrorKind::ServerTooOld => NET_REGISTRY_ERR_SERVER_TOO_OLD,
     }
 }
 
+fn classify_fold_query(err: &FoldQueryClientError) -> (i32, String) {
+    (fold_query_code(err.error_kind()), err.detail())
+}
+
 fn classify_fold_query_v2(err: &FoldQueryV2ClientError) -> (i32, String) {
-    match err {
-        FoldQueryV2ClientError::ServerTooOld => (
-            NET_REGISTRY_ERR_SERVER_TOO_OLD,
-            "the target does not serve fold.query.v2".to_string(),
-        ),
-        FoldQueryV2ClientError::Transport(e) => (NET_REGISTRY_ERR_TRANSPORT, format!("{e}")),
-        FoldQueryV2ClientError::Codec(c) => (NET_REGISTRY_ERR_CODEC, c.clone()),
-        FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownKind { kind }) => (
-            NET_REGISTRY_ERR_UNKNOWN_KIND,
-            format!("unknown fold kind: 0x{kind:04x}"),
-        ),
-        FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownGroup(g)) => (
-            NET_REGISTRY_ERR_UNKNOWN_GROUP,
-            format!("unknown group: {g}"),
-        ),
-        FoldQueryV2ClientError::Server(FoldQueryV2Error::NotAuthorized) => (
-            NET_REGISTRY_ERR_UNAUTHORIZED,
-            "caller is outside the daemon's summary visibility and not an operator".to_string(),
-        ),
-        FoldQueryV2ClientError::Server(FoldQueryV2Error::DecodeFailed(s)) => {
-            (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
-        }
-    }
+    (fold_query_code(err.error_kind()), err.detail())
 }
 
 /// An optional string argument: NULL means `None`; a non-NULL pointer must
@@ -1087,6 +1084,7 @@ impl<'a> From<&'a RegistryGroupSummary> for GroupWire<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::net::behavior::aggregator::FoldQueryError;
 
     #[test]
     fn visibility_round_trips_through_raw() {
@@ -1199,6 +1197,71 @@ mod tests {
         assert_eq!(
             classify_fold_query(&decode_failed).0,
             NET_REGISTRY_ERR_CODEC,
+        );
+
+        // A daemon-level v1 refusal is its own kind, not transport.
+        let refused = FoldQueryClientError::from(RpcError::ServerError {
+            status: crate::adapter::net::behavior::aggregator::FOLD_QUERY_V1_NOT_AUTHORIZED,
+            message: String::new(),
+            headers: Vec::new(),
+        });
+        let (code, detail) = classify_fold_query(&refused);
+        assert_eq!(code, NET_REGISTRY_ERR_UNAUTHORIZED);
+        assert!(detail.contains("not an operator"), "{detail}");
+    }
+
+    /// v1 and v2 report the same detail text for the same failure, the
+    /// text Node and Python report too (they share `detail()`).
+    #[test]
+    fn classify_fold_query_v2_maps_every_variant_like_v1() {
+        use crate::adapter::net::behavior::aggregator::{FoldQueryV2Error, FOLD_QUERY_V2_SERVICE};
+        let cases = [
+            (
+                FoldQueryV2ClientError::ServerTooOld,
+                NET_REGISTRY_ERR_SERVER_TOO_OLD,
+                FOLD_QUERY_V2_SERVICE,
+            ),
+            (
+                FoldQueryV2ClientError::Codec("bad".into()),
+                NET_REGISTRY_ERR_CODEC,
+                "bad",
+            ),
+            (
+                FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownKind { kind: 0x42 }),
+                NET_REGISTRY_ERR_UNKNOWN_KIND,
+                "0x0042",
+            ),
+            (
+                FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownGroup("alpha".into())),
+                NET_REGISTRY_ERR_UNKNOWN_GROUP,
+                "alpha",
+            ),
+            (
+                FoldQueryV2ClientError::Server(FoldQueryV2Error::NotAuthorized),
+                NET_REGISTRY_ERR_UNAUTHORIZED,
+                "not an operator",
+            ),
+            (
+                FoldQueryV2ClientError::Server(FoldQueryV2Error::DecodeFailed("boom".into())),
+                NET_REGISTRY_ERR_CODEC,
+                "server-decode: boom",
+            ),
+        ];
+        for (err, want_code, want_detail) in cases {
+            let (code, detail) = classify_fold_query_v2(&err);
+            assert_eq!(code, want_code, "{err:?}");
+            assert!(detail.contains(want_detail), "{err:?}: {detail}");
+        }
+        // Same failure, same detail on v1 and v2.
+        assert_eq!(
+            classify_fold_query(&FoldQueryClientError::Server(FoldQueryError::UnknownKind {
+                kind: 0x42
+            }))
+            .1,
+            classify_fold_query_v2(&FoldQueryV2ClientError::Server(
+                FoldQueryV2Error::UnknownKind { kind: 0x42 }
+            ))
+            .1,
         );
     }
 }

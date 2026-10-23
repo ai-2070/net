@@ -3349,15 +3349,23 @@ class FoldQueryClientError(Exception):
     """Fold-query RPC failure.
 
     ``kind`` is one of ``"transport"`` | ``"codec"`` |
-    ``"unknown-kind"``, plus from the ``fold.query.v2`` calls
-    ``"unknown-group"`` | ``"unauthorized"`` | ``"server-too-old"``.
+    ``"unknown-kind"`` | ``"unauthorized"`` (a daemon refused the caller:
+    outside its summary visibility and not an operator), plus from the
+    ``fold.query.v2`` calls ``"unknown-group"`` | ``"server-too-old"``.
     ``server_detail`` carries the long-form text.
     """
     kind: str
     server_detail: str | None
 
 class UnknownFoldKind(FoldQueryClientError): ...
-class FoldQueryServerTooOld(FoldQueryClientError): ...
+class FoldQueryServerTooOld(FoldQueryClientError):
+    """The target answered NotFound for ``fold.query.v2``.
+
+    Only a node without a channel registry answers that way, typically an
+    aggregator daemon from before v2, which serves no v1 ``fold.query``
+    either: this is not a cue to retry v1. A node with a registry that
+    lacks v2 fails as ``"transport"`` instead.
+    """
 
 class RegistryClient:
     """Client for the ``aggregator.registry`` RPC service."""

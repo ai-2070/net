@@ -43,7 +43,10 @@ use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::query_client::FoldQueryClient;
+use super::query_client::{
+    server_decode_detail, unknown_kind_detail, FoldQueryClient, FoldQueryErrorKind,
+    NOT_AUTHORIZED_DETAIL,
+};
 use super::query_service::{
     answer, encode_response as encode, FoldQueryError, FoldQueryOp, FoldQueryRequest,
     FoldQueryResponse,
@@ -392,6 +395,16 @@ pub enum FoldQueryV2ClientError {
     /// the service. Mapped from that one observable result only. A timeout
     /// or any other failure keeps its own kind, because it says nothing
     /// about the server's version.
+    ///
+    /// Only a node **without** a channel registry answers this way. A node
+    /// with one (every SDK- and binding-built node, and every daemon that
+    /// serves v2) refuses the caller's reply-channel subscribe for a
+    /// service it does not serve, so the call fails as `Transport`. A node
+    /// too old to answer unserved calls times out (`Transport`). So this
+    /// means "a registry-less node without v2", typically an aggregator
+    /// daemon from before v2. It is **not** a cue to retry v1: such a
+    /// daemon serves no `fold.query` either. See D9 in
+    /// `docs/internal/plans/AGGREGATOR_MULTI_HOST_PLAN.md`.
     #[error("the target does not serve {FOLD_QUERY_V2_SERVICE} (server too old)")]
     ServerTooOld,
     /// Any other transport failure (no route, timeout, other status).
@@ -403,6 +416,37 @@ pub enum FoldQueryV2ClientError {
     /// The handler refused the request.
     #[error("server: {0}")]
     Server(FoldQueryV2Error),
+}
+
+impl FoldQueryV2ClientError {
+    /// The binding-facing kind of this error. One mapping for the C ABI,
+    /// Node, Python and Go.
+    pub fn error_kind(&self) -> FoldQueryErrorKind {
+        match self {
+            Self::ServerTooOld => FoldQueryErrorKind::ServerTooOld,
+            Self::Transport(_) => FoldQueryErrorKind::Transport,
+            Self::Codec(_) | Self::Server(FoldQueryV2Error::DecodeFailed(_)) => {
+                FoldQueryErrorKind::Codec
+            }
+            Self::Server(FoldQueryV2Error::UnknownKind { .. }) => FoldQueryErrorKind::UnknownKind,
+            Self::Server(FoldQueryV2Error::UnknownGroup(_)) => FoldQueryErrorKind::UnknownGroup,
+            Self::Server(FoldQueryV2Error::NotAuthorized) => FoldQueryErrorKind::Unauthorized,
+        }
+    }
+
+    /// The binding-facing detail text of this error. Every binding
+    /// reports this string, so they agree.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::ServerTooOld => format!("the target does not serve {FOLD_QUERY_V2_SERVICE}"),
+            Self::Transport(e) => e.to_string(),
+            Self::Codec(c) => c.clone(),
+            Self::Server(FoldQueryV2Error::DecodeFailed(s)) => server_decode_detail(s),
+            Self::Server(FoldQueryV2Error::UnknownKind { kind }) => unknown_kind_detail(*kind),
+            Self::Server(FoldQueryV2Error::UnknownGroup(g)) => g.clone(),
+            Self::Server(FoldQueryV2Error::NotAuthorized) => NOT_AUTHORIZED_DETAIL.to_string(),
+        }
+    }
 }
 
 impl From<RpcError> for FoldQueryV2ClientError {

@@ -69,8 +69,8 @@
 
 // ─── Client surfaces (every binding can re-export these) ───
 pub use net::adapter::net::behavior::aggregator::{
-    FoldQueryClient, FoldQueryClientError, FoldQueryError, FoldQueryOp, FoldQueryRequest,
-    FoldQueryResponse, RegistryClient, RegistryClientError, RegistryGroupSummary,
+    FoldQueryClient, FoldQueryClientError, FoldQueryError, FoldQueryErrorKind, FoldQueryOp,
+    FoldQueryRequest, FoldQueryResponse, RegistryClient, RegistryClientError, RegistryGroupSummary,
     RegistryReplicaSummary, RegistryRequest, RegistryResponse, RegistryRpcError, ScaleFn,
     ScaleRequest, SpawnFn, SpawnRequest, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
     DEFAULT_REGISTRY_DEADLINE, FOLD_QUERY_SERVICE, REGISTRY_SERVICE,

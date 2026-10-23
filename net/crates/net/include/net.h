@@ -405,8 +405,11 @@ typedef struct net_registry_client_handle_t net_registry_client_handle_t;
 #define NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED  10
 #define NET_REGISTRY_ERR_UNAUTHORIZED         11
 /* The target does not serve fold.query.v2 (it answered NotFound for the
- * service). Only from net_fold_query_client_query_group_*; fall back to
- * the v1 net_fold_query_client_query_* calls. */
+ * service). Only from net_fold_query_client_query_group_*. Only a node
+ * without a channel registry answers that way, typically an aggregator
+ * daemon from before v2, which serves no v1 fold.query either: this is not
+ * a cue to retry the v1 calls. A node with a registry that lacks v2 fails
+ * as NET_REGISTRY_ERR_TRANSPORT, and so does one too old to answer. */
 #define NET_REGISTRY_ERR_SERVER_TOO_OLD       12
 #define NET_REGISTRY_ERR_INVALID_ARGS         99
 
@@ -546,7 +549,9 @@ void net_fold_query_client_set_deadline(
  * response, and returns. Returns a JSON-encoded
  * `[SummaryAnnouncementJson]` string — caller frees via
  * `net_free_string`. On error, writes the error discriminant
- * to `*out_error_kind` and returns NULL.
+ * to `*out_error_kind` and returns NULL: UNKNOWN_KIND,
+ * UNAUTHORIZED (a daemon refused the caller: outside its summary
+ * visibility and not an operator), TRANSPORT, CODEC or INVALID_ARGS.
  *
  * JSON shape:
  *   [{"fold_kind": N, "source_subnet": "...", "generation": N,
@@ -575,7 +580,8 @@ char* net_fold_query_client_query_summarize_now(
  * `_query_latest`. Returns a JSON array of records — caller frees via
  * `net_free_string`. On error, writes the discriminant to
  * `*out_error_kind` and returns NULL:
- *   NET_REGISTRY_ERR_SERVER_TOO_OLD  the target has no v2 service;
+ *   NET_REGISTRY_ERR_SERVER_TOO_OLD  the target answered NotFound for v2
+ *                                    (see the constant; not a v1 cue);
  *   NET_REGISTRY_ERR_UNKNOWN_GROUP   `group` names no group there;
  *   NET_REGISTRY_ERR_UNKNOWN_KIND    no queried group aggregates `kind`;
  *   NET_REGISTRY_ERR_UNAUTHORIZED    the caller is outside the daemon's

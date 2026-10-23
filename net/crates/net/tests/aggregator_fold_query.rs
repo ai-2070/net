@@ -348,9 +348,9 @@ mod v2 {
 
     use net::adapter::net::behavior::aggregator::{
         decode_strict, install_fold_query_services, AggregatorRegistry, FoldQueryAccess,
-        FoldQueryOp, FoldQueryV2ClientError, FoldQueryV2Error, FoldQueryV2Request,
-        FoldQueryV2Response, RegistryAdminPolicy, StrictDecodeError, SummaryRecord,
-        FOLD_QUERY_V1_NOT_AUTHORIZED, FOLD_QUERY_V2_SERVICE,
+        FoldQueryErrorKind, FoldQueryOp, FoldQueryV2ClientError, FoldQueryV2Error,
+        FoldQueryV2Request, FoldQueryV2Response, RegistryAdminPolicy, StrictDecodeError,
+        SummaryRecord, FOLD_QUERY_V1_NOT_AUTHORIZED, FOLD_QUERY_V2_SERVICE,
     };
     use net::adapter::net::behavior::capability::CapabilitySet;
     use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -702,7 +702,8 @@ mod v2 {
             .expect("same-subnet caller admitted");
 
         // Sibling subnet: refused on v2 with the typed error, and on the
-        // daemon-level v1 handler with the application status.
+        // daemon-level v1 handler with the application status, which the
+        // v1 client reports as NotAuthorized (not as a transport failure).
         let (host, _q, _s, client) = setup("us", false).await;
         match client
             .query_group_latest(host.node_id(), CapabilityFold::KIND_ID, None)
@@ -715,10 +716,12 @@ mod v2 {
             .query_latest(host.node_id(), CapabilityFold::KIND_ID)
             .await
         {
-            Err(FoldQueryClientError::Transport(RpcError::ServerError { status, .. })) => {
-                assert_eq!(status, FOLD_QUERY_V1_NOT_AUTHORIZED)
+            Err(e @ FoldQueryClientError::NotAuthorized) => {
+                assert_eq!(e.error_kind(), FoldQueryErrorKind::Unauthorized);
+                // The wire status the client recognizes is frozen.
+                assert_eq!(FOLD_QUERY_V1_NOT_AUTHORIZED, 0x8001);
             }
-            other => panic!("expected v1 refusal status, got {other:?}"),
+            other => panic!("expected the v1 refusal as NotAuthorized, got {other:?}"),
         }
 
         // Sibling subnet, but named as an operator: admitted.

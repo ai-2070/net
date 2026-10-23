@@ -23,7 +23,8 @@ pub mod summarizer;
 pub use config::AggregatorConfig;
 pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
 pub use query_client::{
-    FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
+    FoldQueryClient, FoldQueryClientError, FoldQueryErrorKind, DEFAULT_QUERY_CACHE_TTL,
+    DEFAULT_QUERY_DEADLINE,
 };
 pub use query_service::{
     FoldQueryError, FoldQueryHandler, FoldQueryOp, FoldQueryRequest, FoldQueryResponse,
