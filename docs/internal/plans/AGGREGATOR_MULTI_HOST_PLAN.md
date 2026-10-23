@@ -2,23 +2,25 @@
 
 ## Status
 
-**Planned. Revised after review 1** (both 2026-10-23), on branch
+**Planned. Revised after reviews 1 and 2** (all 2026-10-23), on branch
 `LZL0/aggregators` (forked from `master` at `541cc0078`). No release has been
 chosen.
 
 - **Phases 0 and 1 are cleared to start.**
-- **Phases 2–3 were revised** around the daemon's actual boot path,
-  configuration and publication scope.
+- **Phase 2 now opens with the subnet-policy slice** (formerly S0), because its
+  delivery and query-access checks cannot classify callers without it
+  (review 2).
 - **Phase 4 is gated** on the identity, member-lifecycle and receiver contracts
-  (D1, D3, D7, D8) being implemented as written.
+  (D1, D3, D7, D8) being implemented as written. Review 2 tightened D3's
+  ordering scope and D7's member identity and retirement memory.
 
 Predecessors, both closed: `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`
 (AL-1..AL-8) and `AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md` (A, B, C).
 Phase 0 corrects claims in them, and in `SCALING_SUBNET_SPEC.md`, that turned
 out to be wrong.
 
-[Review 1](#review-1-2026-10-23) lists every finding and where this revision
-answers it.
+[Review 1](#review-1-2026-10-23) and [review 2](#review-2-2026-10-23) list
+every finding and where it is answered.
 
 ---
 
@@ -196,13 +198,30 @@ The daemon config gains `subnet = "<SubnetId>"`, installed with
 subnet. Every `[[group]]` and `[[template]]` must name the same `source_subnet`.
 Boot and Spawn refuse a mismatch; omitting it defaults to the daemon's subnet.
 
-Before `start`, boot installs a `ChannelConfigRegistry` with one
-`summary/<kind>` entry for every fold kind any group **or template** uses, so
-dynamically spawned groups are covered. Each entry carries the daemon's
-`summary_visibility`. Groups on one daemon must agree on visibility; boot
-refuses a conflict.
+Before `start`, boot installs a `ChannelConfigRegistry`. It has one entry for
+every summary channel name the daemon can publish on, for every fold kind any
+group **or template** uses, so dynamically spawned groups are covered:
+
+- `summary/<kind>` from Phase 2;
+- `summary.v2/<kind>` from M6 on (both while v1 is still served).
+
+Each entry carries the daemon's `summary_visibility`. Groups on one daemon must
+agree on visibility; boot refuses a conflict.
 
 Then publication scope is something the existing gateway can enforce.
+
+**At most one group per fold kind per daemon** (review 2, finding 3). One
+subnet per daemon means two groups of the same kind would read the same fold
+and publish the same counts on the same channel. Boot and Spawn refuse a second
+one (`KindOccupied`). This makes `(publisher, kind)` the unique identity of a
+summary stream, which D3 relies on.
+
+**The subnet policy is a prerequisite for D0, not a Phase 3 refinement**
+(review 2, finding 1). The gateway and the `fold.query` check both need the
+caller's subnet. The production announcement path records a peer's subnet only
+when the node has a policy installed (`mesh.rs:42139-42143`); setting the
+daemon's own `subnet` classifies nobody. D4's `[[subnet_rule]]` therefore lands
+in the same phase (Q0).
 
 `fold.query` returns the same summaries the channel carries, so it enforces the
 same boundary. It admits a caller only if the summary channel's visibility would
@@ -242,29 +261,42 @@ identity (D6).
 Rejected: keeping in-process replicas as cheap HA. `HealthMonitor` respawn
 already covers a dead task with one replica.
 
-**D3. Ordering a publisher's summaries across restarts.** *(Revised after review
-1, finding 5. It was "epoch = start time in ms", which is not monotonic under
-clock correction or two starts in the same millisecond.)* *Recommend: a
-persisted boot counter plus an in-memory start sequence.*
+**D3. Ordering a summary stream across restarts.** *(Revised after review 1,
+finding 5: it was "epoch = start time in ms", which is not monotonic under clock
+correction or two starts in the same millisecond. Revised again after review 2,
+finding 3: ordering was per publisher, so one group's restart retired a sibling
+group's live stream.)* *Recommend: a persisted, publisher-wide boot counter,
+plus a start sequence scoped to the stream.*
 
-- **What gets stamped.** Each daemon keeps `boot_epoch: u64` in its state
-  directory (D6). At boot, before anything is published, it is incremented and
-  written with an fsync. Within one boot, every member start (including a
+- **The stream.** A stream is `(publisher, subnet, kind)`. D0 makes it unique
+  per group: one subnet per daemon and at most one group per kind. A
+  publisher's capability and reservation summaries are therefore separate
+  streams, ordered independently.
+- **`boot_epoch: u64`** is publisher-wide. It lives in the state directory (D6)
+  and is allocated once per boot, before anything is published, under I3's
+  exclusive lock with a crash-safe write.
+- **`stream_seq: u32`** is per stream and in memory, reset each boot. A stream
+  takes the next value each time its member starts within the boot, including a
   `HealthMonitor` respawn, whose fresh `AggregatorDaemon` restarts `generation`
-  at 0) takes the next `start_seq: u32`. Each summary carries
-  `incarnation = (boot_epoch, start_seq)` and `generation`.
-- **How a receiver orders them.** Per publisher, order is lexicographic on
-  `(boot_epoch, start_seq, generation)`. A summary that sorts below the highest
-  incarnation already seen from that publisher is dropped.
-- **Why this works.** The publisher's identity persists (D6), so the order holds
-  across restarts.
+  at 0.
+- **What a summary carries:** `boot_epoch`, `stream_seq` and `generation`.
+- **How a receiver orders them.** Per stream, order is lexicographic on
+  `(boot_epoch, stream_seq, generation)`. A summary that sorts below the highest
+  one already seen **on that stream** is dropped. A summary on a different
+  stream from the same publisher never retires it.
+- **Why this works.** The publisher's identity persists (D6), and `boot_epoch`
+  increases strictly across that identity's boots (I3). Within a boot,
+  `stream_seq` increases strictly for its stream.
 
 Rejected:
 
 - **Wall-clock time.** Not monotonic.
 - **A random incarnation id.** Not ordered.
-- **Coordinator-issued incarnations.** The order would depend on the coordinator
-  being reachable when a member restarts.
+- **Coordinator-issued incarnations for ordering.** The order would depend on
+  the coordinator being reachable when a member restarts. D7's coordinator
+  incarnation is a lifecycle identity, not an ordering key.
+- **A publisher-wide start sequence** (review 1's revision). It let sibling
+  streams retire each other (review 2).
 
 **D4. How summaries pick their subnet.** *(Revised after review 1, finding 2:
 the policy now has a production source.)*
@@ -280,9 +312,15 @@ the policy now has a production source.)*
 - **Missing policy.** If the daemon's `subnet` is not `GLOBAL` and no rules are
   configured, boot refuses ("a non-global source subnet needs subnet rules").
   A `GLOBAL` daemon with no rules counts the whole mesh, explicitly.
-- **Policy fingerprint.** A BLAKE2s hash of the canonically ordered rules is
-  reported in `List`. Spawn compares it (D7) so a group's hosts cannot classify
-  differently.
+- **Policy fingerprint.** A BLAKE2s hash of the rules **in declaration order**
+  is reported in `List`. Spawn compares it (D7) so a group's hosts cannot
+  classify differently.
+  - Order is part of the policy: `SubnetPolicy` resolves same-level matches as
+    later-rule-wins (`subnet/assignment.rs:30-35`). Sorting the rules before
+    hashing would give two different policies one fingerprint (review 2,
+    finding 2).
+  - Only each rule's value map, which is unordered, is canonicalized (entries
+    sorted by key).
 
 **What the counts mean.** Buckets count **capability entries** (one publisher
 may hold several classes), which keeps today's semantics. A new `publishers`
@@ -315,49 +353,103 @@ M8).*
     that it is ephemeral.
   - Every Phase 4 feature (peers, coordination, being a member) refuses to run
     on an ephemeral identity.
-- **State.** `state_dir = "<path>"` holds `boot_epoch` (D3) and the
-  coordinator's records (D7). Phase 4 features require it.
+- **State.** `state_dir = "<path>"` holds `boot_epoch` (D3), the coordinator's
+  records and the host's member records (D7). Phase 4 features require it.
+- **Exclusive ownership** (review 2). At boot the daemon takes an exclusive
+  advisory lock on `<state_dir>/LOCK` (the `fs2` crate, already a
+  `net-mesh-sdk` dependency) and holds it for the process lifetime. It also
+  takes one on `<identity>.lock` when the identity file lives outside
+  `state_dir`. A second process using either refuses to boot. `state_dir`
+  records the node id it belongs to, and refuses a different identity. Durable
+  writes go to a temporary file, then fsync, rename and directory fsync.
 - **Peers.** `[[peer]]` blocks give `addr`, `public_key` and `node_id`. The
   daemon dials each with the SDK's `connect_via` (the routed handshake, which
   completes against a running responder without pre-`accept`). It redials with
   backoff when a session drops.
 
-**D7. Member lifecycle protocol.** *(New in review 1, finding 4.)* This is a
-small protocol between two daemons, not a distributed transaction.
+**D7. Member lifecycle protocol.** *(New in review 1, finding 4. Revised after
+review 2, findings 4 and 5: member identity now includes the coordinator, and
+the host keeps retirement memory so a retired member cannot come back.)* This
+is bounded soft-state reconciliation between two daemons. There are no
+distributed transactions and no fencing.
 
-- **Member identity.** A logical group `g` has members `(g, index)`. The
-  coordinator assigns each placement an `incarnation: u64` from a counter
-  persisted in its `state_dir`. On the host, the member runs as the local group
-  `g#<index>`, stamped with that incarnation.
-- **Idempotent spawn.** `SpawnMember { template, group, index, incarnation,
-  policy_fp, template_fp }`:
-  - same name and same incarnation → reply `Spawned` again (a replay);
-  - same name, different incarnation → `IncarnationConflict { running }`;
-  - a fingerprint mismatch → refused.
+**Member identity** is `(coordinator, group, index)`, plus an `incarnation: u64`
+from a counter in the coordinator's `state_dir`.
 
-  After a lost reply, the coordinator retries the identical request until it
-  gets an answer, or reconciles from `List`.
-- **Conditional teardown.** `UnregisterMember { group, index, incarnation }`
-  removes the member only if the running incarnation matches; otherwise it
-  replies `NotRunning`. A delayed cleanup therefore cannot stop a replacement
-  that reused the name.
+- **Where `coordinator` comes from.** It is the authenticated
+  `RpcContext::session_peer` of the request, never a payload field.
+- **Direct sessions only.** `session_peer` authenticates the deliverer
+  (`registry_service.rs:314-325`), so member ops are accepted only over a
+  direct session. D6's `[[peer]]` dial is a single-hop `connect_via`, so the
+  deliverer is the coordinator. A member op whose session peer is a relay is
+  refused.
+- **Local name.** On the host, the member runs as the local group
+  `<coordinator_hex>/<group>#<index>`. Two coordinators that both create `g`
+  with index 0 and incarnation 1 get two distinct records; neither can replay,
+  adopt or clean up the other's member. D0's one-group-per-kind rule still
+  applies on the host, so the second spawn of the same kind gets `KindOccupied`
+  rather than a silent replay.
+
+**Host-side member record.** The host persists one record per
+`(coordinator, group, index)` in its `state_dir`:
+`{ high_water: u64, running: Option<u64> }`. `high_water` is the highest
+incarnation ever accepted for that key.
+
+- **`SpawnMember { template, group, index, incarnation, policy_fp, template_fp }`**:
+  - `incarnation == running` → `Spawned` again (a replay);
+  - `incarnation < high_water`, or equal to it while not running →
+    `Retired { high_water }`. This covers a delayed Spawn retry arriving after
+    a successful teardown: the member does not come back;
+  - `incarnation > high_water` → the record is updated first, then any lower
+    running incarnation is stopped, then the new one starts. A newer
+    incarnation from the same coordinator supersedes the old one;
+  - a fingerprint mismatch → refused, with no state change.
+- **`UnregisterMember { group, index, incarnation }`**:
+  - `incarnation >= high_water` → record `high_water = incarnation` and stop
+    the member if it is running;
+  - `incarnation < high_water` → `Superseded` and no change. A delayed cleanup
+    therefore cannot stop a replacement.
+- **`ForgetGroup { group }`** drops the records for one of that coordinator's
+  groups. The coordinator sends it only after every member's teardown has been
+  acknowledged.
+- **Retention.** Records are kept until `ForgetGroup` from their coordinator,
+  never by age. They are bounded by the host's existing `max_groups ×
+  max_replica_count`. At the bound, the host refuses new keys (`HostFull`)
+  instead of evicting records, because eviction would reopen resurrection.
+
+**Coordinator write-ahead intent.** Before any remote effect, the coordinator
+fsyncs its intent to `state_dir`:
+
+- the allocated incarnation;
+- the target host;
+- the operation (`Spawning`, `Retiring`, `Forgetting`).
+
+It updates the record only after the reply. On restart, every unresolved intent
+is re-sent unchanged. That is safe because each op is idempotent under the
+host record. This covers a crash after the remote success and before the reply.
+
 - **Partial failure.** A logical Spawn either succeeds for all N members or is
-  rolled back. Members that started are torn down with conditional Unregister,
-  retried in the background, and the operator gets a typed error naming the
-  member that failed.
-- **Logical Unregister.** The coordinator writes a tombstone listing every
-  member incarnation, then conditionally unregisters each one. It retries until
-  each is acknowledged or the host has been absent past the retire budget.
-  Repeated Unregisters return the same result while the tombstone exists.
-- **Coordinator restart.** Logical groups, incarnations and tombstones live in
-  `state_dir`. On boot the coordinator reconciles each host's `List` against
-  them.
-- **Partition semantics** (finding 7). There is **no fencing**. When a host
-  misses its `List` budget, the coordinator places a replacement with a new
-  incarnation. During a partition, the group may briefly run more than N
-  members. After the partition heals, conditional cleanup removes the old
-  incarnation. The extra publishers are harmless to receivers (D8). Strict
-  exclusion is not promised.
+  rolled back: each started member gets a `Retiring` intent, and the operator
+  gets a typed error naming the member that failed.
+- **Logical Unregister.** The coordinator writes a tombstone and a `Retiring`
+  intent for every member incarnation. Repeated Unregisters return the same
+  result while the tombstone exists.
+- **Absence is not retirement.** A cleanup obligation stays pending, retried
+  with backoff and on every reconnect, for as long as it takes. Elapsed time
+  never discharges it. The first draft's "retire budget" is removed. A host that
+  comes back after a long absence still gets its `UnregisterMember`, and its
+  record makes the result exact.
+- **Partition semantics** (review 1, finding 7). There is **no fencing**:
+  - when a host misses its `List` budget, the coordinator places a replacement
+    with a new incarnation, usually on another host;
+  - during the partition, the group may run more than N members;
+  - after the partition heals, the pending conditional cleanup stops the old
+    incarnation, and never the replacement;
+  - extra publishers are harmless to receivers (D8).
+
+  A host never retires a member on its own because its coordinator went quiet.
+  An unreachable coordinator is not a deleted group. Strict exclusion is not
+  promised.
 
 **D8. Receiver freshness.** *(New in review 1, finding 6.)* This is kept
 separate from D3's ordering.
@@ -372,26 +464,39 @@ separate from D3's ordering.
   When it expires, the view falls back to the next fresh one. With no fresh
   publisher it returns `NoFreshPublisher { last_known, age }`, never an old
   value presented as current.
-- **Late subscribers.** `SummaryView::bootstrap` calls `fold.query`
+- **Late subscribers.** `SummaryView::bootstrap` calls `fold.query.v2`
   `LatestSummary` on any known member. Otherwise the view fills within one
   `refresh_interval`.
+  - The v2 response carries the ordering and freshness fields each summary
+    needs (`boot_epoch`, `stream_seq`, `generation`, `refresh_ms`). Frozen v1
+    summaries cannot supply them (review 2).
+  - Q2 freezes those fields in the v2 layout from the start: `refresh_ms` is
+    populated from Phase 2, and `boot_epoch` and `stream_seq` are `Option`s
+    filled in from I3. That way M6 needs no v3.
+  - A bootstrapped summary enters the view under the same ordering rule as a
+    channel one.
 
 **D9. Wire evolution.** *(New in review 1, finding 8.)* *Recommend: versioned
 service and channel names, with strict decoding on the new versions.*
 
 - **What gets versioned.** Changed shapes ship under new names:
-  - `fold.query.v2` (the group selector, Q1);
+  - `fold.query.v2` (the group selector, Q2);
   - `aggregator.registry.v2` (the D7 ops and the M3 reply shape);
   - channel `summary.v2/<kind>` (D3 incarnation, D8 `refresh_ms`).
 - **Strict decoding.** v2 decoders use `postcard::take_from_bytes` and reject
   any trailing bytes.
-- **Mixed versions fail closed.** A new client calling an old server gets "no
-  handler", surfaced as a typed `ServerTooOld`, instead of silently dropped
-  fields.
+- **Mixed versions fail closed.** A new client calling an old server gets an
+  explicit refusal instead of silently dropped fields.
+- **`ServerTooOld` comes from one observable result only** (review 2):
+  `RpcStatus::NotFound` for the v2 service name. The mesh answers unserved
+  requests with it (`mesh_rpc.rs:933`, via `answer_unserved_rpc_requests`).
+  Other failures keep their own kinds: a timeout stays `Timeout` (the server's
+  version is unknown), `Unauthorized` stays `NotAuthorized`, and a missing
+  capability advertisement stays a discovery result.
 - **v1 stays.** v1 names keep their current layouts and are served for at least
   one release.
 
-Exact v2 field layouts are frozen in the slices that introduce them (Q1, M3, M6)
+Exact v2 field layouts are frozen in the slices that introduce them (Q2, M3, M6)
 and pinned by golden-byte tests.
 
 Rejected: appending fields to v1 types (G9), and relying on release notes for
@@ -453,41 +558,67 @@ were wrong. Sizes are rough working days.
   *Proof:* R1 green, plus a `tests/capability_multihop.rs` test that pins the
   cause at the `MeshNode` level.
 
-### Phase 2 — Publication scope and a live query path (G5; 4–5 days)
+### Phase 2 — Subnet policy, publication scope and a live query path (G3, G5; about 1½ weeks)
 
-- **Q0. Daemon publication scope (D0).**
+Every Phase 2 test boots the daemon entirely from production TOML. No policy,
+subnet or channel registry is injected through a test-only setup path
+(review 2, finding 1).
+
+- **Q0. Subnet policy in the daemon (D4).** *(Moved from Phase 3's S0 in
+  review 2: Q1 and Q2 cannot classify callers without it.)*
+  - `[[subnet_rule]]` parsing, installed with
+    `MeshNodeConfig::with_subnet_policy`.
+  - The missing-policy refusal.
+  - The declaration-order policy fingerprint in `List`.
+
+  *Proof:*
+  - Boot cases: rules installed, and a non-global subnet with no rules refused.
+  - Fingerprint: inserting a rule's value-map entries in a different order
+    leaves it unchanged. Reversing two conflicting same-level rules changes
+    **both** the classification of a sample tag set and the fingerprint.
+  - A direct peer's subnet appears in `peer_subnets` after its announcement,
+    with the policy coming only from the TOML.
+- **Q1. Daemon publication scope (D0).**
   - Add `subnet`, and source-subnet and visibility agreement checks for groups
-    and templates.
+    and templates, plus the one-group-per-kind refusal.
   - Install the `ChannelConfigRegistry` before `start`, covering every static
     and template fold kind.
 
   *Proof*, in `aggregator-daemon/tests/`, with real delivery rather than a
-  registered field: a daemon in subnet S with `SubnetLocal` summaries.
+  registered field: a daemon in subnet S with `SubnetLocal` summaries, its
+  policy from TOML.
   - A subscriber in S receives `summary/<kind>`.
   - A subscriber in a sibling subnet is denied, as counted by the gateway's
     dropped counter and by no delivery.
   - A Spawn-created group's channel gets the same verdicts.
-  - Boot refuses a template whose subnet disagrees.
-- **Q1. `fold.query.v2`** (D9).
+  - Boot refuses a template whose subnet disagrees, and a second group of an
+    occupied kind.
+- **Q2. `fold.query.v2`** (D9).
   - Request layout `{ kind: u16, op: FoldQueryOp, group: Option<String> }`.
-  - Response adds `UnknownGroup` and `NotAuthorized`.
+  - Each summary in the response carries
+    `{ summary, generation: u64, refresh_ms: u32, boot_epoch: Option<u64>, stream_seq: Option<u32> }`
+    (D8).
+  - Errors add `UnknownGroup` and `NotAuthorized`.
   - Strict decoding.
   - The D0 access check.
 
   *Proof:*
   - Round trips in `tests/aggregator_fold_query.rs` for all groups, a named
     group, and an unknown group.
-  - A golden-byte test of the request layout.
+  - Golden-byte tests of the request and response layouts.
   - Trailing bytes rejected.
-  - A sibling-subnet caller refused, and an `operators` caller admitted.
-  - A v2 client against a v1-only server gets `ServerTooOld`.
-- **Q2. The daemon installs v1 and v2.** v1 answers with "all groups" semantics.
+  - A same-subnet caller admitted, a sibling-subnet caller refused, and an
+    `operators` caller admitted, all classified by the TOML policy.
+  - A v2 client against a v1-only server gets `ServerTooOld`. That mapping is
+    tested from the observed `NotFound`, and a timeout is tested to stay
+    `Timeout`.
+- **Q3. The daemon installs v1 and v2.** v1 answers with "all groups" semantics.
   The `ServeHandle`s are kept on `BootedDaemon`.
 
   *Proof:* un-ignore
   `cli/tests/aggregator_remote.rs::query_returns_summary_for_configured_group`,
   and replace its ignore note's premise: the target is the daemon's node id.
-- **Q3. Bindings expose the group argument and the new error kinds.**
+- **Q4. Bindings expose the group argument and the new error kinds.**
   - Node: `bindings/node`, `sdk-ts/src/aggregator.ts`.
   - Python: `bindings/python`.
   - Go: `go/`, `bindings/go/*-ffi`.
@@ -498,14 +629,10 @@ were wrong. Sizes are rough working days.
   *Proof:* each binding's aggregator test gains named-group and unknown-group
   cases, and `aggregator.c` keeps its NET-CHECKS line.
 
-### Phase 3 — Summaries that are right, and cheap at 1M (G3, G7; about 1½ weeks)
+### Phase 3 — Summaries that are right, and cheap at 1M (G3, G7; about 1 week)
 
-- **S0. Subnet policy in the daemon (D4).** `[[subnet_rule]]` parsing,
-  installation, the missing-policy refusal, and the policy fingerprint in `List`.
+The subnet policy itself arrives in Q0. This phase uses it for counting.
 
-  *Proof:*
-  - Boot cases: rules installed; a non-global subnet with no rules refused; the
-    fingerprint is stable across rule order.
 - **S1. Classified incremental counters (D4).** Counters cover insert, replace,
   forced replacement, expire, `evict_node` and restore, and are read as one
   snapshot. Add the `publishers` bucket and the reservation-on-non-GLOBAL
@@ -551,13 +678,22 @@ Gated on D1, D3, D7 and D8.
   *Proof* (review 1's witness): a real daemon restarted with the same config
   keeps its node id, is still admitted by a peer whose `operators` list names
   it, and reconnects with no test-only peer wiring.
-- **I3. Boot epoch (D3).** Persisted, fsynced, incremented before first publish;
-  `start_seq` per member start.
+- **I3. State-directory ownership and boot epoch (D3, D6).**
+  - The exclusive locks on `state_dir` and the identity file, and the node-id
+    binding of `state_dir`.
+  - Crash-safe `boot_epoch` allocation (temporary file, fsync, rename,
+    directory fsync) under the lock, before first publish.
+  - `stream_seq` per stream start.
 
   *Proof:*
-  - Restart increments it.
-  - A corrupt or missing file is refused rather than reset, unless the operator
-    passes an explicit reset flag.
+  - Restart increments `boot_epoch`.
+  - A second daemon on the same `state_dir` or identity refuses to boot while
+    the first runs.
+  - A `state_dir` written by another identity is refused.
+  - Killing the process between write and rename leaves either the old or the
+    new value, never a torn file, and the next boot allocates past both.
+  - A corrupt or missing epoch file is refused rather than reset, unless the
+    operator passes an explicit reset flag.
 - **M0. One member per host (D2).**
   - `replica_count > 1` on a daemon with no peers is refused at Spawn.
   - A static `[[group]]` with `replica_count > 1` warns and clamps to 1 for one
@@ -566,7 +702,8 @@ Gated on D1, D3, D7 and D8.
   *Proof:* `boot_and_query.rs` refuse and clamp cases.
 - **M1. Hosts announce themselves.** `aggregator-host`, one
   `aggregator-template:<name>` per template, the subnet, the policy fingerprint,
-  and free-member capacity.
+  free-member capacity, and the fold kinds already occupied (D0), so placement
+  skips hosts that would answer `KindOccupied`.
 
   *Proof:* two daemons dialed via `[[peer]]` find each other by filter.
 - **M2. Placement over hosts.** The candidate set comes from M1 and is limited
@@ -576,30 +713,48 @@ Gated on D1, D3, D7 and D8.
   *Proof:* three members land on three distinct hosts; a fourth fails with
   `PlacementFailed` when only three hosts qualify.
 - **M3. Remote members under D7** (`aggregator.registry.v2`).
-  - `SpawnMember` and `UnregisterMember` with frozen layouts.
+  - `SpawnMember`, `UnregisterMember` and `ForgetGroup` with frozen layouts.
+  - Coordinator identity from `session_peer`, with relayed member ops refused.
   - Template and policy fingerprints.
-  - Distributed group records persisted in `state_dir`.
-  - `List` v2 reports `host_node_id: u64` (not `Option`) and the incarnation
-    per member.
+  - The host member records and the coordinator's write-ahead intents,
+    persisted in `state_dir`.
+  - `List` v2 reports `host_node_id: u64` (not `Option`), the coordinator and
+    the incarnation per member.
 
   *Proof*, multi-daemon tests on loopback:
-  - A dropped Spawn reply, injected by blocking the reply path with
-    `MeshNode::block_peer` (`mesh.rs:24467`) for one exchange, is retried and
-    yields exactly one member.
-  - A failure after one remote member starts rolls the group back, and the
-    started member is gone.
-  - Repeated logical Unregister is idempotent.
-  - A delayed `UnregisterMember` for an old incarnation, arriving after the
-    name was reused, leaves the replacement running.
-  - A coordinator restart reconciles from `state_dir` with no duplicate members.
-  - Golden-byte tests for each v2 layout.
+  - **Dropped reply:** a Spawn reply blocked with `MeshNode::block_peer`
+    (`mesh.rs:24467`) for one exchange is retried and yields exactly one member.
+  - **Coordinator crash:** the coordinator is killed after the host started the
+    member and before the reply arrived. On restart it re-sends the intent,
+    gets `Spawned` as a replay, and there is one member.
+  - **Delayed Spawn after teardown:** a `SpawnMember` for incarnation 7
+    arriving after `UnregisterMember` 7 succeeded gets `Retired`; nothing
+    starts.
+  - **Delayed cleanup after reuse:** an `UnregisterMember` for an old
+    incarnation, arriving after a newer one started, gets `Superseded` and
+    leaves the replacement running.
+  - **Two coordinators** with identical group names, indices and counter values
+    on one host. Neither can replay, adopt or clean up the other's member. The
+    second spawn of an occupied kind gets `KindOccupied`.
+  - **A relayed member op** (session peer ≠ coordinator) is refused.
+  - **Partial failure:** a failure after one remote member started rolls the
+    group back, and the started member is gone.
+  - **Repeated logical Unregister** is idempotent. `ForgetGroup` goes out only
+    after every teardown has been acknowledged.
+  - **`HostFull`** at the record bound, with no record evicted.
+  - **Golden bytes:** one test per v2 layout.
 - **M4. Health and re-placement (D7 partition semantics).**
 
-  *Proof:* partition a **still-running** member with `block_peer` on both sides.
-  The coordinator places a replacement with a new incarnation. While
-  partitioned, both publish. After healing, conditional cleanup removes the old
-  incarnation and not the replacement. Stopping a daemon outright is a
-  separate, narrower test.
+  *Proof:*
+  - **Partition:** cut a **still-running** member off with `block_peer` on
+    both sides. The coordinator places a replacement with a new incarnation.
+    While partitioned, both publish. After healing, the pending cleanup removes
+    the old incarnation and not the replacement.
+  - **Long absence:** a host that returns long after any timeout the
+    coordinator uses still receives its pending `UnregisterMember`, and its
+    member stops.
+  - **Stopped daemon:** stopping a daemon outright is a separate, narrower
+    test.
 - **M5. Scale with placement.** `add_replica_with_placement`, or the
   distributed-group equivalent. Scale-down retires the member on the most loaded
   host (highest index on a tie) via conditional Unregister.
@@ -609,6 +764,10 @@ Gated on D1, D3, D7 and D8.
 - **M6. `summary.v2` and `SummaryView` (D3, D8)**, built in `net-mesh-sdk` first
   and then exposed in the bindings.
 
+  M6 also registers `summary.v2/<kind>` in the daemon's channel registry with
+  the same visibility as v1 (D0). Q1's allowed/denied delivery test is repeated
+  on the v2 channel.
+
   *Proof*, ordering witnesses:
   - A backward wall-clock step between restarts.
   - Two restarts within the same millisecond.
@@ -617,6 +776,10 @@ Gated on D1, D3, D7 and D8.
   - Progress by the current incarnation afterwards.
 
   In each case, the old incarnation is dropped and the new one wins.
+
+  *Proof*, sibling streams (review 2, finding 3): a GLOBAL daemon runs a
+  capability group and a reservation group at once. Restarting either one,
+  in either order, never causes the other's later summaries to be dropped.
 
   *Proof*, freshness witnesses:
   - Healthy publisher B stays unchanged and is still fresh (refresh keeps it
@@ -645,6 +808,8 @@ Gated on D1, D3, D7 and D8.
 | R1 case 2 fails deep in routed-session forwarding | Phases 2–3 don't depend on it. Phase 4's `[[peer]]` dialing gives daemons direct sessions with each other regardless. |
 | The coordinator is lost for good | Members keep running and publishing; re-placement stops. Coordinator takeover is out of scope (below). Its `state_dir` makes a restart on the same host safe. |
 | Partitions cause temporary over-replication | Accepted by design (D7). Receivers tolerate extra publishers (D8). Cleanup is conditional on incarnation, so it cannot remove a replacement. |
+| A coordinator that is gone for good leaves member records, and possibly running members, on its hosts | Records are never evicted by age, because that would reopen resurrection. An operator on the host removes them with the host's own `Unregister` (the operator path, not the member path). `HostFull` makes the bound visible rather than silent. |
+| One group per fold kind per daemon is too tight for some deployment | Run another daemon on the host. The restriction exists because two same-kind groups on one subnet would publish identical streams (D0). |
 | `boot_epoch` file lost or corrupted | Refused at boot, not silently reset (I3). An operator reset must be explicit, and the docs say receivers may drop that publisher's summaries until its epoch passes the last one they saw. |
 | Operators deploy one-subnet-per-daemon and want more subnets per host | Run several daemons per host; each is cheap. Per-group nodes inside one daemon (rejected in D0) stay available as a follow-up if this hurts. |
 | S2 shows ingest, not the fold, is the ceiling | S3 records the real figure. Sharding gets its own plan. |
@@ -673,11 +838,11 @@ Gated on D1, D3, D7 and D8.
 
 | ID | Defect | Where | Disposition |
 |---|---|---|---|
-| F1 | Daemon never serves `fold.query` | `aggregator-daemon/src/lib.rs:495` | Q2 |
-| F2 | The CLI query test's ignore note names the wrong cause | `cli/tests/aggregator_remote.rs:335` | Q2 |
-| F3 | Capability summary counts the whole fold, not its `source_subnet` | `aggregator/summarizer.rs:109-150` | S0, S1 |
+| F1 | Daemon never serves `fold.query` | `aggregator-daemon/src/lib.rs:495` | Q3 |
+| F2 | The CLI query test's ignore note names the wrong cause | `cli/tests/aggregator_remote.rs:335` | Q3 |
+| F3 | Capability summary counts the whole fold, not its `source_subnet` | `aggregator/summarizer.rs:109-150` | Q0, S1 |
 | F4 | In-process replicas share one `MeshNode` and publish duplicates | `aggregator-daemon/src/lib.rs:680-692` | M0 |
-| F5 | No `ChannelConfigRegistry` is installed, so summary visibility is never enforced | `aggregator-daemon/src/lib.rs:464-466`; `aggregator/daemon.rs:483-487` | Q0 |
+| F5 | No `ChannelConfigRegistry` is installed, so summary visibility is never enforced | `aggregator-daemon/src/lib.rs:464-466`; `aggregator/daemon.rs:483-487` | Q1 |
 | F6 | Predecessor plan claims CLI `query` is closed | `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md` | P0-1 |
 | F7 | Daemon identity is regenerated every boot | `aggregator-daemon/src/lib.rs:464-466` | I1 |
 | F8 | Spec promises fencing, identity continuity and `ReplicaGroup` deployment that were never built | `SCALING_SUBNET_SPEC.md` (G10) | P0-2 |
@@ -695,13 +860,13 @@ code before this revision and accepted.
 | # | Sev | Finding | Verified at | Answered by |
 |---|---|---|---|---|
 | 1 | High | No persistent daemon identity and no peer bootstrap, yet D5/M1/M4 assumed both | `aggregator-daemon/src/lib.rs:464-466`; config fields `:111-176` | G6, D6, I1, I2 |
-| 2 | High | S1's classification policy had no production source | config has no policy; `MeshNodeConfig::new` → `None`; classifier at `subnet/assignment.rs:232` | G3, D4, S0, S1's end-to-end proof |
-| 3 | High | Registering summary channels was a no-op, and visibility is per node, not per summary label | `daemon.rs:483-487`; `mesh.rs:35524-35527` | G5, D0, Q0 (real allowed/denied delivery); `fold.query` boundary in D0 |
+| 2 | High | S1's classification policy had no production source | config has no policy; `MeshNodeConfig::new` → `None`; classifier at `subnet/assignment.rs:232` | G3, D4, S0 (now Q0), S1's end-to-end proof |
+| 3 | High | Registering summary channels was a no-op, and visibility is per node, not per summary label | `daemon.rs:483-487`; `mesh.rs:35524-35527` | G5, D0, Q0 (now Q1; real allowed/denied delivery); `fold.query` boundary in D0 |
 | 4 | High | Remote Spawn lacked uncertain-outcome, partial-failure and teardown semantics | `registry_service.rs:606` (`DuplicateGroupName`) | G8, D7, M3 witnesses |
 | 5 | High | A millisecond start time is not a monotonic epoch | design flaw in the first draft's D3 | D3 rewritten, I3, M6 ordering witnesses |
 | 6 | High | "Most recently received" had no freshness lifecycle; `filter_novel` suppresses unchanged summaries | `daemon.rs:347-364` | D8, M6 freshness witnesses |
 | 7 | Med | Missed `List` budget ≠ stopped member | design gap | D7 partition semantics (over-replication, no fencing), M4 partition witness |
-| 8 | Med | The claim that appended postcard fields fail closed was false; renaming changes no bytes | reviewer's probe, postcard 1.1.3 | G9, D9 (versioned names, strict decoding), golden-byte tests in Q1/M3/M6 |
+| 8 | Med | The claim that appended postcard fields fail closed was false; renaming changes no bytes | reviewer's probe, postcard 1.1.3 | G9, D9 (versioned names, strict decoding), golden-byte tests in Q2 (formerly Q1), M3, M6 |
 | s1 | — | Reservation summaries must not carry mesh-wide counts under a subnet label | — | D4 (GLOBAL-only), S1 refusal test |
 | s2 | — | Counters must cover restore and forced replacement, read coherently, and say what they count | — | D4 ("what the counts mean", "how counts are kept"), S1 property and coherence tests |
 | s3 | — | Phase 0 must correct the spec's obsolete contracts, not only the capacity figure | `SCALING_SUBNET_SPEC.md` lines in G10 | P0-2 |
@@ -716,3 +881,40 @@ What changed in the design, in short:
 - **Ordering and freshness are separate contracts (D3, D8).**
 - **Wire changes go to versioned names with strict decoding (D9),** instead of
   appended fields.
+
+---
+
+## Review 2 (2026-10-23)
+
+Re-review of `783128bda`. The reviewer worked from source inspection plus small
+executable transition models (rule ordering, sibling-stream suppression,
+post-teardown resurrection); the Net test suite was not run.
+
+Verdict: Phases 0–1 stay clear; hold Phases 2–4. The remaining problems were
+dependency order, identity scope and lifecycle closure, not a need for a larger
+architecture. Findings 1 and 2 and the `ServerTooOld` correction were checked
+against the code before this revision. Findings 3–5 are design flaws in the
+previous revision, confirmed by reading it against the review's sequences. All
+were accepted.
+
+| # | Sev | Finding | Verified at | Answered by |
+|---|---|---|---|---|
+| 1 | High | Phase 2's delivery and query-access checks need the subnet policy, which arrived only in Phase 3; the production path records peer subnets only when a policy is installed | `mesh.rs:42139-42143` | D0 (policy is a prerequisite); S0 moved to Q0; Phase 2 tests boot from production TOML only |
+| 2 | High | Sorting rules before fingerprinting would give order-sensitive policies one fingerprint | `subnet/assignment.rs:30-35` (later rule wins) | D4 fingerprint in declaration order, value maps canonicalized; Q0 witness |
+| 3 | High | A publisher-wide start sequence let one group's restart retire a sibling group's live stream | previous D3 | D3 orders per stream `(publisher, subnet, kind)`; D0's one-group-per-kind rule makes the stream unique; M6 sibling-stream witness |
+| 4 | High | Member identity omitted the coordinator, so two coordinators could replay or clean up each other's members | previous D7 | D7 identity `(coordinator, group, index)`, coordinator taken from `session_peer` over a direct session; M3 two-coordinator witness |
+| 5 | High | Conditional Unregister did not stop a delayed Spawn from resurrecting a retired member; the retire budget gave up on absent hosts | previous D7 | D7 host records with a high-water incarnation, `Retired`/`Superseded`, `ForgetGroup` retention, coordinator write-ahead intents, no age-based discharge; M3/M4 witnesses |
+| s1 | — | v2 summary channels were never registered for visibility; bootstrap named v1, whose summaries lack ordering/freshness fields | — | D0 registers `summary.v2/<kind>`; D8 bootstraps from `fold.query.v2`, whose layout carries the fields from Q2 on; M6 repeats the delivery test on v2 |
+| s2 | — | `ServerTooOld` must not be inferred from arbitrary failures | `RpcStatus::NotFound` (`cortex/rpc.rs:303`), sent for unserved services (`mesh_rpc.rs:933`) | D9 maps only `NotFound` for the v2 name; Q2 witness that a timeout stays `Timeout` |
+| s3 | — | Increment-and-fsync does not stop two processes allocating the same epoch | — | D6 exclusive locks on `state_dir` and the identity file, node-id binding, crash-safe writes; I3 witnesses |
+
+What changed, in short:
+
+- **The policy moved to Phase 2's first slice.** Phase 2's tests use
+  production TOML only.
+- **Fingerprints keep rule order.**
+- **Ordering is per stream, not per publisher.**
+- **Member identity is scoped to the authenticated coordinator,** and hosts
+  remember retirements until the coordinator says to forget them.
+- **The coordinator writes its intent before acting,** and never treats a
+  host's absence as proof that a member retired.
