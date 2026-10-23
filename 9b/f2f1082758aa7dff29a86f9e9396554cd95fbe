@@ -1,0 +1,35 @@
+net/crates/net/aggregator-daemon/tests/publication_scope.rs
+  s_1dd2179accbdc5::t_948e52bec24d0c 430-486
+net/crates/net/src/adapter/net/behavior/aggregator/query_v2.rs
+  s_1dd2179accbdc5::t_59ceee0ef14a25 526-586
+  s_1dd2179accbdc5::t_4b13f7daa21a2a 48-49,51,208-222,229,231-241,244,247
+net/crates/net/src/adapter/net/behavior/aggregator/registry.rs
+  s_1dd2179accbdc5::t_853813f0c68306 91-98
+net/crates/net/src/adapter/net/behavior/aggregator/query_service.rs
+  s_1dd2179accbdc5::t_e28cef3c88f1a9 62-69,142,149,164-168,170-171,176-178,196-197
+  s_1dd2179accbdc5::t_000ada11f1ddbf 332,356,375,391,400
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs
+  s_1dd2179accbdc5::t_c16eaafb7462a4 32,132-141,163-170,219-220,278-284,308,338,358-400
+  s_1dd2179accbdc5::t_fdfb8c5e22e6be 401,948-954,962-964,966-972,980-999,1006-1021
+  s_1dd2179accbdc5::t_ea69cff04db997 955-961,973-979,1000-1005
+  s_1dd2179accbdc5::t_de89f1f00ac509 965
+  s_1dd2179accbdc5::t_818f3b63e3ca7d 402
+net/crates/net/aggregator-daemon/src/scope.rs
+  s_1dd2179accbdc5::t_351c0873593691 148-149,158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9bf2f1082758aa7dff29a86f9e9396554cd95fbe",
+  "prompts": {},
+  "sessions": {
+    "s_1dd2179accbdc5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b1c333-4602-4b8f-808b-360ea84bffa6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
