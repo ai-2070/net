@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
@@ -128,6 +129,16 @@ impl std::error::Error for AggregatorPublishError {}
 /// responsibility once the wire-publish slice lands).
 const LATEST_SUMMARIES_CAP: usize = 32;
 
+/// Shortest gap between two on-demand ticks
+/// ([`AggregatorDaemon::summarize_now`]).
+///
+/// `SummarizeNow` is reachable by any peer inside the summary visibility
+/// once a daemon serves `fold.query`, and each tick summarizes the whole
+/// fold. A call inside this window gets the latest buffer instead of a
+/// new tick, so callers cannot drive more than one on-demand tick per
+/// window per daemon, however many of them there are.
+pub const SUMMARIZE_NOW_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Long-running aggregator daemon. Construct, then `spawn()` to
 /// launch its background task.
 pub struct AggregatorDaemon {
@@ -149,6 +160,14 @@ pub struct AggregatorDaemon {
     /// rebuild the inner Vec then swap the Arc — copy cost is
     /// bounded by the cap so the rebuild is cheap.
     latest: Arc<RwLock<Arc<Vec<SummaryAnnouncement>>>>,
+    /// Serializes the publishing ticks: the background loop and
+    /// [`Self::summarize_now`]. Both diff against `latest`, publish, then
+    /// append. Two running at once would both see the same change as
+    /// novel, publish it twice under two generations, and append both.
+    tick_lock: tokio::sync::Mutex<()>,
+    /// When [`Self::summarize_now`] last ran a tick. See
+    /// [`SUMMARIZE_NOW_MIN_INTERVAL`].
+    last_on_demand_tick: parking_lot::Mutex<Option<Instant>>,
     /// Cooperative-shutdown flag. The background loop polls this
     /// between ticks; [`Self::shutdown`] sets it.
     shutdown: Arc<AtomicBool>,
@@ -197,6 +216,8 @@ impl AggregatorDaemon {
             latest: Arc::new(RwLock::new(Arc::new(Vec::with_capacity(
                 LATEST_SUMMARIES_CAP,
             )))),
+            tick_lock: tokio::sync::Mutex::new(()),
+            last_on_demand_tick: parking_lot::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
             start_instant: std::time::Instant::now(),
@@ -254,10 +275,13 @@ impl AggregatorDaemon {
     /// NOT publish onto the wire.
     ///
     /// Returns the novel summaries just appended (empty when the
-    /// tick was a no-op). Callers that need the freshly-produced
-    /// batch — e.g. the `SummarizeNow` RPC path — avoid a full
-    /// re-scan of the latest-summaries buffer by reading the
-    /// return value directly.
+    /// tick was a no-op).
+    ///
+    /// Not for a daemon that publishes. A summary this appends is
+    /// never novel again, so the next [`Self::tick_and_publish`]
+    /// skips it and subscribers never receive it. The `SummarizeNow`
+    /// RPC uses [`Self::summarize_now`], which publishes. This method
+    /// also does not take the tick lock the publishing ticks share.
     pub fn tick_once(&self) -> Vec<SummaryAnnouncement> {
         let batch = self.produce_summaries();
         let novel = self.filter_novel(batch);
@@ -281,6 +305,7 @@ impl AggregatorDaemon {
     /// aborts the batch; preceding summaries still land in the
     /// latest buffer so the daemon's local view stays consistent.
     pub async fn tick_and_publish(&self) -> Result<usize, AggregatorPublishError> {
+        let _tick = self.tick_lock.lock().await;
         let batch = self.produce_summaries();
         let novel = self.filter_novel(batch);
         let mut published = 0;
@@ -310,6 +335,7 @@ impl AggregatorDaemon {
         &self,
         shutdown: &AtomicBool,
     ) -> Result<usize, AggregatorPublishError> {
+        let _tick = self.tick_lock.lock().await;
         let batch = self.produce_summaries();
         let novel = self.filter_novel(batch);
         let mut published = 0;
@@ -327,6 +353,51 @@ impl AggregatorDaemon {
         }
         self.append_to_latest(kept);
         Ok(published)
+    }
+
+    /// One tick on demand, for the `SummarizeNow` query: produce, publish
+    /// what is novel, and return it.
+    ///
+    /// It publishes exactly like a background tick. An on-demand tick that
+    /// only appended to the latest buffer (as [`Self::tick_once`] does)
+    /// would make its summaries look already-published: the next
+    /// background tick would find nothing novel and publish nothing, so
+    /// subscribers would miss that change until the fold changed again.
+    ///
+    /// Returns the novel summaries, published or not, so the caller sees
+    /// the fold as of the call. Empty when the tick found nothing new, or
+    /// when an on-demand tick ran less than
+    /// [`SUMMARIZE_NOW_MIN_INTERVAL`] ago; either way the latest buffer
+    /// is current, and callers answer from it.
+    ///
+    /// A publish failure is logged, and the summaries from that one on
+    /// are not appended to the latest buffer. They stay novel, so the
+    /// next tick publishes them.
+    pub async fn summarize_now(&self) -> Vec<SummaryAnnouncement> {
+        let _tick = self.tick_lock.lock().await;
+        {
+            let mut last = self.last_on_demand_tick.lock();
+            if last.is_some_and(|at| at.elapsed() < SUMMARIZE_NOW_MIN_INTERVAL) {
+                return Vec::new();
+            }
+            *last = Some(Instant::now());
+        }
+        let novel = self.filter_novel(self.produce_summaries());
+        let mut published = novel.len();
+        for (i, summary) in novel.iter().enumerate() {
+            if let Err(e) = self.publish_summary(summary).await {
+                tracing::warn!(
+                    error = %e,
+                    source_subnet = %self.config.source_subnet,
+                    fold_kind = summary.fold_kind,
+                    "aggregator: on-demand tick could not publish; the next tick retries",
+                );
+                published = i;
+                break;
+            }
+        }
+        self.append_to_latest(novel[..published].to_vec());
+        novel
     }
 
     /// Drop summaries whose `buckets` match the most recent prior
@@ -872,6 +943,80 @@ mod tests {
         let second = agg.tick_and_publish().await.expect("second");
         assert_eq!(second, 0, "unchanged buckets skip publish");
         assert_eq!(agg.latest_summaries().len(), 1);
+    }
+
+    /// An on-demand tick inside the coalescing window does not tick
+    /// again: no generation bump and nothing new. Past the window it
+    /// ticks, and a fold change made in between is picked up.
+    #[tokio::test]
+    async fn summarize_now_coalesces_calls_inside_the_window() {
+        let mesh = build_mesh().await;
+        let fold = mesh.capability_fold();
+        fold.apply(sign_cap(
+            &EntityKeypair::generate(),
+            0xA,
+            1,
+            NodeState::Idle,
+        ))
+        .unwrap();
+        let cfg = AggregatorConfig::new(SubnetId::new(&[3]))
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh.clone()).expect("new");
+
+        let first = agg.summarize_now().await;
+        assert_eq!(first.len(), 1, "the first on-demand tick finds the fold");
+        assert_eq!(agg.generation(), 1);
+        assert_eq!(agg.latest_summaries(), first);
+
+        // A fold change inside the window is not ticked for...
+        fold.apply(sign_cap(
+            &EntityKeypair::generate(),
+            0xB,
+            1,
+            NodeState::Idle,
+        ))
+        .unwrap();
+        assert!(agg.summarize_now().await.is_empty(), "coalesced");
+        assert_eq!(agg.generation(), 1, "no tick inside the window");
+
+        // ...but is past it.
+        tokio::time::sleep(SUMMARIZE_NOW_MIN_INTERVAL + Duration::from_millis(20)).await;
+        let third = agg.summarize_now().await;
+        assert_eq!(agg.generation(), 2);
+        assert_eq!(third.len(), 1, "the change is novel");
+        assert_eq!(agg.latest_summaries().len(), 2);
+    }
+
+    /// The bug `summarize_now` exists for: an on-demand tick must not
+    /// leave a summary in the latest buffer that was never published.
+    /// After it, the background tick has nothing left to publish, so the
+    /// on-demand tick must have published the change itself; it reports
+    /// that by appending only what it published.
+    #[tokio::test]
+    async fn summarize_now_appends_only_what_it_published() {
+        let mesh = build_mesh().await;
+        mesh.capability_fold()
+            .apply(sign_cap(
+                &EntityKeypair::generate(),
+                0xA,
+                1,
+                NodeState::Idle,
+            ))
+            .unwrap();
+        let cfg = AggregatorConfig::new(SubnetId::new(&[3]))
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+
+        let fresh = agg.summarize_now().await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(agg.latest_summaries(), fresh, "published, then appended");
+        assert_eq!(
+            agg.tick_and_publish().await.expect("tick"),
+            0,
+            "nothing is left unpublished for the background tick"
+        );
     }
 
     #[tokio::test]

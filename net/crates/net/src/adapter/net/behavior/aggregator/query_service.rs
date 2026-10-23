@@ -59,9 +59,14 @@ pub enum FoldQueryOp {
     /// Return the aggregator's most recent batch of summaries
     /// for `kind`. Cheap — reads the daemon's in-memory ring.
     LatestSummary,
-    /// Force the aggregator to summarize-now (synchronously) and
-    /// return the fresh result. Used when staleness tolerance is
-    /// tighter than the daemon's `summary_interval`.
+    /// Force the aggregator to summarize-now and return the fresh
+    /// result. Used when staleness tolerance is tighter than the
+    /// daemon's `summary_interval`.
+    ///
+    /// The tick publishes what it finds, like a background tick
+    /// ([`AggregatorDaemon::summarize_now`]). A second call within
+    /// [`super::daemon::SUMMARIZE_NOW_MIN_INTERVAL`] answers from the
+    /// latest summaries instead of ticking again.
     ///
     /// Operators should reach for `LatestSummary` first;
     /// `SummarizeNow` is the "I need a tight read RIGHT NOW"
@@ -134,14 +139,14 @@ impl RpcHandler for FoldQueryHandler {
                 return Ok(encode_response(&response));
             }
         };
-        let response = answer(&self.aggregator, &request);
+        let response = answer(&self.aggregator, &request).await;
         Ok(encode_response(&response))
     }
 }
 
 /// Pure-function answer logic, broken out for direct unit
 /// testing without going through the RPC plumbing.
-pub(crate) fn answer(
+pub(crate) async fn answer(
     aggregator: &Arc<AggregatorDaemon>,
     request: &FoldQueryRequest,
 ) -> FoldQueryResponse {
@@ -156,17 +161,21 @@ pub(crate) fn answer(
             .filter(|s| s.fold_kind == request.kind)
             .collect(),
         FoldQueryOp::SummarizeNow => {
-            // Run one fresh tick synchronously so the response
-            // reflects the moment-of-call fold state, not the
-            // last background-loop tick.
+            // Run one fresh tick so the response reflects the
+            // moment-of-call fold state, not the last background-loop
+            // tick. It publishes what it finds: a tick that only
+            // buffered would hide the change from the next background
+            // tick, and subscribers would never receive it.
             let fresh: Vec<SummaryAnnouncement> = aggregator
-                .tick_once()
+                .summarize_now()
+                .await
                 .into_iter()
                 .filter(|s| s.fold_kind == request.kind)
                 .collect();
             // If the tick was a no-op (buckets unchanged →
-            // change-detection guard), fall back to the latest
-            // buffer so the operator gets the most recent value.
+            // change-detection guard) or was coalesced into a recent
+            // one, fall back to the latest buffer so the operator gets
+            // the most recent value.
             if fresh.is_empty() {
                 aggregator
                     .latest_summaries()
@@ -184,7 +193,8 @@ pub(crate) fn answer(
     }
 }
 
-fn encode_response(response: &FoldQueryResponse) -> RpcResponsePayload {
+/// Encode a fold-query response (v1 or v2) as an `Ok` reply body.
+pub(crate) fn encode_response<T: Serialize>(response: &T) -> RpcResponsePayload {
     // Postcard can fail on serializer-level OOM / IO; not expected
     // for these small payloads. Log a warning so an unexpected
     // encode failure shows up in operator output, then fall back
@@ -319,7 +329,7 @@ mod tests {
             kind: CapabilityFold::KIND_ID,
             op: FoldQueryOp::LatestSummary,
         };
-        let resp = answer(&agg, &req);
+        let resp = answer(&agg, &req).await;
         match resp {
             FoldQueryResponse::Summaries { kind, summaries } => {
                 assert_eq!(kind, CapabilityFold::KIND_ID);
@@ -343,7 +353,7 @@ mod tests {
             kind: 0xDEAD,
             op: FoldQueryOp::LatestSummary,
         };
-        let resp = answer(&agg, &req);
+        let resp = answer(&agg, &req).await;
         match resp {
             FoldQueryResponse::Error(FoldQueryError::UnknownKind { kind }) => {
                 assert_eq!(kind, 0xDEAD);
@@ -362,7 +372,7 @@ mod tests {
             kind: CapabilityFold::KIND_ID,
             op: FoldQueryOp::SummarizeNow,
         };
-        let _ = answer(&agg, &req);
+        let _ = answer(&agg, &req).await;
         assert_eq!(agg.generation(), gen_before + 1);
     }
 
@@ -378,7 +388,7 @@ mod tests {
             kind: CapabilityFold::KIND_ID,
             op: FoldQueryOp::SummarizeNow,
         };
-        let first = answer(&agg, &req);
+        let first = answer(&agg, &req).await;
         match first {
             FoldQueryResponse::Summaries { ref summaries, .. } => {
                 assert_eq!(summaries.len(), 1, "first tick produces a novel summary");
@@ -387,7 +397,7 @@ mod tests {
         }
         // Second call — fold state unchanged → tick_once returns
         // empty → handler falls back to latest_summaries.
-        let second = answer(&agg, &req);
+        let second = answer(&agg, &req).await;
         match second {
             FoldQueryResponse::Summaries { summaries, .. } => {
                 assert_eq!(

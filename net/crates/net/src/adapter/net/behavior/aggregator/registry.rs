@@ -88,6 +88,14 @@ impl AggregatorGroupEntry {
         }
     }
 
+    /// The first replica, or `None` once the group has been taken via
+    /// `unregister`. Replicas of one group share their daemon's fold, so
+    /// any one answers for the group; this is the cheap way to get one
+    /// (one brief lock, one `Arc` clone, no health polls).
+    pub async fn first_replica(&self) -> Option<Arc<AggregatorDaemon>> {
+        self.group.lock().await.as_ref().and_then(|g| g.replica(0))
+    }
+
     /// Per-replica placement decisions in declaration order.
     /// Empty when the group was created via the placement-free
     /// [`LifecycleGroup::spawn`], or after `unregister`.

@@ -427,3 +427,60 @@ async fn any_admitted_peer_operators_bypass_query_visibility() {
         .expect("an any-admitted-peer operator is admitted outside visibility");
     assert!(records.iter().all(|r| r.group == "capability"));
 }
+
+/// A `SummarizeNow` from a peer publishes what its tick found.
+///
+/// The group's background tick is an hour away, so a summary the
+/// subscriber receives can only come from the on-demand tick. An
+/// on-demand tick that only buffered its summaries would also hide them
+/// from that background tick, which would see nothing new, so
+/// subscribers would miss the change until the fold changed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn summarize_now_publishes_what_it_ticks() {
+    let config = SCOPED
+        .replace("operators_any_admitted_peer = true", "")
+        .replace(
+            "fold_kinds = [1]\n    replica_count = 1\n    summary_interval_ms = 50",
+            "fold_kinds = [1]\n    replica_count = 1\n    summary_interval_ms = 3600000",
+        );
+    assert!(config.contains("3600000"), "the static group ticks hourly");
+    let (hub, _cfg) = boot_config(&config).await;
+    let eu = leaf_in(&hub, "eu").await;
+    let us = leaf_in(&hub, "us").await;
+    classified(&hub, &eu, &us).await;
+    let hub_id = hub.mesh.node_id();
+
+    let channel = summary_channel(&hub, "capability", CapabilityFold::KIND_ID).await;
+    eu.subscribe_channel(hub_id, channel)
+        .await
+        .expect("same-subnet Subscribe admitted");
+
+    // A same-subnet peer that is not an operator asks for a fresh read.
+    let records = FoldQueryClient::new(eu.clone())
+        .with_ttl(Duration::ZERO)
+        .with_deadline(Duration::from_secs(3))
+        .query_group_summarize_now(hub_id, CapabilityFold::KIND_ID, Some("capability"))
+        .await
+        .expect("SummarizeNow admitted");
+    let generation = records
+        .first()
+        .expect("the on-demand tick summarizes the fold")
+        .summary
+        .generation;
+
+    let mut got: Option<SummaryAnnouncement> = None;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while got.is_none() && tokio::time::Instant::now() < deadline {
+        let polled = eu.poll_shard(0, None, 64).await.expect("poll");
+        got = polled
+            .events
+            .iter()
+            .filter_map(|e| postcard::from_bytes::<SummaryAnnouncement>(&e.raw).ok())
+            .find(|s| s.fold_kind == CapabilityFold::KIND_ID);
+        if got.is_none() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    let published = got.expect("the subscriber receives the on-demand tick's summary");
+    assert_eq!(published.generation, generation);
+}

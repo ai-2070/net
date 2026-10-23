@@ -45,9 +45,10 @@ use serde::{Deserialize, Serialize};
 
 use super::query_client::FoldQueryClient;
 use super::query_service::{
-    answer, FoldQueryError, FoldQueryOp, FoldQueryRequest, FoldQueryResponse,
+    answer, encode_response as encode, FoldQueryError, FoldQueryOp, FoldQueryRequest,
+    FoldQueryResponse,
 };
-use super::registry::AggregatorRegistry;
+use super::registry::{AggregatorGroupEntry, AggregatorRegistry};
 use super::registry_service::RegistryAdminPolicy;
 use super::summarizer::SummaryAnnouncement;
 use crate::adapter::net::cortex::rpc::{
@@ -204,33 +205,46 @@ pub(crate) async fn answer_v2(
     registry: &AggregatorRegistry,
     request: &FoldQueryV2Request,
 ) -> FoldQueryV2Response {
-    let names = match &request.group {
-        Some(group) if registry.get(group).is_none() => {
-            return FoldQueryV2Response::Error(FoldQueryV2Error::UnknownGroup(group.clone()));
-        }
-        Some(group) => vec![group.clone()],
-        None => registry.names(),
-    };
+    match &request.group {
+        Some(group) => match registry.get(group) {
+            Some(entry) => answer_from(vec![entry], request).await,
+            None => FoldQueryV2Response::Error(FoldQueryV2Error::UnknownGroup(group.clone())),
+        },
+        None => answer_from(registry.entries(), request).await,
+    }
+}
+
+/// [`answer_v2`] over already-resolved entries: one entry when the request
+/// names a group, every entry otherwise.
+async fn answer_from(
+    entries: Vec<Arc<AggregatorGroupEntry>>,
+    request: &FoldQueryV2Request,
+) -> FoldQueryV2Response {
     let v1 = FoldQueryRequest {
         kind: request.kind,
         op: request.op.clone(),
     };
     let mut records = Vec::new();
     let mut served = false;
-    for name in names {
-        let Some(entry) = registry.get(&name) else {
-            continue; // unregistered since `names()`
-        };
-        let snap = entry.snapshot().await;
+    for entry in entries {
         // Replicas of one group share their daemon's fold, so any one
-        // answers for the group.
-        let Some(aggregator) = snap.replicas.first() else {
+        // answers for the group. A group with none has been taken by an
+        // `unregister` since it was looked up.
+        let Some(aggregator) = entry.first_replica().await else {
+            if request.group.is_some() {
+                // The named group is going away. Saying the kind is
+                // unknown would read as "this group never aggregates
+                // it", which is false.
+                return FoldQueryV2Response::Error(FoldQueryV2Error::UnknownGroup(
+                    entry.name.clone(),
+                ));
+            }
             continue;
         };
-        if let FoldQueryResponse::Summaries { summaries, .. } = answer(aggregator, &v1) {
+        if let FoldQueryResponse::Summaries { summaries, .. } = answer(&aggregator, &v1).await {
             served = true;
             records.extend(summaries.into_iter().map(|summary| SummaryRecord {
-                group: name.clone(),
+                group: entry.name.clone(),
                 summary,
                 refresh_ms: None,
                 boot_epoch: None,
@@ -362,21 +376,6 @@ pub fn install_fold_query_services(
         }),
     )?;
     Ok((v1, v2))
-}
-
-fn encode<T: Serialize>(response: &T) -> RpcResponsePayload {
-    let body = match postcard::to_allocvec(response) {
-        Ok(b) => Bytes::from(b),
-        Err(e) => {
-            tracing::warn!(error = %e, "aggregator: fold query response encode failed");
-            Bytes::new()
-        }
-    };
-    RpcResponsePayload {
-        status: RpcStatus::Ok,
-        headers: Vec::new(),
-        body,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +520,67 @@ impl FoldQueryClient {
         match response {
             FoldQueryV2Response::Summaries { records, .. } => Ok(records),
             FoldQueryV2Response::Error(e) => Err(FoldQueryV2ClientError::Server(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::net::behavior::aggregator::{AggregatorConfig, AggregatorDaemon};
+    use crate::adapter::net::behavior::fold::capability::CapabilityFold;
+    use crate::adapter::net::behavior::fold::FoldKind;
+    use crate::adapter::net::behavior::lifecycle::LifecycleGroup;
+    use crate::adapter::net::identity::EntityKeypair;
+    use crate::adapter::net::{MeshNodeConfig, SubnetId};
+    use std::time::Duration;
+
+    /// A named group that an `unregister` takes after the lookup has no
+    /// replicas left. It is answered as `UnknownGroup`, not as
+    /// `UnknownKind`, which would say the group never aggregates the kind.
+    /// Without a named group it is just skipped.
+    #[tokio::test]
+    async fn a_named_group_taken_mid_query_is_unknown_group() {
+        let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x17u8; 32]);
+        let mesh = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("mesh"),
+        );
+        let agg_cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let group = LifecycleGroup::<AggregatorDaemon>::spawn(1, [7u8; 32], move |_| {
+            Arc::new(AggregatorDaemon::new(agg_cfg.clone(), mesh.clone()).expect("aggregator"))
+        })
+        .await
+        .expect("spawn");
+        let registry = AggregatorRegistry::new();
+        registry.register("alpha", group).expect("register");
+
+        // The query resolved the entry; then the group was taken.
+        let entry = registry.get("alpha").expect("entry");
+        let _taken = registry.unregister("alpha").await.expect("unregister");
+
+        let named = FoldQueryV2Request {
+            kind: CapabilityFold::KIND_ID,
+            op: FoldQueryOp::LatestSummary,
+            group: Some("alpha".into()),
+        };
+        match answer_from(vec![entry.clone()], &named).await {
+            FoldQueryV2Response::Error(FoldQueryV2Error::UnknownGroup(g)) => assert_eq!(g, "alpha"),
+            other => panic!("expected UnknownGroup, got {other:?}"),
+        }
+
+        let every = FoldQueryV2Request {
+            group: None,
+            ..named
+        };
+        match answer_from(vec![entry], &every).await {
+            FoldQueryV2Response::Error(FoldQueryV2Error::UnknownKind { kind }) => {
+                assert_eq!(kind, CapabilityFold::KIND_ID)
+            }
+            other => panic!("expected UnknownKind with no group left, got {other:?}"),
         }
     }
 }

@@ -145,12 +145,8 @@ pub(crate) async fn occupied_kind(
     registry: &net::adapter::net::behavior::aggregator::AggregatorRegistry,
     kinds: &[u16],
 ) -> Option<(u16, String)> {
-    for name in registry.names() {
-        let Some(entry) = registry.get(&name) else {
-            continue;
-        };
-        let snap = entry.snapshot().await;
-        let Some(replica) = snap.replicas.first() else {
+    for entry in registry.entries() {
+        let Some(replica) = entry.first_replica().await else {
             continue;
         };
         if let Some(kind) = replica
@@ -159,7 +155,7 @@ pub(crate) async fn occupied_kind(
             .iter()
             .find(|k| kinds.contains(k))
         {
-            return Some((*kind, name));
+            return Some((*kind, entry.name.clone()));
         }
     }
     None
