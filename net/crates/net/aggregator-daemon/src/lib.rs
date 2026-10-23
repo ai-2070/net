@@ -80,8 +80,9 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    install_fold_query_services, snapshot_group, AggregatorConfig, AggregatorDaemon,
-    AggregatorRegistry, FoldQueryAccess, RegistryAdminPolicy, RegistryRpcError, SpawnFn,
+    install_fold_query_services, snapshot_group, summary_channel_config, AggregatorConfig,
+    AggregatorDaemon, AggregatorRegistry, FoldQueryAccess, RegistryAdminPolicy, RegistryRpcError,
+    SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -211,6 +212,10 @@ struct Config {
     subnet_rules: Vec<subnet_policy::SubnetRuleConfig>,
     /// The one source subnet this daemon serves, in dotted form
     /// (`"3.7"`) or `"global"`. Absent means `global`.
+    ///
+    /// Boot refuses rules that can never classify a peer into the part of
+    /// this subnet `summary_visibility` admits, and rules on a global
+    /// daemon unless `summary_visibility = "global"` (see `scope.rs`).
     ///
     /// It becomes the daemon node's own subnet, and channel visibility
     /// is enforced against a node's own subnet. So one daemon can give
@@ -381,6 +386,35 @@ pub enum DaemonError {
          and nothing is in this subnet. Add rules, or set subnet = \"global\""
     )]
     MissingSubnetPolicy { subnet: String },
+    /// A global daemon has `[[subnet_rule]]`s but non-global summaries. A
+    /// global publisher's subnet-local or parent-visible summaries reach
+    /// only peers with no subnet, so every peer the rules classify would
+    /// get none.
+    #[error(
+        "this daemon is global (no `subnet`) and its [[subnet_rule]] blocks classify \
+         peers into subnets, but summary_visibility = \"{visibility}\" delivers a \
+         global daemon's summaries only to peers with no subnet: every peer the rules \
+         classify would receive no summaries and be refused by fold.query. Set \
+         summary_visibility = \"global\", set `subnet` to the subnet this daemon \
+         serves, or remove the rules"
+    )]
+    GlobalDaemonWithSubnetRules { visibility: &'static str },
+    /// No `[[subnet_rule]]` can classify a peer into the part of the
+    /// daemon's subnet its summary visibility admits, so summaries and
+    /// queries would reach no classified peer.
+    #[error(
+        "subnet = {subnet:?}, but no [[subnet_rule]] writes {value} at level {level}, \
+         so no peer can be classified into this subnet's part that \
+         summary_visibility = \"{visibility}\" admits: summaries would reach no \
+         classified peer and fold.query would refuse them all. Add a rule that maps a \
+         tag to {value} at level {level}, or set summary_visibility = \"global\""
+    )]
+    SubnetUnreachable {
+        subnet: String,
+        level: u8,
+        value: u8,
+        visibility: &'static str,
+    },
     /// A group or template names a source subnet other than the
     /// daemon's.
     #[error(
@@ -591,9 +625,10 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // by. Installed before any service is served: `serve_rpc` adds its
     // own RPC channels to it, and with a registry present a Subscribe
     // to a channel it does not list is refused.
-    mesh_node.set_channel_configs(Arc::new(ChannelConfigRegistry::new()));
+    let channels = Arc::new(ChannelConfigRegistry::new());
+    register_summary_channels(&config, scope, &channels)?;
+    mesh_node.set_channel_configs(channels);
     let mesh = Arc::new(mesh_node);
-    register_summary_channels(&config, scope, &mesh)?;
 
     // Build the SpawnFn + ScaleFn from the operator's template
     // registry, then install the registry service with both
@@ -881,19 +916,19 @@ async fn spawn_group(
     Ok(())
 }
 
-/// Register every summary channel this daemon can publish on in the
-/// node's channel registry, with the daemon's summary visibility (D0).
+/// Register every summary channel this daemon can publish on in
+/// `channels`, with the daemon's summary visibility (D0).
 ///
 /// That is one channel per fold kind used by any `[[group]]` or
 /// `[[template]]`; templates are included so groups spawned later over
-/// RPC are covered. Each is registered through
-/// `AggregatorDaemon::register_summary_channels` on a throwaway daemon,
-/// so the channel name has a single owner. Unknown fold kinds are skipped
-/// here; group and template validation reports them by name.
+/// RPC are covered. The name and entry come from core's
+/// `summary_channel_config`, the same function a running daemon
+/// registers through. Unknown fold kinds are skipped here; group and
+/// template validation reports them by name.
 fn register_summary_channels(
     config: &Config,
     scope: scope::Scope,
-    mesh: &Arc<MeshNode>,
+    channels: &ChannelConfigRegistry,
 ) -> Result<(), DaemonError> {
     let mut kinds: Vec<u16> = config
         .groups
@@ -912,24 +947,13 @@ fn register_summary_channels(
         if check_known_fold_kind(kind, "").is_err() {
             continue;
         }
-        let channel_error = |error: String| DaemonError::AggregatorConfig {
-            name: format!("summary channel for fold kind {kind:#06x}"),
-            error,
-        };
-        let cfg = AggregatorConfig::new(scope.subnet)
-            .with_visibility(scope.summary_visibility)
-            .with_fold_kind(kind);
-        let throwaway =
-            AggregatorDaemon::new(cfg, mesh.clone()).map_err(|e| channel_error(e.to_string()))?;
-        let registered = throwaway
-            .register_summary_channels()
-            .map_err(|e| channel_error(e.to_string()))?;
-        if registered == 0 {
-            return Err(channel_error(
-                "the node has no channel registry, so summary visibility would not be enforced"
-                    .into(),
-            ));
-        }
+        let cfg = summary_channel_config(kind, scope.summary_visibility).map_err(|e| {
+            DaemonError::AggregatorConfig {
+                name: format!("summary channel for fold kind {kind:#06x}"),
+                error: e.to_string(),
+            }
+        })?;
+        channels.insert(cfg);
     }
     Ok(())
 }

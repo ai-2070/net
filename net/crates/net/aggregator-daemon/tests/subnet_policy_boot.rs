@@ -21,7 +21,15 @@ const PSK: [u8; 32] = [0x42u8; 32];
 const PSK_HEX: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 const DEADLINE: Duration = Duration::from_secs(5);
 
+/// Rules on a global daemon need global summaries: under any narrower
+/// visibility its summaries would skip every peer the rules classify, and
+/// boot refuses that (`scope.rs`). These tests are about classification,
+/// so they say so explicitly.
+const GLOBAL_SUMMARIES: &str = "summary_visibility = \"global\"\n";
+
 const TWO_REGIONS: &str = r#"
+    summary_visibility = "global"
+
     [[subnet_rule]]
     tag_prefix = "region:"
     level = 0
@@ -191,7 +199,7 @@ async fn booted_fingerprints_ignore_value_order_but_not_rule_order() {
         values = { "north" = 9 }
     "#;
     let fp = |extra: String| async move {
-        let (booted, _cfg) = try_boot(&extra).await;
+        let (booted, _cfg) = try_boot(&format!("{GLOBAL_SUMMARIES}{extra}")).await;
         booted
             .expect("boot")
             .subnet_policy_fingerprint

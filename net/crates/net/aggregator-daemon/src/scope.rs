@@ -15,11 +15,22 @@
 //! [`resolve`] checks all of that at boot, before the node exists, and
 //! normalizes every group's and template's `source_subnet` to the
 //! daemon's. Code downstream of boot can then rely on it.
+//!
+//! It also refuses a subnet policy that would leave the summaries with no
+//! classified audience, which would otherwise show up only as summaries
+//! reaching nobody and queries refused, one warn log at a time:
+//! - a global daemon with `[[subnet_rule]]`s under a non-global
+//!   visibility (a global publisher's subnet-local or parent-visible
+//!   summaries reach only peers with no subnet, so every peer the rules
+//!   classify is cut off);
+//! - a subnet daemon whose rules can never classify a peer into the part
+//!   of its subnet the visibility admits.
 
 use std::collections::HashMap;
 
 use net::adapter::net::{SubnetId, Visibility};
 
+use super::subnet_policy::SubnetRuleConfig;
 use super::{Config, DaemonError};
 
 /// The resolved scope every group on this daemon shares.
@@ -52,6 +63,7 @@ pub(crate) fn resolve(config: &mut Config) -> Result<Scope, DaemonError> {
         None => DEFAULT_SUMMARY_VISIBILITY,
         Some(raw) => parse_visibility(raw)?,
     };
+    check_audience(subnet, summary_visibility, &config.subnet_rules)?;
     let canonical = subnet.to_string();
 
     for group in &mut config.groups {
@@ -85,6 +97,79 @@ pub(crate) fn resolve(config: &mut Config) -> Result<Scope, DaemonError> {
         subnet,
         summary_visibility,
     })
+}
+
+/// Refuse a policy under which the daemon's summaries (and `fold.query`,
+/// which uses the same rule) can reach no classified peer.
+///
+/// The rule is `MeshNode::subnet_visible` from the daemon's subnet `S`. A
+/// peer is recorded with the subnet the rules assign it, `GLOBAL` when none
+/// matches. The rules can assign any combination of their per-level values,
+/// since a peer may carry any tags.
+/// - `global` visibility reaches everyone: nothing to check.
+/// - `S` global: subnet-local and parent-visible reach only `GLOBAL`
+///   peers, so rules (which exist to classify peers away from `GLOBAL`)
+///   cut off everyone they classify.
+/// - subnet-local: the rules must be able to assign exactly `S`.
+/// - parent-visible: `S` and its ancestors are admitted. Unclassified
+///   (`GLOBAL`) peers always are, so require that the rules can classify
+///   a peer at least into `S`'s top level, i.e. into `S`'s lineage.
+fn check_audience(
+    subnet: SubnetId,
+    visibility: Visibility,
+    rules: &[SubnetRuleConfig],
+) -> Result<(), DaemonError> {
+    if visibility == Visibility::Global {
+        return Ok(());
+    }
+    if subnet.is_global() {
+        if rules.is_empty() {
+            return Ok(());
+        }
+        return Err(DaemonError::GlobalDaemonWithSubnetRules {
+            visibility: visibility_name(visibility),
+        });
+    }
+    // Levels the rules must be able to write: all of `S` for subnet-local,
+    // its top level for parent-visible.
+    let needed = match visibility {
+        Visibility::SubnetLocal => subnet.depth(),
+        _ => 1,
+    };
+    for level in 0..needed {
+        let value = subnet.level(level);
+        if value == 0 {
+            // "No restriction at this level": every peer has it.
+            continue;
+        }
+        let assignable = rules.iter().any(|rule| {
+            rule.level == level
+                && rule.values.iter().any(|(tag_value, v)| {
+                    // A mapping matching only the empty tag never fires
+                    // (`SubnetPolicy::can_assign_non_global`).
+                    *v == value && !(rule.tag_prefix.is_empty() && tag_value.is_empty())
+                })
+        });
+        if !assignable {
+            return Err(DaemonError::SubnetUnreachable {
+                subnet: subnet.to_string(),
+                level,
+                value,
+                visibility: visibility_name(visibility),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The config spelling of `visibility`, for error messages.
+fn visibility_name(visibility: Visibility) -> &'static str {
+    match visibility {
+        Visibility::SubnetLocal => "subnet-local",
+        Visibility::ParentVisible => "parent-visible",
+        Visibility::Global => "global",
+        Visibility::Exported => "exported",
+    }
 }
 
 /// An absent (`""`) source subnet inherits the daemon's; a present one
@@ -179,6 +264,82 @@ mod tests {
         level = 0
         values = { "eu" = 3 }
     "#;
+
+    /// AG-3: rules on a global daemon cut off every peer they classify
+    /// unless summaries are global.
+    #[test]
+    fn a_global_daemon_with_rules_needs_global_summaries() {
+        for visibility in ["", "summary_visibility = \"parent-visible\"\n"] {
+            let mut c = config(&format!("{visibility}{RULES}"));
+            match resolve(&mut c) {
+                Err(e @ DaemonError::GlobalDaemonWithSubnetRules { .. }) => {
+                    assert!(
+                        e.to_string().contains("summary_visibility = \"global\""),
+                        "{e}"
+                    );
+                }
+                other => panic!("expected GlobalDaemonWithSubnetRules, got {other:?}"),
+            }
+        }
+        let mut c = config(&format!("summary_visibility = \"subnet-local\"\n{RULES}"));
+        assert!(matches!(
+            resolve(&mut c),
+            Err(DaemonError::GlobalDaemonWithSubnetRules {
+                visibility: "subnet-local"
+            })
+        ));
+        let mut c = config(&format!("summary_visibility = \"global\"\n{RULES}"));
+        assert_eq!(
+            resolve(&mut c)
+                .expect("global summaries reach everyone")
+                .subnet,
+            SubnetId::GLOBAL
+        );
+    }
+
+    /// AG-5: the rules must be able to classify a peer into the part of
+    /// the daemon's subnet its visibility admits.
+    #[test]
+    fn rules_that_cannot_reach_the_daemon_subnet_are_refused() {
+        const TWO_LEVELS: &str = r#"
+            [[subnet_rule]]
+            tag_prefix = "region:"
+            level = 0
+            values = { "eu" = 3, "us" = 4 }
+
+            [[subnet_rule]]
+            tag_prefix = "rack:"
+            level = 1
+            values = { "r1" = 1 }
+        "#;
+        let outcome = |subnet: &str, visibility: &str| {
+            let mut c = config(&format!(
+                "subnet = \"{subnet}\"\nsummary_visibility = \"{visibility}\"\n{TWO_LEVELS}"
+            ));
+            resolve(&mut c).map(|_| ())
+        };
+        // Exactly reachable.
+        outcome("3.1", "subnet-local").expect("3.1 is assignable");
+        outcome("4", "subnet-local").expect("4 is assignable");
+        // Level 1 has no 7: no peer is ever in 3.7.
+        match outcome("3.7", "subnet-local") {
+            Err(DaemonError::SubnetUnreachable {
+                level: 1, value: 7, ..
+            }) => {}
+            other => panic!("expected 3.7 unreachable at level 1, got {other:?}"),
+        }
+        // Parent-visible reaches 3.7's lineage through level 0 alone.
+        outcome("3.7", "parent-visible").expect("peers in 3 see 3.7's summaries");
+        // No rule writes 5 at level 0: outside every classified lineage.
+        match outcome("5.1", "parent-visible") {
+            Err(DaemonError::SubnetUnreachable {
+                level: 0, value: 5, ..
+            }) => {}
+            other => panic!("expected 5.1 unreachable at level 0, got {other:?}"),
+        }
+        // Global summaries reach everyone, so nothing is checked.
+        outcome("5.1", "global").expect("global summaries");
+    }
 
     #[test]
     fn absent_subnet_is_global_with_parent_visible_summaries() {

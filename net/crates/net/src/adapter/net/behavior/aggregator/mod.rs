@@ -21,7 +21,10 @@ pub mod registry_service;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
-pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
+pub use daemon::{
+    summary_channel_config, summary_channel_name, AggregatorDaemon, AggregatorError,
+    AggregatorPublishError, SUMMARIZE_NOW_MIN_INTERVAL,
+};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, FoldQueryErrorKind, DEFAULT_QUERY_CACHE_TTL,
     DEFAULT_QUERY_DEADLINE,

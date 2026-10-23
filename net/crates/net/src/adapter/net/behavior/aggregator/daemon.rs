@@ -47,7 +47,7 @@ use crate::adapter::net::behavior::fold::reservation::ReservationFold;
 use crate::adapter::net::behavior::fold::FoldKind;
 use crate::adapter::net::behavior::lifecycle::{LifecycleDaemon, LifecycleError, ReplicaHealth};
 use crate::adapter::net::{
-    AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig,
+    AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig, Visibility,
 };
 
 /// Configuration-validation error.
@@ -138,6 +138,33 @@ const LATEST_SUMMARIES_CAP: usize = 32;
 /// new tick, so callers cannot drive more than one on-demand tick per
 /// window per daemon, however many of them there are.
 pub const SUMMARIZE_NOW_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Canonical summary channel name for `fold_kind`. One summary channel
+/// per fold kind per host; source-subnet discrimination is carried on the
+/// payload's `source_subnet` field. Format: `"summary/<hex_kind>"`.
+///
+/// The single owner of the name format: the daemon publishes on it, and
+/// hosts that register summary channels before any daemon exists (the
+/// aggregator daemon binary at boot) use it too.
+pub fn summary_channel_name(fold_kind: u16) -> Result<ChannelName, AggregatorPublishError> {
+    let name = format!("summary/{fold_kind:#06x}");
+    ChannelName::new(&name)
+        .map_err(|e| AggregatorPublishError::InvalidChannelName(format!("{name}: {e:?}")))
+}
+
+/// The [`ChannelConfig`] for `fold_kind`'s summary channel with
+/// `visibility`, ready to insert in a
+/// [`ChannelConfigRegistry`](crate::adapter::net::ChannelConfigRegistry).
+pub fn summary_channel_config(
+    fold_kind: u16,
+    visibility: Visibility,
+) -> Result<ChannelConfig, AggregatorPublishError> {
+    let channel_name = summary_channel_name(fold_kind)?;
+    let channel_id = ChannelId::parse(channel_name.as_str()).map_err(|e| {
+        AggregatorPublishError::InvalidChannelName(format!("{}: {e:?}", channel_name.as_str()))
+    })?;
+    Ok(ChannelConfig::new(channel_id).with_visibility(visibility))
+}
 
 /// Long-running aggregator daemon. Construct, then `spawn()` to
 /// launch its background task.
@@ -523,17 +550,13 @@ impl AggregatorDaemon {
         Ok(())
     }
 
-    /// Canonical summary channel name for `fold_kind`. One
-    /// summary channel per fold-kind per host; source-subnet
-    /// discrimination is carried on the payload's
-    /// `source_subnet` field. Format: `"summary/<hex_kind>"`.
+    /// Canonical summary channel name for `fold_kind`. Same as the free
+    /// [`summary_channel_name`].
     pub fn summary_channel_name(
         &self,
         fold_kind: u16,
     ) -> Result<ChannelName, AggregatorPublishError> {
-        let name = format!("summary/{fold_kind:#06x}");
-        ChannelName::new(&name)
-            .map_err(|e| AggregatorPublishError::InvalidChannelName(format!("{name}: {e:?}")))
+        summary_channel_name(fold_kind)
     }
 
     /// Register every configured fold-kind's summary channel in
@@ -556,16 +579,10 @@ impl AggregatorDaemon {
         };
         let mut registered = 0;
         for kind in &self.config.fold_kinds {
-            let channel_name = self.summary_channel_name(*kind)?;
-            let channel_id = ChannelId::parse(channel_name.as_str()).map_err(|e| {
-                AggregatorPublishError::InvalidChannelName(format!(
-                    "{}: {e:?}",
-                    channel_name.as_str()
-                ))
-            })?;
-            let cfg =
-                ChannelConfig::new(channel_id).with_visibility(self.config.summary_visibility);
-            registry.insert(cfg);
+            registry.insert(summary_channel_config(
+                *kind,
+                self.config.summary_visibility,
+            )?);
             registered += 1;
         }
         Ok(registered)
