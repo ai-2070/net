@@ -141,15 +141,13 @@ async fn ls_remote_lists_configured_groups() {
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 2
             summary_interval_ms = 50
 
             [[group]]
             name = "beta"
-            source_subnet = "3.8"
-            fold_kinds = [1]
+            fold_kinds = [3]
             replica_count = 1
             summary_interval_ms = 50
         "#
@@ -241,7 +239,6 @@ async fn spawn_against_template_adds_a_group() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
         "#
@@ -294,13 +291,11 @@ async fn scale_resizes_existing_group() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 2
             summary_interval_ms = 50
@@ -351,7 +346,6 @@ async fn query_returns_summary_for_configured_group() {
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 1
             summary_interval_ms = 50

@@ -85,15 +85,13 @@ async fn daemon_boots_two_groups_and_serves_registry_rpc() {
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 2
             summary_interval_ms = 50
 
             [[group]]
             name = "beta"
-            source_subnet = "3.8"
-            fold_kinds = [1]
+            fold_kinds = [3]
             replica_count = 1
             summary_interval_ms = 50
         "#
@@ -173,7 +171,6 @@ async fn daemon_rejects_unknown_fold_kind_at_boot() {
 
             [[group]]
             name = "bad"
-            source_subnet = "3.7"
             fold_kinds = [0xDEAD]
             replica_count = 1
             summary_interval_ms = 50
@@ -215,7 +212,6 @@ async fn spawn_and_unregister_rpc_round_trip_against_running_daemon() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
         "#
@@ -292,7 +288,6 @@ async fn scale_grows_existing_group_via_wire() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
         "#
@@ -371,7 +366,6 @@ async fn scale_unknown_group_returns_typed_server_error() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
         "#
@@ -411,9 +405,11 @@ async fn scale_unknown_group_returns_typed_server_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scale_template_mismatch_returns_typed_server_error() {
-    // Two templates with different source_subnets. Spawn the
-    // group via one, then attempt to scale using the other —
-    // the daemon detects the spec mismatch and refuses.
+    // Two templates with different fold kinds. Spawn the group via
+    // one, then attempt to scale using the other — the daemon
+    // detects the spec mismatch and refuses. (They used to differ
+    // by source_subnet; a daemon now serves one source subnet, so
+    // that mismatch is refused at boot instead.)
     let toml = format!(
         r#"
             listen = "127.0.0.1:0"
@@ -427,14 +423,12 @@ async fn scale_template_mismatch_returns_typed_server_error() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
 
             [[template]]
             name = "secondary"
-            source_subnet = "3.8"
-            fold_kinds = [1]
+            fold_kinds = [3]
             summary_interval_ms = 50
         "#
     );
@@ -470,10 +464,7 @@ async fn scale_template_mismatch_returns_typed_server_error() {
     use net::adapter::net::behavior::aggregator::{RegistryClientError, RegistryRpcError};
     match client.scale(daemon_node_id, "swarm", "secondary", 3).await {
         Err(RegistryClientError::Server(RegistryRpcError::ScaleRejected(msg))) => {
-            assert!(
-                msg.contains("source_subnet") || msg.contains("does not match"),
-                "diagnostic was: {msg}"
-            );
+            assert!(msg.contains("fold_kinds differ"), "diagnostic was: {msg}");
         }
         other => panic!("expected ScaleRejected(template mismatch), got {other:?}"),
     }
@@ -543,14 +534,12 @@ async fn daemon_rejects_duplicate_group_names_at_boot() {
 
             [[group]]
             name = "dup"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 1
             summary_interval_ms = 50
 
             [[group]]
             name = "dup"
-            source_subnet = "3.8"
             fold_kinds = [1]
             replica_count = 1
             summary_interval_ms = 50

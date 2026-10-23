@@ -816,6 +816,82 @@ subnet or channel registry is injected through a test-only setup path
   - A Spawn-created group's channel gets the same verdicts.
   - Boot refuses a template whose subnet disagrees, and a second group of an
     occupied kind.
+
+  **Done 2026-10-23.**
+
+  **Decision (user, 2026-10-23): refuse at boot.** A pre-Q1 config that labels
+  a group with a non-global `source_subnet` but sets no daemon `subnet` is
+  refused. The error names the fix (`set subnet = "3.7"` …). No warn-and-infer
+  release. Reason: those configs publish whole-fold counts under a subnet
+  label (F3), so failing loudly beats running with wrong output.
+  Alternatives rejected: warn for one release; enforce only when the new key
+  is present.
+
+  **What landed:**
+  - **Config.** New keys `subnet` and `summary_visibility`
+    (`subnet-local` | `parent-visible` | `global`, default `parent-visible`,
+    as before). `source_subnet` on groups and templates becomes optional and
+    inherits the daemon's.
+  - **Scope.** `aggregator-daemon/src/scope.rs` resolves it at boot. It refuses
+    `MissingSubnetPolicy`, `SourceSubnetMismatch` (group or template) and
+    `FoldKindOccupied`, and normalizes every group and template to the
+    daemon's subnet.
+  - **Boot.** `boot()` sets the node's subnet, installs a
+    `ChannelConfigRegistry` before any service is served, and registers
+    `summary/<kind>` for every group **and template** kind through
+    `AggregatorDaemon::register_summary_channels`.
+  - **Spawn.** Spawns are serialized, and Spawn refuses an occupied kind as
+    `SpawnRejected`, naming the owning group.
+
+  **Evidence.**
+  - `aggregator-daemon/tests/publication_scope.rs` (3 tests), booted from
+    TOML, daemon in subnet `1`, `subnet-local`:
+    - the same-subnet peer's Subscribe is admitted, and it receives and
+      decodes a summary the daemon itself published (`source_subnet = 1`,
+      capability kind);
+    - the sibling's Subscribe is refused, and a publish from the daemon's
+      node reports `(attempted, delivered) = (1, 1)`;
+    - a group spawned over RPC gets the same verdicts on its channel;
+    - a second capability group is refused at Spawn with the owner named;
+    - boot refusals for the pre-Q1 config, a non-global subnet with no
+      rules, a mismatched template, and an occupied kind.
+  - 7 unit tests in `scope.rs`.
+  - Full `cargo test -p net-aggregator-daemon`: 52 pass. That includes the
+    registry RPC tests, which now run with the channel registry installed.
+  - `net-cli`'s `aggregator_remote`: the 5 regular tests pass against the
+    changed daemon. The ignored `query` test still fails, as expected until Q3.
+  - Clippy (`--all-targets -D warnings`, from the crate directory), rustdoc
+    (`-D warnings`) and rustfmt are clean.
+
+  **Where the implementation departs from the text above, and why:**
+  1. **No gateway dropped-counter witness.** Denial is witnessed by the
+     refused Subscribe and by the daemon-side publish report `(1, 1)`. The
+     sibling never reaches the roster, so the publish-time gateway counter
+     has nothing to count. The refusal happens earlier, in
+     `authorize_subscribe`.
+  2. **No new `KindOccupied` reply variant.** Spawn reports an occupied kind
+     as `SpawnRejected` with a diagnostic. A new `RegistryRpcError` variant
+     would change the frozen v1 registry wire shape (D9). The M3 v2 layout
+     can give it its own variant.
+  3. **`exported` visibility is refused.** It needs explicit export targets,
+     which the daemon config has no key for yet.
+
+  **Found on the way:**
+  - **A registry installed without RPC entries would have broken RPC.** With
+    a `ChannelConfigRegistry` installed, a Subscribe to any channel it does
+    not list is refused (`UnknownChannel`, `mesh.rs:43491`). That would break
+    nRPC unless the RPC channels are listed. Core's `serve_rpc` lists them
+    itself when a registry is present (`sdk/src/mesh_rpc.rs:320-334`), so
+    the registry must be installed before any service is served. `boot()`
+    does that, and the RPC tests confirm it.
+  - **The web guide's daemon TOML example
+    (`web/src/content/docs/guides/daemons-and-placement.md`) had never matched
+    the real schema.** It used `source_subnet` as an array, fold kinds by name,
+    `summary_interval = "30s"`, and `[[group]] template/replicas`. It is
+    replaced with the real schema, and the new example was booted through the
+    actual binary (subnet `3.7`, 2 rules, group spawned). Its claim that
+    subscribers "pick the latest by generation" across replicas was also
+    corrected. `bun run check:docs` passes.
 - **Q2. `fold.query.v2`** (D9).
   - Request layout `{ kind: u16, op: FoldQueryOp, group: Option<String> }`.
   - Each summary in the response carries

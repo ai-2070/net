@@ -136,7 +136,7 @@ pub(crate) fn policy_fingerprint(rules: &[SubnetRuleConfig]) -> [u8; 32] {
 
 /// Lowercase hex, for logs and operator output.
 pub(crate) fn fingerprint_hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(fp)
 }
 
 #[cfg(test)]

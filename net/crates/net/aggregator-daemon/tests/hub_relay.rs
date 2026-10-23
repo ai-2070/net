@@ -66,7 +66,6 @@ async fn boot_hub() -> (BootedDaemon, NamedTempFile) {
 
             [[group]]
             name = "hub-summary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 1
             summary_interval_ms = 100
