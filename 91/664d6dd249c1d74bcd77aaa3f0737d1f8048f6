@@ -1,0 +1,78 @@
+net/crates/net/bindings/python/src/aggregator.rs
+  s_a45750ef6fc5fc::t_c78e88bf6cf657 27,29,80-82,90-96,158-171,173-185,246-258,263-269,461-512,598-616,782-819
+  s_a45750ef6fc5fc::t_0040c0a325c378 172,259-262
+  s_a45750ef6fc5fc::t_12001f65f949cc 820
+net/crates/net/bindings/python/tests/test_fold_query_v2.py
+  s_a45750ef6fc5fc::t_6c3cc989ad7ac3 4-7,10-16
+  s_a45750ef6fc5fc::t_c60223b379bfa0 1-3,8-9,17-78
+net/crates/net/src/ffi/aggregator.rs
+  s_a45750ef6fc5fc::t_0040c0a325c378 877-880
+  s_a45750ef6fc5fc::t_0e5f668911ba9b 26-28,73-76,669-731,799,808-821,841,865-876,881-900,918-940
+  s_a45750ef6fc5fc::t_de6f29db2bd66f 941
+net/crates/net/include/net.h
+  s_a45750ef6fc5fc::t_dac4ca04de6cde 407-410,571-606
+  s_a45750ef6fc5fc::t_99039ec44c15b6 607
+go/aggregator_test.go
+  s_a45750ef6fc5fc::t_b6875dd6501bcd 82-87,109-112,200-205,245-286,289-290
+  s_a45750ef6fc5fc::t_5b8776af09ea43 287-288
+  s_a45750ef6fc5fc::t_776307d71f6205 291
+net/crates/net/sdk/src/aggregator.rs
+  s_a45750ef6fc5fc::t_8f5a0f234db5e5 79-88
+  s_a45750ef6fc5fc::t_2d5508d877e5eb 449-473
+net/crates/net/examples/c/aggregator.c
+  s_a45750ef6fc5fc::t_2619498ba05aef 58-59
+  s_a45750ef6fc5fc::t_211758ac9cbc98 122-149
+go/abi_stability_test.go
+  s_a45750ef6fc5fc::t_91f47a7e909bd1 780-782,871-872,875
+  s_a45750ef6fc5fc::t_d0016c4b59d013 766-778,783-870,873-874,876-879
+  s_a45750ef6fc5fc::t_9f86fbf46a3ad3 779
+net/crates/net/bindings/node/aggregator.ts
+  s_a45750ef6fc5fc::t_c288fa7a3eba64 31-36,81-83,132-142,236-244
+  s_a45750ef6fc5fc::t_37a8fba7ab77d9 245
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_a45750ef6fc5fc::t_c78e88bf6cf657 3352-3354,3360,3390-3395,4313-4318
+net/crates/net/tests/error_kind_mirror.rs
+  s_a45750ef6fc5fc::t_dac4ca04de6cde 31,138-142,205
+  s_a45750ef6fc5fc::t_0040c0a325c378 32-34
+net/crates/net/bindings/python/python/net/__init__.py
+  s_a45750ef6fc5fc::t_c78e88bf6cf657 753,772
+go/aggregator.go
+  s_a45750ef6fc5fc::t_dac4ca04de6cde 36-40,83-94,135-139,158-161,187-191,226-235,253-258,302-312,638-695,697,699
+  s_a45750ef6fc5fc::t_8d5c7f323461a7 696,698,700
+net/crates/net/bindings/python/src/lib.rs
+  s_a45750ef6fc5fc::t_c78e88bf6cf657 4639-4642
+docs/internal/plans/AGGREGATOR_MULTI_HOST_PLAN.md
+  s_a45750ef6fc5fc::t_afa594e80c44fb 1036-1113
+  s_a45750ef6fc5fc::t_b3be593c2caae5 630-650
+net/crates/net/bindings/node/src/aggregator.rs
+  s_a45750ef6fc5fc::t_bad2bf23945ce4 83-88,92-102,104-107
+  s_a45750ef6fc5fc::t_f87dd630015387 160-183
+  s_a45750ef6fc5fc::t_da0e9365922ac6 393-433
+  s_a45750ef6fc5fc::t_0040c0a325c378 89-91,103
+  s_a45750ef6fc5fc::t_22be1947ae9c1f 22-24
+net/crates/net/examples/c/FLOORS
+  s_a45750ef6fc5fc::t_8733744af329e1 21
+net/crates/net/bindings/node/test/aggregator.test.ts
+  s_a45750ef6fc5fc::t_8f468c20db4388 103-129
+net/crates/net/sdk-ts/test/small_surfaces.test.ts
+  s_a45750ef6fc5fc::t_2ac847fb4c81bf 92,97,103-104
+  s_a45750ef6fc5fc::t_5a3efcfb22f129 93-96,98-102,105,107-111
+  s_a45750ef6fc5fc::t_74cabefec1163e 90-91,106,112-142
+  s_a45750ef6fc5fc::t_379fddc82b0348 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "91664d6dd249c1d74bcd77aaa3f0737d1f8048f6",
+  "prompts": {},
+  "sessions": {
+    "s_a45750ef6fc5fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23eac748-8ed1-44a6-ada9-14748f2b62e8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
