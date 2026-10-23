@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/aggregator/query_v2.rs
+  s_a45750ef6fc5fc::t_1ecf33f2fbab37 412
+  s_a45750ef6fc5fc::t_4bbe1b45e768da 427-432
+  s_a45750ef6fc5fc::t_e64454e5ad889c 1-8,10-37,39-46,50-300,305-411,413-426,433-511,518,521-526
+  s_a45750ef6fc5fc::t_c8c2719ffc65c0 38
+  s_a45750ef6fc5fc::t_7bf88f455f89a2 9
+  s_a45750ef6fc5fc::t_659d171b40c363 47-49,301-304,512-517,519-520
+net/crates/net/tests/aggregator_fold_query.rs
+  s_a45750ef6fc5fc::t_b66c724ab32f40 340-783
+net/crates/net/src/adapter/net/behavior/aggregator/query_client.rs
+  s_a45750ef6fc5fc::t_a4f33c39358ff9 92-94
+  s_a45750ef6fc5fc::t_c8e27cb8ff5e36 107
+  s_a45750ef6fc5fc::t_968f603dfea5ff 240
+  s_a45750ef6fc5fc::t_65f96b23ce3540 249-269
+net/crates/net/src/adapter/net/behavior/aggregator/mod.rs
+  s_a45750ef6fc5fc::t_4d5bc87eaeff0d 17
+  s_a45750ef6fc5fc::t_d0ab1c7c65071b 32-37
+net/crates/net/src/adapter/net/mesh.rs
+  s_a45750ef6fc5fc::t_3bc0696bb77fa6 44118-44122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1b76b346f624b5f5f9c6639ea2685be2c5e2b89d",
+  "prompts": {},
+  "sessions": {
+    "s_a45750ef6fc5fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23eac748-8ed1-44a6-ada9-14748f2b62e8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
