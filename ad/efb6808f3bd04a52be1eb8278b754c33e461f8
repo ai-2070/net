@@ -1,0 +1,33 @@
+net/crates/net/aggregator-daemon/tests/subnet_policy_boot.rs
+  s_1dd2179accbdc5::t_aacb0e44193c67 24-29,31-32,202
+net/crates/net/src/adapter/net/behavior/aggregator/mod.rs
+  s_1dd2179accbdc5::t_effd56960df45c 24-27
+web/src/content/docs/guides/daemons-and-placement.md
+  s_1dd2179accbdc5::t_f4c402377b7154 262
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs
+  s_1dd2179accbdc5::t_effd56960df45c 50,142-168,553-554,559,582-585
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_1dd2179accbdc5::t_aacb0e44193c67 216-219,389-417
+  s_1dd2179accbdc5::t_effd56960df45c 83,628-630,919-920,924-927,931,950-956
+  s_1dd2179accbdc5::t_c3ce6ed897fd15 84-85
+net/crates/net/aggregator-daemon/src/scope.rs
+  s_1dd2179accbdc5::t_aacb0e44193c67 18-27,33,66,102-174,268-275,280-292,296-342
+  s_1dd2179accbdc5::t_c3ce6ed897fd15 276-279,293-295
+  s_1dd2179accbdc5::t_71fdd86367cb1a 343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "adefb6808f3bd04a52be1eb8278b754c33e461f8",
+  "prompts": {},
+  "sessions": {
+    "s_1dd2179accbdc5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b1c333-4602-4b8f-808b-360ea84bffa6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
