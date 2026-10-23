@@ -1,0 +1,24 @@
+net/crates/net/aggregator-daemon/tests/hub_relay.rs
+  s_a45750ef6fc5fc::t_ec649d782559e3 1-35,39-44,51-168,174-223
+  s_a45750ef6fc5fc::t_6322428d4ba582 36-38
+  s_a45750ef6fc5fc::t_9b5cdb611d3b07 169-173
+  s_a45750ef6fc5fc::t_b2dbe6096af856 45-50
+docs/internal/plans/AGGREGATOR_MULTI_HOST_PLAN.md
+  s_a45750ef6fc5fc::t_8597b9e9d92912 708-739
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "afb7560c4a86caaa666658480bf5bdcf11dc5b57",
+  "prompts": {},
+  "sessions": {
+    "s_a45750ef6fc5fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23eac748-8ed1-44a6-ada9-14748f2b62e8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
