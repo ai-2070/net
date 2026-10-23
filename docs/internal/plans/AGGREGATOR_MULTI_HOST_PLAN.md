@@ -2,7 +2,7 @@
 
 ## Status
 
-**Planned. Revised after reviews 1 and 2** (all 2026-10-23), on branch
+**Planned. Revised after reviews 1, 2 and 3** (all 2026-10-23), on branch
 `LZL0/aggregators` (forked from `master` at `541cc0078`). No release has been
 chosen.
 
@@ -10,17 +10,24 @@ chosen.
 - **Phase 2 now opens with the subnet-policy slice** (formerly S0), because its
   delivery and query-access checks cannot classify callers without it
   (review 2).
+- **Phases 2 and 3 are cleared at the plan level** (review 3). Implementation
+  and acceptance evidence are still owed.
 - **Phase 4 is gated** on the identity, member-lifecycle and receiver contracts
-  (D1, D3, D7, D8) being implemented as written. Review 2 tightened D3's
-  ordering scope and D7's member identity and retirement memory.
+  (D1, D3, D7, D8) being implemented as written.
+  - Review 2 tightened D3's ordering scope and D7's member identity and
+    retirement memory.
+  - Review 3 replaced `ForgetGroup` with floor-based reclamation, made the
+    identity lock unconditional, and split the host's desired state from
+    observed liveness, with crash recovery.
+  - This revision awaits re-review.
 
 Predecessors, both closed: `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`
 (AL-1..AL-8) and `AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md` (A, B, C).
 Phase 0 corrects claims in them, and in `SCALING_SUBNET_SPEC.md`, that turned
 out to be wrong.
 
-[Review 1](#review-1-2026-10-23) and [review 2](#review-2-2026-10-23) list
-every finding and where it is answered.
+[Review 1](#review-1-2026-10-23), [review 2](#review-2-2026-10-23) and
+[review 3](#review-3-2026-10-23) list every finding and where it is answered.
 
 ---
 
@@ -355,13 +362,26 @@ M8).*
     on an ephemeral identity.
 - **State.** `state_dir = "<path>"` holds `boot_epoch` (D3), the coordinator's
   records and the host's member records (D7). Phase 4 features require it.
-- **Exclusive ownership** (review 2). At boot the daemon takes an exclusive
-  advisory lock on `<state_dir>/LOCK` (the `fs2` crate, already a
-  `net-mesh-sdk` dependency) and holds it for the process lifetime. It also
-  takes one on `<identity>.lock` when the identity file lives outside
-  `state_dir`. A second process using either refuses to boot. `state_dir`
-  records the node id it belongs to, and refuses a different identity. Durable
-  writes go to a temporary file, then fsync, rename and directory fsync.
+- **Exclusive ownership** (review 2; identity lock made unconditional in
+  review 3, finding 2). At boot, every daemon with a persistent identity takes
+  two exclusive advisory locks and holds them for the process lifetime (the
+  `fs2` crate, already a `net-mesh-sdk` dependency):
+  - **`<identity>.lock`**, next to the identity file, wherever that file lives,
+    found by its canonicalized path;
+  - **`<state_dir>/LOCK`.**
+
+  A second process that shares either the identity file or the state directory
+  refuses to boot, whatever the layout. Locking the identity only when it sat
+  outside `state_dir` let a daemon with the identity inside its own state
+  directory and another daemon pointing at that same file from elsewhere hold
+  disjoint lock sets (review 3).
+
+  `state_dir` records the node id it belongs to, and refuses a different
+  identity. Durable writes go to a temporary file, then fsync, rename and
+  directory fsync.
+
+  Out of reach of any lock: a *copy* of the identity file at another path. That
+  is the operator's responsibility and is documented as such.
 - **Peers.** `[[peer]]` blocks give `addr`, `public_key` and `node_id`. The
   daemon dials each with the SDK's `connect_via` (the routed handshake, which
   completes against a running responder without pre-`accept`). It redials with
@@ -374,7 +394,10 @@ is bounded soft-state reconciliation between two daemons. There are no
 distributed transactions and no fencing.
 
 **Member identity** is `(coordinator, group, index)`, plus an `incarnation: u64`
-from a counter in the coordinator's `state_dir`.
+from **one** counter in the coordinator's `state_dir`. It is shared by all of
+that coordinator's groups and only ever increases. A recreated group therefore
+always gets incarnations above every one its earlier lifetime used; the floor
+below relies on this.
 
 - **Where `coordinator` comes from.** It is the authenticated
   `RpcContext::session_peer` of the request, never a payload field.
@@ -390,39 +413,117 @@ from a counter in the coordinator's `state_dir`.
   applies on the host, so the second spawn of the same kind gets `KindOccupied`
   rather than a silent replay.
 
-**Host-side member record.** The host persists one record per
-`(coordinator, group, index)` in its `state_dir`:
-`{ high_water: u64, running: Option<u64> }`. `high_water` is the highest
-incarnation ever accepted for that key.
+**Host-side state.** *(Revised after review 3, findings 1 and 3. `ForgetGroup`
+is gone, and durable desired state is now separate from observed liveness.)*
 
-- **`SpawnMember { template, group, index, incarnation, policy_fp, template_fp }`**:
-  - `incarnation == running` → `Spawned` again (a replay);
-  - `incarnation < high_water`, or equal to it while not running →
-    `Retired { high_water }`. This covers a delayed Spawn retry arriving after
-    a successful teardown: the member does not come back;
-  - `incarnation > high_water` → the record is updated first, then any lower
-    running incarnation is stopped, then the new one starts. A newer
-    incarnation from the same coordinator supersedes the old one;
+The host keeps two kinds of durable state in its `state_dir`, plus one fact
+observed in memory.
+
+- **Per coordinator:** `floor: u64`, starting at 0. It only ever increases. Any
+  member op carrying an incarnation `< floor` (strictly below) is answered `Retired { floor }`
+  with no state change. The floor is the retained rejection evidence that lets
+  records be reclaimed without reopening resurrection.
+- **Per member key `(coordinator, group, index)`:**
+  `{ high_water: u64, desired: Option<Desired> }`, where
+  `Desired = { incarnation, template, template_fp, policy_fp }`.
+  - `high_water` is the highest incarnation ever accepted for the key.
+  - `desired` is what the host has committed to run. It carries enough to
+    restart the member after a crash.
+- **Observed, in memory only:** whether a live task exists for the desired
+  incarnation. A persisted record never claims a task is alive. Only the
+  in-memory handle does.
+
+What the host reports for a key follows from desired and observed together:
+
+- `Running(i)`: desired is `i` and its task is live.
+- `Starting(i)`: desired is `i` and no task is live yet (accepted, recovering,
+  or retrying a failed start).
+- `StartFailed(i, reason)`: the last attempt to start `i` failed. Desired is
+  kept, and a retried Spawn tries again.
+- `Retired`: nothing desired.
+
+**Transitions.** Every one persists before it acts, so a crash at any point
+leaves either the old durable state or the new one. Recovery on boot (below)
+then makes the observed state match.
+
+- **`SpawnMember { template, group, index, incarnation: i, policy_fp, template_fp }`:**
+  - `i < floor`, or `i < high_water`, or (`i == high_water` and desired is not
+    `i`) → `Retired`, with no change. A delayed Spawn after a teardown, or after
+    a reclamation, cannot start anything.
+  - desired is `i` → a replay. Reply `Spawned` **only if the task is live**;
+    otherwise reply `Starting` (retryable) and make sure a start is in
+    progress. An unfinished valid start is never reported `Retired`, and a
+    missing task is never reported `Spawned`.
+  - `i > high_water` →
+    1. persist `{ high_water = i, desired = i }`;
+    2. stop any task for a lower incarnation;
+    3. start `i`;
+    4. reply `Spawned` once the task is live, or `StartFailed` if it fails.
   - a fingerprint mismatch → refused, with no state change.
-- **`UnregisterMember { group, index, incarnation }`**:
-  - `incarnation >= high_water` → record `high_water = incarnation` and stop
-    the member if it is running;
-  - `incarnation < high_water` → `Superseded` and no change. A delayed cleanup
-    therefore cannot stop a replacement.
-- **`ForgetGroup { group }`** drops the records for one of that coordinator's
-  groups. The coordinator sends it only after every member's teardown has been
-  acknowledged.
-- **Retention.** Records are kept until `ForgetGroup` from their coordinator,
-  never by age. They are bounded by the host's existing `max_groups ×
-  max_replica_count`. At the bound, the host refuses new keys (`HostFull`)
-  instead of evicting records, because eviction would reopen resurrection.
+- **`UnregisterMember { group, index, incarnation: i }`:**
+  - `i < floor` or `i < high_water` → `Superseded`, with no change. A delayed
+    cleanup cannot stop a replacement.
+  - otherwise →
+    1. persist `{ high_water = i, desired = None }`;
+    2. stop the task if one is live;
+    3. reply `Stopped`.
+
+    Replays get `Stopped` again.
+- **`Reclaim { below: u64 }`** (replaces `ForgetGroup`):
+  1. persist `floor = max(floor, below)`;
+  2. delete only records that have `desired = None` and `high_water < floor`.
+
+  Properties:
+  - **It never affects a newer group lifetime.** The coordinator's counter
+    only increases, so every record of a recreated group has
+    `high_water ≥ below` and survives.
+  - **A delayed old `Reclaim` is a no-op.** Its `below` is not above the
+    current floor, so `max` leaves the floor unchanged.
+  - **Deleted keys stay rejected.** A delayed `SpawnMember` for a deleted key
+    has `i < floor` and gets `Retired`.
+
+  The coordinator computes `below` as the smallest incarnation that is still
+  desired, or still has a pending intent, among its members on that host. If
+  there are none, it uses its next unallocated incarnation. It sends `Reclaim`
+  only after writing that value to its own write-ahead log.
+- **Retention.** Per-key records live until `Reclaim` passes them, never by
+  age. Per-coordinator floors are kept permanently: one `u64` for each
+  coordinator ever admitted, bounded by the `operators` list. Live keys are
+  bounded by `max_groups × max_replica_count`. At that bound the host refuses
+  new keys (`HostFull`) instead of evicting records.
+
+**Host recovery on boot.** This happens before any member op is served.
+
+1. Under the D6 locks, load the floors and records.
+2. Start every desired member.
+3. Only then register the `aggregator.registry.v2` member ops.
+
+Details:
+
+- A desired member whose template no longer exists, or whose fingerprint no
+  longer matches, stays desired and reports `StartFailed(TemplateChanged)`.
+  The coordinator sees that in `List` and in Spawn replays, and treats it as a
+  member failure (re-place or roll back).
+- Ordinary restarts take the same path. They lose every in-process task, so
+  "desired" is all that carries over and liveness is re-observed.
+
+**What a host crash leaves behind**, by crash point:
+
+| Crash point | State on restart | Retry answer |
+|---|---|---|
+| Spawn: before persisting | Old state | Spawn proceeds normally |
+| Spawn: after persisting, before start | Desired `i`; recovery starts it | `Spawned` once live; `Starting` until then. Never `Retired` |
+| Spawn: after start, before reply | Desired `i`; recovery restarts it (the old task died with the process) | `Spawned`; exactly one member |
+| Replacement: after persisting new desired, before stopping old | Desired is the new incarnation only; the old task died with the process | New incarnation runs; old is `Superseded`/`Retired` |
+| Unregister: after persisting, before stop | Nothing desired; nothing restarted | `Stopped` |
+| Reclaim: after persisting floor, before deleting records | Floor raised; recovery finishes the deletion | Delayed old Spawn → `Retired` |
 
 **Coordinator write-ahead intent.** Before any remote effect, the coordinator
 fsyncs its intent to `state_dir`:
 
 - the allocated incarnation;
 - the target host;
-- the operation (`Spawning`, `Retiring`, `Forgetting`).
+- the operation (`Spawning`, `Retiring`, `Reclaiming { below }`).
 
 It updates the record only after the reply. On restart, every unresolved intent
 is re-sent unchanged. That is safe because each op is idempotent under the
@@ -687,11 +788,21 @@ Gated on D1, D3, D7 and D8.
 
   *Proof:*
   - Restart increments `boot_epoch`.
-  - A second daemon on the same `state_dir` or identity refuses to boot while
-    the first runs.
+  - A second daemon on the same `state_dir` refuses to boot while the first
+    runs.
+  - **Asymmetric shared identity** (review 3): daemon A has `state_dir = stateA`
+    and `identity = stateA/identity`; daemon B has `state_dir = stateB` and
+    `identity = stateA/identity`. B refuses to boot while A runs, and so does A
+    when started second.
   - A `state_dir` written by another identity is refused.
-  - Killing the process between write and rename leaves either the old or the
-    new value, never a torn file, and the next boot allocates past both.
+  - **Torn writes:** killing the process between write and rename leaves either
+    the old or the new value, never a torn file.
+  - **No published epoch is ever reused** (review 3). Publishing starts only
+    after the epoch's rename and directory fsync. A boot that crashed before
+    that commit may hand out the same value again, which is safe because
+    nothing was published under it. The witness kills the process at both
+    points: before the commit, the next epoch may repeat the uncommitted value;
+    after the first publish, it must be strictly greater.
   - A corrupt or missing epoch file is refused rather than reset, unless the
     operator passes an explicit reset flag.
 - **M0. One member per host (D2).**
@@ -713,11 +824,17 @@ Gated on D1, D3, D7 and D8.
   *Proof:* three members land on three distinct hosts; a fourth fails with
   `PlacementFailed` when only three hosts qualify.
 - **M3. Remote members under D7** (`aggregator.registry.v2`).
-  - `SpawnMember`, `UnregisterMember` and `ForgetGroup` with frozen layouts.
+  - `SpawnMember`, `UnregisterMember` and `Reclaim` with frozen layouts, and
+    the reply set `Spawned`, `Starting`, `StartFailed`, `Stopped`, `Retired`,
+    `Superseded`, `KindOccupied` and `HostFull`.
   - Coordinator identity from `session_peer`, with relayed member ops refused.
   - Template and policy fingerprints.
-  - The host member records and the coordinator's write-ahead intents,
-    persisted in `state_dir`.
+  - The host's per-coordinator floors and per-key desired records, with boot
+    recovery before member ops are served. Also the coordinator's write-ahead
+    intents. All of it persisted in `state_dir`.
+  - Host crash points for the witnesses come from a crash-injection hook that
+    aborts the daemon subprocess at a named point. It is compiled only in test
+    builds and never changes configuration.
   - `List` v2 reports `host_node_id: u64` (not `Option`), the coordinator and
     the incarnation per member.
 
@@ -739,9 +856,25 @@ Gated on D1, D3, D7 and D8.
   - **A relayed member op** (session peer ≠ coordinator) is refused.
   - **Partial failure:** a failure after one remote member started rolls the
     group back, and the started member is gone.
-  - **Repeated logical Unregister** is idempotent. `ForgetGroup` goes out only
-    after every teardown has been acknowledged.
-  - **`HostFull`** at the record bound, with no record evicted.
+  - **Repeated logical Unregister** is idempotent.
+  - **Reclamation** (review 3, finding 1):
+    - A delayed `SpawnMember` arriving **after `Reclaim`** has deleted its key
+      gets `Retired`, and nothing starts.
+    - A delayed **old `Reclaim`** arriving after the group was recreated with
+      higher incarnations leaves the new records and members untouched.
+    - With a host restart between `Reclaim` and each of those delayed
+      operations, the answers are the same.
+  - **Host crash recovery** (review 3, finding 3), using the crash-injection
+    hook on the host subprocess:
+    - **After persisting, before start:** the retry gets `Starting` or
+      `Spawned`, never `Retired`, and ends with exactly one member.
+    - **After start, before the reply:** the retry gets `Spawned` only once the
+      recovered task is live, with exactly one member.
+    - **During replacement:** only the new incarnation runs afterwards.
+    - **During teardown:** nothing is restarted, and the retry gets `Stopped`.
+    - **Any other point:** no member op is answered before recovery finishes,
+      and no `Spawned` reply is ever sent for a key with no live task.
+  - **`HostFull`** at the live-key bound, with no record evicted.
   - **Golden bytes:** one test per v2 layout.
 - **M4. Health and re-placement (D7 partition semantics).**
 
@@ -808,7 +941,8 @@ Gated on D1, D3, D7 and D8.
 | R1 case 2 fails deep in routed-session forwarding | Phases 2–3 don't depend on it. Phase 4's `[[peer]]` dialing gives daemons direct sessions with each other regardless. |
 | The coordinator is lost for good | Members keep running and publishing; re-placement stops. Coordinator takeover is out of scope (below). Its `state_dir` makes a restart on the same host safe. |
 | Partitions cause temporary over-replication | Accepted by design (D7). Receivers tolerate extra publishers (D8). Cleanup is conditional on incarnation, so it cannot remove a replacement. |
-| A coordinator that is gone for good leaves member records, and possibly running members, on its hosts | Records are never evicted by age, because that would reopen resurrection. An operator on the host removes them with the host's own `Unregister` (the operator path, not the member path). `HostFull` makes the bound visible rather than silent. |
+| A coordinator that is gone for good leaves member records, and possibly running members, on its hosts | Records are never evicted by age, because that would reopen resurrection. An operator on the host retires the members with the host's own operator path. That path raises the coordinator's floor past them, so their records become reclaimable and stay rejected. `HostFull` makes the bound visible rather than silent. |
+| Host recovery starts a desired member whose template changed since it was accepted | It stays desired and reports `StartFailed(TemplateChanged)`. The coordinator treats it as a member failure; nothing runs under a template that no longer matches its fingerprint. |
 | One group per fold kind per daemon is too tight for some deployment | Run another daemon on the host. The restriction exists because two same-kind groups on one subnet would publish identical streams (D0). |
 | `boot_epoch` file lost or corrupted | Refused at boot, not silently reset (I3). An operator reset must be explicit, and the docs say receivers may drop that publisher's summaries until its epoch passes the last one they saw. |
 | Operators deploy one-subnet-per-daemon and want more subnets per host | Run several daemons per host; each is cheap. Per-group nodes inside one daemon (rejected in D0) stay available as a follow-up if this hurts. |
@@ -903,7 +1037,7 @@ were accepted.
 | 2 | High | Sorting rules before fingerprinting would give order-sensitive policies one fingerprint | `subnet/assignment.rs:30-35` (later rule wins) | D4 fingerprint in declaration order, value maps canonicalized; Q0 witness |
 | 3 | High | A publisher-wide start sequence let one group's restart retire a sibling group's live stream | previous D3 | D3 orders per stream `(publisher, subnet, kind)`; D0's one-group-per-kind rule makes the stream unique; M6 sibling-stream witness |
 | 4 | High | Member identity omitted the coordinator, so two coordinators could replay or clean up each other's members | previous D7 | D7 identity `(coordinator, group, index)`, coordinator taken from `session_peer` over a direct session; M3 two-coordinator witness |
-| 5 | High | Conditional Unregister did not stop a delayed Spawn from resurrecting a retired member; the retire budget gave up on absent hosts | previous D7 | D7 host records with a high-water incarnation, `Retired`/`Superseded`, `ForgetGroup` retention, coordinator write-ahead intents, no age-based discharge; M3/M4 witnesses |
+| 5 | High | Conditional Unregister did not stop a delayed Spawn from resurrecting a retired member; the retire budget gave up on absent hosts | previous D7 | D7 host records with a high-water incarnation, `Retired`/`Superseded`, `ForgetGroup` retention (replaced by floor-based `Reclaim` in review 3), coordinator write-ahead intents, no age-based discharge; M3/M4 witnesses |
 | s1 | — | v2 summary channels were never registered for visibility; bootstrap named v1, whose summaries lack ordering/freshness fields | — | D0 registers `summary.v2/<kind>`; D8 bootstraps from `fold.query.v2`, whose layout carries the fields from Q2 on; M6 repeats the delivery test on v2 |
 | s2 | — | `ServerTooOld` must not be inferred from arbitrary failures | `RpcStatus::NotFound` (`cortex/rpc.rs:303`), sent for unserved services (`mesh_rpc.rs:933`) | D9 maps only `NotFound` for the v2 name; Q2 witness that a timeout stays `Timeout` |
 | s3 | — | Increment-and-fsync does not stop two processes allocating the same epoch | — | D6 exclusive locks on `state_dir` and the identity file, node-id binding, crash-safe writes; I3 witnesses |
@@ -918,3 +1052,38 @@ What changed, in short:
   remember retirements until the coordinator says to forget them.
 - **The coordinator writes its intent before acting,** and never treats a
   host's absence as proof that a member retired.
+
+---
+
+## Review 3 (2026-10-23)
+
+Re-review of `6af702f0c`, based on the revision diff, relevant source checks,
+and executable transition models of the counterexamples below; no production
+runtime tests.
+
+Verdict:
+
+- **Phases 0–3 are clear to implement.** Implementation and acceptance evidence
+  are still owed.
+- **Phase 4 stays on hold** for three lifecycle defects in D6/D7.
+
+Review 2's dependency, fingerprint, stream-ordering, coordinator-namespace and
+v2-handoff findings were confirmed addressed. The three findings are design
+flaws in the previous revision's text, confirmed by tracing the review's
+sequences against it. All were accepted.
+
+| # | Sev | Finding | Answered by |
+|---|---|---|---|
+| 1 | High | `ForgetGroup` deleted the high-water evidence, so a delayed Spawn after Forget was accepted again. An unversioned delayed Forget could also erase a recreated group's records. | `ForgetGroup` removed. A per-coordinator monotonic `floor` is the retained rejection evidence. `Reclaim { below }` raises it with `max` and deletes only retired records below it, so it cannot touch a newer group lifetime, because the coordinator's single counter only increases. Coordinator write-ahead `Reclaiming`. M3 witnesses: Spawn after Reclaim, old Reclaim after recreation, host restart between. |
+| 2 | High | The identity lock was conditional on the file living outside `state_dir`, so an inside/outside pair held disjoint lock sets under one identity. | D6: every persistent-identity daemon locks `<identity>.lock` (canonicalized path) plus `<state_dir>/LOCK`. I3 asymmetric-layout witness. A copied identity file remains the operator's responsibility. |
+| 3 | High | Host persistence `{ high_water, running }` conflated pending, live and retired. Crash points between persisting and starting gave false `Retired` or false `Spawned`, and a restart lost every task. | D7: durable `desired` (carrying enough to restart) separate from in-memory observed liveness. Reported states `Running`/`Starting`/`StartFailed`/`Retired`. `Spawned` only when a task is live. Boot recovery before member ops are served. A crash-point table. M3 host-crash witnesses via a test-only crash-injection hook on the daemon subprocess. |
+| s1 | — | "The next boot allocates past both" demanded more than the write protocol provides. | I3: no *published* epoch is ever reused; reusing a never-committed, never-published value is allowed. Witness kills at both points. |
+
+What changed, in short:
+
+- **The host never forgets an incarnation without a floor that still rejects
+  it.**
+- **Every daemon locks its identity file.**
+- **The host persists what it intends to run, not what it believes is
+  running.** It re-observes liveness after any restart before answering member
+  ops.
