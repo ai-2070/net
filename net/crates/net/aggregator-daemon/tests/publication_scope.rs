@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::aggregator::{
-    RegistryClient, RegistryClientError, RegistryRpcError, SummaryAnnouncement,
+    FoldQueryClient, FoldQueryV2ClientError, FoldQueryV2Error, RegistryClient, RegistryClientError,
+    RegistryRpcError, SummaryAnnouncement,
 };
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
@@ -107,7 +108,19 @@ async fn try_boot(extra: &str) -> (Result<BootedDaemon, DaemonError>, NamedTempF
 }
 
 async fn boot_scoped() -> (BootedDaemon, NamedTempFile) {
-    let (booted, file) = try_boot(SCOPED).await;
+    boot_config(SCOPED).await
+}
+
+/// `SCOPED` without `operators_any_admitted_peer`: no caller is an
+/// operator, so visibility alone decides who may query.
+async fn boot_scoped_without_operators() -> (BootedDaemon, NamedTempFile) {
+    let config = SCOPED.replace("operators_any_admitted_peer = true", "");
+    assert_ne!(config, SCOPED, "the operator line was removed");
+    boot_config(&config).await
+}
+
+async fn boot_config(config: &str) -> (BootedDaemon, NamedTempFile) {
+    let (booted, file) = try_boot(config).await;
     let booted = booted.expect("daemon boot");
     booted.mesh.start();
     (booted, file)
@@ -356,4 +369,61 @@ async fn boot_refuses_configs_that_break_one_subnet_per_daemon() {
         matches!(e, DaemonError::FoldKindOccupied { kind: 1, .. }),
         "{e:?}"
     );
+}
+
+/// Q3: the daemon serves `fold.query.v2` with the same boundary as its
+/// summary channels. The same-subnet caller gets the group's records; the
+/// sibling is refused. Access comes only from the TOML (subnet, rules,
+/// `summary_visibility`), with no operators configured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_answers_fold_query_v2_inside_its_visibility_only() {
+    let (hub, _cfg) = boot_scoped_without_operators().await;
+    let eu = leaf_in(&hub, "eu").await;
+    let us = leaf_in(&hub, "us").await;
+    classified(&hub, &eu, &us).await;
+    let hub_id = hub.mesh.node_id();
+    // Let the group tick once so it has a summary to return.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = |node: &Arc<MeshNode>| {
+        FoldQueryClient::new(node.clone())
+            .with_ttl(Duration::ZERO)
+            .with_deadline(Duration::from_secs(3))
+    };
+    let records = client(&eu)
+        .query_group_latest(hub_id, CapabilityFold::KIND_ID, Some("capability"))
+        .await
+        .expect("same-subnet caller admitted");
+    assert!(!records.is_empty(), "the group has a summary to return");
+    assert!(records.iter().all(|r| r.group == "capability"));
+    assert!(records
+        .iter()
+        .all(|r| r.summary.source_subnet == SubnetId::new(&[1])));
+
+    match client(&us)
+        .query_group_latest(hub_id, CapabilityFold::KIND_ID, None)
+        .await
+    {
+        Err(FoldQueryV2ClientError::Server(FoldQueryV2Error::NotAuthorized)) => {}
+        other => panic!("expected NotAuthorized for the sibling, got {other:?}"),
+    }
+}
+
+/// `operators_any_admitted_peer = true` makes every admitted peer an
+/// operator, and operators bypass summary visibility (D0). So the sibling
+/// that is refused above is admitted here. Pinned so the bypass is a
+/// decision someone sees, not a surprise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn any_admitted_peer_operators_bypass_query_visibility() {
+    let (hub, _cfg) = boot_scoped().await;
+    let eu = leaf_in(&hub, "eu").await;
+    let us = leaf_in(&hub, "us").await;
+    classified(&hub, &eu, &us).await;
+    let records = FoldQueryClient::new(us.clone())
+        .with_ttl(Duration::ZERO)
+        .with_deadline(Duration::from_secs(3))
+        .query_group_latest(hub.mesh.node_id(), CapabilityFold::KIND_ID, None)
+        .await
+        .expect("an any-admitted-peer operator is admitted outside visibility");
+    assert!(records.iter().all(|r| r.group == "capability"));
 }

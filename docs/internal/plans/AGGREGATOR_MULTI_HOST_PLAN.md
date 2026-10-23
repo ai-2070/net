@@ -911,12 +911,96 @@ subnet or channel registry is injected through a test-only setup path
   - A v2 client against a v1-only server gets `ServerTooOld`. That mapping is
     tested from the observed `NotFound`, and a timeout is tested to stay
     `Timeout`.
+
+  **Done 2026-10-23.** The code is
+  `src/adapter/net/behavior/aggregator/query_v2.rs` (core, re-exported from
+  `behavior::aggregator`).
+
+  **What landed:**
+  - **Frozen v2 types:** `FoldQueryV2Request`, `FoldQueryV2Response`,
+    `SummaryRecord` and `FoldQueryV2Error`.
+  - **Strict decoding:** `decode_strict`, over `take_from_bytes`, rejecting
+    any remainder.
+  - **Access:** `FoldQueryAccess { visibility, operators }`. It applies
+    `MeshNode::subnet_visible`, the fan-out's own rule, now `pub(crate)`
+    rather than copied; operators bypass it.
+  - **Server:** two daemon-level handlers over an `AggregatorRegistry`:
+    - `FoldQueryV2Handler`, which authorizes before decoding;
+    - `FoldQueryRegistryV1Handler`, which answers v1's frozen shape and
+      refuses with application status `FOLD_QUERY_V1_NOT_AUTHORIZED`
+      (`0x8001`), since v1's body has no such variant.
+
+    `install_fold_query_services` serves both.
+  - **Client:** `FoldQueryClient::query_group_latest` (cached per
+    `(target, kind, group)`) and `query_group_summarize_now`, with their own
+    `FoldQueryV2ClientError`.
+
+  **Evidence.** `tests/aggregator_fold_query.rs::v2` adds 6 tests to the
+  binary CI already runs. The command is CI's:
+  `cargo nextest run --features "cortex tool fixtures" --test aggregator_fold_query`.
+  All 11 tests in the binary pass, the 5 v1 tests included.
+  - golden bytes for the request (named and all-groups), a full response
+    record, and all four errors;
+  - strict decoding: a trailing byte gives `TrailingBytes(1)` where
+    `from_bytes` would accept it, and a v1-shaped request does not decode as
+    v2;
+  - an access matrix for SubnetLocal, ParentVisible (including an ancestor
+    admitted and a child refused) and Global, plus the operator bypass;
+  - live round trips: a named group, all groups (only those of the kind), a
+    SummarizeNow, `UnknownGroup`, `UnknownKind`, and the daemon-level v1
+    agreeing with v2;
+  - live access: same subnet admitted; sibling refused on v2
+    (`NotAuthorized`) and on v1 (status `0x8001`); a sibling named as an
+    operator admitted;
+  - `ServerTooOld` against a v1-only host, and a slow v2 handler past the
+    deadline staying a transport error, not a server answer.
+
+  **Where the implementation departs from the text above, and why:**
+  1. **`refresh_ms` is `Option<u32>`, not `u32`.** Today a summary is
+     republished only when it changes, so there is no refresh interval to
+     state. Sending a number the daemon does not honour would mislead
+     receivers. It is filled in when D8's bounded refresh lands (M6), with no
+     layout change.
+  2. **No separate `generation` field.** The record embeds the frozen v1
+     `SummaryAnnouncement`, which already carries `generation`.
+  3. **Each record names its `group`.** With `group: None` the response spans
+     several groups, and without the name a receiver could not tell them
+     apart.
+  4. **The v2 errors live in a separate client error type.** The v1
+     `FoldQueryClientError` and `FoldQueryError` are left untouched, because
+     the Node and Python bindings match them exhaustively. Adding variants
+     would break their build ahead of Q4.
 - **Q3. The daemon installs v1 and v2.** v1 answers with "all groups" semantics.
   The `ServeHandle`s are kept on `BootedDaemon`.
 
   *Proof:* un-ignore
   `cli/tests/aggregator_remote.rs::query_returns_summary_for_configured_group`,
   and replace its ignore note's premise: the target is the daemon's node id.
+
+  **Done 2026-10-23.** `boot()` installs both services after the registry
+  service. Access is the daemon's `summary_visibility` plus its `operators`
+  policy. The handles are kept on `BootedDaemon::_fold_query`.
+
+  **Evidence:**
+  - **CLI.** The CLI test is un-ignored, with the wrong premise replaced by
+    a note, and passes. All 6 `net-cli` `aggregator_remote` tests pass.
+  - **Daemon.** `aggregator-daemon/tests/publication_scope.rs` adds two
+    tests:
+    - with no operators, a same-subnet caller gets the group's records
+      (`source_subnet = 1`) and the sibling gets `NotAuthorized`;
+    - with `operators_any_admitted_peer = true`, the sibling is admitted.
+  - The full daemon suite passes (54 tests).
+
+  **Found on the way (a semantic worth stating):**
+  - `operators_any_admitted_peer = true` makes every admitted peer an
+    operator, and operators bypass query visibility (D0). On such a daemon,
+    `fold.query` is therefore open to every peer, whatever
+    `summary_visibility` says.
+  - That is consistent with the decision, which says operators see
+    everything, and the second daemon test pins it.
+  - It was caught because the first version of the visibility test booted
+    the shared `SCOPED` config, which opens operators, and the sibling was
+    correctly admitted.
 - **Q4. Bindings expose the group argument and the new error kinds.**
   - Node: `bindings/node`, `sdk-ts/src/aggregator.ts`.
   - Python: `bindings/python`.

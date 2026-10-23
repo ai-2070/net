@@ -80,8 +80,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryAdminPolicy,
-    RegistryRpcError, SpawnFn,
+    install_fold_query_services, snapshot_group, AggregatorConfig, AggregatorDaemon,
+    AggregatorRegistry, FoldQueryAccess, RegistryAdminPolicy, RegistryRpcError, SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -501,6 +501,12 @@ pub struct BootedDaemon {
     /// Held to keep the registry RPC service registration alive.
     /// Dropping un-installs the service.
     pub _serve: net::adapter::net::mesh_rpc::ServeHandle,
+    /// Held to keep `fold.query` (v1) and `fold.query.v2` served.
+    /// Dropping un-serves them.
+    pub _fold_query: (
+        net::adapter::net::mesh_rpc::ServeHandle,
+        net::adapter::net::mesh_rpc::ServeHandle,
+    ),
     /// Listen address the mesh bound to (post-`MeshNode::new`
     /// resolution — ephemeral `:0` ports surface as the
     /// concrete bound port here).
@@ -611,8 +617,18 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         limits,
         scope,
     );
+    // Queries see what the summary channels would deliver, and
+    // operators see everything (D0).
+    let query_access = FoldQueryAccess {
+        visibility: scope.summary_visibility,
+        operators: admin_policy.clone(),
+    };
     let serve = registry
         .install_registry_service_with_handlers(&mesh, spawner, scaler, admin_policy)
+        .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
+    // `fold.query` (v1, frozen shape) and `fold.query.v2`, both
+    // answered from every group in the registry.
+    let fold_query = install_fold_query_services(&mesh, registry.clone(), query_access)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
 
     let bound_addr = mesh.local_addr();
@@ -673,6 +689,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         mesh,
         registry,
         _serve: serve,
+        _fold_query: fold_query,
         bound_addr,
         public_key,
         subnet_policy_fingerprint,
