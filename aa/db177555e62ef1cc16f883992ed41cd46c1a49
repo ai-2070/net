@@ -1,0 +1,31 @@
+docs/internal/plans/AGGREGATOR_MULTI_HOST_PLAN.md
+  s_a45750ef6fc5fc::t_6ba6f0865386ce 859-877
+  s_a45750ef6fc5fc::t_5d7d79c8552317 423,450,464
+  s_a45750ef6fc5fc::t_3be545c8004f33 416-422,424-449,451-461,463,465-519
+  s_a45750ef6fc5fc::t_4410ffaba562df 5
+  s_a45750ef6fc5fc::t_59c68c9e303778 526
+  s_a45750ef6fc5fc::t_9a80e5389bbcaa 944-945
+  s_a45750ef6fc5fc::t_cf5397156888b2 29-30
+  s_a45750ef6fc5fc::t_85ce608b242e91 365-384
+  s_a45750ef6fc5fc::t_b3931845c464b3 791-796,798-805
+  s_a45750ef6fc5fc::t_c478955a1144a2 13-14,16-22
+  s_a45750ef6fc5fc::t_a4a04032d6fda4 397-400
+  s_a45750ef6fc5fc::t_4d944c3a62fef2 827-829,832-837
+  s_a45750ef6fc5fc::t_d62a5d4f547b95 1040,1055-1089
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aadb177555e62ef1cc16f883992ed41cd46c1a49",
+  "prompts": {},
+  "sessions": {
+    "s_a45750ef6fc5fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23eac748-8ed1-44a6-ada9-14748f2b62e8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
