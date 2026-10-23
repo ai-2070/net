@@ -27,10 +27,32 @@
 //!
 //! [[group]]
 //! name = "primary"
-//! source_subnet = "3.7"
 //! fold_kinds = [0x0001]
 //! replica_count = 3
 //! summary_interval_ms = 1000
+//! ```
+//!
+//! A daemon serves **one source subnet**, `global` unless `subnet` says
+//! otherwise. Channel visibility is enforced against the node's own
+//! subnet, so every group and template on a daemon summarizes that
+//! subnet, and at most one group runs per fold kind. A non-global subnet
+//! needs `[[subnet_rule]]` blocks, which classify peers into subnets from
+//! their signed capability tags. Rules apply in declaration order, and a
+//! later rule wins on a shared level:
+//!
+//! ```toml
+//! subnet = "3.7"
+//! summary_visibility = "parent-visible"   # or "subnet-local", "global"
+//!
+//! [[subnet_rule]]
+//! tag_prefix = "region:"
+//! level = 0
+//! values = { "eu" = 3 }
+//!
+//! [[subnet_rule]]
+//! tag_prefix = "rack:"
+//! level = 1
+//! values = { "r7" = 7 }
 //! ```
 //!
 //! # Lifecycle
@@ -43,6 +65,13 @@
 //! 4. Block on SIGINT (Ctrl-C). On signal: drain the registry
 //!    (stop every group, await teardown) then exit.
 
+mod scope;
+mod subnet_policy;
+
+pub use subnet_policy::SubnetRuleError;
+
+use net::adapter::net::channel::ChannelConfigRegistry;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,8 +80,9 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryAdminPolicy,
-    RegistryRpcError, SpawnFn,
+    install_fold_query_services, snapshot_group, summary_channel_config, AggregatorConfig,
+    AggregatorDaemon, AggregatorRegistry, FoldQueryAccess, RegistryAdminPolicy, RegistryRpcError,
+    SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -174,6 +204,31 @@ struct Config {
     /// deployment genuinely needs wider groups.
     #[serde(default = "default_max_replica_count")]
     max_replica_count: u8,
+    /// Subnet policy: `[[subnet_rule]]` blocks, applied in declaration
+    /// order (a later rule wins on a shared level). Empty, the default,
+    /// installs no policy, so the mesh records no peer subnets. See
+    /// `subnet_policy.rs`.
+    #[serde(default, rename = "subnet_rule")]
+    subnet_rules: Vec<subnet_policy::SubnetRuleConfig>,
+    /// The one source subnet this daemon serves, in dotted form
+    /// (`"3.7"`) or `"global"`. Absent means `global`.
+    ///
+    /// Boot refuses rules that can never classify a peer into the part of
+    /// this subnet `summary_visibility` admits, and rules on a global
+    /// daemon unless `summary_visibility = "global"` (see `scope.rs`).
+    ///
+    /// It becomes the daemon node's own subnet, and channel visibility
+    /// is enforced against a node's own subnet. So one daemon can give
+    /// its summaries only one publication boundary, and every group and
+    /// template on it must summarize this subnet. Run other subnets on
+    /// other daemons. A non-global subnet needs `[[subnet_rule]]`s,
+    /// without which no peer can be classified into it.
+    #[serde(default)]
+    subnet: Option<String>,
+    /// Visibility of this daemon's summary channels: `"subnet-local"`,
+    /// `"parent-visible"` (the default) or `"global"`.
+    #[serde(default)]
+    summary_visibility: Option<String>,
 }
 
 /// Default ceiling on hosted groups. Generous for the intended
@@ -202,8 +257,10 @@ struct GroupConfig {
     /// Operator-chosen name (the registry key). Must be unique
     /// within the daemon process.
     name: String,
-    /// Dotted-notation `SubnetId` (e.g. `"3.7"`) — the subnet
-    /// this aggregator summarizes detail from.
+    /// Dotted-notation `SubnetId` (e.g. `"3.7"`) — the subnet this
+    /// aggregator summarizes detail from. Optional: absent means the
+    /// daemon's `subnet`, and if set it must equal it.
+    #[serde(default)]
     source_subnet: String,
     /// `FoldKind::KIND_ID`s to aggregate. Accepts decimal or
     /// `0x`-prefixed hex via [`u16`] deserialization.
@@ -227,7 +284,9 @@ struct TemplateConfig {
     /// resolves against this. Must be unique within the daemon's
     /// template registry.
     name: String,
-    /// Dotted-notation `SubnetId` for the spawned group.
+    /// Dotted-notation `SubnetId` for the spawned group. Optional:
+    /// absent means the daemon's `subnet`, and if set it must equal it.
+    #[serde(default)]
     source_subnet: String,
     /// `FoldKind::KIND_ID`s the template aggregates.
     fold_kinds: Vec<u16>,
@@ -316,6 +375,76 @@ pub enum DaemonError {
     },
     #[error("subnet identifier {raw:?}: {error}")]
     SubnetInvalid { raw: String, error: String },
+    /// A `[[subnet_rule]]` block was refused.
+    #[error("{0}")]
+    SubnetRule(SubnetRuleError),
+    /// The daemon serves a non-global subnet but has no rules to
+    /// classify peers into it.
+    #[error(
+        "subnet = {subnet:?} is not global, so the daemon needs [[subnet_rule]] \
+         blocks to classify peers into it; without them every peer is GLOBAL \
+         and nothing is in this subnet. Add rules, or set subnet = \"global\""
+    )]
+    MissingSubnetPolicy { subnet: String },
+    /// A global daemon has `[[subnet_rule]]`s but non-global summaries. A
+    /// global publisher's subnet-local or parent-visible summaries reach
+    /// only peers with no subnet, so every peer the rules classify would
+    /// get none.
+    #[error(
+        "this daemon is global (no `subnet`) and its [[subnet_rule]] blocks classify \
+         peers into subnets, but summary_visibility = \"{visibility}\" delivers a \
+         global daemon's summaries only to peers with no subnet: every peer the rules \
+         classify would receive no summaries and be refused by fold.query. Set \
+         summary_visibility = \"global\", set `subnet` to the subnet this daemon \
+         serves, or remove the rules"
+    )]
+    GlobalDaemonWithSubnetRules { visibility: &'static str },
+    /// No `[[subnet_rule]]` can classify a peer into the part of the
+    /// daemon's subnet its summary visibility admits, so summaries and
+    /// queries would reach no classified peer.
+    #[error(
+        "subnet = {subnet:?}, but no [[subnet_rule]] writes {value} at level {level}, \
+         so no peer can be classified into this subnet's part that \
+         summary_visibility = \"{visibility}\" admits: summaries would reach no \
+         classified peer and fold.query would refuse them all. Add a rule that maps a \
+         tag to {value} at level {level}, or set summary_visibility = \"global\""
+    )]
+    SubnetUnreachable {
+        subnet: String,
+        level: u8,
+        value: u8,
+        visibility: &'static str,
+    },
+    /// A group or template names a source subnet other than the
+    /// daemon's.
+    #[error(
+        "{what} {name:?} has source_subnet {source_subnet:?}, but this daemon \
+         serves subnet {daemon_subnet:?}. One daemon serves one source subnet: \
+         set `subnet = {source_subnet:?}` at the top of the config, or run this \
+         {what} on a daemon for that subnet"
+    )]
+    SourceSubnetMismatch {
+        what: &'static str,
+        name: String,
+        source_subnet: String,
+        daemon_subnet: String,
+    },
+    /// Two `[[group]]`s aggregate the same fold kind. On one subnet
+    /// they would read the same fold and publish the same stream.
+    #[error(
+        "groups {first:?} and {second:?} both aggregate fold kind {kind:#06x}; \
+         a daemon runs at most one group per fold kind"
+    )]
+    FoldKindOccupied {
+        kind: u16,
+        first: String,
+        second: String,
+    },
+    #[error(
+        "summary_visibility {raw:?}: expected \"subnet-local\", \"parent-visible\" \
+         or \"global\"{hint}"
+    )]
+    SummaryVisibilityInvalid { raw: String, hint: &'static str },
     #[error("group seed for {name:?} must be 64 hex chars: {error}")]
     GroupSeedInvalid { name: String, error: String },
     #[error("mesh: {0}")]
@@ -406,6 +535,12 @@ pub struct BootedDaemon {
     /// Held to keep the registry RPC service registration alive.
     /// Dropping un-installs the service.
     pub _serve: net::adapter::net::mesh_rpc::ServeHandle,
+    /// Held to keep `fold.query` (v1) and `fold.query.v2` served.
+    /// Dropping un-serves them.
+    pub _fold_query: (
+        net::adapter::net::mesh_rpc::ServeHandle,
+        net::adapter::net::mesh_rpc::ServeHandle,
+    ),
     /// Listen address the mesh bound to (post-`MeshNode::new`
     /// resolution — ephemeral `:0` ports surface as the
     /// concrete bound port here).
@@ -413,6 +548,11 @@ pub struct BootedDaemon {
     /// Public key the listening node accepts handshakes against.
     /// Test fixtures pass this to `MeshNode::connect`.
     pub public_key: [u8; 32],
+    /// Fingerprint of the configured `[[subnet_rule]]` list, in
+    /// declaration order, or `None` when no rules are configured (and so
+    /// no policy is installed). Two daemons with equal fingerprints
+    /// classify every tag set the same way.
+    pub subnet_policy_fingerprint: Option<[u8; 32]>,
 }
 
 /// Boot the registry + groups without entering the
@@ -443,7 +583,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     })?
     .map_err(DaemonError::ConfigPermissions)?;
 
-    let config: Config = toml::from_str(&raw).map_err(|_| DaemonError::ConfigParse {
+    let mut config: Config = toml::from_str(&raw).map_err(|_| DaemonError::ConfigParse {
         path: cli.config.clone(),
     })?;
 
@@ -456,19 +596,38 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         })?;
     let psk = decode_psk(&config.psk_hex)?;
     let admin_policy = resolve_admin_policy(&config)?;
+    let subnet_policy =
+        subnet_policy::build_policy(&config.subnet_rules).map_err(DaemonError::SubnetRule)?;
+    let subnet_policy_fingerprint = subnet_policy
+        .as_ref()
+        .map(|_| subnet_policy::policy_fingerprint(&config.subnet_rules));
+    // One source subnet per daemon (D0). Also normalizes every group's
+    // and template's `source_subnet` to it.
+    let scope = scope::resolve(&mut config)?;
 
     // Boot the MeshNode, install the registry, expose the RPC
-    // service. Order matters: `set_aggregator_registry`
-    // requires `&mut MeshNode`, so install before wrapping in
-    // Arc.
-    let mut mesh_node = MeshNode::new(
-        EntityKeypair::generate(),
-        MeshNodeConfig::new(listen_addr, psk),
-    )
-    .await
-    .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
+    // service. Order matters: `set_aggregator_registry` and
+    // `set_channel_configs` require `&mut MeshNode`, so install
+    // before wrapping in Arc. The node's own subnet is the daemon's
+    // source subnet, because channel visibility is enforced against
+    // it. The subnet policy rides the node config: the mesh reads it
+    // when it classifies a direct peer's announcement.
+    let mut mesh_config = MeshNodeConfig::new(listen_addr, psk).with_subnet(scope.subnet);
+    if let Some(policy) = subnet_policy {
+        mesh_config = mesh_config.with_subnet_policy(Arc::new(policy));
+    }
+    let mut mesh_node = MeshNode::new(EntityKeypair::generate(), mesh_config)
+        .await
+        .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
     let registry = Arc::new(AggregatorRegistry::new());
     mesh_node.set_aggregator_registry(registry.clone());
+    // The channel registry is the ACL summary visibility is enforced
+    // by. Installed before any service is served: `serve_rpc` adds its
+    // own RPC channels to it, and with a registry present a Subscribe
+    // to a channel it does not list is refused.
+    let channels = Arc::new(ChannelConfigRegistry::new());
+    register_summary_channels(&config, scope, &channels)?;
+    mesh_node.set_channel_configs(channels);
     let mesh = Arc::new(mesh_node);
 
     // Build the SpawnFn + ScaleFn from the operator's template
@@ -484,15 +643,27 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         registry.clone(),
         mesh.clone(),
         limits,
+        scope,
     );
     let scaler = make_scaler(
         config.templates.clone(),
         registry.clone(),
         mesh.clone(),
         limits,
+        scope,
     );
+    // Queries see what the summary channels would deliver, and
+    // operators see everything (D0).
+    let query_access = FoldQueryAccess {
+        visibility: scope.summary_visibility,
+        operators: admin_policy.clone(),
+    };
     let serve = registry
         .install_registry_service_with_handlers(&mesh, spawner, scaler, admin_policy)
+        .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
+    // `fold.query` (v1, frozen shape) and `fold.query.v2`, both
+    // answered from every group in the registry.
+    let fold_query = install_fold_query_services(&mesh, registry.clone(), query_access)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
 
     let bound_addr = mesh.local_addr();
@@ -503,6 +674,13 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         node_id = mesh.node_id(),
         groups = config.groups.len(),
         templates = config.templates.len(),
+        subnet = %scope.subnet,
+        summary_visibility = ?scope.summary_visibility,
+        subnet_rules = config.subnet_rules.len(),
+        subnet_policy_fingerprint = subnet_policy_fingerprint
+            .as_ref()
+            .map(subnet_policy::fingerprint_hex)
+            .unwrap_or_else(|| "none".to_string()),
         "aggregator daemon booted",
     );
 
@@ -527,7 +705,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         let registry = registry.clone();
         let mesh = mesh.clone();
         async move {
-            let res = spawn_group(&registry, &mesh, group_cfg).await;
+            let res = spawn_group(&registry, &mesh, group_cfg, scope).await;
             (group_cfg.name.clone(), res)
         }
     });
@@ -546,8 +724,10 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         mesh,
         registry,
         _serve: serve,
+        _fold_query: fold_query,
         bound_addr,
         public_key,
+        subnet_policy_fingerprint,
     })
 }
 
@@ -565,13 +745,15 @@ struct AggregatorSpec {
     replica_count: u8,
     summary_interval_ms: u64,
     group_seed: [u8; 32],
+    summary_visibility: net::adapter::net::Visibility,
 }
 
 impl AggregatorSpec {
     /// Resolve a static `[[group]]` config into a spec, doing
-    /// the field-wise validation (subnet parse, replica_count,
-    /// interval floor, fold_kinds).
-    fn from_group(group_cfg: &GroupConfig) -> Result<Self, DaemonError> {
+    /// the field-wise validation (replica_count, interval floor,
+    /// fold_kinds). The source subnet is the daemon's: `scope::resolve`
+    /// already refused any group that names another.
+    fn from_group(group_cfg: &GroupConfig, scope: scope::Scope) -> Result<Self, DaemonError> {
         if group_cfg.replica_count == 0 {
             return Err(DaemonError::AggregatorConfig {
                 name: group_cfg.name.clone(),
@@ -584,11 +766,6 @@ impl AggregatorSpec {
                 error: "summary_interval_ms must be >= 10".into(),
             });
         }
-        let source_subnet =
-            parse_subnet(&group_cfg.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
-                raw: group_cfg.source_subnet.clone(),
-                error: e,
-            })?;
         for kind in &group_cfg.fold_kinds {
             check_known_fold_kind(*kind, &group_cfg.name)?;
         }
@@ -601,42 +778,46 @@ impl AggregatorSpec {
         };
         Ok(Self {
             name: group_cfg.name.clone(),
-            source_subnet,
+            source_subnet: scope.subnet,
             fold_kinds: group_cfg.fold_kinds.clone(),
             replica_count: group_cfg.replica_count,
             summary_interval_ms: group_cfg.summary_interval_ms,
             group_seed,
+            summary_visibility: scope.summary_visibility,
         })
     }
 
     /// Build a spec from a `Spawn` RPC request + the matching
     /// template. Returns RegistryRpcError shapes since the
-    /// caller is the spawner closure surfaced over the wire.
+    /// caller is the spawner closure surfaced over the wire. The
+    /// source subnet is the daemon's (templates naming another were
+    /// refused at boot).
     fn from_template(
         template: &TemplateConfig,
         group_name: String,
         replica_count: u8,
+        scope: scope::Scope,
     ) -> Result<Self, RegistryRpcError> {
         if replica_count == 0 {
             return Err(RegistryRpcError::SpawnRejected(
                 "replica_count must be > 0".into(),
             ));
         }
-        let source_subnet = parse_subnet(&template.source_subnet)
-            .map_err(|e| RegistryRpcError::SpawnRejected(format!("source_subnet: {e}")))?;
         Ok(Self {
             group_seed: derive_seed_from_name(&group_name),
             name: group_name,
-            source_subnet,
+            source_subnet: scope.subnet,
             fold_kinds: template.fold_kinds.clone(),
             replica_count,
             summary_interval_ms: template.summary_interval_ms,
+            summary_visibility: scope.summary_visibility,
         })
     }
 
     /// Build the `AggregatorConfig` used per-replica.
     fn aggregator_config(&self) -> AggregatorConfig {
         let mut cfg = AggregatorConfig::new(self.source_subnet)
+            .with_visibility(self.summary_visibility)
             .with_interval(Duration::from_millis(self.summary_interval_ms));
         for kind in &self.fold_kinds {
             cfg = cfg.with_fold_kind(*kind);
@@ -720,8 +901,9 @@ async fn spawn_group(
     registry: &Arc<AggregatorRegistry>,
     mesh: &Arc<MeshNode>,
     group_cfg: &GroupConfig,
+    scope: scope::Scope,
 ) -> Result<(), DaemonError> {
-    let spec = AggregatorSpec::from_group(group_cfg)?;
+    let spec = AggregatorSpec::from_group(group_cfg, scope)?;
     spawn_and_register(&spec, registry, mesh)
         .await
         .map_err(|e| match e {
@@ -731,6 +913,48 @@ async fn spawn_group(
             },
             SpawnAndRegisterError::RegisterFailed(s) => DaemonError::Registry(s),
         })?;
+    Ok(())
+}
+
+/// Register every summary channel this daemon can publish on in
+/// `channels`, with the daemon's summary visibility (D0).
+///
+/// That is one channel per fold kind used by any `[[group]]` or
+/// `[[template]]`; templates are included so groups spawned later over
+/// RPC are covered. The name and entry come from core's
+/// `summary_channel_config`, the same function a running daemon
+/// registers through. Unknown fold kinds are skipped here; group and
+/// template validation reports them by name.
+fn register_summary_channels(
+    config: &Config,
+    scope: scope::Scope,
+    channels: &ChannelConfigRegistry,
+) -> Result<(), DaemonError> {
+    let mut kinds: Vec<u16> = config
+        .groups
+        .iter()
+        .flat_map(|g| g.fold_kinds.iter().copied())
+        .chain(
+            config
+                .templates
+                .iter()
+                .flat_map(|t| t.fold_kinds.iter().copied()),
+        )
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    for kind in kinds {
+        if check_known_fold_kind(kind, "").is_err() {
+            continue;
+        }
+        let cfg = summary_channel_config(kind, scope.summary_visibility).map_err(|e| {
+            DaemonError::AggregatorConfig {
+                name: format!("summary channel for fold kind {kind:#06x}"),
+                error: e.to_string(),
+            }
+        })?;
+        channels.insert(cfg);
+    }
     Ok(())
 }
 
@@ -854,20 +1078,38 @@ fn make_spawner(
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
     limits: SpawnLimits,
+    scope: scope::Scope,
 ) -> SpawnFn {
     let by_name = build_template_index(templates);
+    // Spawns run one at a time, so the group-count limit and the
+    // one-group-per-fold-kind check below see every group a concurrent
+    // spawn could add. Without it, two spawns of the same kind could
+    // both pass the check.
+    let spawn_lock = Arc::new(tokio::sync::Mutex::new(()));
     Box::new(move |req| {
         let registry = registry.clone();
         let mesh = mesh.clone();
         let by_name = by_name.clone();
+        let spawn_lock = spawn_lock.clone();
         Box::pin(async move {
+            let _serialized = spawn_lock.lock().await;
             check_spawn_limits(limits, req.replica_count, Some(registry.entries().len()))?;
             let template = resolve_template(&by_name, &req.template_name)?;
             let spec = AggregatorSpec::from_template(
                 &template,
                 req.group_name.clone(),
                 req.replica_count,
+                scope,
             )?;
+            // One group per fold kind (D0). Reported as a rejection
+            // with a diagnostic, an existing variant, because the v1
+            // registry wire shape is frozen (D9).
+            if let Some((kind, owner)) = scope::occupied_kind(&registry, &spec.fold_kinds).await {
+                return Err(RegistryRpcError::SpawnRejected(format!(
+                    "fold kind {kind:#06x} is already aggregated by group {owner:?}; \
+                     a daemon runs at most one group per fold kind"
+                )));
+            }
             let entry = spawn_and_register(&spec, &registry, &mesh)
                 .await
                 .map_err(|e| match e {
@@ -895,6 +1137,7 @@ fn make_scaler(
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
     limits: SpawnLimits,
+    scope: scope::Scope,
 ) -> net::adapter::net::behavior::aggregator::ScaleFn {
     let by_name = build_template_index(templates);
     Box::new(move |req| {
@@ -919,6 +1162,7 @@ fn make_scaler(
                 &template,
                 req.group_name.clone(),
                 req.target_replica_count,
+                scope,
             )
             .map_err(|e| match e {
                 RegistryRpcError::SpawnRejected(d) => RegistryRpcError::ScaleRejected(d),

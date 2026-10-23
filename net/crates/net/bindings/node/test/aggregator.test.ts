@@ -100,6 +100,33 @@ describe('classifyAggregatorError — fold-query-specific kinds', () => {
     expect(e.kind).toBe('unknown-kind')
     expect(e.serverDetail).toBe('0x0042')
   })
+
+  // fold.query.v2 (AGGREGATOR_MULTI_HOST_PLAN.md Q4).
+  it('routes server-too-old → FoldQueryClientError with or without a hint', () => {
+    for (const surface of [undefined, 'fold-query', 'registry'] as const) {
+      const typed = classifyAggregatorError(
+        fakeErr('agg:server-too-old: the target does not serve fold.query.v2'),
+        surface,
+      )
+      expect(typed, String(surface)).toBeInstanceOf(FoldQueryClientError)
+      expect((typed as FoldQueryClientError).kind).toBe('server-too-old')
+    }
+  })
+
+  it('routes the shared v2 kinds by the fold-query hint, and to the registry without it', () => {
+    for (const kind of ['unknown-group', 'unauthorized'] as const) {
+      const v2 = classifyAggregatorError(fakeErr(`agg:${kind}: x`), 'fold-query')
+      expect(v2, kind).toBeInstanceOf(FoldQueryClientError)
+      expect((v2 as FoldQueryClientError).kind).toBe(kind)
+      // Unchanged for registry callers and for callers passing no hint.
+      expect(classifyAggregatorError(fakeErr(`agg:${kind}: x`), 'registry')).toBeInstanceOf(
+        RegistryClientError,
+      )
+      expect(classifyAggregatorError(fakeErr(`agg:${kind}: x`))).toBeInstanceOf(
+        RegistryClientError,
+      )
+    }
+  })
 })
 
 describe('classifyAggregatorError — shared kinds (transport / codec / invalid-args)', () => {

@@ -75,4 +75,7 @@ futures = "0.3"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Decodes the summaries a subscriber receives (tests/publication_scope.rs);
+# the same codec the daemon publishes them with.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

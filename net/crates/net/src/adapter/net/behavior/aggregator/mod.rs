@@ -14,19 +14,30 @@ pub mod config;
 pub mod daemon;
 pub mod query_client;
 pub mod query_service;
+pub mod query_v2;
 pub mod registry;
 pub mod registry_client;
 pub mod registry_service;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
-pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
+pub use daemon::{
+    summary_channel_config, summary_channel_name, AggregatorDaemon, AggregatorError,
+    AggregatorPublishError, SUMMARIZE_NOW_MIN_INTERVAL,
+};
 pub use query_client::{
-    FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
+    FoldQueryClient, FoldQueryClientError, FoldQueryErrorKind, DEFAULT_QUERY_CACHE_TTL,
+    DEFAULT_QUERY_DEADLINE,
 };
 pub use query_service::{
     FoldQueryError, FoldQueryHandler, FoldQueryOp, FoldQueryRequest, FoldQueryResponse,
     FOLD_QUERY_SERVICE,
+};
+pub use query_v2::{
+    decode_strict, install_fold_query_services, FoldQueryAccess, FoldQueryRegistryV1Handler,
+    FoldQueryV2ClientError, FoldQueryV2Error, FoldQueryV2Handler, FoldQueryV2Request,
+    FoldQueryV2Response, StrictDecodeError, SummaryRecord, FOLD_QUERY_V1_NOT_AUTHORIZED,
+    FOLD_QUERY_V2_SERVICE,
 };
 pub use registry::{
     AggregatorGroupEntry, AggregatorRegistry, AggregatorRegistryError, EntrySnapshot,

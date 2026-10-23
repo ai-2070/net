@@ -49,19 +49,112 @@ pub enum FoldQueryClientError {
     /// [`super::FoldQueryResponse::Error`].
     #[error("server: {0:?}")]
     Server(FoldQueryError),
+    /// The target refused the caller: it is outside the daemon's summary
+    /// visibility and not an operator. A daemon-level v1 handler sends
+    /// this as the application status
+    /// [`FOLD_QUERY_V1_NOT_AUTHORIZED`](super::FOLD_QUERY_V1_NOT_AUTHORIZED),
+    /// because v1's frozen body has no variant for it.
+    #[error("not authorized to query this daemon's summaries")]
+    NotAuthorized,
 }
 
 impl From<RpcError> for FoldQueryClientError {
     fn from(e: RpcError) -> Self {
-        Self::Transport(e)
+        match e {
+            RpcError::ServerError { status, .. }
+                if status == super::query_v2::FOLD_QUERY_V1_NOT_AUTHORIZED =>
+            {
+                Self::NotAuthorized
+            }
+            other => Self::Transport(other),
+        }
     }
 }
 
 impl From<TypedCallError> for FoldQueryClientError {
     fn from(e: TypedCallError) -> Self {
         match e {
-            TypedCallError::Transport(t) => Self::Transport(t),
+            TypedCallError::Transport(t) => t.into(),
             TypedCallError::Codec(c) => Self::Codec(c),
+        }
+    }
+}
+
+/// The kind of a fold-query failure, as every binding names it.
+///
+/// [`FoldQueryClientError::error_kind`] and
+/// [`FoldQueryV2ClientError::error_kind`](super::FoldQueryV2ClientError::error_kind)
+/// are the one mapping from the client errors to these. The C ABI maps
+/// each to its `NET_REGISTRY_ERR_*` code, and Node, Python and Go expose
+/// [`Self::as_str`] as the error's `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FoldQueryErrorKind {
+    /// No route, timeout, or another non-Ok status.
+    Transport,
+    /// A request or response did not encode or decode, on either side.
+    Codec,
+    /// No queried group aggregates the requested fold kind.
+    UnknownKind,
+    /// `fold.query.v2` only: the named group does not exist.
+    UnknownGroup,
+    /// The caller is outside the daemon's summary visibility and not an
+    /// operator.
+    Unauthorized,
+    /// `fold.query.v2` only: the target answered `NotFound` for the v2
+    /// service.
+    ServerTooOld,
+}
+
+impl FoldQueryErrorKind {
+    /// The kebab-case name every binding uses for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Codec => "codec",
+            Self::UnknownKind => "unknown-kind",
+            Self::UnknownGroup => "unknown-group",
+            Self::Unauthorized => "unauthorized",
+            Self::ServerTooOld => "server-too-old",
+        }
+    }
+}
+
+/// Detail text for a refused caller, shared by v1 and v2.
+pub(crate) const NOT_AUTHORIZED_DETAIL: &str =
+    "caller is outside the daemon's summary visibility and not an operator";
+
+/// Detail text for a handler-side decode failure, shared by v1 and v2.
+pub(crate) fn server_decode_detail(message: &str) -> String {
+    format!("server-decode: {message}")
+}
+
+/// Detail text for an unknown fold kind, shared by v1 and v2.
+pub(crate) fn unknown_kind_detail(kind: u16) -> String {
+    format!("0x{kind:04x}")
+}
+
+impl FoldQueryClientError {
+    /// The binding-facing kind of this error.
+    pub fn error_kind(&self) -> FoldQueryErrorKind {
+        match self {
+            Self::Transport(_) => FoldQueryErrorKind::Transport,
+            Self::Codec(_) | Self::Server(FoldQueryError::DecodeFailed(_)) => {
+                FoldQueryErrorKind::Codec
+            }
+            Self::Server(FoldQueryError::UnknownKind { .. }) => FoldQueryErrorKind::UnknownKind,
+            Self::NotAuthorized => FoldQueryErrorKind::Unauthorized,
+        }
+    }
+
+    /// The binding-facing detail text of this error. Every binding
+    /// reports this string, so they agree.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Transport(e) => e.to_string(),
+            Self::Codec(c) => c.clone(),
+            Self::Server(FoldQueryError::DecodeFailed(s)) => server_decode_detail(s),
+            Self::Server(FoldQueryError::UnknownKind { kind }) => unknown_kind_detail(*kind),
+            Self::NotAuthorized => NOT_AUTHORIZED_DETAIL.to_string(),
         }
     }
 }
@@ -89,6 +182,9 @@ struct CacheEntry {
 pub struct FoldQueryClient {
     mesh: Arc<MeshNode>,
     cache: Arc<RwLock<HashMap<CacheKey, CacheEntry>>>,
+    /// `fold.query.v2` results, keyed with the group selector
+    /// (`super::query_v2`).
+    v2_cache: super::query_v2::V2Cache,
     ttl: Duration,
     deadline: Duration,
 }
@@ -101,6 +197,7 @@ impl FoldQueryClient {
         Self {
             mesh,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            v2_cache: Arc::new(RwLock::new(HashMap::new())),
             ttl: DEFAULT_QUERY_CACHE_TTL,
             deadline: DEFAULT_QUERY_DEADLINE,
         }
@@ -233,6 +330,7 @@ impl FoldQueryClient {
     /// query re-resolves against the new aggregator replica.
     pub fn invalidate_cache(&self) {
         self.cache.write().clear();
+        self.v2_cache.write().clear();
     }
 
     /// Drop just the entries matching `target_node_id`. Used when
@@ -241,6 +339,27 @@ impl FoldQueryClient {
     pub fn invalidate_target(&self, target_node_id: u64) {
         let mut cache = self.cache.write();
         cache.retain(|k, _| k.target != target_node_id);
+        drop(cache);
+        self.v2_cache
+            .write()
+            .retain(|k, _| !k.is_for_target(target_node_id));
+    }
+
+    // Crate-private accessors for the v2 methods in `query_v2`.
+    pub(crate) fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    pub(crate) fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    pub(crate) fn mesh(&self) -> &Arc<MeshNode> {
+        &self.mesh
+    }
+
+    pub(crate) fn v2_cache(&self) -> &super::query_v2::V2Cache {
+        &self.v2_cache
     }
 
     async fn issue_call(

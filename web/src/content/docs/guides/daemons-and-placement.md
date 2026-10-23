@@ -221,24 +221,45 @@ let registry = Arc::new(AggregatorRegistry::new());
 registry.register("fleet-west", group)?;
 ```
 
-Each replica publishes summaries independently — no election machinery, no leader. Subscribers see N summary announcements per cycle and the fold's merge picks the latest by generation. Operators can scale the group down to a single replica through the registry when availability isn't the constraint. State across re-placements rebuilds from incoming channel announcements + TTL refreshes within one TTL cycle.
+Each replica publishes summaries independently — no election machinery, no leader. A replica republishes only when its summary changes. Each replica's `generation` counts its own ticks, so generations are not comparable across replicas or across a replica's restart; don't use them to choose between publishers. Operators can scale the group down to a single replica through the registry when availability isn't the constraint. State across re-placements rebuilds from incoming channel announcements + TTL refreshes within one TTL cycle.
 
 For operators who don't want to embed the substrate in their own process, the `net-aggregator-daemon` binary boots from a TOML config, registers templates the operator can instantiate by name, defaults to auto-respawn-on-failure, and prints a single JSON bootstrap line on stdout (`{"node_id": …, "bound_addr": …, "public_key_hex": …}`) so tools that orchestrate it can find its address and pubkey without parsing logs.
 
 ```toml
 # net-aggregator-daemon.toml
-[[template]]
-name = "fleet-summary"
-source_subnet = [3, 7]
-summary_visibility = "parent-visible"
-fold_kinds = ["capability", "reservation"]
-summary_interval = "30s"
+listen = "0.0.0.0:7400"
+psk_hex = "<64 hex chars: the mesh pre-shared key>"
+
+# One daemon serves one source subnet. Rules classify peers into
+# subnets from their signed capability tags (declaration order;
+# a later rule wins on a shared level).
+subnet = "3.7"
+summary_visibility = "parent-visible"   # or "subnet-local", "global"
+operators = ["0x1a2b3c4d5e6f7788"]      # who may drive aggregator.registry
+
+[[subnet_rule]]
+tag_prefix = "region:"
+level = 0
+values = { "eu" = 3 }
+
+[[subnet_rule]]
+tag_prefix = "fleet:"
+level = 1
+values = { "west" = 7 }
 
 [[group]]
-template = "fleet-summary"
 name = "fleet-west"
-replicas = 3
+fold_kinds = [0x0001]          # capability
+replica_count = 1
+summary_interval_ms = 30000
+
+[[template]]                   # instantiated by name over aggregator.registry
+name = "reservations"
+fold_kinds = [0x0003]          # reservation
+summary_interval_ms = 30000
 ```
+
+A daemon serves **one source subnet** (`global` when `subnet` is omitted). Channel visibility is enforced against the publishing node's own subnet, so a daemon's summaries have one publication boundary. Every group and template on it summarizes that subnet, and at most one group runs per fold kind. A non-global `subnet` needs `[[subnet_rule]]` blocks, without which no peer can be classified into it. The rules must also be able to classify a peer into the part of that subnet `summary_visibility` admits: all of it for `subnet-local`, at least its top level for `parent-visible`. On a global daemon, rules need `summary_visibility = "global"`, because a global daemon's narrower summaries reach only peers with no subnet. The daemon refuses at boot a config that breaks any of these rules, including a group that names a different `source_subnet`, and the error names the fix. To aggregate several subnets, run one daemon per subnet.
 
 The `aggregator.registry` RPC service lets any node enumerate, spawn, scale, and unregister aggregator groups on any other node. The CLI exposes `net-mesh aggregator spawn / scale / ls / query --remote --node-addr <ip:port> --node-pubkey <hex>` for operating against a live daemon over the wire — normally a managed node: `up` runs one long-lived node per profile (foreground), `down` drains and stops exactly that node, and `node status` verifies it through its lifetime lock and authenticated control endpoint.
 

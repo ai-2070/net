@@ -3135,6 +3135,7 @@ dependencies = [
  "hex",
  "net-mesh",
  "net-mesh-sdk",
+ "postcard",
  "predicates",
  "serde",
  "serde_json",

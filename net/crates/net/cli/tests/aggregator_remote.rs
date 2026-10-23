@@ -141,15 +141,13 @@ async fn ls_remote_lists_configured_groups() {
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 2
             summary_interval_ms = 50
 
             [[group]]
             name = "beta"
-            source_subnet = "3.8"
-            fold_kinds = [1]
+            fold_kinds = [3]
             replica_count = 1
             summary_interval_ms = 50
         "#
@@ -241,7 +239,6 @@ async fn spawn_against_template_adds_a_group() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
         "#
@@ -294,13 +291,11 @@ async fn scale_resizes_existing_group() {
 
             [[template]]
             name = "primary"
-            source_subnet = "3.7"
             fold_kinds = [1]
             summary_interval_ms = 50
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 2
             summary_interval_ms = 50
@@ -331,12 +326,11 @@ async fn scale_resizes_existing_group() {
     drain_registry(&booted.registry).await;
 }
 
+// Was `#[ignore]`d with a note blaming replica node-id discovery. The real
+// cause was that the daemon binary served no `fold.query` at all; it serves
+// the daemon-level v1 and v2 services now (AGGREGATOR_MULTI_HOST_PLAN.md Q3),
+// and the target is simply the daemon's node id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs replica node_id discovery — the fold.query service \
-            handler is keyed on each replica's keypair-derived node_id, \
-            not on the daemon's main mesh node_id. Either expose a \
-            `booted.registry.first_replica_node_id(group)` helper or \
-            spawn a single-node registry mode."]
 async fn query_returns_summary_for_configured_group() {
     let toml = format!(
         r#"
@@ -351,7 +345,6 @@ async fn query_returns_summary_for_configured_group() {
 
             [[group]]
             name = "alpha"
-            source_subnet = "3.7"
             fold_kinds = [1]
             replica_count = 1
             summary_interval_ms = 50

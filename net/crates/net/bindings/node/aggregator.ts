@@ -28,6 +28,17 @@ export type FoldQueryErrorKind =
   | 'codec'
   | 'unknown-kind'
   | 'invalid-args'
+  // A daemon refused the caller (outside its summary visibility and not
+  // an operator), from v1 and v2. Shares its string with the registry
+  // surface; pass the 'fold-query' hint to route it here.
+  | 'unauthorized'
+  // fold.query.v2 (queryGroupLatest / queryGroupSummarizeNow).
+  // `unknown-group` is shared with the registry the same way.
+  | 'unknown-group'
+  // The target answered NotFound for v2. Only a registry-less node does,
+  // typically a daemon from before v2, which serves no v1 either: not a
+  // cue to retry v1. A node with a registry that lacks v2 is `transport`.
+  | 'server-too-old'
 
 export class RegistryClientError extends Error {
   readonly kind: RegistryErrorKind
@@ -72,6 +83,9 @@ const FOLD_KINDS: ReadonlySet<string> = new Set([
   'codec',
   'unknown-kind',
   'invalid-args',
+  'unknown-group',
+  'unauthorized',
+  'server-too-old',
 ])
 
 /**
@@ -120,8 +134,17 @@ export function classifyAggregatorError(
   if (!parsed) return e
 
   // Surface-specific kinds take priority — they are unambiguous.
-  if (parsed.kind === 'unknown-kind') {
-    return new FoldQueryClientError('unknown-kind', parsed.detail)
+  if (parsed.kind === 'unknown-kind' || parsed.kind === 'server-too-old') {
+    return new FoldQueryClientError(parsed.kind, parsed.detail)
+  }
+  // fold.query.v2 raises these too; the strings are shared with the
+  // registry, so the caller's hint decides. Without a hint they stay
+  // registry errors, as before.
+  if (
+    surface === 'fold-query' &&
+    (parsed.kind === 'unknown-group' || parsed.kind === 'unauthorized')
+  ) {
+    return new FoldQueryClientError(parsed.kind, parsed.detail)
   }
   if (
     parsed.kind === 'unknown-template' ||
@@ -214,4 +237,14 @@ export interface SummaryAnnouncement {
   sourceSubnet: string
   generation: bigint
   buckets: SummaryBucket[]
+}
+
+// Mirrors `SummaryRecordJs` in `src/aggregator.rs`: one fold.query.v2
+// record. The stream metadata are absent until the daemon fills them in.
+export interface SummaryRecord {
+  group: string
+  summary: SummaryAnnouncement
+  refreshMs?: number
+  bootEpoch?: bigint
+  streamSeq?: number
 }

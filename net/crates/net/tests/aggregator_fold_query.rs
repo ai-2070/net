@@ -337,3 +337,450 @@ async fn cache_hit_short_circuits_second_identical_call() {
         "second call should not have ticked the host's generation (cache hit)"
     );
 }
+
+// ============================================================================
+// fold.query.v2 and the daemon-level v1 handler
+// (AGGREGATOR_MULTI_HOST_PLAN.md slice Q2; decisions D0, D8, D9)
+// ============================================================================
+
+mod v2 {
+    use super::*;
+
+    use net::adapter::net::behavior::aggregator::{
+        decode_strict, install_fold_query_services, AggregatorRegistry, FoldQueryAccess,
+        FoldQueryErrorKind, FoldQueryOp, FoldQueryV2ClientError, FoldQueryV2Error,
+        FoldQueryV2Request, FoldQueryV2Response, RegistryAdminPolicy, StrictDecodeError,
+        SummaryRecord, FOLD_QUERY_V1_NOT_AUTHORIZED, FOLD_QUERY_V2_SERVICE,
+    };
+    use net::adapter::net::behavior::capability::CapabilitySet;
+    use net::adapter::net::behavior::fold::reservation::ReservationFold;
+    use net::adapter::net::behavior::lifecycle::LifecycleGroup;
+    use net::adapter::net::cortex::rpc::{
+        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload,
+    };
+    use net::adapter::net::mesh_rpc::RpcError;
+    use net::adapter::net::{SubnetPolicy, SubnetRule};
+
+    // ---- frozen layouts and strict decoding (no network) ------------------
+
+    /// Golden bytes for every v2 shape. These are wire contracts: if one
+    /// of these fails, the layout changed, and that needs a new service
+    /// name (D9), not an updated constant.
+    #[test]
+    fn golden_bytes_pin_the_frozen_layouts() {
+        let req = FoldQueryV2Request {
+            kind: 1,
+            op: FoldQueryOp::LatestSummary,
+            group: Some("g".into()),
+        };
+        // kind varint 1 | op variant 0 | Some | len 1 | 'g'
+        assert_eq!(
+            postcard::to_allocvec(&req).unwrap(),
+            [0x01, 0x00, 0x01, 0x01, 0x67]
+        );
+        let all = FoldQueryV2Request {
+            kind: 3,
+            op: FoldQueryOp::SummarizeNow,
+            group: None,
+        };
+        // kind varint 3 | op variant 1 | None
+        assert_eq!(postcard::to_allocvec(&all).unwrap(), [0x03, 0x01, 0x00]);
+
+        let record = SummaryRecord {
+            group: "g".into(),
+            summary: SummaryAnnouncement {
+                source_subnet: SubnetId::new(&[1]),
+                fold_kind: 1,
+                generation: 2,
+                buckets: vec![("idle".into(), 3)],
+            },
+            refresh_ms: None,
+            boot_epoch: Some(4),
+            stream_seq: None,
+        };
+        let resp = FoldQueryV2Response::Summaries {
+            kind: 1,
+            records: vec![record],
+        };
+        let source_subnet = postcard::to_allocvec(&SubnetId::new(&[1])).unwrap();
+        let mut expected = vec![
+            0x00, // Summaries
+            0x01, // kind 1
+            0x01, // one record
+            0x01, 0x67, // group "g"
+        ];
+        expected.extend_from_slice(&source_subnet);
+        expected.extend_from_slice(&[
+            0x01, // fold_kind 1
+            0x02, // generation 2
+            0x01, // one bucket
+            0x04, b'i', b'd', b'l', b'e', // "idle"
+            0x03, // 3
+            0x00, // refresh_ms None
+            0x01, 0x04, // boot_epoch Some(4)
+            0x00, // stream_seq None
+        ]);
+        assert_eq!(postcard::to_allocvec(&resp).unwrap(), expected);
+
+        let errors = [
+            (
+                FoldQueryV2Error::UnknownKind { kind: 9 },
+                vec![0x01, 0x00, 0x09],
+            ),
+            (
+                FoldQueryV2Error::UnknownGroup("g".into()),
+                vec![0x01, 0x01, 0x01, 0x67],
+            ),
+            (FoldQueryV2Error::NotAuthorized, vec![0x01, 0x02]),
+            (
+                FoldQueryV2Error::DecodeFailed("x".into()),
+                vec![0x01, 0x03, 0x01, 0x78],
+            ),
+        ];
+        for (error, bytes) in errors {
+            let resp = FoldQueryV2Response::Error(error.clone());
+            assert_eq!(postcard::to_allocvec(&resp).unwrap(), bytes, "{error:?}");
+        }
+    }
+
+    /// `postcard::from_bytes` ignores trailing input, which is how an
+    /// appended field would be silently dropped. `decode_strict` refuses
+    /// it, and a v1-shaped (shorter) request does not decode as v2.
+    #[test]
+    fn strict_decoding_refuses_trailing_and_short_input() {
+        let mut bytes = postcard::to_allocvec(&FoldQueryV2Request {
+            kind: 1,
+            op: FoldQueryOp::LatestSummary,
+            group: None,
+        })
+        .unwrap();
+        assert!(decode_strict::<FoldQueryV2Request>(&bytes).is_ok());
+        bytes.push(0x00);
+        assert_eq!(
+            decode_strict::<FoldQueryV2Request>(&bytes),
+            Err(StrictDecodeError::TrailingBytes(1))
+        );
+        // The lenient decoder would have accepted it.
+        assert!(postcard::from_bytes::<FoldQueryV2Request>(&bytes).is_ok());
+
+        // A v1 request is `{ kind, op }`: two bytes, no group.
+        let v1 = [0x01, 0x00];
+        assert!(matches!(
+            decode_strict::<FoldQueryV2Request>(&v1),
+            Err(StrictDecodeError::Codec(_))
+        ));
+    }
+
+    /// The access rule is the channel fan-out's own (`subnet_visible`):
+    /// spot-check it from the publisher's side, plus the operator bypass.
+    #[test]
+    fn access_follows_the_fan_out_visibility_rule() {
+        let local = SubnetId::new(&[1]);
+        let same = Some(SubnetId::new(&[1]));
+        let child = Some(SubnetId::new(&[1, 4]));
+        let parent = Some(SubnetId::GLOBAL);
+        let sibling = Some(SubnetId::new(&[2]));
+        let unknown = None;
+        let access = |visibility| FoldQueryAccess {
+            visibility,
+            operators: RegistryAdminPolicy::Closed,
+        };
+
+        let local_only = access(Visibility::SubnetLocal);
+        assert!(local_only.admits(local, 7, same));
+        assert!(!local_only.admits(local, 7, sibling));
+        assert!(!local_only.admits(local, 7, unknown));
+
+        let upward = access(Visibility::ParentVisible);
+        assert!(upward.admits(local, 7, same));
+        assert!(upward.admits(local, 7, parent), "an ancestor sees it");
+        assert!(!upward.admits(local, 7, child), "not pushed downward");
+        assert!(!upward.admits(local, 7, sibling));
+        assert!(!upward.admits(local, 7, unknown));
+
+        let everyone = access(Visibility::Global);
+        assert!(everyone.admits(local, 7, sibling));
+        assert!(everyone.admits(local, 7, unknown));
+
+        // A global publisher reaches an unclassified caller, as fan-out does.
+        assert!(local_only.admits(SubnetId::GLOBAL, 7, unknown));
+
+        // Operators bypass visibility, and only operators do.
+        let operators = FoldQueryAccess {
+            visibility: Visibility::SubnetLocal,
+            operators: RegistryAdminPolicy::operators([7]),
+        };
+        assert!(operators.admits(local, 7, sibling));
+        assert!(!operators.admits(local, 8, sibling));
+    }
+
+    // ---- live round trips -------------------------------------------------
+
+    fn region_policy() -> Arc<SubnetPolicy> {
+        Arc::new(
+            SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("eu", 1).map("us", 2)),
+        )
+    }
+
+    /// A host in `subnet` (with the region policy when `classify`), plus a
+    /// directly connected querier announcing `region:<region>`.
+    async fn host_and_querier(
+        subnet: SubnetId,
+        classify: bool,
+        region: &str,
+    ) -> (Arc<MeshNode>, Arc<MeshNode>) {
+        let mut cfg = test_config().with_subnet(subnet);
+        if classify {
+            cfg = cfg.with_subnet_policy(region_policy());
+        }
+        let host = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("host"),
+        );
+        let querier = build_node().await;
+        handshake(&host, &querier).await;
+        querier
+            .announce_capabilities(CapabilitySet::new().add_tag(format!("region:{region}")))
+            .await
+            .expect("announce");
+        if classify {
+            let q = querier.node_id();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while host.peer_subnet(q).is_none() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(host.peer_subnet(q).is_some(), "host classifies the querier");
+        }
+        (host, querier)
+    }
+
+    /// Register a one-replica group aggregating `kind`, with a primed
+    /// latest-summary buffer.
+    async fn add_group(host: &Arc<MeshNode>, registry: &AggregatorRegistry, name: &str, kind: u16) {
+        let cfg = AggregatorConfig::new(host.local_subnet())
+            .with_fold_kind(kind)
+            .with_interval(Duration::from_secs(60));
+        let mesh = host.clone();
+        let mut seed = [0u8; 32];
+        seed[..name.len()].copy_from_slice(name.as_bytes());
+        let group = LifecycleGroup::<AggregatorDaemon>::spawn(1, seed, move |_| {
+            Arc::new(AggregatorDaemon::new(cfg.clone(), mesh.clone()).expect("aggregator"))
+        })
+        .await
+        .expect("spawn group");
+        let entry = registry.register(name, group).expect("register");
+        entry.snapshot().await.replicas[0].tick_once();
+    }
+
+    fn open_access() -> FoldQueryAccess {
+        FoldQueryAccess {
+            visibility: Visibility::Global,
+            operators: RegistryAdminPolicy::Closed,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_round_trips_by_group_all_groups_and_unknowns() {
+        let (host, querier) = host_and_querier(SubnetId::new(&[3, 7]), false, "eu").await;
+        let kp = EntityKeypair::generate();
+        host.capability_fold()
+            .apply(sign_cap(&kp, 0xA, 1, NodeState::Idle))
+            .unwrap();
+        let registry = Arc::new(AggregatorRegistry::new());
+        add_group(&host, &registry, "caps-a", CapabilityFold::KIND_ID).await;
+        add_group(&host, &registry, "caps-b", CapabilityFold::KIND_ID).await;
+        add_group(&host, &registry, "res", ReservationFold::KIND_ID).await;
+        let _serve =
+            install_fold_query_services(&host, registry.clone(), open_access()).expect("install");
+
+        let client = FoldQueryClient::new(querier.clone())
+            .with_ttl(Duration::ZERO)
+            .with_deadline(Duration::from_secs(3));
+        let target = host.node_id();
+
+        // One named group.
+        let one = client
+            .query_group_latest(target, CapabilityFold::KIND_ID, Some("caps-b"))
+            .await
+            .expect("named group");
+        assert!(!one.is_empty());
+        assert!(one.iter().all(|r| r.group == "caps-b"));
+        assert!(one
+            .iter()
+            .all(|r| r.summary.fold_kind == CapabilityFold::KIND_ID));
+        assert!(one
+            .iter()
+            .all(|r| r.refresh_ms.is_none() && r.boot_epoch.is_none() && r.stream_seq.is_none()));
+
+        // Every group aggregating the kind, and only those.
+        let all = client
+            .query_group_latest(target, CapabilityFold::KIND_ID, None)
+            .await
+            .expect("all groups");
+        let mut groups: Vec<&str> = all.iter().map(|r| r.group.as_str()).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        assert_eq!(groups, ["caps-a", "caps-b"]);
+
+        // SummarizeNow is answered too.
+        let fresh = client
+            .query_group_summarize_now(target, ReservationFold::KIND_ID, Some("res"))
+            .await
+            .expect("summarize now");
+        assert!(fresh.iter().all(|r| r.group == "res"));
+
+        // Unknowns are typed.
+        match client
+            .query_group_latest(target, CapabilityFold::KIND_ID, Some("nope"))
+            .await
+        {
+            Err(FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownGroup(g))) => {
+                assert_eq!(g, "nope")
+            }
+            other => panic!("expected UnknownGroup, got {other:?}"),
+        }
+        match client
+            .query_group_latest(target, ReservationFold::KIND_ID, Some("caps-a"))
+            .await
+        {
+            Err(FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownKind { kind })) => {
+                assert_eq!(kind, ReservationFold::KIND_ID)
+            }
+            other => panic!("expected UnknownKind, got {other:?}"),
+        }
+
+        // The daemon-level v1 handler answers v1's frozen shape from the
+        // same registry.
+        let v1 = client
+            .query_latest(target, CapabilityFold::KIND_ID)
+            .await
+            .expect("v1 query");
+        assert_eq!(v1.len(), all.len());
+    }
+
+    /// D0's access check, live: the host serves subnet 1 with
+    /// subnet-local summaries and classifies callers by region.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v2_admits_inside_visibility_and_operators_and_refuses_the_rest() {
+        async fn setup(
+            region: &str,
+            operator: bool,
+        ) -> (
+            Arc<MeshNode>,
+            Arc<MeshNode>,
+            (
+                net::adapter::net::mesh_rpc::ServeHandle,
+                net::adapter::net::mesh_rpc::ServeHandle,
+            ),
+            FoldQueryClient,
+        ) {
+            let (host, querier) = host_and_querier(SubnetId::new(&[1]), true, region).await;
+            let registry = Arc::new(AggregatorRegistry::new());
+            add_group(&host, &registry, "caps", CapabilityFold::KIND_ID).await;
+            let operators = if operator {
+                RegistryAdminPolicy::operators([querier.node_id()])
+            } else {
+                RegistryAdminPolicy::Closed
+            };
+            let access = FoldQueryAccess {
+                visibility: Visibility::SubnetLocal,
+                operators,
+            };
+            let serve = install_fold_query_services(&host, registry, access).expect("install");
+            let client = FoldQueryClient::new(querier.clone())
+                .with_ttl(Duration::ZERO)
+                .with_deadline(Duration::from_secs(3));
+            (host, querier, serve, client)
+        }
+
+        // Same subnet: admitted.
+        let (host, _q, _s, client) = setup("eu", false).await;
+        client
+            .query_group_latest(host.node_id(), CapabilityFold::KIND_ID, None)
+            .await
+            .expect("same-subnet caller admitted");
+
+        // Sibling subnet: refused on v2 with the typed error, and on the
+        // daemon-level v1 handler with the application status, which the
+        // v1 client reports as NotAuthorized (not as a transport failure).
+        let (host, _q, _s, client) = setup("us", false).await;
+        match client
+            .query_group_latest(host.node_id(), CapabilityFold::KIND_ID, None)
+            .await
+        {
+            Err(FoldQueryV2ClientError::Server(FoldQueryV2Error::NotAuthorized)) => {}
+            other => panic!("expected NotAuthorized, got {other:?}"),
+        }
+        match client
+            .query_latest(host.node_id(), CapabilityFold::KIND_ID)
+            .await
+        {
+            Err(e @ FoldQueryClientError::NotAuthorized) => {
+                assert_eq!(e.error_kind(), FoldQueryErrorKind::Unauthorized);
+                // The wire status the client recognizes is frozen.
+                assert_eq!(FOLD_QUERY_V1_NOT_AUTHORIZED, 0x8001);
+            }
+            other => panic!("expected the v1 refusal as NotAuthorized, got {other:?}"),
+        }
+
+        // Sibling subnet, but named as an operator: admitted.
+        let (host, _q, _s, client) = setup("us", true).await;
+        client
+            .query_group_latest(host.node_id(), CapabilityFold::KIND_ID, None)
+            .await
+            .expect("operator admitted outside visibility");
+    }
+
+    /// A v2 handler that never answers in time.
+    struct Slow;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for Slow {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(RpcHandlerError::Internal("too late".into()))
+        }
+    }
+
+    /// `ServerTooOld` comes from the observed `NotFound` for the v2
+    /// service and nothing else: a timeout stays a timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_client_maps_only_not_found_to_server_too_old() {
+        // A v1-only host: the per-daemon v1 service, no v2.
+        let (host, querier, _agg, _serve) = build_aggregator_pair().await;
+        let client = FoldQueryClient::new(querier)
+            .with_ttl(Duration::ZERO)
+            .with_deadline(Duration::from_secs(3));
+        match client
+            .query_group_latest(host.node_id(), CapabilityFold::KIND_ID, None)
+            .await
+        {
+            Err(FoldQueryV2ClientError::ServerTooOld) => {}
+            other => panic!("expected ServerTooOld, got {other:?}"),
+        }
+
+        // A host whose v2 service exists but never answers in time.
+        let slow_host = build_node().await;
+        let querier = build_node().await;
+        handshake(&slow_host, &querier).await;
+        let _slow = slow_host
+            .serve_rpc(FOLD_QUERY_V2_SERVICE, Arc::new(Slow))
+            .expect("serve slow v2");
+        let client = FoldQueryClient::new(querier)
+            .with_ttl(Duration::ZERO)
+            .with_deadline(Duration::from_millis(500));
+        match client
+            .query_group_latest(slow_host.node_id(), CapabilityFold::KIND_ID, None)
+            .await
+        {
+            Err(FoldQueryV2ClientError::Transport(e)) => {
+                assert!(
+                    !matches!(e, RpcError::ServerError { .. }),
+                    "a timeout must not look like a server answer: {e:?}"
+                );
+            }
+            other => panic!("expected a transport timeout, got {other:?}"),
+        }
+    }
+}
