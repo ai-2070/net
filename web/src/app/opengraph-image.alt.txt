@@ -1,0 +1,1 @@
+NET. Moves at light. A latency-first encrypted mesh where every device is a first-class node.
