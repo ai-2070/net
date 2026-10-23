@@ -1,0 +1,14 @@
+docs/internal/plans/MESH_TO_MCP_PLAN.md
+  h_64425bc75e3f3d 1-497
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d19114b40ec6cdcdd8fab54a2bebbb3d786b6316",
+  "prompts": {},
+  "humans": {
+    "h_64425bc75e3f3d": {
+      "author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
