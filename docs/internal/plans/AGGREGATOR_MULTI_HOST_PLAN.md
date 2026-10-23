@@ -2,7 +2,7 @@
 
 ## Status
 
-**Planned. Revised after reviews 1, 2 and 3** (all 2026-10-23), on branch
+**Planned. Revised after reviews 1–4** (all 2026-10-23), on branch
 `LZL0/aggregators` (forked from `master` at `541cc0078`). No release has been
 chosen.
 
@@ -19,6 +19,9 @@ chosen.
   - Review 3 replaced `ForgetGroup` with floor-based reclamation, made the
     identity lock unconditional, and split the host's desired state from
     observed liveness, with crash recovery.
+  - Review 4 confirmed those, and found the last hold: retained state was
+    bounded for live keys only. This revision caps all member records and
+    coordinator floors, fail-loud with `HostFull`, and adds the churn witness.
   - This revision awaits re-review.
 
 Predecessors, both closed: `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`
@@ -26,8 +29,9 @@ Predecessors, both closed: `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`
 Phase 0 corrects claims in them, and in `SCALING_SUBNET_SPEC.md`, that turned
 out to be wrong.
 
-[Review 1](#review-1-2026-10-23), [review 2](#review-2-2026-10-23) and
-[review 3](#review-3-2026-10-23) list every finding and where it is answered.
+[Review 1](#review-1-2026-10-23), [review 2](#review-2-2026-10-23),
+[review 3](#review-3-2026-10-23) and [review 4](#review-4-2026-10-23) list
+every finding and where it is answered.
 
 ---
 
@@ -486,11 +490,40 @@ then makes the observed state match.
   desired, or still has a pending intent, among its members on that host. If
   there are none, it uses its next unallocated incarnation. It sends `Reclaim`
   only after writing that value to its own write-ahead log.
-- **Retention.** Per-key records live until `Reclaim` passes them, never by
-  age. Per-coordinator floors are kept permanently: one `u64` for each
-  coordinator ever admitted, bounded by the `operators` list. Live keys are
-  bounded by `max_groups × max_replica_count`. At that bound the host refuses
-  new keys (`HostFull`) instead of evicting records.
+- **Retention and hard caps.** *(Revised after review 4: the earlier bound
+  covered live keys only.)* Per-key records live until `Reclaim` passes them,
+  never by age, and nothing is ever evicted to make room. Two explicit caps
+  bound everything the host retains, with a refusal at each:
+  - **`max_member_records`** caps **all** per-key records: live, starting,
+    failed **and retired**. Allocating a new key at the cap is refused with
+    `HostFull { records }` **before** anything is written.
+    - It must be at least the live-key bound `max_groups × max_replica_count`;
+      boot refuses a smaller value.
+    - Its default is a fixed multiple of that bound, chosen in M3 and stated in
+      the config docs.
+  - **`max_coordinators`** caps per-coordinator floor records. A request from a
+    coordinator with no floor record yet is refused at the cap with
+    `HostFull { coordinators }`.
+    - Floors are never deleted. Removing a coordinator from `operators` does not
+      remove its floor, because a re-admitted coordinator's delayed requests
+      must still be rejected. So the set of floors is "every coordinator ever
+      admitted", which can exceed the current `operators` list. The cap, not
+      the list, is the bound.
+- **What stays usable at capacity.** Only *new allocations* are refused. These
+  all keep working:
+  - operations on existing keys: Spawn replays, a higher incarnation for an
+    existing key, `UnregisterMember`;
+  - `Reclaim`, which is how the records cap is relieved;
+  - every request from an already-known coordinator.
+- **A pinned floor can exhaust record capacity while few members are live**
+  (review 4). The floor cannot rise past the oldest still-desired incarnation,
+  so a long-lived member at incarnation 1 keeps every later retired record. For
+  example, a GLOBAL daemon running one permanent capability group while
+  reservation groups are created and deleted alongside it accumulates one
+  retired record per churned key. That is accepted, and it fails loudly with
+  `HostFull` rather than growing without bound. Operators relieve it by
+  replacing the long-lived member with a fresh incarnation (a normal
+  re-spawn), which lets the coordinator's next `Reclaim` raise the floor.
 
 **Host recovery on boot.** This happens before any member op is served.
 
@@ -874,7 +907,26 @@ Gated on D1, D3, D7 and D8.
     - **During teardown:** nothing is restarted, and the retry gets `Stopped`.
     - **Any other point:** no member op is answered before recovery finishes,
       and no `Spawned` reply is ever sent for a key with no live task.
-  - **`HostFull`** at the live-key bound, with no record evicted.
+  - **Bounded retained state under a pinned floor** (review 4), with
+    `max_member_records` set small for the test:
+    1. Keep incarnation 1 running as a capability member.
+    2. Churn reservation members under new group names, each spawned then
+       unregistered, with incarnations 2, 3, …, until the cap is reached.
+
+    Then:
+    - the record count equals `max_member_records` and the on-disk state stops
+      growing;
+    - the next new key gets `HostFull { records }` and writes nothing;
+    - `UnregisterMember` of the live member, and Spawn replays for existing
+      keys, still succeed at capacity;
+    - after a host restart, a delayed `SpawnMember` for any churned (retired)
+      incarnation still gets `Retired`;
+    - replacing the incarnation-1 member and sending `Reclaim` frees the
+      retired records, and new keys are accepted again.
+  - **Coordinator cap:** with `max_coordinators` reached, a request from a new
+    coordinator gets `HostFull { coordinators }`. A coordinator removed from
+    `operators` and later re-admitted still has its delayed retired Spawns
+    rejected, because its floor survived.
   - **Golden bytes:** one test per v2 layout.
 - **M4. Health and re-placement (D7 partition semantics).**
 
@@ -942,6 +994,7 @@ Gated on D1, D3, D7 and D8.
 | The coordinator is lost for good | Members keep running and publishing; re-placement stops. Coordinator takeover is out of scope (below). Its `state_dir` makes a restart on the same host safe. |
 | Partitions cause temporary over-replication | Accepted by design (D7). Receivers tolerate extra publishers (D8). Cleanup is conditional on incarnation, so it cannot remove a replacement. |
 | A coordinator that is gone for good leaves member records, and possibly running members, on its hosts | Records are never evicted by age, because that would reopen resurrection. An operator on the host retires the members with the host's own operator path. That path raises the coordinator's floor past them, so their records become reclaimable and stay rejected. `HostFull` makes the bound visible rather than silent. |
+| A long-lived member pins the reclamation floor, and churn of other groups fills `max_member_records` | Accepted and fail-loud (D7): new keys get `HostFull { records }`, while teardown, replays and `Reclaim` keep working. Relief is replacing the long-lived member with a fresh incarnation so the floor can rise. If this proves common in practice, a follow-up can compact retired records into per-coordinator incarnation ranges; that is not needed for correctness. |
 | Host recovery starts a desired member whose template changed since it was accepted | It stays desired and reports `StartFailed(TemplateChanged)`. The coordinator treats it as a member failure; nothing runs under a template that no longer matches its fingerprint. |
 | One group per fold kind per daemon is too tight for some deployment | Run another daemon on the host. The restriction exists because two same-kind groups on one subnet would publish identical streams (D0). |
 | `boot_epoch` file lost or corrupted | Refused at boot, not silently reset (I3). An operator reset must be explicit, and the docs say receivers may drop that publisher's summaries until its epoch passes the last one they saw. |
@@ -1087,3 +1140,30 @@ What changed, in short:
 - **The host persists what it intends to run, not what it believes is
   running.** It re-observes liveness after any restart before answering member
   ops.
+
+---
+
+## Review 4 (2026-10-23)
+
+Re-review of `aadb17755`, based on the revision diff and an executable
+transition model; no production runtime tests.
+
+Verdict:
+
+- **Phases 0–3 remain clear to implement.**
+- **Phase 4 has one remaining hold:** make the retained-state bounds explicit
+  and add the churn witness.
+
+The review confirmed that review 3's findings are resolved: the unconditional
+identity lock, the desired-versus-observed recovery model, and the corrected
+published-epoch requirement. The finding below is a gap in the previous
+revision's text, confirmed by tracing the review's sequence against it.
+Accepted.
+
+| # | Sev | Finding | Answered by |
+|---|---|---|---|
+| 1 | High | A long-lived member pins the floor while retired records grow without bound. The model kept incarnation 1 live and churned reservation members: floor 1, peak 2 live members, 1,000 retired records. The cap applied to live keys only. The coordinator-floor bound "the `operators` list" did not hold across config changes. | D7 "Retention and hard caps": `max_member_records` covers every per-key record (retired included), with `HostFull { records }` before any new key is allocated. `max_coordinators` caps floors, which are never deleted (`HostFull { coordinators }`). Teardown, replays, higher incarnations for existing keys and `Reclaim` stay usable at capacity. The pinned-floor exhaustion is documented, with its relief. M3 churn and coordinator-cap witnesses. Risk row added. |
+
+The reviewer's smallest repair was adopted as proposed. No new reclamation
+protocol was added. Range compaction of retired records is recorded as a
+possible follow-up in Risks, not as part of this plan.
