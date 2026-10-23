@@ -705,6 +705,38 @@ were wrong. Sizes are rough working days.
   *Proof:* R1 green, plus a `tests/capability_multihop.rs` test that pins the
   cause at the `MeshNode` level.
 
+**Done 2026-10-23. R2 was not needed.**
+
+- **Evidence.** `aggregator-daemon/tests/hub_relay.rs`, run with
+  `cargo nextest run -p net-aggregator-daemon --test hub_relay --no-tests=fail --retries 0`:
+  3 passed. The full `cargo test -p net-aggregator-daemon` also passes, and so
+  do rustfmt and `cargo clippy -p net-aggregator-daemon --all-targets` with
+  CI's `-D warnings` and test-surface allows.
+- **What each case proves:**
+  1. **Replay:** a consumer that attaches after the announcement discovers the
+     provider.
+  2. **Flood:** both leaves are attached, then the test waits past the hub's
+     last replay pass for those sessions before the provider announces. The
+     waits are 250 ms and 2 s (`REPLAY_SETTLE`, `mesh.rs:10859`), so discovery
+     can only come from the live forward. In the first run, before that wait
+     was added, discovery took about 100 ms, under the first replay pass.
+  3. **Supersede:** a re-announcement with a different tag replaces the
+     relayed set at the consumer.
+- **G4 is closed.** The July Hermes anomaly (two clients on one daemon never
+  seeing each other's tags) does not reproduce against the current daemon. It
+  was fixed by hub replay and forwarding (`caee075ac`) and is now witnessed by
+  the real binary's boot path.
+- **Found on the way, not a defect:**
+  - The first supersede run failed. The origin coalesces explicit
+    re-announcements inside `min_announce_interval`, which defaults to 10 s
+    (`mesh.rs:3725`). It sends the newest one when the window ends, so a quick
+    second announcement reaches peers up to 10 s late. That is the documented
+    rate limit (RT-1), not a relay fault.
+  - The test leaves set the interval to 100 ms so case 3 measures the relay.
+  - Operators should expect up to `min_announce_interval` of lag for
+    capability changes made in quick succession. Phase 4's M1 host
+    announcements need to account for this.
+
 ### Phase 2 — Subnet policy, publication scope and a live query path (G3, G5; about 1½ weeks)
 
 Every Phase 2 test boots the daemon entirely from production TOML. No policy,
