@@ -1,0 +1,19 @@
+docs/internal/misc/CODE_REVIEW_2026_10_23_AGGREGATOR_MULTI_HOST.md
+  s_1dd2179accbdc5::t_0970bf9beb594d 1-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "23e17426deb161e5464c4fa06bb1648540bc59fb",
+  "prompts": {},
+  "sessions": {
+    "s_1dd2179accbdc5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b1c333-4602-4b8f-808b-360ea84bffa6",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
