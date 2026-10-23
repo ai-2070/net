@@ -76,6 +76,16 @@ pub use net::adapter::net::behavior::aggregator::{
     DEFAULT_REGISTRY_DEADLINE, FOLD_QUERY_SERVICE, REGISTRY_SERVICE,
 };
 
+// ─── fold.query.v2 (AGGREGATOR_MULTI_HOST_PLAN.md Q2) ───
+//
+// The v2 client methods live on `FoldQueryClient` itself
+// (`query_group_latest`, `query_group_summarize_now`); these are the
+// wire types and errors they return.
+pub use net::adapter::net::behavior::aggregator::{
+    FoldQueryV2ClientError, FoldQueryV2Error, FoldQueryV2Request, FoldQueryV2Response,
+    SummaryRecord, FOLD_QUERY_V1_NOT_AUTHORIZED, FOLD_QUERY_V2_SERVICE,
+};
+
 // ─── Daemon-author surfaces (Rust-only re-exports) ───
 pub use net::adapter::net::behavior::aggregator::{
     snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorError, AggregatorGroupEntry,
@@ -433,6 +443,31 @@ impl BoundFoldQueryClient {
     ) -> Result<Vec<SummaryAnnouncement>, FoldQueryClientError> {
         self.inner
             .query_summarize_now(self.target_node_id, kind)
+            .await
+    }
+
+    /// `fold.query.v2` latest summaries for `kind` from one `group`, or
+    /// (`None`) every group on the bound daemon that aggregates it.
+    /// Each record names its group. Cached like [`Self::query_latest`].
+    pub async fn query_group_latest(
+        &self,
+        kind: u16,
+        group: Option<&str>,
+    ) -> Result<Vec<SummaryRecord>, FoldQueryV2ClientError> {
+        self.inner
+            .query_group_latest(self.target_node_id, kind, group)
+            .await
+    }
+
+    /// `fold.query.v2` `SummarizeNow` against the bound daemon. Never
+    /// cached.
+    pub async fn query_group_summarize_now(
+        &self,
+        kind: u16,
+        group: Option<&str>,
+    ) -> Result<Vec<SummaryRecord>, FoldQueryV2ClientError> {
+        self.inner
+            .query_group_summarize_now(self.target_node_id, kind, group)
             .await
     }
 

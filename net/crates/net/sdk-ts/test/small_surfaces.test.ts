@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   FoldQueryClient,
+  FoldQueryClientError,
   MemoriesAdapter,
   MeshNode,
   Redex,
@@ -86,6 +87,59 @@ describe('aggregator clients', () => {
       if (!shutDown) await node.shutdown().catch(() => {});
     }
   }, 15_000);
+
+  // fold.query.v2 (AGGREGATOR_MULTI_HOST_PLAN.md Q4). Serving it is the
+  // aggregator daemon's job, so the live check runs against a peer in the
+  // shape of a pre-v2 daemon: one with no channel registry, as every
+  // daemon before Q1 ran. The v2 call must come back as the typed
+  // `server-too-old`, which proves the request reached the peer and its
+  // NotFound answer was mapped.
+  //
+  // Why no registry: the reply channel is per service
+  // (`<service>.replies.<origin>`). A peer with a registry lists only the
+  // reply channels of services it serves, so the caller's reply-channel
+  // subscribe for an unserved service is refused (`UnknownChannel`). The
+  // call then fails as `transport` before any NotFound can come back.
+  // Named-group and unknown-group answers are covered by the Rust tests
+  // against real registries.
+  it('queryGroupLatest against a pre-v2 (registry-less) peer is server-too-old', async () => {
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    const b = await MeshNode.create({
+      bindAddr: '127.0.0.1:0',
+      psk: PSK,
+      permissiveChannels: true,
+    });
+    const fold = createFoldQueryClient(a).withDeadline(3_000).withTtl(0);
+    try {
+      await Promise.all([
+        b.accept(a.nodeId()),
+        (async () => {
+          await new Promise((r) => setTimeout(r, 50));
+          await a.connect(b.localAddr(), b.publicKey(), b.nodeId());
+        })(),
+      ]);
+      await a.start();
+      await b.start();
+
+      for (const call of [
+        () => fold.queryGroupLatest(b.nodeId(), 1, 'some-group'),
+        () => fold.queryGroupSummarizeNow(b.nodeId(), 1),
+      ]) {
+        let caught: unknown;
+        try {
+          await call();
+        } catch (e) {
+          caught = classifyAggregatorError(e, 'fold-query');
+        }
+        expect(caught).toBeInstanceOf(FoldQueryClientError);
+        expect((caught as FoldQueryClientError).kind).toBe('server-too-old');
+      }
+    } finally {
+      fold.close();
+      await a.shutdown().catch(() => {});
+      await b.shutdown().catch(() => {});
+    }
+  }, 20_000);
 });
 
 describe('WriteToken', () => {

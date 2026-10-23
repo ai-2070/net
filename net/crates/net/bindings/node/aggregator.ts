@@ -28,6 +28,12 @@ export type FoldQueryErrorKind =
   | 'codec'
   | 'unknown-kind'
   | 'invalid-args'
+  // fold.query.v2 (queryGroupLatest / queryGroupSummarizeNow).
+  // `unknown-group` and `unauthorized` share their strings with the
+  // registry surface; pass the 'fold-query' hint to route them here.
+  | 'unknown-group'
+  | 'unauthorized'
+  | 'server-too-old'
 
 export class RegistryClientError extends Error {
   readonly kind: RegistryErrorKind
@@ -72,6 +78,9 @@ const FOLD_KINDS: ReadonlySet<string> = new Set([
   'codec',
   'unknown-kind',
   'invalid-args',
+  'unknown-group',
+  'unauthorized',
+  'server-too-old',
 ])
 
 /**
@@ -120,8 +129,17 @@ export function classifyAggregatorError(
   if (!parsed) return e
 
   // Surface-specific kinds take priority — they are unambiguous.
-  if (parsed.kind === 'unknown-kind') {
-    return new FoldQueryClientError('unknown-kind', parsed.detail)
+  if (parsed.kind === 'unknown-kind' || parsed.kind === 'server-too-old') {
+    return new FoldQueryClientError(parsed.kind, parsed.detail)
+  }
+  // fold.query.v2 raises these too; the strings are shared with the
+  // registry, so the caller's hint decides. Without a hint they stay
+  // registry errors, as before.
+  if (
+    surface === 'fold-query' &&
+    (parsed.kind === 'unknown-group' || parsed.kind === 'unauthorized')
+  ) {
+    return new FoldQueryClientError(parsed.kind, parsed.detail)
   }
   if (
     parsed.kind === 'unknown-template' ||
@@ -214,4 +232,14 @@ export interface SummaryAnnouncement {
   sourceSubnet: string
   generation: bigint
   buckets: SummaryBucket[]
+}
+
+// Mirrors `SummaryRecordJs` in `src/aggregator.rs`: one fold.query.v2
+// record. The stream metadata are absent until the daemon fills them in.
+export interface SummaryRecord {
+  group: string
+  summary: SummaryAnnouncement
+  refreshMs?: number
+  bootEpoch?: bigint
+  streamSeq?: number
 }

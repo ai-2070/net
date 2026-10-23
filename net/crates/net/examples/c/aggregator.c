@@ -55,6 +55,8 @@ int main(void) {
         CLM_FN(net_fold_query_client_set_deadline),
         CLM_FN(net_fold_query_client_set_ttl),
         CLM_FN(net_registry_client_set_deadline),
+        CLM_FN(net_fold_query_client_query_group_latest),
+        CLM_FN(net_fold_query_client_query_group_summarize_now),
     };
     /* The mesh bring-up runs in mesh_opaque.c, whose calls this unit
      * cannot address; it hands over its list, checked with this one. */
@@ -116,6 +118,34 @@ int main(void) {
     out = net_fold_query_client_query_summarize_now(fq, b_id, 1, &kind);
     CHECK("net_fold_query_client_query_summarize_now: NULL, NET_REGISTRY_ERR_TRANSPORT",
           out == NULL && kind == NET_REGISTRY_ERR_TRANSPORT);
+
+    /* fold.query.v2 (AGGREGATOR_MULTI_HOST_PLAN.md Q4). Same peer: the
+     * caller's per-service reply-channel subscribe is refused (C nodes
+     * install a channel registry), so the call fails as TRANSPORT before
+     * any answer. NET_REGISTRY_ERR_SERVER_TOO_OLD needs a registry-less
+     * peer (every pre-Q1 daemon), which C cannot build; the Node and
+     * Python bindings witness it. */
+    kind = -1;
+    out = net_fold_query_client_query_group_latest(fq, b_id, 1, "some-group", &kind);
+    CHECK("net_fold_query_client_query_group_latest: NULL, NET_REGISTRY_ERR_TRANSPORT",
+          out == NULL && kind == NET_REGISTRY_ERR_TRANSPORT);
+    detail = net_fold_query_last_error_detail(fq);
+    CHECK("net_fold_query_last_error_detail after a v2 call: says why",
+          detail != NULL && strlen(detail) > 0);
+    net_free_string(detail);
+    kind = -1;
+    out = net_fold_query_client_query_group_summarize_now(fq, b_id, 1, NULL, &kind);
+    CHECK("net_fold_query_client_query_group_summarize_now: NULL group (every group), TRANSPORT",
+          out == NULL && kind == NET_REGISTRY_ERR_TRANSPORT);
+    kind = -1;
+    out = net_fold_query_client_query_group_latest(fq, b_id, 1, "\xff", &kind);
+    CHECK("net_fold_query_client_query_group_latest: a non-UTF-8 group is INVALID_ARGS",
+          out == NULL && kind == NET_REGISTRY_ERR_INVALID_ARGS);
+    kind = -1;
+    out = net_fold_query_client_query_group_latest(NULL, b_id, 1, NULL, &kind);
+    CHECK("net_fold_query_client_query_group_latest: a NULL handle is INVALID_ARGS",
+          out == NULL && kind == NET_REGISTRY_ERR_INVALID_ARGS);
+    CHECK("NET_REGISTRY_ERR_SERVER_TOO_OLD is declared as 12", NET_REGISTRY_ERR_SERVER_TOO_OLD == 12);
 
     CHECK("net_register_channel: global", net_register_channel(a, "c/agg-global", NET_VISIBILITY_GLOBAL) == NET_REGISTRY_OK);
     CHECK("net_register_channel: subnet-local",

@@ -404,6 +404,10 @@ typedef struct net_registry_client_handle_t net_registry_client_handle_t;
 #define NET_REGISTRY_ERR_SCALE_REJECTED       9
 #define NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED  10
 #define NET_REGISTRY_ERR_UNAUTHORIZED         11
+/* The target does not serve fold.query.v2 (it answered NotFound for the
+ * service). Only from net_fold_query_client_query_group_*; fall back to
+ * the v1 net_fold_query_client_query_* calls. */
+#define NET_REGISTRY_ERR_SERVER_TOO_OLD       12
 #define NET_REGISTRY_ERR_INVALID_ARGS         99
 
 /* Visibility discriminants, mirroring the substrate's `Visibility` enum.
@@ -562,6 +566,43 @@ char* net_fold_query_client_query_summarize_now(
     net_fold_query_client_handle_t* handle,
     uint64_t target_node_id,
     uint16_t kind,
+    int* out_error_kind);
+
+/*
+ * fold.query.v2: latest summaries for `kind` from the group named by
+ * `group` (NUL-terminated UTF-8), or from every group on the target
+ * daemon aggregating `kind` when `group` is NULL. Cached like
+ * `_query_latest`. Returns a JSON array of records — caller frees via
+ * `net_free_string`. On error, writes the discriminant to
+ * `*out_error_kind` and returns NULL:
+ *   NET_REGISTRY_ERR_SERVER_TOO_OLD  the target has no v2 service;
+ *   NET_REGISTRY_ERR_UNKNOWN_GROUP   `group` names no group there;
+ *   NET_REGISTRY_ERR_UNKNOWN_KIND    no queried group aggregates `kind`;
+ *   NET_REGISTRY_ERR_UNAUTHORIZED    the caller is outside the daemon's
+ *                                    summary visibility and not an operator;
+ *   otherwise TRANSPORT, CODEC or INVALID_ARGS.
+ *
+ * JSON shape (`summary` is the `_query_latest` object; the last three
+ * fields are null until the daemon fills them in):
+ *   [{"group": "...", "summary": {...}, "refresh_ms": N|null,
+ *     "boot_epoch": N|null, "stream_seq": N|null}, ...]
+ */
+char* net_fold_query_client_query_group_latest(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id,
+    uint16_t kind,
+    const char* group,
+    int* out_error_kind);
+
+/*
+ * fold.query.v2 `SummarizeNow` — never cached. Same arguments, JSON
+ * shape and error kinds as `_query_group_latest`.
+ */
+char* net_fold_query_client_query_group_summarize_now(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id,
+    uint16_t kind,
+    const char* group,
     int* out_error_kind);
 
 /* Drop every cached entry. */

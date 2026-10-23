@@ -23,9 +23,9 @@ use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use super::handle_guard::{BeginFree, HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 
 use crate::adapter::net::behavior::aggregator::{
-    FoldQueryClient, FoldQueryClientError, FoldQueryError, RegistryClient, RegistryClientError,
-    RegistryGroupSummary, RegistryRpcError, SummaryAnnouncement, DEFAULT_QUERY_DEADLINE,
-    DEFAULT_REGISTRY_DEADLINE,
+    FoldQueryClient, FoldQueryClientError, FoldQueryError, FoldQueryV2ClientError,
+    FoldQueryV2Error, RegistryClient, RegistryClientError, RegistryGroupSummary, RegistryRpcError,
+    SummaryAnnouncement, SummaryRecord, DEFAULT_QUERY_DEADLINE, DEFAULT_REGISTRY_DEADLINE,
 };
 use crate::adapter::net::{ChannelConfig, ChannelId, ChannelName, Visibility};
 
@@ -70,6 +70,10 @@ pub const NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED: i32 = 10;
 /// Server refused: the caller is not an operator of the target
 /// daemon's aggregator registry. See `RegistryAdminPolicy`.
 pub const NET_REGISTRY_ERR_UNAUTHORIZED: i32 = 11;
+/// The target does not serve `fold.query.v2`: it answered `NotFound` for
+/// the service. Only emitted by `net_fold_query_client_query_group_*`.
+/// Fall back to the v1 `net_fold_query_client_query_*` calls.
+pub const NET_REGISTRY_ERR_SERVER_TOO_OLD: i32 = 12;
 /// Caller-side error: a string argument wasn't valid UTF-8 or
 /// a pointer was null where one was required.
 pub const NET_REGISTRY_ERR_INVALID_ARGS: i32 = 99;
@@ -662,6 +666,69 @@ pub unsafe extern "C" fn net_fold_query_client_query_summarize_now(
     }
 }
 
+/// `fold.query.v2` latest summaries for `kind`, from the group named by
+/// `group` (a NUL-terminated UTF-8 string), or from every group on the
+/// target daemon aggregating `kind` when `group` is NULL. Cached like
+/// [`net_fold_query_client_query_latest`].
+///
+/// Returns a JSON array of records the caller frees with
+/// `net_free_string`: `[{"group", "summary", "refresh_ms", "boot_epoch",
+/// "stream_seq"}]`, where `summary` is the object
+/// [`net_fold_query_client_query_latest`] returns and the last three are
+/// `null` until the daemon fills them in. On failure returns NULL and
+/// writes the kind:
+/// - `NET_REGISTRY_ERR_SERVER_TOO_OLD`: the target has no v2 service;
+/// - `NET_REGISTRY_ERR_UNKNOWN_GROUP`: `group` names no group there;
+/// - `NET_REGISTRY_ERR_UNKNOWN_KIND`: no queried group aggregates `kind`;
+/// - `NET_REGISTRY_ERR_UNAUTHORIZED`: the caller is outside the daemon's
+///   summary visibility and not an operator;
+/// - otherwise `TRANSPORT`, `CODEC` or `INVALID_ARGS`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_fold_query_client_query_group_latest(
+    handle: *mut FoldQueryClientHandle,
+    target_node_id: u64,
+    kind: u16,
+    group: *const c_char,
+    out_error_kind: *mut c_int,
+) -> *mut c_char {
+    if out_error_kind.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(group) = (unsafe { optional_cstr_arg(group, out_error_kind) }) else {
+        return std::ptr::null_mut();
+    };
+    unsafe {
+        fold_query_op_json_with(handle, out_error_kind, classify_fold_query_v2, |client| {
+            block_on(client.query_group_latest(target_node_id, kind, group.as_deref()))
+                .map(|records| records_to_json(&records))
+        })
+    }
+}
+
+/// `fold.query.v2` `SummarizeNow`. Never cached. Same arguments, result
+/// and error kinds as [`net_fold_query_client_query_group_latest`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_fold_query_client_query_group_summarize_now(
+    handle: *mut FoldQueryClientHandle,
+    target_node_id: u64,
+    kind: u16,
+    group: *const c_char,
+    out_error_kind: *mut c_int,
+) -> *mut c_char {
+    if out_error_kind.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(group) = (unsafe { optional_cstr_arg(group, out_error_kind) }) else {
+        return std::ptr::null_mut();
+    };
+    unsafe {
+        fold_query_op_json_with(handle, out_error_kind, classify_fold_query_v2, |client| {
+            block_on(client.query_group_summarize_now(target_node_id, kind, group.as_deref()))
+                .map(|records| records_to_json(&records))
+        })
+    }
+}
+
 /// Drop every cached entry.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_invalidate_cache(
@@ -729,7 +796,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     super::mesh::block_on(future)
 }
 
-/// Funnel for any fold-query op that returns a JSON string.
+/// Funnel for any v1 fold-query op that returns a JSON string.
 /// Mirror of [`registry_op_json`].
 unsafe fn fold_query_op_json<F>(
     handle: *mut FoldQueryClientHandle,
@@ -738,6 +805,20 @@ unsafe fn fold_query_op_json<F>(
 ) -> *mut c_char
 where
     F: FnOnce(FoldQueryClient) -> Result<String, FoldQueryClientError>,
+{
+    unsafe { fold_query_op_json_with(handle, out_error_kind, classify_fold_query, op) }
+}
+
+/// The fold-query funnel, generic over the op's error type: v1 and v2
+/// report through their own classifiers.
+unsafe fn fold_query_op_json_with<E, F>(
+    handle: *mut FoldQueryClientHandle,
+    out_error_kind: *mut c_int,
+    classify: fn(&E) -> (i32, String),
+    op: F,
+) -> *mut c_char
+where
+    F: FnOnce(FoldQueryClient) -> Result<String, E>,
 {
     if handle.is_null() {
         unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
@@ -757,7 +838,7 @@ where
     match op(client) {
         Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
         Err(e) => {
-            let (kind, detail) = classify_fold_query(&e);
+            let (kind, detail) = classify(&e);
             if let Some(_op) = h.guard.try_enter() {
                 store_fold_query_error_detail(h, detail);
             }
@@ -781,6 +862,42 @@ fn classify_fold_query(err: &FoldQueryClientError) -> (i32, String) {
     }
 }
 
+fn classify_fold_query_v2(err: &FoldQueryV2ClientError) -> (i32, String) {
+    match err {
+        FoldQueryV2ClientError::ServerTooOld => (
+            NET_REGISTRY_ERR_SERVER_TOO_OLD,
+            "the target does not serve fold.query.v2".to_string(),
+        ),
+        FoldQueryV2ClientError::Transport(e) => (NET_REGISTRY_ERR_TRANSPORT, format!("{e}")),
+        FoldQueryV2ClientError::Codec(c) => (NET_REGISTRY_ERR_CODEC, c.clone()),
+        FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownKind { kind }) => (
+            NET_REGISTRY_ERR_UNKNOWN_KIND,
+            format!("unknown fold kind: 0x{kind:04x}"),
+        ),
+        FoldQueryV2ClientError::Server(FoldQueryV2Error::UnknownGroup(g)) => (
+            NET_REGISTRY_ERR_UNKNOWN_GROUP,
+            format!("unknown group: {g}"),
+        ),
+        FoldQueryV2ClientError::Server(FoldQueryV2Error::NotAuthorized) => (
+            NET_REGISTRY_ERR_UNAUTHORIZED,
+            "caller is outside the daemon's summary visibility and not an operator".to_string(),
+        ),
+        FoldQueryV2ClientError::Server(FoldQueryV2Error::DecodeFailed(s)) => {
+            (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
+        }
+    }
+}
+
+/// An optional string argument: NULL means `None`; a non-NULL pointer must
+/// be valid UTF-8, or the out-param is set to `INVALID_ARGS`.
+#[inline]
+unsafe fn optional_cstr_arg(ptr: *const c_char, out: *mut c_int) -> Option<Option<String>> {
+    if ptr.is_null() {
+        return Some(None);
+    }
+    unsafe { cstr_arg(ptr, out) }.map(Some)
+}
+
 fn store_fold_query_error_detail(h: &FoldQueryClientHandle, detail: String) {
     let c = match CString::new(detail) {
         Ok(c) => c,
@@ -796,6 +913,30 @@ fn summaries_to_json(summaries: &[SummaryAnnouncement]) -> String {
     // the unwrap is unreachable. Defensive `to_string`-on-error
     // keeps the FFI surface infallible.
     serde_json::to_string(&wire).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn records_to_json(records: &[SummaryRecord]) -> String {
+    let wire: Vec<RecordWire<'_>> = records
+        .iter()
+        .map(|r| RecordWire {
+            group: &r.group,
+            summary: SummaryWire::from(&r.summary),
+            refresh_ms: r.refresh_ms,
+            boot_epoch: r.boot_epoch,
+            stream_seq: r.stream_seq,
+        })
+        .collect();
+    serde_json::to_string(&wire).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// One `fold.query.v2` record in the C ABI's JSON.
+#[derive(serde::Serialize)]
+struct RecordWire<'a> {
+    group: &'a str,
+    summary: SummaryWire<'a>,
+    refresh_ms: Option<u32>,
+    boot_epoch: Option<u64>,
+    stream_seq: Option<u32>,
 }
 
 #[cfg(test)]

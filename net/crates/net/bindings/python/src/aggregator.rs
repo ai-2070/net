@@ -24,9 +24,9 @@ use pyo3::types::{PyDict, PyList};
 
 use net_sdk::aggregator::{
     FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError as SdkFoldQueryClientError,
-    FoldQueryError, RegistryClient as SdkRegistryClient,
+    FoldQueryError, FoldQueryV2ClientError, FoldQueryV2Error, RegistryClient as SdkRegistryClient,
     RegistryClientError as SdkRegistryClientError, RegistryGroupSummary, RegistryReplicaSummary,
-    RegistryRpcError, SummaryAnnouncement,
+    RegistryRpcError, SummaryAnnouncement, SummaryRecord,
 };
 
 // =========================================================================
@@ -77,13 +77,22 @@ create_exception!(
     FoldQueryClientError,
     PyException,
     "Fold-query RPC failure. `.kind` is one of `transport` | `codec` | \
-     `unknown-kind`. `.server_detail` carries the long-form text."
+     `unknown-kind`, plus from the fold.query.v2 calls `unknown-group` | \
+     `unauthorized` | `server-too-old`. `.server_detail` carries the \
+     long-form text."
 );
 create_exception!(
     _net,
     UnknownFoldKind,
     FoldQueryClientError,
     "Daemon does not register a summarizer for the requested fold kind."
+);
+create_exception!(
+    _net,
+    FoldQueryServerTooOld,
+    FoldQueryClientError,
+    "The target does not serve fold.query.v2 (it answered NotFound for the \
+     service). Use query_latest / query_summarize_now (v1) against it."
 );
 
 fn set_err_attrs<T: Into<PyErr>>(py: Python<'_>, err: T, kind: &str, detail: &str) -> PyErr {
@@ -141,6 +150,34 @@ fn fold_query_err(py: Python<'_>, e: SdkFoldQueryClientError) -> PyErr {
     let message = format!("agg:{kind}: {detail}");
     let py_err = match kind {
         "unknown-kind" => UnknownFoldKind::new_err(message),
+        _ => FoldQueryClientError::new_err(message),
+    };
+    set_err_attrs(py, py_err, kind, &detail)
+}
+
+/// `fold.query.v2` errors. Same `.kind` strings as the Node binding.
+fn fold_query_v2_err(py: Python<'_>, e: FoldQueryV2ClientError) -> PyErr {
+    let (kind, detail): (&str, String) = match &e {
+        FoldQueryV2ClientError::ServerTooOld => (
+            "server-too-old",
+            "the target does not serve fold.query.v2".to_string(),
+        ),
+        FoldQueryV2ClientError::Transport(t) => ("transport", t.to_string()),
+        FoldQueryV2ClientError::Codec(c) => ("codec", c.to_string()),
+        FoldQueryV2ClientError::Server(srv) => match srv {
+            FoldQueryV2Error::UnknownKind { kind } => ("unknown-kind", format!("0x{kind:04x}")),
+            FoldQueryV2Error::UnknownGroup(g) => ("unknown-group", g.clone()),
+            FoldQueryV2Error::NotAuthorized => (
+                "unauthorized",
+                "caller is outside the daemon's summary visibility and not an operator".to_string(),
+            ),
+            FoldQueryV2Error::DecodeFailed(s) => ("codec", format!("server-decode: {s}")),
+        },
+    };
+    let message = format!("agg:{kind}: {detail}");
+    let py_err = match kind {
+        "unknown-kind" => UnknownFoldKind::new_err(message),
+        "server-too-old" => FoldQueryServerTooOld::new_err(message),
         _ => FoldQueryClientError::new_err(message),
     };
     set_err_attrs(py, py_err, kind, &detail)
@@ -204,6 +241,30 @@ fn summary_to_dict<'py>(py: Python<'py>, s: &SummaryAnnouncement) -> PyResult<Bo
     }
     d.set_item("buckets", buckets)?;
     Ok(d)
+}
+
+/// One `fold.query.v2` record as a dict: `group`, `summary` (the same dict
+/// shape `query_latest` returns), and the stream metadata (`None` until the
+/// daemon fills them in).
+fn record_to_dict<'py>(py: Python<'py>, r: &SummaryRecord) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("group", &r.group)?;
+    d.set_item("summary", summary_to_dict(py, &r.summary)?)?;
+    d.set_item("refresh_ms", r.refresh_ms)?;
+    d.set_item("boot_epoch", r.boot_epoch)?;
+    d.set_item("stream_seq", r.stream_seq)?;
+    Ok(d)
+}
+
+fn records_to_list<'py>(
+    py: Python<'py>,
+    records: &[SummaryRecord],
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for r in records {
+        out.append(record_to_dict(py, r)?)?;
+    }
+    Ok(out)
 }
 
 fn summaries_to_list<'py>(
@@ -397,6 +458,58 @@ impl PyFoldQueryClient {
         }
     }
 
+    /// ``fold.query.v2`` latest summaries for ``kind`` from ``group``, or
+    /// (``None``) every group on the target daemon aggregating it. Returns
+    /// a list of record dicts, each naming its group. Cached like
+    /// :meth:`query_latest`. Raises :class:`FoldQueryServerTooOld` when the
+    /// target has no v2 service.
+    #[pyo3(signature = (target_node_id, kind, group=None))]
+    fn query_group_latest<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        kind: u16,
+        group: Option<String>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner_snapshot = self.inner.read().clone();
+        let runtime = self.runtime.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                inner_snapshot
+                    .query_group_latest(target_node_id, kind, group.as_deref())
+                    .await
+            })
+        });
+        match result {
+            Ok(records) => records_to_list(py, &records),
+            Err(e) => Err(fold_query_v2_err(py, e)),
+        }
+    }
+
+    /// ``fold.query.v2`` ``SummarizeNow``. Never cached.
+    #[pyo3(signature = (target_node_id, kind, group=None))]
+    fn query_group_summarize_now<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        kind: u16,
+        group: Option<String>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner_snapshot = self.inner.read().clone();
+        let runtime = self.runtime.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                inner_snapshot
+                    .query_group_summarize_now(target_node_id, kind, group.as_deref())
+                    .await
+            })
+        });
+        match result {
+            Ok(records) => records_to_list(py, &records),
+            Err(e) => Err(fold_query_v2_err(py, e)),
+        }
+    }
+
     /// Drop every cached entry. Use after a topology change so the
     /// next query re-resolves.
     fn invalidate_cache(&self) {
@@ -479,6 +592,25 @@ struct AsyncFoldQueryClientError(SdkFoldQueryClientError);
 impl From<AsyncFoldQueryClientError> for PyErr {
     fn from(value: AsyncFoldQueryClientError) -> Self {
         Python::attach(|py| fold_query_err(py, value.0))
+    }
+}
+
+struct AsyncRecordsListWrap(Vec<SummaryRecord>);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncRecordsListWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(records_to_list(py, &self.0)?.into_any())
+    }
+}
+
+struct AsyncFoldQueryV2ClientError(FoldQueryV2ClientError);
+
+impl From<AsyncFoldQueryV2ClientError> for PyErr {
+    fn from(value: AsyncFoldQueryV2ClientError) -> Self {
+        Python::attach(|py| fold_query_v2_err(py, value.0))
     }
 }
 
@@ -644,6 +776,45 @@ impl PyAsyncFoldQueryClient {
                 .await
                 .map_err(AsyncFoldQueryClientError)?;
             Ok::<AsyncSummariesListWrap, PyErr>(AsyncSummariesListWrap(summaries))
+        })
+    }
+
+    /// Awaitable ``fold.query.v2`` latest summaries. Resolves to
+    /// ``list[dict]`` of records.
+    #[pyo3(signature = (target_node_id, kind, group=None))]
+    fn query_group_latest<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        kind: u16,
+        group: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let records = inner_snapshot
+                .query_group_latest(target_node_id, kind, group.as_deref())
+                .await
+                .map_err(AsyncFoldQueryV2ClientError)?;
+            Ok::<AsyncRecordsListWrap, PyErr>(AsyncRecordsListWrap(records))
+        })
+    }
+
+    /// Awaitable ``fold.query.v2`` ``SummarizeNow``.
+    #[pyo3(signature = (target_node_id, kind, group=None))]
+    fn query_group_summarize_now<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        kind: u16,
+        group: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let records = inner_snapshot
+                .query_group_summarize_now(target_node_id, kind, group.as_deref())
+                .await
+                .map_err(AsyncFoldQueryV2ClientError)?;
+            Ok::<AsyncRecordsListWrap, PyErr>(AsyncRecordsListWrap(records))
         })
     }
 

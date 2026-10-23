@@ -33,6 +33,11 @@ typedef struct net_fold_query_client_handle_t net_fold_query_client_handle_t;
 #define NET_REGISTRY_ERR_SPAWN_REJECTED       5
 #define NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED  6
 #define NET_REGISTRY_ERR_UNKNOWN_KIND         7
+#define NET_REGISTRY_ERR_UNKNOWN_GROUP        8
+#define NET_REGISTRY_ERR_SCALE_REJECTED       9
+#define NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED  10
+#define NET_REGISTRY_ERR_UNAUTHORIZED         11
+#define NET_REGISTRY_ERR_SERVER_TOO_OLD       12
 #define NET_REGISTRY_ERR_INVALID_ARGS         99
 
 // RegistryClient.
@@ -75,6 +80,18 @@ extern char* net_fold_query_client_query_summarize_now(
     uint64_t target_node_id,
     uint16_t kind,
     int* out_error_kind);
+extern char* net_fold_query_client_query_group_latest(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id,
+    uint16_t kind,
+    const char* group,
+    int* out_error_kind);
+extern char* net_fold_query_client_query_group_summarize_now(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id,
+    uint16_t kind,
+    const char* group,
+    int* out_error_kind);
 extern void net_fold_query_client_invalidate_cache(net_fold_query_client_handle_t* handle);
 extern void net_fold_query_client_invalidate_target(
     net_fold_query_client_handle_t* handle, uint64_t target_node_id);
@@ -115,6 +132,11 @@ const (
 	netRegistryErrSpawnRejected      int32 = 5
 	netRegistryErrSpawnNotSupported  int32 = 6
 	netRegistryErrUnknownKind        int32 = 7
+	netRegistryErrUnknownGroup       int32 = 8
+	netRegistryErrScaleRejected      int32 = 9
+	netRegistryErrScaleNotSupported  int32 = 10
+	netRegistryErrUnauthorized       int32 = 11
+	netRegistryErrServerTooOld       int32 = 12
 	netRegistryErrInvalidArgs        int32 = 99
 )
 
@@ -133,6 +155,10 @@ const (
 	RegistryErrKindDuplicateGroupName RegistryErrorKind = "duplicate-group-name"
 	RegistryErrKindSpawnRejected      RegistryErrorKind = "spawn-rejected"
 	RegistryErrKindSpawnNotSupported  RegistryErrorKind = "spawn-not-supported"
+	RegistryErrKindUnknownGroup       RegistryErrorKind = "unknown-group"
+	RegistryErrKindScaleRejected      RegistryErrorKind = "scale-rejected"
+	RegistryErrKindScaleNotSupported  RegistryErrorKind = "scale-not-supported"
+	RegistryErrKindUnauthorized       RegistryErrorKind = "unauthorized"
 	RegistryErrKindInvalidArgs        RegistryErrorKind = "invalid-args"
 )
 
@@ -158,6 +184,11 @@ const (
 	FoldQueryErrKindCodec       FoldQueryErrorKind = "codec"
 	FoldQueryErrKindUnknownKind FoldQueryErrorKind = "unknown-kind"
 	FoldQueryErrKindInvalidArgs FoldQueryErrorKind = "invalid-args"
+	// From the fold.query.v2 calls (QueryGroupLatest /
+	// QueryGroupSummarizeNow).
+	FoldQueryErrKindUnknownGroup FoldQueryErrorKind = "unknown-group"
+	FoldQueryErrKindUnauthorized FoldQueryErrorKind = "unauthorized"
+	FoldQueryErrKindServerTooOld FoldQueryErrorKind = "server-too-old"
 )
 
 // FoldQueryClientError is the typed failure from any fold-query op.
@@ -192,6 +223,16 @@ func registryErrFromKind(kind int32, detail string) *RegistryClientError {
 		k = RegistryErrKindSpawnRejected
 	case netRegistryErrSpawnNotSupported:
 		k = RegistryErrKindSpawnNotSupported
+	// 8-11 were declared in the C ABI but unmapped here, so an operator
+	// refusal surfaced as "unknown-11".
+	case netRegistryErrUnknownGroup:
+		k = RegistryErrKindUnknownGroup
+	case netRegistryErrScaleRejected:
+		k = RegistryErrKindScaleRejected
+	case netRegistryErrScaleNotSupported:
+		k = RegistryErrKindScaleNotSupported
+	case netRegistryErrUnauthorized:
+		k = RegistryErrKindUnauthorized
 	case netRegistryErrInvalidArgs:
 		k = RegistryErrKindInvalidArgs
 	default:
@@ -209,6 +250,12 @@ func foldQueryErrFromKind(kind int32, detail string) *FoldQueryClientError {
 		k = FoldQueryErrKindCodec
 	case netRegistryErrUnknownKind:
 		k = FoldQueryErrKindUnknownKind
+	case netRegistryErrUnknownGroup:
+		k = FoldQueryErrKindUnknownGroup
+	case netRegistryErrUnauthorized:
+		k = FoldQueryErrKindUnauthorized
+	case netRegistryErrServerTooOld:
+		k = FoldQueryErrKindServerTooOld
 	case netRegistryErrInvalidArgs:
 		k = FoldQueryErrKindInvalidArgs
 	default:
@@ -250,6 +297,17 @@ type SummaryAnnouncement struct {
 	SourceSubnet string          `json:"source_subnet"`
 	Generation   uint64          `json:"generation"`
 	Buckets      []SummaryBucket `json:"buckets"`
+}
+
+// SummaryRecord is one fold.query.v2 record: the summary and the group
+// that produced it. RefreshMS, BootEpoch and StreamSeq are nil until the
+// daemon fills them in.
+type SummaryRecord struct {
+	Group     string              `json:"group"`
+	Summary   SummaryAnnouncement `json:"summary"`
+	RefreshMS *uint32             `json:"refresh_ms"`
+	BootEpoch *uint64             `json:"boot_epoch"`
+	StreamSeq *uint32             `json:"stream_seq"`
 }
 
 // =====================================================================
@@ -572,6 +630,69 @@ func (c *FoldQueryClient) QuerySummarizeNow(
 		return nil, &FoldQueryClientError{
 			Kind:   FoldQueryErrKindCodec,
 			Detail: fmt.Sprintf("decode query_summarize_now response: %v", err),
+		}
+	}
+	return out, nil
+}
+
+// QueryGroupLatest is fold.query.v2: the latest summaries for `kind`
+// from `group`, or from every group on the target daemon aggregating
+// it when `group` is "". Cached like QueryLatest. A target without v2
+// returns a *FoldQueryClientError with Kind FoldQueryErrKindServerTooOld.
+func (c *FoldQueryClient) QueryGroupLatest(
+	ctx context.Context,
+	targetNodeID uint64,
+	kind uint16,
+	group string,
+) ([]SummaryRecord, error) {
+	return c.queryGroup(targetNodeID, kind, group, false)
+}
+
+// QueryGroupSummarizeNow is fold.query.v2 SummarizeNow — never cached.
+func (c *FoldQueryClient) QueryGroupSummarizeNow(
+	ctx context.Context,
+	targetNodeID uint64,
+	kind uint16,
+	group string,
+) ([]SummaryRecord, error) {
+	return c.queryGroup(targetNodeID, kind, group, true)
+}
+
+func (c *FoldQueryClient) queryGroup(
+	targetNodeID uint64,
+	kind uint16,
+	group string,
+	fresh bool,
+) ([]SummaryRecord, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.handle == nil {
+		return nil, ErrAggregatorHandleClosed
+	}
+	// "" means every group: pass NULL.
+	var cGroup *C.char
+	if group != "" {
+		cGroup = C.CString(group)
+		defer C.free(unsafe.Pointer(cGroup))
+	}
+	var errKind C.int
+	var jsonPtr *C.char
+	if fresh {
+		jsonPtr = C.net_fold_query_client_query_group_summarize_now(
+			c.handle, C.uint64_t(targetNodeID), C.uint16_t(kind), cGroup, &errKind)
+	} else {
+		jsonPtr = C.net_fold_query_client_query_group_latest(
+			c.handle, C.uint64_t(targetNodeID), C.uint16_t(kind), cGroup, &errKind)
+	}
+	if jsonPtr == nil {
+		return nil, foldQueryErrFromKind(int32(errKind), c.lastErrorDetail())
+	}
+	defer C.net_free_string(jsonPtr)
+	var out []SummaryRecord
+	if err := json.Unmarshal([]byte(C.GoString(jsonPtr)), &out); err != nil {
+		return nil, &FoldQueryClientError{
+			Kind:   FoldQueryErrKindCodec,
+			Detail: fmt.Sprintf("decode fold.query.v2 response: %v", err),
 		}
 	}
 	return out, nil

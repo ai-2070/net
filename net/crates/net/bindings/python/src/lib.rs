@@ -4636,6 +4636,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "UnknownFoldKind",
             m.py().get_type::<aggregator::UnknownFoldKind>(),
         )?;
+        m.add(
+            "FoldQueryServerTooOld",
+            m.py().get_type::<aggregator::FoldQueryServerTooOld>(),
+        )?;
     }
     #[cfg(feature = "deck")]
     {

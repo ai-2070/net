@@ -627,6 +627,27 @@ service and channel names, with strict decoding on the new versions.*
   Other failures keep their own kinds: a timeout stays `Timeout` (the server's
   version is unknown), `Unauthorized` stays `NotAuthorized`, and a missing
   capability advertisement stays a discovery result.
+- **Where `ServerTooOld` can be observed** (found in Q4, 2026-10-23).
+  - The reply channel is per service (`<service>.replies.<origin>`,
+    `mesh_rpc.rs:992`), and the caller subscribes to it on the server
+    before the request is answered.
+  - A server with a `ChannelConfigRegistry` lists only the reply channels of
+    the services it serves. Every SDK- and binding-built node has one, and
+    so does every daemon from Q1 on. So the caller's subscribe for an
+    unserved service is refused (`UnknownChannel`), and the call fails as
+    `Transport` before any `NotFound` can come back.
+  - `ServerTooOld` is therefore observable only against a server **without**
+    a registry. Every daemon before Q1 is one, so the case this mapping
+    exists for, a v2 client calling a pre-v2 daemon, is covered.
+  - It does **not** cover a future v3 client calling a v2-only daemon. That
+    caller would see `Transport` with an `UnknownChannel` detail.
+  - Not fixed here. Admitting reply-channel subscribes for unserved services
+    is a core channel-auth decision, since reply channels are bound to the
+    caller's pinned identity.
+  - Before a v3 exists, either core answers the unserved call without the
+    reply subscription, or the v3 client checks for the service first (for
+    example through the capability index). Recorded so the next version
+    bump does not rediscover it.
 - **v1 stays.** v1 names keep their current layouts and are served for at least
   one release.
 
@@ -1011,6 +1032,84 @@ subnet or channel registry is injected through a test-only setup path
 
   *Proof:* each binding's aggregator test gains named-group and unknown-group
   cases, and `aggregator.c` keeps its NET-CHECKS line.
+
+  **Done 2026-10-23.**
+
+  **Every binding forwards to the SDK client.**
+  - **Rust SDK:** re-exports the v2 types, plus
+    `BoundFoldQueryClient::query_group_latest` and
+    `query_group_summarize_now`.
+  - **Node:** napi `queryGroupLatest` / `queryGroupSummarizeNow` (group
+    optional) returning `SummaryRecordJs`. Errors use the kinds
+    `server-too-old`, `unknown-group`, `unauthorized` and `unknown-kind`.
+    `aggregator.ts` adds those kinds and the `SummaryRecord` type.
+    - The classifier routes the two shared kinds (`unknown-group`,
+      `unauthorized`) to `FoldQueryClientError` when the caller passes the
+      `'fold-query'` hint. Without the hint they still go to the registry,
+      so existing behavior is unchanged.
+  - **Python:** sync and async `query_group_latest` /
+    `query_group_summarize_now` (`group=None`), returning record dicts. A new
+    `FoldQueryServerTooOld` subclass; the stubs and `__init__` exports are
+    updated.
+  - **C ABI:** `net_fold_query_client_query_group_latest` /
+    `_summarize_now`, where a NULL group means every group; result is a JSON
+    array of records. New `NET_REGISTRY_ERR_SERVER_TOO_OLD = 12`, declared
+    in `include/net.h`. The fold-query funnel is now generic over the error
+    classifier.
+  - **Go:** the cgo preamble declares both functions and codes 8–12.
+    `QueryGroupLatest` / `QueryGroupSummarizeNow` (`""` means every group),
+    returning `[]SummaryRecord`.
+
+  **Evidence (all local, Windows):**
+  - **Node:** `bindings/node` built with CI's napi feature list.
+    `test/aggregator.test.ts` passes (24), including the guard that every
+    `agg_err` kind the binding emits is typed.
+  - **TS SDK:** `sdk-ts/test/small_surfaces.test.ts` passes (8). Live: a v2
+    call to a registry-less peer returns `server-too-old`, for both the
+    named-group call and the summarize-now call.
+  - **Python:** `maturin develop` with CI's feature list.
+    `tests/test_fold_query_v2.py` (3: subclassing, plus sync and async live
+    `FoldQueryServerTooOld` against the registry-less `mesh_pair`) and
+    `test_aggregator_error_kinds.py` pass. A wider 731-test selection,
+    stub checks included, also passes.
+  - **Go:** CI's `net-ffi` release cdylib, then `go test`. New tests pass:
+    - the code mappings for 8–12;
+    - closed-handle errors;
+    - a live v2 call against a connected Go peer, typed `transport` (see
+      the D9 note);
+    - `TestABIStabilityAggregatorPreambleMatchesCanonicalHeader`, which
+      compares every function and code in Go's preamble with
+      `include/net.h`, compares the Go int32 mirrors, and requires every
+      code to map to a named kind.
+
+    The whole ABI-stability and header-parity group still passes.
+  - **C:** `examples/c/aggregator.c` compiled exactly as the MinGW lane of
+    `run-c-consumers.py` does (`-Werror`) against the same `net.dll`.
+    `NET-CHECKS: 27`, up from 21, and `examples/c/FLOORS` was raised to
+    match. The new checks: the v2 calls fail typed, a non-UTF-8 group and a
+    NULL handle are `INVALID_ARGS`, and `SERVER_TOO_OLD` is 12.
+  - **Rust:** `tests/error_kind_mirror.rs` (with CI's
+    `--features fixtures`) pins `SERVER_TOO_OLD` in the header and its
+    `server-too-old` string.
+
+  **Where the implementation departs from the text above, and why:**
+  1. **No live named-group or unknown-group case in the bindings.** No
+     binding can host an aggregator (daemon-author surfaces are Rust-only by
+     decision). Those answers are proven in Rust against real registries
+     (Q2, Q3). Each binding instead proves the full wire path with
+     `server-too-old` (Node, Python) or a typed `transport` (Go, C, which
+     cannot build a registry-less node).
+  2. **The C example lives at `examples/c/aggregator.c`**, not
+     `tests/c_sdk/`.
+  3. **Fixed on the way: Go's registry error mapping** had no case for codes
+     8–11, so an operator refusal surfaced as `unknown-11`. It now maps
+     `unknown-group`, `scale-rejected`, `scale-not-supported` and
+     `unauthorized`.
+
+  **Found on the way:** `ServerTooOld` is observable only against a peer
+  with no channel registry. See the note under D9. The witnesses were
+  shaped by it: the first TS version expected `server-too-old` from an
+  SDK-built peer and got `transport`, which led to the finding.
 
 ### Phase 3 — Summaries that are right, and cheap at 1M (G3, G7; about 1 week)
 

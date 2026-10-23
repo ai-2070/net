@@ -19,8 +19,9 @@ use parking_lot::RwLock as ParkingRwLock;
 
 use net_sdk::aggregator::{
     FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError, FoldQueryError,
-    RegistryClient as SdkRegistryClient, RegistryClientError, RegistryGroupSummary,
-    RegistryReplicaSummary, RegistryRpcError,
+    FoldQueryV2ClientError, FoldQueryV2Error, RegistryClient as SdkRegistryClient,
+    RegistryClientError, RegistryGroupSummary, RegistryReplicaSummary, RegistryRpcError,
+    SummaryRecord,
 };
 
 // ============================================================================
@@ -79,6 +80,31 @@ fn fold_query_err(e: FoldQueryClientError) -> Error {
     }
 }
 
+/// `fold.query.v2` errors. `server-too-old` is the target answering
+/// `NotFound` for the v2 service; `unknown-group` and `unauthorized` share
+/// their strings with the registry surface, so `aggregator.ts` routes them by
+/// the caller's `'fold-query'` hint.
+fn fold_query_v2_err(e: FoldQueryV2ClientError) -> Error {
+    match e {
+        FoldQueryV2ClientError::ServerTooOld => {
+            agg_err("server-too-old", "the target does not serve fold.query.v2")
+        }
+        FoldQueryV2ClientError::Transport(t) => agg_err("transport", t),
+        FoldQueryV2ClientError::Codec(c) => agg_err("codec", c),
+        FoldQueryV2ClientError::Server(srv) => match srv {
+            FoldQueryV2Error::UnknownKind { kind } => {
+                agg_err("unknown-kind", format!("0x{kind:04x}"))
+            }
+            FoldQueryV2Error::UnknownGroup(g) => agg_err("unknown-group", g),
+            FoldQueryV2Error::NotAuthorized => agg_err(
+                "unauthorized",
+                "caller is outside the daemon's summary visibility and not an operator",
+            ),
+            FoldQueryV2Error::DecodeFailed(s) => agg_err("codec", format!("server-decode: {s}")),
+        },
+    }
+}
+
 // ============================================================================
 // POJO shapes — wire-contract-locked across all language SDKs.
 // ============================================================================
@@ -129,6 +155,30 @@ pub struct SummaryAnnouncementJs {
     pub source_subnet: String,
     pub generation: BigInt,
     pub buckets: Vec<SummaryBucketJs>,
+}
+
+/// One `fold.query.v2` record: the summary and the group it came from,
+/// with the stream metadata the daemon fills in as it gains them (absent
+/// until then).
+#[napi(object)]
+pub struct SummaryRecordJs {
+    pub group: String,
+    pub summary: SummaryAnnouncementJs,
+    pub refresh_ms: Option<u32>,
+    pub boot_epoch: Option<BigInt>,
+    pub stream_seq: Option<u32>,
+}
+
+impl From<&SummaryRecord> for SummaryRecordJs {
+    fn from(r: &SummaryRecord) -> Self {
+        Self {
+            group: r.group.clone(),
+            summary: (&r.summary).into(),
+            refresh_ms: r.refresh_ms,
+            boot_epoch: r.boot_epoch.map(BigInt::from),
+            stream_seq: r.stream_seq,
+        }
+    }
 }
 
 #[napi(object)]
@@ -338,6 +388,47 @@ impl FoldQueryClient {
             .await
             .map_err(fold_query_err)?;
         Ok(summaries.iter().map(Into::into).collect())
+    }
+
+    /// `fold.query.v2` latest summaries for `kind`, from `group` or (omitted)
+    /// every group on the target daemon aggregating it. Cached like
+    /// `queryLatest`. A target without v2 rejects with
+    /// `agg:server-too-old`.
+    #[napi]
+    pub async fn query_group_latest(
+        &self,
+        target_node_id: BigInt,
+        kind: u32,
+        group: Option<String>,
+    ) -> Result<Vec<SummaryRecordJs>> {
+        let target = crate::common::bigint_u64(target_node_id)?;
+        let kind_u16 = u16::try_from(kind)
+            .map_err(|_| agg_err("invalid-args", format!("kind must fit in u16, got {kind}")))?;
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
+        let records = client
+            .query_group_latest(target, kind_u16, group.as_deref())
+            .await
+            .map_err(fold_query_v2_err)?;
+        Ok(records.iter().map(Into::into).collect())
+    }
+
+    /// `fold.query.v2` `SummarizeNow`. Never cached.
+    #[napi]
+    pub async fn query_group_summarize_now(
+        &self,
+        target_node_id: BigInt,
+        kind: u32,
+        group: Option<String>,
+    ) -> Result<Vec<SummaryRecordJs>> {
+        let target = crate::common::bigint_u64(target_node_id)?;
+        let kind_u16 = u16::try_from(kind)
+            .map_err(|_| agg_err("invalid-args", format!("kind must fit in u16, got {kind}")))?;
+        let client = self.inner.read().clone().ok_or_else(closed_err)?;
+        let records = client
+            .query_group_summarize_now(target, kind_u16, group.as_deref())
+            .await
+            .map_err(fold_query_v2_err)?;
+        Ok(records.iter().map(Into::into).collect())
     }
 
     #[napi]

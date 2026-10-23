@@ -763,3 +763,117 @@ func TestABIStabilityWriteTokenCarriesTheChannel(t *testing.T) {
 		t.Errorf("-160 is defined at %v; only NET_ERR_WRONG_CHANNEL in src/ffi/cortex.rs may", found)
 	}
 }
+
+// TestABIStabilityAggregatorPreambleMatchesCanonicalHeader pins the
+// aggregator surface Go declares in its own cgo preamble
+// (go/aggregator.go) to the canonical include/net.h. No mirror header
+// covers this surface, so this is where a drift between the two would
+// surface (AGGREGATOR_MULTI_HOST_PLAN.md Q4 added fold.query.v2 here).
+//
+//   - Every function the preamble declares has net.h's parameters and
+//     return type, and the fold.query.v2 calls are declared.
+//   - Every NET_REGISTRY_* constant the preamble defines has net.h's value.
+//   - The Go-side int32 mirrors equal those values.
+//   - Every NET_REGISTRY_ERR_* in net.h maps to a named kind on the
+//     fold-query or the registry surface, never the unknown-N fallback.
+//
+// unknownCodeKind is the forward-compat fallback kind, `unknown-<code>`.
+var unknownCodeKind = regexp.MustCompile(`^unknown-\d+$`)
+
+func TestABIStabilityAggregatorPreambleMatchesCanonicalHeader(t *testing.T) {
+	requireCrateTree(t)
+	canonical := parseHeader(t, "../net/crates/net/include/net.h")
+
+	// The preamble is the block comment directly above `import "C"`;
+	// parseHeader strips comments, so lift it into a file of its own.
+	src, err := os.ReadFile("aggregator.go")
+	if err != nil {
+		t.Fatalf("read aggregator.go: %v", err)
+	}
+	m := regexp.MustCompile(`(?s)/\*(.*?)\*/\s*import "C"`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("no cgo preamble found in aggregator.go")
+	}
+	tmp := filepath.Join(t.TempDir(), "aggregator_preamble.h")
+	if err := os.WriteFile(tmp, m[1], fs.FileMode(0o600)); err != nil {
+		t.Fatalf("write preamble: %v", err)
+	}
+	preamble := parseHeader(t, tmp)
+
+	if len(preamble.fns) == 0 {
+		t.Fatal("parsed no functions from the aggregator preamble")
+	}
+	for _, name := range []string{
+		"net_fold_query_client_query_group_latest",
+		"net_fold_query_client_query_group_summarize_now",
+	} {
+		if _, ok := preamble.fns[name]; !ok {
+			t.Errorf("the aggregator preamble does not declare %s", name)
+		}
+	}
+	for name, params := range preamble.fns {
+		want, ok := canonical.fns[name]
+		if !ok {
+			t.Errorf("%s is declared in the Go preamble but not in include/net.h", name)
+			continue
+		}
+		if params != want {
+			t.Errorf("%s parameters differ:\n  net.h:    (%s)\n  preamble: (%s)", name, want, params)
+		}
+		if w, g := canonical.rets[name], preamble.rets[name]; w != g {
+			t.Errorf("%s return type differs: net.h %q, preamble %q", name, w, g)
+		}
+	}
+
+	goValues := map[string]int32{
+		"NET_REGISTRY_OK":                       netRegistryOk,
+		"NET_REGISTRY_ERR_TRANSPORT":            netRegistryErrTransport,
+		"NET_REGISTRY_ERR_CODEC":                netRegistryErrCodec,
+		"NET_REGISTRY_ERR_UNKNOWN_TEMPLATE":     netRegistryErrUnknownTemplate,
+		"NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME": netRegistryErrDuplicateGroupName,
+		"NET_REGISTRY_ERR_SPAWN_REJECTED":       netRegistryErrSpawnRejected,
+		"NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED":  netRegistryErrSpawnNotSupported,
+		"NET_REGISTRY_ERR_UNKNOWN_KIND":         netRegistryErrUnknownKind,
+		"NET_REGISTRY_ERR_UNKNOWN_GROUP":        netRegistryErrUnknownGroup,
+		"NET_REGISTRY_ERR_SCALE_REJECTED":       netRegistryErrScaleRejected,
+		"NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED":  netRegistryErrScaleNotSupported,
+		"NET_REGISTRY_ERR_UNAUTHORIZED":         netRegistryErrUnauthorized,
+		"NET_REGISTRY_ERR_SERVER_TOO_OLD":       netRegistryErrServerTooOld,
+		"NET_REGISTRY_ERR_INVALID_ARGS":         netRegistryErrInvalidArgs,
+	}
+	for name, raw := range preamble.consts {
+		if !strings.HasPrefix(name, "NET_REGISTRY_") {
+			continue
+		}
+		if want := canonical.consts[name]; raw != want {
+			t.Errorf("%s = %s in the preamble but %s in net.h", name, raw, want)
+		}
+	}
+	for name, raw := range canonical.consts {
+		if !strings.HasPrefix(name, "NET_REGISTRY_") {
+			continue
+		}
+		code, err := strconv.Atoi(raw)
+		if err != nil {
+			t.Fatalf("%s = %q is not an integer", name, raw)
+		}
+		goValue, ok := goValues[name]
+		if !ok {
+			t.Errorf("%s (%d) has no Go-side mirror; add it to aggregator.go and this table", name, code)
+			continue
+		}
+		if int32(code) != goValue {
+			t.Errorf("%s: net.h %d, Go %d", name, code, goValue)
+		}
+		if name == "NET_REGISTRY_OK" {
+			continue
+		}
+		// The fallback is `unknown-<code>`; real kinds such as
+		// `unknown-template` also start with "unknown-".
+		fold := foldQueryErrFromKind(int32(code), "")
+		reg := registryErrFromKind(int32(code), "")
+		if unknownCodeKind.MatchString(string(fold.Kind)) && unknownCodeKind.MatchString(string(reg.Kind)) {
+			t.Errorf("%s (%d) maps to no named kind on either surface", name, code)
+		}
+	}
+}

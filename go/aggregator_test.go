@@ -79,6 +79,12 @@ func TestRegistryErrFromKindMapping(t *testing.T) {
 		{netRegistryErrDuplicateGroupName, RegistryErrKindDuplicateGroupName},
 		{netRegistryErrSpawnRejected, RegistryErrKindSpawnRejected},
 		{netRegistryErrSpawnNotSupported, RegistryErrKindSpawnNotSupported},
+		// 8-11 were declared in the C ABI but unmapped, so an operator
+		// refusal surfaced as "unknown-11".
+		{netRegistryErrUnknownGroup, RegistryErrKindUnknownGroup},
+		{netRegistryErrScaleRejected, RegistryErrKindScaleRejected},
+		{netRegistryErrScaleNotSupported, RegistryErrKindScaleNotSupported},
+		{netRegistryErrUnauthorized, RegistryErrKindUnauthorized},
 		{netRegistryErrInvalidArgs, RegistryErrKindInvalidArgs},
 	} {
 		got := registryErrFromKind(tt.raw, "detail")
@@ -100,6 +106,10 @@ func TestFoldQueryErrFromKindMapping(t *testing.T) {
 		{netRegistryErrCodec, FoldQueryErrKindCodec},
 		{netRegistryErrUnknownKind, FoldQueryErrKindUnknownKind},
 		{netRegistryErrInvalidArgs, FoldQueryErrKindInvalidArgs},
+		// fold.query.v2 (AGGREGATOR_MULTI_HOST_PLAN.md Q4).
+		{netRegistryErrUnknownGroup, FoldQueryErrKindUnknownGroup},
+		{netRegistryErrUnauthorized, FoldQueryErrKindUnauthorized},
+		{netRegistryErrServerTooOld, FoldQueryErrKindServerTooOld},
 	} {
 		got := foldQueryErrFromKind(tt.raw, "detail")
 		if got.Kind != tt.want {
@@ -187,6 +197,12 @@ func TestClosedClientReturnsHandleClosedError(t *testing.T) {
 	if _, err := fq.QuerySummarizeNow(ctx, 0, 0); !errors.Is(err, ErrAggregatorHandleClosed) {
 		t.Errorf("QuerySummarizeNow on nil-handle = %v, want ErrAggregatorHandleClosed", err)
 	}
+	if _, err := fq.QueryGroupLatest(ctx, 0, 0, "g"); !errors.Is(err, ErrAggregatorHandleClosed) {
+		t.Errorf("QueryGroupLatest on nil-handle = %v, want ErrAggregatorHandleClosed", err)
+	}
+	if _, err := fq.QueryGroupSummarizeNow(ctx, 0, 0, ""); !errors.Is(err, ErrAggregatorHandleClosed) {
+		t.Errorf("QueryGroupSummarizeNow on nil-handle = %v, want ErrAggregatorHandleClosed", err)
+	}
 
 	// `InvalidateCache` / `InvalidateTarget` are no-ops on a
 	// nil-handle client (the C call is guarded). Just confirm
@@ -224,5 +240,52 @@ func TestAggregatorClientsAreBuiltFromAMeshNode(t *testing.T) {
 	}
 	if _, err := NewFoldQueryClient(node); err == nil {
 		t.Fatal("a shut-down node must be refused")
+	}
+}
+
+// fold.query.v2 from Go (AGGREGATOR_MULTI_HOST_PLAN.md Q4), live. Serving
+// it is the aggregator daemon's job, so the call goes to a connected peer
+// that serves no fold query.
+//
+// Every Go-built node installs a channel registry, and RPC reply channels
+// are per service (`<service>.replies.<origin>`). So the caller's
+// reply-channel subscribe for the unserved service is refused before the
+// request is answered. The call fails as a typed `transport` error that
+// says so, not as `server-too-old`; that kind needs a registry-less peer
+// (every pre-Q1 daemon), which Go cannot build. The Node and Python
+// bindings witness it against one.
+func TestQueryGroupAgainstAPeerWithoutV2IsATypedTransportError(t *testing.T) {
+	a, b, cleanup := meshHandshakePair(t)
+	defer cleanup()
+	fq, err := NewFoldQueryClient(a)
+	if err != nil {
+		t.Fatalf("NewFoldQueryClient: %v", err)
+	}
+	defer fq.Close()
+	fq.WithDeadline(3 * time.Second).WithTTL(0)
+
+	ctx := context.Background()
+	for name, call := range map[string]func() ([]SummaryRecord, error){
+		"QueryGroupLatest(named)": func() ([]SummaryRecord, error) {
+			return fq.QueryGroupLatest(ctx, b.NodeID(), 1, "some-group")
+		},
+		"QueryGroupSummarizeNow(all)": func() ([]SummaryRecord, error) {
+			return fq.QueryGroupSummarizeNow(ctx, b.NodeID(), 1, "")
+		},
+	} {
+		records, err := call()
+		if err == nil {
+			t.Fatalf("%s: want an error from a peer without fold.query.v2, got %v", name, records)
+		}
+		var fqErr *FoldQueryClientError
+		if !errors.As(err, &fqErr) {
+			t.Fatalf("%s: want *FoldQueryClientError, got %T (%v)", name, err, err)
+		}
+		if fqErr.Kind != FoldQueryErrKindTransport {
+			t.Errorf("%s: kind = %q, want %q", name, fqErr.Kind, FoldQueryErrKindTransport)
+		}
+		if !strings.Contains(fqErr.Detail, "reply-channel subscribe rejected") {
+			t.Errorf("%s: detail should say the reply-channel subscribe was refused: %q", name, fqErr.Detail)
+		}
 	}
 }
