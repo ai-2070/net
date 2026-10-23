@@ -757,6 +757,50 @@ subnet or channel registry is injected through a test-only setup path
     **both** the classification of a sample tag set and the fingerprint.
   - A direct peer's subnet appears in `peer_subnets` after its announcement,
     with the policy coming only from the TOML.
+
+  **Done 2026-10-23.** The code is `aggregator-daemon/src/subnet_policy.rs`,
+  wired into `boot()`.
+
+  - **Unit tests** (7, in-module):
+    - parsing and classification;
+    - value-map order leaves the fingerprint unchanged;
+    - reversing two conflicting same-level rules changes both the
+      classification (`[9]` vs `[1]`) and the fingerprint;
+    - distinct policies get distinct fingerprints;
+    - invalid rules are refused with their index;
+    - unknown keys are refused.
+  - **Boot tests** (4, in `aggregator-daemon/tests/subnet_policy_boot.rs`;
+    every daemon booted from TOML through `boot()`):
+    - direct peers tagged `region:eu`, `region:us` and `region:mars` are
+      recorded on the daemon's mesh as `[1]`, `[2]` and `GLOBAL`;
+    - with no rules there is no policy, and the peer's subnet stays `None`.
+      This is the negative control: without the TOML path nothing classifies;
+    - an invalid rule refuses boot with `SubnetRule(Invalid { index: 1 })`;
+    - booted fingerprints ignore value order but not rule order.
+  - **Gates:** the full `cargo test -p net-aggregator-daemon` passes. CI's
+    `cargo clippy --all-targets -- -D warnings` (run from the crate
+    directory), `RUSTDOCFLAGS="-D warnings" cargo doc -p net-aggregator-daemon`
+    and rustfmt are all clean.
+
+  **Where the implementation departs from the text above, and why:**
+
+  1. **BLAKE3, not BLAKE2s.** The fingerprint uses BLAKE3 in derive-key mode
+     with a versioned context string. The daemon already depends on `blake3`;
+     the property that matters (rule order hashed, value maps canonical,
+     length-prefixed fields) is unchanged.
+  2. **The fingerprint is not in `List` yet.** `List` is a v1 wire shape,
+     frozen by D9. Adding a field would change its bytes, so the fingerprint
+     reaches `List` with the v2 registry layout in M3. Until then it is on
+     `BootedDaemon::subnet_policy_fingerprint` and in the boot log line.
+  3. **The missing-policy refusal moves to Q1.** That refusal is keyed on the
+     daemon's own `subnet` setting, which Q1 introduces. Q0 has nothing to key
+     it on.
+
+  **Added beyond the plan:** a rule with empty `values` is refused, a value
+  of 0 is refused (it is reserved), a rule set that can never assign a
+  non-global subnet is refused, and unknown keys in a `[[subnet_rule]]` block
+  are refused. Each of these would otherwise produce a policy that silently
+  classifies everything as `GLOBAL`.
 - **Q1. Daemon publication scope (D0).**
   - Add `subnet`, and source-subnet and visibility agreement checks for groups
     and templates, plus the one-group-per-kind refusal.

@@ -33,6 +33,17 @@
 //! summary_interval_ms = 1000
 //! ```
 //!
+//! Optional `[[subnet_rule]]` blocks install a subnet policy, which
+//! classifies peers into subnets from their signed capability tags. Rules
+//! apply in declaration order, and a later rule wins on a shared level:
+//!
+//! ```toml
+//! [[subnet_rule]]
+//! tag_prefix = "region:"
+//! level = 0
+//! values = { "eu" = 1, "us" = 2 }
+//! ```
+//!
 //! # Lifecycle
 //!
 //! 1. Parse CLI + config.
@@ -42,6 +53,10 @@
 //!    and register it under the operator-chosen name.
 //! 4. Block on SIGINT (Ctrl-C). On signal: drain the registry
 //!    (stop every group, await teardown) then exit.
+
+mod subnet_policy;
+
+pub use subnet_policy::SubnetRuleError;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -174,6 +189,12 @@ struct Config {
     /// deployment genuinely needs wider groups.
     #[serde(default = "default_max_replica_count")]
     max_replica_count: u8,
+    /// Subnet policy: `[[subnet_rule]]` blocks, applied in declaration
+    /// order (a later rule wins on a shared level). Empty, the default,
+    /// installs no policy, so the mesh records no peer subnets. See
+    /// `subnet_policy.rs`.
+    #[serde(default, rename = "subnet_rule")]
+    subnet_rules: Vec<subnet_policy::SubnetRuleConfig>,
 }
 
 /// Default ceiling on hosted groups. Generous for the intended
@@ -316,6 +337,9 @@ pub enum DaemonError {
     },
     #[error("subnet identifier {raw:?}: {error}")]
     SubnetInvalid { raw: String, error: String },
+    /// A `[[subnet_rule]]` block was refused.
+    #[error("{0}")]
+    SubnetRule(SubnetRuleError),
     #[error("group seed for {name:?} must be 64 hex chars: {error}")]
     GroupSeedInvalid { name: String, error: String },
     #[error("mesh: {0}")]
@@ -413,6 +437,11 @@ pub struct BootedDaemon {
     /// Public key the listening node accepts handshakes against.
     /// Test fixtures pass this to `MeshNode::connect`.
     pub public_key: [u8; 32],
+    /// Fingerprint of the configured `[[subnet_rule]]` list, in
+    /// declaration order, or `None` when no rules are configured (and so
+    /// no policy is installed). Two daemons with equal fingerprints
+    /// classify every tag set the same way.
+    pub subnet_policy_fingerprint: Option<[u8; 32]>,
 }
 
 /// Boot the registry + groups without entering the
@@ -456,17 +485,24 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         })?;
     let psk = decode_psk(&config.psk_hex)?;
     let admin_policy = resolve_admin_policy(&config)?;
+    let subnet_policy =
+        subnet_policy::build_policy(&config.subnet_rules).map_err(DaemonError::SubnetRule)?;
+    let subnet_policy_fingerprint = subnet_policy
+        .as_ref()
+        .map(|_| subnet_policy::policy_fingerprint(&config.subnet_rules));
 
     // Boot the MeshNode, install the registry, expose the RPC
     // service. Order matters: `set_aggregator_registry`
     // requires `&mut MeshNode`, so install before wrapping in
-    // Arc.
-    let mut mesh_node = MeshNode::new(
-        EntityKeypair::generate(),
-        MeshNodeConfig::new(listen_addr, psk),
-    )
-    .await
-    .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
+    // Arc. The subnet policy rides the node config: the mesh reads
+    // it when it classifies a direct peer's announcement.
+    let mut mesh_config = MeshNodeConfig::new(listen_addr, psk);
+    if let Some(policy) = subnet_policy {
+        mesh_config = mesh_config.with_subnet_policy(Arc::new(policy));
+    }
+    let mut mesh_node = MeshNode::new(EntityKeypair::generate(), mesh_config)
+        .await
+        .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
     let registry = Arc::new(AggregatorRegistry::new());
     mesh_node.set_aggregator_registry(registry.clone());
     let mesh = Arc::new(mesh_node);
@@ -503,6 +539,11 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         node_id = mesh.node_id(),
         groups = config.groups.len(),
         templates = config.templates.len(),
+        subnet_rules = config.subnet_rules.len(),
+        subnet_policy_fingerprint = subnet_policy_fingerprint
+            .as_ref()
+            .map(subnet_policy::fingerprint_hex)
+            .unwrap_or_else(|| "none".to_string()),
         "aggregator daemon booted",
     );
 
@@ -548,6 +589,7 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         _serve: serve,
         bound_addr,
         public_key,
+        subnet_policy_fingerprint,
     })
 }
 
