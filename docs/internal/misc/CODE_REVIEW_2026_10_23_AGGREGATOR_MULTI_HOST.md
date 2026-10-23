@@ -16,7 +16,8 @@ independently confirmed.
 **Receipts:** none. No `cargo`, nextest, Go, Node or Python run backed this
 pass. No finding below has a test that covers it.
 
-**Verdict: HOLD.** Fix AG-1, AG-3 and AG-4 before opening a PR. AG-1 can
+**Verdict: HOLD** at review time; **all ten findings are now fixed** (see
+Resolution at the end). AG-1, AG-3 and AG-4 were the must-fixes. AG-1 can
 silently stop a summary update from being published. AG-3 and AG-4 give
 operators and callers a wrong signal, or none at all, about why summaries
 and queries are refused.
@@ -221,3 +222,58 @@ effects, and needs a `registered == 0` "no registry" check as a result.
 **Fix direction:** a free `summary_channel_name(kind)` plus a direct
 `channel_configs().insert(ChannelConfig::new(..).with_visibility(..))`,
 so one function owns the channel-name format.
+
+---
+
+## Resolution (2026-10-23)
+
+Every finding is fixed on `LZL0/aggregators`:
+
+| ID | Commit | Test |
+|---|---|---|
+| AG-1 | `9bf2f1082` | daemon `summarize_now_publishes_what_it_ticks` (fails on the old `tick_once` path, checked by reverting it); `summarize_now_coalesces_calls_inside_the_window`, `summarize_now_appends_only_what_it_published` |
+| AG-2 | `c1e48c790` | none (docs: FFI, `net.h`, Python, Go, TS, core) |
+| AG-3 | `adefb6808` | `a_global_daemon_with_rules_needs_global_summaries` |
+| AG-4 | `c1e48c790` | `aggregator_fold_query` v1 refusal is `NotAuthorized`; FFI `classify_fold_query_maps_every_variant` |
+| AG-5 | `adefb6808` | `rules_that_cannot_reach_the_daemon_subnet_are_refused` |
+| AG-6 | `9bf2f1082` | covered by the existing query and Spawn tests |
+| AG-7 | `9bf2f1082` | covered by the existing query tests |
+| AG-8 | `c1e48c790` | FFI `classify_fold_query_v2_maps_every_variant_like_v1` |
+| AG-9 | `adefb6808` | covered by the daemon `publication_scope` tests |
+| AG-10 | `9bf2f1082` | `a_named_group_taken_mid_query_is_unknown_group` |
+
+**How AG-1 was fixed.** SummarizeNow keeps its pinned contract (it forces
+a tick, and the generation advances), and that tick now publishes like a
+background tick. `AggregatorDaemon::summarize_now` appends only what it
+published, so a failed publish is retried by the next tick. Publishing
+ticks share a lock, so a query and the background loop cannot publish one
+change twice. On-demand ticks are coalesced to one per
+`SUMMARIZE_NOW_MIN_INTERVAL` (100 ms) per daemon; a call inside the window
+answers from the latest buffer. Not done: restricting SummarizeNow to
+operators. The coalescing bounds the cost without changing who may ask.
+
+**Behavior changes.**
+- AG-3 and AG-5 refuse configs that booted before. The Q0 boot tests ran
+  a global daemon with rules under the default visibility; they now set
+  `summary_visibility = "global"`.
+- AG-4 adds a variant to `FoldQueryClientError` (`NotAuthorized`).
+- AG-8 unifies the detail text: the C ABI now reports `server-decode: …`
+  and `0x0001` like Node and Python, not `server decode: …` and
+  `unknown fold kind: 0x0001`.
+
+**Not changed by AG-2.** `ServerTooOld` still maps only `NotFound`. A
+registry-protected peer without v2 still fails as `Transport`; changing
+that is the core channel-auth decision recorded under D9 in the plan.
+
+**Receipts.** Local, Windows: `cargo fmt` (workspace); aggregator and
+`ffi::aggregator` lib units (63); `aggregator_fold_query` and
+`error_kind_mirror` (13); `net-aggregator-daemon` (57); `cargo clippy -p
+net-mesh -p net-aggregator-daemon -p net-mesh-sdk --all-features
+--all-targets` with CI's `-A` flags; strict `--lib --bins -D warnings`
+(default, all features, no default features); rustdoc `-D warnings` for the
+root (all features), `net-mesh-sdk` and `net-aggregator-daemon`; `cargo
+clippy -D warnings` for `net-python` with the `aggregator` feature. Node:
+`net-node` with only `aggregator` compiles, and its only lints are four
+dead-code items in `common.rs` that this narrow feature set leaves unused.
+Not run locally: Go, the Python and Node test suites, and the bindings'
+full CI feature sets.
