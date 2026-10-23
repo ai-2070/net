@@ -44115,7 +44115,11 @@ impl MeshNode {
     /// nothing else in front of it, and an attacker can choose a
     /// colliding name on purpose. See
     /// `exported_policy_does_not_alias_across_a_wire_hash_collision`.
-    fn subnet_visible(
+    ///
+    /// `pub(crate)` so the aggregator's `fold.query.v2` access check
+    /// applies this same rule to queries for the summaries a channel
+    /// carries, rather than a copy that could drift.
+    pub(crate) fn subnet_visible(
         source: SubnetId,
         dest: Option<SubnetId>,
         visibility: Visibility,

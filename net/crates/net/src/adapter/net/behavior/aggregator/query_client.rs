@@ -89,6 +89,9 @@ struct CacheEntry {
 pub struct FoldQueryClient {
     mesh: Arc<MeshNode>,
     cache: Arc<RwLock<HashMap<CacheKey, CacheEntry>>>,
+    /// `fold.query.v2` results, keyed with the group selector
+    /// (`super::query_v2`).
+    v2_cache: super::query_v2::V2Cache,
     ttl: Duration,
     deadline: Duration,
 }
@@ -101,6 +104,7 @@ impl FoldQueryClient {
         Self {
             mesh,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            v2_cache: Arc::new(RwLock::new(HashMap::new())),
             ttl: DEFAULT_QUERY_CACHE_TTL,
             deadline: DEFAULT_QUERY_DEADLINE,
         }
@@ -233,6 +237,7 @@ impl FoldQueryClient {
     /// query re-resolves against the new aggregator replica.
     pub fn invalidate_cache(&self) {
         self.cache.write().clear();
+        self.v2_cache.write().clear();
     }
 
     /// Drop just the entries matching `target_node_id`. Used when
@@ -241,6 +246,27 @@ impl FoldQueryClient {
     pub fn invalidate_target(&self, target_node_id: u64) {
         let mut cache = self.cache.write();
         cache.retain(|k, _| k.target != target_node_id);
+        drop(cache);
+        self.v2_cache
+            .write()
+            .retain(|k, _| !k.is_for_target(target_node_id));
+    }
+
+    // Crate-private accessors for the v2 methods in `query_v2`.
+    pub(crate) fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    pub(crate) fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    pub(crate) fn mesh(&self) -> &Arc<MeshNode> {
+        &self.mesh
+    }
+
+    pub(crate) fn v2_cache(&self) -> &super::query_v2::V2Cache {
+        &self.v2_cache
     }
 
     async fn issue_call(
