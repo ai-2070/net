@@ -1,0 +1,63 @@
+net/crates/net/aggregator-daemon/tests/publication_scope.rs
+  s_a45750ef6fc5fc::t_9cf0ea616c206b 64
+  s_a45750ef6fc5fc::t_aa6df1b630537b 183
+  s_a45750ef6fc5fc::t_fa3117db476530 30-31,305-308
+  s_a45750ef6fc5fc::t_7e1f47e7a961f1 1-29,32-63,65-182,184-304,309-359
+net/crates/net/aggregator-daemon/src/scope.rs
+  s_a45750ef6fc5fc::t_02cfc415534994 1-63,65-327
+  s_a45750ef6fc5fc::t_fa3117db476530 64
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_a45750ef6fc5fc::t_cd8c011e95c9f4 1040,1043-1047,1052,1054,1061,1063-1071
+  s_a45750ef6fc5fc::t_b94467f70d5577 1099
+  s_a45750ef6fc5fc::t_b0df3f518e5f41 1124
+  s_a45750ef6fc5fc::t_e7872ee35c19b1 564-566,569-575,584-588,590
+  s_a45750ef6fc5fc::t_a34ab570ab5542 35-41,44-46,50-55
+  s_a45750ef6fc5fc::t_912eb3f8a789d7 626-627
+  s_a45750ef6fc5fc::t_c2da8326d5c3fe 212-226
+  s_a45750ef6fc5fc::t_6db5b010a5c227 255-258
+  s_a45750ef6fc5fc::t_321a43f5600bd5 605,612
+  s_a45750ef6fc5fc::t_655566b9472ab5 376-413
+  s_a45750ef6fc5fc::t_5c00080b47289a 68,73
+  s_a45750ef6fc5fc::t_8fb67f52fc0a18 696,701-704
+  s_a45750ef6fc5fc::t_bf21fe3ce95a96 729,734,740-742,747,757,761,768
+  s_a45750ef6fc5fc::t_4dc60fde296c01 852,854
+  s_a45750ef6fc5fc::t_60d42a4fa6e31f 546
+  s_a45750ef6fc5fc::t_d244cff0838934 282-284
+  s_a45750ef6fc5fc::t_07571adfa4c41a 657
+  s_a45750ef6fc5fc::t_f8d4b5cccb1b0b 867-919
+  s_a45750ef6fc5fc::t_f5058e56feb002 74
+net/crates/net/aggregator-daemon/tests/boot_and_query.rs
+  s_a45750ef6fc5fc::t_cdd06f692ec3cb 408-412
+  s_a45750ef6fc5fc::t_9cf0ea616c206b 94,431
+  s_a45750ef6fc5fc::t_fa3117db476530 467
+net/crates/net/aggregator-daemon/src/subnet_policy.rs
+  s_a45750ef6fc5fc::t_8af35b85561ae3 139
+net/crates/net/cli/tests/aggregator_remote.rs
+  s_a45750ef6fc5fc::t_ef83ce73eafe6b 150
+web/src/content/docs/guides/daemons-and-placement.md
+  s_a45750ef6fc5fc::t_166837cbf97bbe 224
+  s_a45750ef6fc5fc::t_f89e7acaee13b9 230-248,252-259,262
+  s_a45750ef6fc5fc::t_2dba41e4b122fd 263
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_a45750ef6fc5fc::t_ade6f2feac4faf 78-80
+docs/internal/plans/AGGREGATOR_MULTI_HOST_PLAN.md
+  s_a45750ef6fc5fc::t_10bed34ae5dc56 819-894
+net/crates/net/Cargo.lock
+  s_a45750ef6fc5fc::t_2317268053f335 3138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aae9bb521041f39a25c5d8cae7cb27a0901f75d5",
+  "prompts": {},
+  "sessions": {
+    "s_a45750ef6fc5fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23eac748-8ed1-44a6-ada9-14748f2b62e8",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
