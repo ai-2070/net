@@ -8,6 +8,10 @@
 [![Go](https://pkg.go.dev/badge/github.com/ai-2070/net/go.svg)](https://pkg.go.dev/github.com/ai-2070/net/go)
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
 
+[![NET. Moves at light. A latency-first encrypted mesh where every device is a first-class node.](web/src/app/opengraph-image.png)](https://ai2070.net)
+
+**[Website](https://ai2070.net)** · [Docs](https://ai2070.net/docs) · [Quickstart](https://ai2070.net/docs/start/quickstart) · [Browser SDK](https://ai2070.net/docs/sdk/browser) · [NET for games](https://ai2070.net/games) · [Release notes](https://ai2070.net/docs/releases)
+
 **Net is what the internet would look like if it were built today** — the Net inspired by the Cyberpunk
 universe, built for real machines. A flat, latency-first, end-to-end encrypted mesh where every
 computer, device, app, and agent is an equal node: no clients, no servers, no coordinators. The mesh
@@ -369,6 +373,12 @@ Not exposed to a browser leaf:
 
 - Subnet exports · Dataforts · RedEX / CortEX / MeshDB · compute / groups / daemons
 - Gang-claim scheduler · Deck · MCP bridge · A2A · consumer-side filter DSL
+
+**Games.** The browser leaf's netcode gives a web game multiplayer with no game server to run:
+players connect directly, and one player hosts or several share a match. Play
+[Rose & Blade](https://rose-and-blade.ai2070.net), a 16-player sword fight, or take apart
+[Net Shooter](https://github.com/ai-2070/net-fps), an open-source three.js FPS
+([play it](https://net-fps.vercel.app)). More in [NET for games](https://ai2070.net/games).
 
 Read: [WebRTC transport](https://ai2070.net/docs/concepts/webrtc-transport),
 [Browser SDK](https://ai2070.net/docs/sdk/browser),
