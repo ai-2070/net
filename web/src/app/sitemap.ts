@@ -60,6 +60,15 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "weekly",
       priority: 0.9,
     },
+    {
+      url: `${globals.site.href}/blacksite`,
+      lastModified: fileLastModified(
+        resolve(APP_ROOT, "blacksite", "page.tsx"),
+        now,
+      ),
+      changeFrequency: "weekly",
+      priority: 0.9,
+    },
   ];
 
   const docPages: MetadataRoute.Sitemap = getAllSlugs().map((slug) => ({

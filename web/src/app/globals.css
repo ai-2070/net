@@ -844,3 +844,275 @@
     animation: none;
   }
 }
+
+/* blacksite page: the made-up Station in the hero (stationSim.ts). Ported
+   from Blacksite's own station.css, so the labels look like the dashboard. */
+.bs-station {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  --bs-line: #33372f;
+  --bs-ink: #e6e8e0;
+  --bs-dim: #969a91;
+  --bs-faint: #555850;
+  --bs-accent: #c4ff3d;
+  --bs-accent-dim: #7a9a2c;
+  --bs-amber: #f0b04a;
+  --bs-red: #ff5a5a;
+  --bs-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+  --bs-sans: var(--font-archivo), "Helvetica Neue", Arial, sans-serif;
+}
+.bs-station-canvas,
+.bs-station-wires,
+.bs-station-labels {
+  position: absolute;
+  inset: 0;
+}
+.bs-station-wires {
+  width: 100%;
+  height: 100%;
+}
+.bs-station-labels > * {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: transform;
+}
+.bs-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  white-space: nowrap;
+  background: rgba(10, 12, 10, 0.88);
+  border: 1px solid var(--bs-line);
+  font: 600 9.5px var(--bs-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--bs-ink);
+}
+.bs-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--bs-faint);
+}
+.bs-chip-lead {
+  color: var(--bs-amber);
+}
+.bs-chip-model {
+  color: var(--bs-faint);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+.bs-chip-model::before {
+  content: "· ";
+}
+.bs-chip[data-status="working"] {
+  border-color: var(--bs-accent-dim);
+}
+.bs-chip[data-status="working"] .bs-chip-dot {
+  background: var(--bs-accent);
+  box-shadow: 0 0 6px var(--bs-accent);
+}
+.bs-chip[data-status="needs"] {
+  border-color: var(--bs-amber);
+}
+.bs-chip[data-status="needs"] .bs-chip-dot {
+  background: var(--bs-red);
+  animation: bs-blink 0.8s infinite;
+}
+@keyframes bs-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+.bs-card {
+  width: 214px;
+  padding: 11px 13px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  background: rgba(13, 16, 13, 0.92);
+  border: 1px solid color-mix(in srgb, var(--c, #555850) 45%, #252723);
+  transition: box-shadow 0.3s;
+}
+.bs-card.live {
+  box-shadow:
+    0 0 0 1px var(--bs-accent-dim),
+    0 0 24px rgba(196, 255, 61, 0.18);
+}
+.bs-card.needs {
+  box-shadow:
+    0 0 0 1px var(--bs-amber),
+    0 0 24px rgba(240, 176, 74, 0.25);
+}
+.bs-card-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font: 700 10.5px var(--bs-mono);
+  letter-spacing: 0.16em;
+  color: var(--bs-ink);
+}
+.bs-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--c, var(--bs-accent));
+  box-shadow: 0 0 8px var(--c, var(--bs-accent));
+}
+.bs-card-big {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 6px 0 2px;
+  color: var(--bs-ink);
+}
+.bs-card-big b {
+  font: 700 28px/1 var(--bs-sans);
+}
+.bs-card-big span {
+  font: 500 9.5px var(--bs-mono);
+  letter-spacing: 0.16em;
+  color: var(--bs-dim);
+}
+.bs-card-big .bs-card-lead {
+  margin-left: auto;
+  letter-spacing: 0.06em;
+}
+.bs-card-desc {
+  font: 12px/1.4 var(--bs-sans);
+  color: var(--bs-dim);
+  margin: 4px 0 6px;
+}
+.bs-card-foot {
+  margin-top: 7px;
+  font: 500 9.5px var(--bs-mono);
+  letter-spacing: 0.1em;
+  color: var(--bs-dim);
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bs-card-foot.live {
+  color: var(--bs-accent);
+}
+.bs-card.needs .bs-card-foot.live {
+  color: var(--bs-amber);
+}
+.bs-brain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 11px;
+  white-space: nowrap;
+  background: rgba(13, 16, 13, 0.92);
+  border: 1px solid var(--bs-accent-dim);
+  font: 700 10.5px var(--bs-mono);
+  letter-spacing: 0.2em;
+  color: var(--bs-ink);
+}
+.bs-brain-mark {
+  color: var(--bs-accent);
+  letter-spacing: 0;
+}
+.bs-brain-n {
+  color: var(--bs-dim);
+  font-weight: 400;
+  letter-spacing: 0.06em;
+}
+/* the header's CONNECTED TO row, top right of the hero */
+.bs-station-tiles {
+  position: absolute;
+  top: 18px;
+  right: max(24px, calc(50% - 720px + 48px));
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bs-tiles-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+  font: 500 9.5px var(--bs-mono);
+  letter-spacing: 0.16em;
+  color: var(--bs-dim);
+}
+.bs-tiles-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--bs-accent);
+  box-shadow: 0 0 6px var(--bs-accent);
+}
+/* tiles and badges: the dashboard's .st-int and .st-badge (rounded, tinted
+   with the program's colour, its logo in the middle) */
+.bs-tile,
+.bs-badge {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
+  background: color-mix(in srgb, var(--c) 10%, #0d100d);
+  color: var(--c);
+  font-size: 13px;
+  line-height: 1;
+}
+.bs-tile {
+  width: 28px;
+  height: 28px;
+}
+.bs-badge {
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+}
+.bs-tile svg,
+.bs-badge svg {
+  display: block;
+}
+.bs-tile.flash {
+  animation: bs-tile-flash 0.9s ease-out;
+}
+@keyframes bs-tile-flash {
+  0% {
+    box-shadow:
+      0 0 0 2px var(--c),
+      0 0 16px var(--c);
+    background: color-mix(in srgb, var(--c) 32%, #0d100d);
+    transform: translateY(-1px);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    background: color-mix(in srgb, var(--c) 10%, #0d100d);
+    transform: none;
+  }
+}
+.bs-card-icons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 8px 0 2px;
+}
+/* rounded like the dashboard: chips 7px, cards and the Brain label 10px */
+.bs-chip {
+  border-radius: 7px;
+}
+.bs-card,
+.bs-brain {
+  border-radius: 10px;
+}
+/* phones and tablets: the map sits behind the text, so drop the wires and
+   the cards and keep the floor, desks and Brain */
+@media (width < 64rem) {
+  .bs-station-tiles,
+  .bs-station-wires,
+  .bs-card {
+    display: none;
+  }
+}

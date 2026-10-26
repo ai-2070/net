@@ -16,6 +16,7 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/#apps", label: "APPS" },
   { href: "/#wall", label: "BLACKWALL" },
   { href: "/games", label: "GAMES" },
+  { href: "/blacksite", label: "BLACKSITE" },
   { href: "/docs", label: "DOCS" },
 ];
 
