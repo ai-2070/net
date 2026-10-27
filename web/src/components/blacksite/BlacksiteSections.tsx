@@ -169,7 +169,7 @@ export function BlacksiteBrainSection() {
               <span className="text-accent">▸</span> brain chat
             </span>
             <span className="font-mono text-[12px] text-ink-dim">
-              Rose &amp; Blade · demo
+              demo project
             </span>
           </div>
           <div className="p-5 flex flex-col gap-5 bg-black/30">
@@ -184,8 +184,7 @@ export function BlacksiteBrainSection() {
               </div>
               <p className="mb-3">
                 I&apos;ve set up the{" "}
-                <span className="font-semibold">Rose &amp; Blade Art Team</span>
-                :
+                <span className="font-semibold">Art Team</span>:
               </p>
               <ul className="flex flex-col gap-2">
                 {BRAIN_TEAM.map((m) => (
@@ -387,6 +386,21 @@ const PROGRAMS: ReadonlyArray<{ group: string; items: ReadonlyArray<string> }> =
     },
   ];
 
+const MCP_POINTS: ReadonlyArray<{ title: string; body: string }> = [
+  {
+    title: "Finds what you have",
+    body: "The Programs page lists the programs on your computer and which ones are running: Blender, ComfyUI, Adobe apps, DaVinci Resolve, CAD and 3D printing tools, and more.",
+  },
+  {
+    title: "Tells you which MCP to add",
+    body: "When a program has an MCP server, its card says which one to add, like GIMP, DaVinci Resolve or Playwright for Chrome. Servers you set up in Claude Code or Claude Desktop can be brought over.",
+  },
+  {
+    title: "Adds it when an agent needs it",
+    body: "When the Brain creates an agent whose work needs an MCP server, it adds a ready-made one and gives it to that agent. If the server needs a key, the Brain asks you for it first.",
+  },
+];
+
 export function BlacksiteProgramsSection() {
   return (
     <section
@@ -401,8 +415,9 @@ export function BlacksiteProgramsSection() {
       </DisplayHeading>
 
       <Lede>
-        Agents work with your files and the programs you already use. Add MCP
-        servers from a list in one click, or ask the Brain to do it.
+        Agents work with your files and the programs you already use. Blacksite
+        finds what you have installed, tells you which MCP server fits it, and
+        adds it in one click, or the Brain adds it for you.
       </Lede>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_1.3fr] gap-10 items-start">
@@ -416,10 +431,8 @@ export function BlacksiteProgramsSection() {
             </div>
           ))}
           <p className="font-sans text-[15px] text-ink-dim leading-[1.6] border-t border-line pt-5">
-            The Programs page also finds Adobe apps, video editors such as
-            DaVinci Resolve, and CAD programs already on your computer. Agents
-            can pull free textures, HDRIs and models from Poly Haven and
-            ambientCG.
+            Agents can also pull free textures, HDRIs and models from Poly Haven
+            and ambientCG.
           </p>
         </div>
         <Shot
@@ -428,6 +441,17 @@ export function BlacksiteProgramsSection() {
           caption="mcp servers, ready-made presets"
           tag="one click"
         />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 lg:gap-6 mt-10">
+        {MCP_POINTS.map((m) => (
+          <div key={m.title} className="slab slab-lift p-7">
+            <h3 className="font-display font-bold tracking-[-0.015em] text-[24px] leading-[1.1] mb-2 text-ink">
+              {m.title}
+            </h3>
+            <p className="text-ink-dim text-[15px] leading-[1.6]">{m.body}</p>
+          </div>
+        ))}
       </div>
     </section>
   );

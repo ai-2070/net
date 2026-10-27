@@ -202,7 +202,7 @@ export function ModelRoster() {
     <div data-ui className="slab">
       <div className="flex items-center justify-between gap-4 border-b border-line px-4 py-2 bg-bg-2/60">
         <span className="font-mono text-[12px] tracking-[0.14em] uppercase text-accent-dim">
-          <span className="text-accent">▸</span> rose &amp; blade launch team
+          <span className="text-accent">▸</span> game launch team
         </span>
         <span className="font-mono text-[12px] text-ink-dim">
           {seats.length} agents · {engines.size} engines

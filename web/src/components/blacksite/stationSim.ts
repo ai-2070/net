@@ -53,7 +53,7 @@ const TOOLS: ReadonlyArray<ToolDef> = [
     color: "#f2ff59",
     acts: [
       ["rendering textures", "padded cloth, weathered"],
-      ["rendering textures", "heraldry: rose on red"],
+      ["rendering textures", "heraldry: lion on red"],
     ],
   },
   {
@@ -84,7 +84,7 @@ const TOOLS: ReadonlyArray<ToolDef> = [
     logo: "github",
     color: "#e6e8e0",
     acts: [
-      ["reading", "rose-and-blade/issues"],
+      ["reading", "game-studio/issues"],
       ["opening a PR", "art: new helm set"],
     ],
   },
@@ -238,9 +238,9 @@ interface TeamDef {
 const TEAMS: ReadonlyArray<TeamDef> = [
   {
     id: "art",
-    name: "Rose & Blade Art Team",
+    name: "Art Team",
     color: "#b8a03a",
-    desc: "Historically accurate, browser-ready 3D models for Rose & Blade.",
+    desc: "Historically accurate, browser-ready 3D models for the game.",
     at: -25,
     dist: 19,
     card: -90,
@@ -1380,11 +1380,7 @@ export function startStation(
     label.append(
       el("span", "bs-brain-mark", "◎"),
       document.createTextNode("THE BRAIN"),
-      el(
-        "span",
-        "bs-brain-n",
-        `Rose & Blade · ${teams.length} teams · ${AGENT_COUNT} agents`,
-      ),
+      el("span", "bs-brain-n", `${teams.length} teams · ${AGENT_COUNT} agents`),
     );
     addLabel({
       el: label,
