@@ -59,7 +59,7 @@ export default function GamesPage(): JSX.Element {
         <GamesAiSection />
         <GamesPropsSection />
         <GamesOpenSection />
-        <Footer world="field" />
+        <Footer world="field" page="games" />
       </main>
     </PageContainer>
   );

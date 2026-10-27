@@ -40,7 +40,7 @@ export default function BlacksitePage(): JSX.Element {
         <BlacksiteReviewSection />
         <BlacksiteLocalSection />
         <BlacksiteGetSection />
-        <Footer world="field" />
+        <Footer world="field" page="blacksite" />
       </main>
     </PageContainer>
   );
