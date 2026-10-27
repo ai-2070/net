@@ -24,20 +24,34 @@ export function StationMap({ onFeed }: { onFeed?: (e: FeedEvent) => void }) {
     const reduced = window.matchMedia(
       "(prefers-reduced-motion: reduce)",
     ).matches;
-    import("./stationSim")
-      .then(({ startStation }) => {
-        if (cancelled) return;
-        stop = startStation(host, {
-          reduced,
-          onFeed: (e) => feedRef.current?.(e),
-          onReady: () => setReady(true),
+    // Fetch three.js now, but build the map only once the headline has risen
+    // and the browser is idle: the screenshot covers the wait, and by then the
+    // browser's GPU process is up, so creating the WebGL context is quick.
+    const sim = import("./stationSim");
+    let idle = 0;
+    const start = (): void => {
+      sim
+        .then(({ startStation }) => {
+          if (cancelled) return;
+          stop = startStation(host, {
+            reduced,
+            onFeed: (e) => feedRef.current?.(e),
+            onReady: () => setReady(true),
+          });
+        })
+        .catch(() => {
+          // the screenshot stays
         });
-      })
-      .catch(() => {
-        // the screenshot stays
-      });
+    };
+    const wait = window.setTimeout(() => {
+      if ("requestIdleCallback" in window) {
+        idle = window.requestIdleCallback(start, { timeout: 800 });
+      } else start();
+    }, 650);
     return () => {
       cancelled = true;
+      window.clearTimeout(wait);
+      if (idle) window.cancelIdleCallback(idle);
       stop?.();
     };
   }, []);
@@ -56,8 +70,10 @@ export function StationMap({ onFeed }: { onFeed?: (e: FeedEvent) => void }) {
       />
       <div
         ref={ref}
+        // Not quite 0 while it warms up: the browser skips drawing a fully
+        // transparent layer, and its first real draw would land mid-fade.
         className={`absolute inset-0 transition-opacity duration-700 ${
-          ready ? "opacity-100" : "opacity-0"
+          ready ? "opacity-100" : "opacity-[0.01]"
         }`}
       />
     </>

@@ -555,7 +555,7 @@ export function startRoute(host: HTMLElement, opts: Options): () => void {
     step(dt);
     draw(dt);
     // fade in only once the first frames (and their hitches) are behind us
-    if (++drawn === 3) opts.onReady?.();
+    if (++drawn === 8) opts.onReady?.();
     raf = requestAnimationFrame(frame);
   };
   const play = (): void => {

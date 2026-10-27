@@ -244,8 +244,10 @@ function RouteMap({
   return (
     <div
       ref={ref}
+      // Not quite 0 while it warms up: the browser skips drawing a fully
+      // transparent layer, and its first real draw would land mid-fade.
       className={`absolute inset-0 transition-opacity duration-1000 ${
-        ready ? "opacity-100" : "opacity-0"
+        ready ? "opacity-100" : "opacity-[0.01]"
       }`}
     />
   );

@@ -1722,6 +1722,8 @@ export function startStation(
   let nextEvent = 1.2;
   let visible = true;
   let ready = false;
+  let drawn = 0;
+  let started = false; // set once fonts, logos and shaders are ready
 
   const frame = (dt: number, motion: boolean): void => {
     clock += dt;
@@ -1822,7 +1824,8 @@ export function startStation(
     placeLabels();
     drawWires(dt, motion);
     renderer.render(scene, camera);
-    if (!ready) {
+    // fade in only once the first frames (and their hitches) are behind us
+    if (!ready && ++drawn >= (opts.reduced ? 1 : 8)) {
       ready = true;
       opts.onReady?.();
     }
@@ -1836,7 +1839,8 @@ export function startStation(
     raf = requestAnimationFrame(loop);
   };
   const play = (): void => {
-    if (running || opts.reduced || !visible || document.hidden) return;
+    if (running || opts.reduced || !started || !visible || document.hidden)
+      return;
     running = true;
     last = performance.now();
     raf = requestAnimationFrame(loop);
@@ -1846,9 +1850,11 @@ export function startStation(
     cancelAnimationFrame(raf);
   };
 
+  // (it fires once right away; drawing then would compile every shader on
+  // the spot, before the fonts and logos are in)
   const ro = new ResizeObserver(() => {
     resize();
-    if (!running) frame(0, false);
+    if (started && !running) frame(0, false);
   });
   ro.observe(root);
   resize();
@@ -1867,10 +1873,21 @@ export function startStation(
   document.addEventListener("visibilitychange", onVis);
 
   // let the canvas fonts settle before the first frame, so monitors aren't drawn in a fallback face
+  // Then compile the shaders off the main thread where the browser can, so
+  // the first frame doesn't stall.
+  let stopped = false;
   const first = (): void => {
+    if (stopped) return;
     for (const d of desks) drawScreen(d, clock);
-    frame(0.016, false);
-    play();
+    renderer
+      .compileAsync(scene, camera)
+      .catch(() => undefined)
+      .then(() => {
+        if (stopped) return;
+        started = true;
+        frame(0.016, false);
+        play();
+      });
   };
   // …and the picture logos, so the still frame (reduced motion) has them too
   const fontsReady = document.fonts?.ready ?? Promise.resolve();
@@ -1880,6 +1897,7 @@ export function startStation(
   );
 
   return () => {
+    stopped = true;
     pause();
     ro.disconnect();
     io.disconnect();
