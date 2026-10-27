@@ -404,7 +404,7 @@ export function HeroSection() {
                 >
                   moves
                 </span>
-              </span>
+              </span>{" "}
               <span className="field-rise" style={{ animationDelay: "0.38s" }}>
                 at light.
               </span>

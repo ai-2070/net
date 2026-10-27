@@ -99,7 +99,7 @@ export function BlacksiteHero() {
               style={{ animationDelay: "0.1s" }}
             >
               your agents.
-            </span>
+            </span>{" "}
             <span
               className="field-rise block text-accent"
               style={{ animationDelay: "0.24s" }}

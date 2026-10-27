@@ -1,3 +1,4 @@
+import { SITE_IMAGES, SITE_NAME } from "@/lib/page-meta";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -20,11 +21,7 @@ import {
 } from "@/lib/docs";
 import { capabilityRow, type CapabilityRow } from "@/lib/capability-record";
 import { RenditionLinks } from "@/components/RenditionLinks";
-import {
-  LENSES,
-  LENS_SLUG,
-  type Lens,
-} from "@/lib/docs-language";
+import { LENSES, LENS_SLUG, type Lens } from "@/lib/docs-language";
 import { DocsContent } from "@/components/DocsContent";
 import { DocsToc } from "@/components/DocsToc";
 import { DocsPrevNextTop, DocsPrevNextBottom } from "@/components/DocsPrevNext";
@@ -67,7 +64,7 @@ export async function generateMetadata({
 }: PageProps): Promise<Metadata> {
   const { slug } = await params;
   const resolved = resolveDoc(slug);
-  if (!resolved) return { title: "Not Found · Docs · Net" };
+  if (!resolved) return { title: "Not Found · Docs · NET" };
 
   const node = resolved.kind === "file" ? resolved.file : resolved.folder;
   const lensName =
@@ -77,8 +74,8 @@ export async function generateMetadata({
         ? "C"
         : null;
   const title = lensName
-    ? `${node.title} in ${lensName} · Docs · Net`
-    : `${node.title} · Docs · Net`;
+    ? `${node.title} in ${lensName} · Docs · NET`
+    : `${node.title} · Docs · NET`;
   const description = node.description;
   const path = `/docs${slug.length ? `/${slug.join("/")}` : ""}`;
 
@@ -106,21 +103,24 @@ export async function generateMetadata({
     title,
     description,
     alternates: { canonical: path, ...(languages ? { languages } : {}) },
+    // Doc pages have no share image of their own, so they use the site's.
     openGraph: {
       type: "article",
-      siteName: "Net",
+      siteName: SITE_NAME,
+      locale: "en_US",
       title,
       description,
       url: path,
+      images: SITE_IMAGES.openGraph,
     },
     twitter: {
-      card: "summary",
+      card: "summary_large_image",
       title,
       description,
+      images: SITE_IMAGES.twitter,
     },
   };
 }
-
 
 // Display names and hreflang codes. `Lens` ids stay `ts`; readers see
 // "TypeScript" and crawlers see a real BCP-47-shaped tag.
@@ -254,9 +254,9 @@ function ParityRow({
       </div>
       {row.cells.some((c) => c.cell.mode === "core-only") ? (
         <p className="font-mono font-light text-[12px] text-ink-dim leading-[1.7] mt-2.5 mb-0">
-          <span className="text-cyan">core-only</span> means the operation exists
-          on the low-level binding but not on the ergonomic SDK wrapper. Reach one
-          layer down; it is not a gap.
+          <span className="text-cyan">core-only</span> means the operation
+          exists on the low-level binding but not on the ergonomic SDK wrapper.
+          Reach one layer down; it is not a gap.
         </p>
       ) : null}
     </div>
@@ -273,9 +273,9 @@ function AbsenceNotice({ lens }: { lens: Lens }) {
       </div>
       <p className="font-mono font-light text-[13px] text-ink leading-[1.8] m-0">
         Everything above is language-neutral and applies to {LENS_LABEL[lens]}.
-        What is missing is the {LENS_LABEL[lens]}-specific part: the install line,
-        the construction, the runtime caveat, and how to verify it worked. This
-        page will not show you another language&rsquo;s code in its place.
+        What is missing is the {LENS_LABEL[lens]}-specific part: the install
+        line, the construction, the runtime caveat, and how to verify it worked.
+        This page will not show you another language&rsquo;s code in its place.
       </p>
     </div>
   );
@@ -294,9 +294,9 @@ function BoundaryNotice({
       </div>
       <p className="font-mono font-light text-[13px] text-ink leading-[1.8] mb-3">
         The C ABI is not a fifth SDK with the same ergonomics under different
-        syntax. It exposes handles, buffers, lengths and explicit teardown, so it
-        is documented by boundary concern rather than by capability — which is why
-        this page has no C rendition and will not grow one.
+        syntax. It exposes handles, buffers, lengths and explicit teardown, so
+        it is documented by boundary concern rather than by capability — which
+        is why this page has no C rendition and will not grow one.
       </p>
       <Link
         href={boundary?.href ?? "/docs/sdk/c"}
@@ -513,7 +513,6 @@ function KindBadge({ section }: { section?: string }) {
   );
 }
 
-
 /** Breadcrumb plus the page-kind badge. `trailing` names the rendition when the
  *  page is one language's reading of an adaptive page, so a screenshot of the
  *  header is unambiguous about which lens it shows. */
@@ -614,9 +613,7 @@ export default async function DocPage({ params }: PageProps) {
       <>
         <RenditionLinks
           links={renditionLinks}
-          current={
-            resolved.kind === "boundary" ? "c" : (lens ?? undefined)
-          }
+          current={resolved.kind === "boundary" ? "c" : (lens ?? undefined)}
         />
         <main className="min-w-0 max-w-[740px]">
           <Breadcrumb
@@ -678,10 +675,7 @@ export default async function DocPage({ params }: PageProps) {
   return (
     <>
       <main className="min-w-0 max-w-[740px]">
-        <Breadcrumb
-          slug={resolved.file.slug}
-          section={resolved.file.slug[0]}
-        />
+        <Breadcrumb slug={resolved.file.slug} section={resolved.file.slug[0]} />
         <DocsPrevNextTop neighbours={neighbours} />
         <DocsContent
           source={source}

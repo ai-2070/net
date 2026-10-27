@@ -21,7 +21,9 @@ import { WhyNotBestEffortSection } from "@/components/WhyNotBestEffortSection";
 import { TopologyClassesSection } from "@/components/TopologyClassesSection";
 import { PageContainer } from "@/components/PageContainer";
 
-export default function Home(): JSX.Element {
+// The landing page's body. A client component because several sections
+// below rely on it (state and hooks without their own "use client").
+export function HomePage(): JSX.Element {
   return (
     <PageContainer className="world-field world-notebook field-grain">
       <NavBar world="field" />

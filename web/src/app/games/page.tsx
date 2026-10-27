@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { Cinzel, EB_Garamond } from "next/font/google";
 import { JSX } from "react";
 import { NavBar } from "@/components/NavBar";
@@ -32,12 +33,12 @@ const rbBody = EB_Garamond({
   weight: ["400", "500", "600"],
 });
 
-export const metadata: Metadata = {
-  title:
-    "NET for games — multiplayer for any engine, plug and play for Three.js",
+export const metadata: Metadata = pageMeta({
+  title: "NET for games — multiplayer for any engine, no server to run",
   description:
-    "Multiplayer for any game engine, plug and play for Three.js. Players connect directly, one player hosts or several share a match, and there is no game server to run. Play Rose & Blade, a 16-player sword fight, or take apart Net Shooter, an open-source FPS. Free and open source.",
-};
+    "Multiplayer for any game engine, plug and play for Three.js. Players connect directly, with no game server to run. Free and open source.",
+  path: "/games",
+});
 
 export default function GamesPage(): JSX.Element {
   return (

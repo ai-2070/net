@@ -1,4 +1,6 @@
+import type { Metadata } from "next";
 import Link from "next/link";
+import { pageMeta } from "@/lib/page-meta";
 import {
   getDocTree,
   readDocSource,
@@ -9,15 +11,20 @@ import {
 } from "@/lib/docs";
 import { DocsContent } from "@/components/DocsContent";
 import { DocsToc } from "@/components/DocsToc";
-import {
-  DocsPrevNextTop,
-  DocsPrevNextBottom,
-} from "@/components/DocsPrevNext";
+import { DocsPrevNextTop, DocsPrevNextBottom } from "@/components/DocsPrevNext";
 
 // Pure SSG — the /docs landing renders the root README or auto-index;
 // content comes from build-time filesystem reads, no runtime work.
 export const dynamic = "force-static";
 export const revalidate = false;
+
+export const metadata: Metadata = pageMeta({
+  title: "NET Docs — guides, SDKs and reference",
+  description:
+    "Guides, tutorials and SDK reference for NET: the event bus, typed RPC, capabilities, storage and payments, in Rust, TypeScript, Python, Go and C.",
+  path: "/docs",
+  siteImage: true,
+});
 
 function folderHref(slug: string[]): string {
   return `/docs/${slug.join("/")}`;
@@ -80,7 +87,7 @@ export default function DocsRootPage() {
             className="font-display text-ink mt-1 mb-8 leading-[1.15] tracking-[0.01em]"
             style={{ fontSize: "clamp(26px, 3vw, 32px)" }}
           >
-            Net Docs
+            NET Docs
           </h1>
           <p className="text-[14px] text-ink-dim leading-[1.7] mb-10 max-w-[640px]">
             Reference, design notes, and release history — mirrored from{" "}

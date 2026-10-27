@@ -269,7 +269,7 @@ function DemoAttract() {
           className={`${RB_DISPLAY} font-black uppercase leading-[0.9] mb-6`}
           style={{ fontSize: "clamp(48px, 7.5vw, 104px)" }}
         >
-          <span className="block text-[#ece4d4]">Rose</span>
+          <span className="block text-[#ece4d4]">Rose</span>{" "}
           <span className="block text-[#c9a54e]">&amp; Blade</span>
         </h2>
         <div
