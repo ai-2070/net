@@ -1907,29 +1907,19 @@ mod mesh_bindings {
                 None => EntityKeypair::generate(),
             };
 
-            // Noise static key: explicit wins; a seeded identity derives
-            // one, so the node's rendezvous address survives a restart;
-            // otherwise core generates a fresh key.
-            let static_key = match options.noise_static_key {
-                Some(key) => {
-                    let bytes: &[u8] = key.as_ref();
-                    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-                        Error::from_reason(format!(
-                            "noise_static_key must be 32 bytes, got {}",
-                            bytes.len()
-                        ))
-                    })?;
-                    Some(NoiseStaticKey::from_private(arr))
-                }
-                None if config.configured_identity => Some(
-                    NoiseStaticKey::derive_from_identity(&identity).map_err(|e| {
-                        Error::from_reason(format!("noise key derivation failed: {e}"))
-                    })?,
-                ),
-                None => None,
-            };
-            if let Some(key) = static_key {
-                config = config.with_static_key(key);
+            // Noise static key: an explicit one wins. Without it,
+            // `MeshNode::new` derives one from a seeded (configured)
+            // identity, so the node's rendezvous address survives a
+            // restart, and otherwise generates a fresh key.
+            if let Some(key) = options.noise_static_key {
+                let bytes: &[u8] = key.as_ref();
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                    Error::from_reason(format!(
+                        "noise_static_key must be 32 bytes, got {}",
+                        bytes.len()
+                    ))
+                })?;
+                config = config.with_static_key(NoiseStaticKey::from_private(arr));
             }
 
             let mut node = MeshNode::new(identity, config)

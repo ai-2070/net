@@ -561,19 +561,10 @@ impl MeshBuilder {
         if let Some(dir) = self.subnet_floor_store {
             config = config.with_subnet_floor_store(dir);
         }
-        // A caller-supplied identity gets a Noise key derived from it
-        // unless one was set explicitly, so a node rebuilt from the same
-        // identity keeps its rendezvous address across restarts. A
-        // public-only identity can't derive one and keeps the old
-        // per-build key.
-        let static_key = match self.static_key {
-            Some(key) => Some(key),
-            None if sdk_identity.is_some() => {
-                net::adapter::net::NoiseStaticKey::derive_from_identity(&keypair).ok()
-            }
-            None => None,
-        };
-        if let Some(key) = static_key {
+        // An explicit Noise key wins. Without one, `MeshNode::new` derives
+        // it from the identity (`configured_identity` above), so a node
+        // rebuilt from the same identity keeps its rendezvous address.
+        if let Some(key) = self.static_key {
             config = config.with_static_key(key);
         }
         // Review-10 P1-6: the checked map is the NODE's, resolved and

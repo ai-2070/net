@@ -3116,7 +3116,8 @@ impl NoiseStaticKey {
     /// A domain-separated BLAKE3 KDF over the ed25519 seed: the result
     /// never equals the signing secret, and the context string is
     /// versioned so the derivation can change without colliding. Every
-    /// binding calls this one function; the golden vector in
+    /// construction path gets it from [`MeshNode::new`] (for a node whose
+    /// [`MeshNodeConfig::configured_identity`] is set); the golden vector in
     /// `a_derived_noise_key_follows_the_identity_seed` pins it.
     ///
     /// Trade-off: rotating this key means rotating the identity. Callers
@@ -3412,10 +3413,14 @@ pub struct MeshNodeConfig {
     /// its apply reports success. `None` keeps floors in memory only — a
     /// restart then forgets them until they are redelivered.
     pub subnet_floor_store: Option<std::path::PathBuf>,
-    /// The node's Noise static key. `None` (the default) generates a fresh
-    /// one per [`MeshNode::new`]; a node whose key other nodes pin (e.g. an
-    /// enrolling node, whose invites and bundles name it) must supply its
-    /// stored key, or every restart strands the nodes that pinned it.
+    /// The node's Noise static key. `None` (the default): [`MeshNode::new`]
+    /// derives one from the identity when [`Self::configured_identity`] is
+    /// set ([`NoiseStaticKey::derive_from_identity`]), so a node restarted
+    /// with the same identity answers on the same rendezvous, and otherwise
+    /// generates a fresh one per start. A node whose key other nodes pin
+    /// (e.g. an enrolling node, whose invites and bundles name it) and
+    /// whose identity is not configured must supply its stored key here,
+    /// or every restart strands the nodes that pinned it.
     pub static_key: Option<NoiseStaticKey>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
@@ -14103,8 +14108,26 @@ impl MeshNode {
             }
         };
 
+        // The Noise static key, decided once here for every construction
+        // path (SDK, bindings, FFI, CLI): an explicit key wins; a
+        // caller-configured identity derives one, so the node answers on
+        // the same rendezvous after a restart; otherwise a fresh key.
         let static_keypair = match &config.static_key {
             Some(key) => key.keypair(),
+            None if config.configured_identity => {
+                match NoiseStaticKey::derive_from_identity(&identity) {
+                    Ok(key) => key.keypair(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "noise static key: cannot derive from the configured identity; \
+                             using a fresh key, so peers that pinned this node's key must \
+                             re-pair after a restart"
+                        );
+                        StaticKeypair::generate()
+                    }
+                }
+            }
             None => StaticKeypair::generate(),
         };
 
@@ -57097,6 +57120,45 @@ mod heartbeat_aead_tests {
         };
         assert_eq!(build().await.public_key(), &a.public_key());
         assert_eq!(build().await.public_key(), &a.public_key());
+    }
+
+    /// AIB-9 (CODE_REVIEW_2026_10_28): `MeshNode::new` itself derives the
+    /// Noise key for a node whose identity is configured, so every
+    /// construction path (SDK, bindings, FFI, CLI) gets the stable key
+    /// without copying the rule. An explicit key still wins, and an
+    /// unconfigured identity still gets a fresh key per start.
+    #[tokio::test]
+    async fn new_derives_the_noise_key_for_a_configured_identity() {
+        let seed = [0x5cu8; 32];
+        let derived =
+            NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap();
+        let build = |configured: bool, key: Option<NoiseStaticKey>| async move {
+            let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [7u8; 32]);
+            cfg.configured_identity = configured;
+            if let Some(key) = key {
+                cfg = cfg.with_static_key(key);
+            }
+            MeshNode::new(EntityKeypair::from_bytes(seed), cfg)
+                .await
+                .unwrap()
+        };
+        assert_eq!(build(true, None).await.public_key(), &derived.public_key());
+        assert_eq!(build(true, None).await.public_key(), &derived.public_key());
+
+        let explicit = NoiseStaticKey::from_private([0x43; 32]);
+        assert_eq!(
+            build(true, Some(explicit.clone())).await.public_key(),
+            &explicit.public_key(),
+            "an explicit key wins over the derived one"
+        );
+
+        let unconfigured = build(false, None).await;
+        assert_ne!(unconfigured.public_key(), &derived.public_key());
+        assert_ne!(
+            unconfigured.public_key(),
+            build(false, None).await.public_key(),
+            "an unconfigured identity gets a fresh key per start"
+        );
     }
 
     /// Every always-compiled subprotocol id is in the control-stream list,

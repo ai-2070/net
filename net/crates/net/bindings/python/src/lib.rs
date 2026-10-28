@@ -1714,28 +1714,18 @@ mod mesh_bindings {
                 }
                 None => EntityKeypair::generate(),
             };
-            // Noise static key: explicit wins; a seeded identity derives
-            // one, so the node's rendezvous address survives a restart;
-            // otherwise core generates a fresh key.
-            let static_key = match noise_static_key {
-                Some(key) => {
-                    let arr: [u8; 32] = key.try_into().map_err(|_| {
-                        PyValueError::new_err(format!(
-                            "noise_static_key must be 32 bytes, got {}",
-                            key.len()
-                        ))
-                    })?;
-                    Some(net::adapter::net::NoiseStaticKey::from_private(arr))
-                }
-                None if config.configured_identity => Some(
-                    net::adapter::net::NoiseStaticKey::derive_from_identity(&identity).map_err(
-                        |e| PyValueError::new_err(format!("noise key derivation failed: {e}")),
-                    )?,
-                ),
-                None => None,
-            };
-            if let Some(key) = static_key {
-                config = config.with_static_key(key);
+            // Noise static key: an explicit one wins. Without it,
+            // `MeshNode::new` derives one from a seeded (configured)
+            // identity, so the node's rendezvous address survives a
+            // restart, and otherwise generates a fresh key.
+            if let Some(key) = noise_static_key {
+                let arr: [u8; 32] = key.try_into().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "noise_static_key must be 32 bytes, got {}",
+                        key.len()
+                    ))
+                })?;
+                config = config.with_static_key(net::adapter::net::NoiseStaticKey::from_private(arr));
             }
             let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
