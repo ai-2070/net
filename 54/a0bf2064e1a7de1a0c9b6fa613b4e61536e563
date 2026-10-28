@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_aa25bb779f3858::t_2040ae59bcac28 3598-3612
+net/crates/net/bindings/python/python/net/mesh_rpc.py
+  s_aa25bb779f3858::t_75b52b19f7408c 788-797
+  s_aa25bb779f3858::t_1b5b861b091b83 809-812,816-825
+  s_aa25bb779f3858::t_766bc7084aa746 826
+net/crates/net/bindings/python/tests/test_streaming_backpressure.py
+  s_aa25bb779f3858::t_c57fcdc14d1da6 67-97
+  s_aa25bb779f3858::t_dacdaccbca4fa5 1-66
+net/crates/net/bindings/python/tests/test_mesh_rpc.py
+  s_aa25bb779f3858::t_8fd782e28a3b29 865-870,1023-1029,1031-1033
+  s_aa25bb779f3858::t_67201e4955f283 1030
+  s_aa25bb779f3858::t_3297fab56fedcd 1034-1035
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_aa25bb779f3858::t_1d431b1f5b8072 888,1962-1966,1974,1989-1990,2020-2060,2154,2251,2329
+  s_aa25bb779f3858::t_cd5e10cae2e5a9 1967-1971
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_45a0f787da4e09 330-336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "54a0bf2064e1a7de1a0c9b6fa613b4e61536e563",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
