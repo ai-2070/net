@@ -801,7 +801,10 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         engine.register_pending(sid, 7, [0xCDu8; 32], tx);
         engine.on_reset(sid);
-        let err = rx.await.expect("settled").expect_err("a reset fails the fetch");
+        let err = rx
+            .await
+            .expect("settled")
+            .expect_err("a reset fails the fetch");
         assert!(is_holder_gave_up(&err), "reset error not recognised: {err}");
 
         assert!(!is_holder_gave_up(&BlobError::NotFound(

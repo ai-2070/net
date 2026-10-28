@@ -250,25 +250,21 @@ async fn typed_try_send_reports_a_dropped_chunk() {
     let (refused_tx, refused_rx) = tokio::sync::oneshot::channel::<u32>();
     let refused_tx = std::sync::Mutex::new(Some(refused_tx));
     let _serve = server
-        .serve_rpc_streaming_typed(
-            "burst",
-            Codec::Json,
-            move |_req: CountRequest, sink| {
-                let tx = refused_tx.lock().unwrap().take();
-                async move {
-                    let mut refused = 0;
-                    for i in 0..BURST {
-                        if !sink.try_send(&i)? {
-                            refused += 1;
-                        }
+        .serve_rpc_streaming_typed("burst", Codec::Json, move |_req: CountRequest, sink| {
+            let tx = refused_tx.lock().unwrap().take();
+            async move {
+                let mut refused = 0;
+                for i in 0..BURST {
+                    if !sink.try_send(&i)? {
+                        refused += 1;
                     }
-                    if let Some(tx) = tx {
-                        let _ = tx.send(refused);
-                    }
-                    Ok(())
                 }
-            },
-        )
+                if let Some(tx) = tx {
+                    let _ = tx.send(refused);
+                }
+                Ok(())
+            }
+        })
         .expect("serve_rpc_streaming_typed");
 
     let mut opts = CallOptionsTyped::default();

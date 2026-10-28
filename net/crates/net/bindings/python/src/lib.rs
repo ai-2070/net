@@ -1725,7 +1725,8 @@ mod mesh_bindings {
                         key.len()
                     ))
                 })?;
-                config = config.with_static_key(net::adapter::net::NoiseStaticKey::from_private(arr));
+                config =
+                    config.with_static_key(net::adapter::net::NoiseStaticKey::from_private(arr));
             }
             let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
