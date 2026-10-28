@@ -327,9 +327,13 @@ Three loss points, none visible to the handler:
   holds an `Arc`, so an in-flight wait keeps the sink alive without a
   lock across the await). TS `RawResponseSink` / `TypedResponseSink`
   gain `sendWait`; `send` stays synchronous. Python: `send()` returns
-  `False` on a drop. **Python `send_wait` deferred:** its handlers run
-  on runtime threads, so a blocking wait needs care to avoid
-  `block_on` inside the runtime.
+  `False` on a drop; `send_wait()` blocks with the GIL released (regular
+  handlers run on the runtime's blocking pool, where `Handle::block_on`
+  is allowed); `asend_wait()` is the awaitable for `async def` handlers
+  (which run on an asyncio loop that must not block). Same on the typed
+  `net.mesh_rpc.TypedResponseSink`. Witness
+  `tests/test_streaming_backpressure.py` (sync 3000 chunks, async 1500,
+  in order; `send` burst reports drops).
 - 3b done. The live test showed `sendWait` alone was not enough: with
   every chunk queued, 1 KB chunks still went missing mid-stream. The
   pump published each chunk once and dropped it when the reply stream's

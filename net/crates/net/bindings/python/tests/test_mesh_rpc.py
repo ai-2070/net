@@ -862,6 +862,12 @@ class _StubRawResponseSink:
         self.sent.append(bytes(body))
         return True
 
+    def send_wait(self, body: bytes) -> bool:
+        return self.send(body)
+
+    async def asend_wait(self, body: bytes) -> bool:
+        return self.send(body)
+
 
 class _StubRawDuplexSink:
     def __init__(self) -> None:
@@ -1012,6 +1018,19 @@ def test_typed_response_sink_returns_false_when_closed() -> None:
     sink = TypedResponseSink(raw)
     assert sink.send({"r": 1}) is False
     assert raw.sent == []
+
+
+def test_typed_response_sink_waiting_sends_encode_and_forward() -> None:
+    import asyncio
+
+    raw = _StubRawResponseSink()
+    sink = TypedResponseSink(raw)
+    assert sink.send_wait({"r": 1}) is True
+    assert asyncio.run(sink.asend_wait({"r": 2})) is True
+    assert raw.sent == [b'{"r":1}', b'{"r":2}']
+    raw.closed = True
+    assert sink.send_wait({"r": 3}) is False
+    assert asyncio.run(sink.asend_wait({"r": 4})) is False
 
 
 def test_typed_response_sink_encode_failure_does_not_enqueue() -> None:

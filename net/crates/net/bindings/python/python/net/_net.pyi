@@ -3595,11 +3595,21 @@ class ResponseSinkSend:
     handlers."""
 
     def send(self, body: bytes) -> bool:
-        """Emit one chunk; ``True`` on success, ``False`` once the sink has
-        been torn down. Non-blocking by design — it is a ``try_send`` into a
-        bounded queue feeding the response pump, so chunks are dropped when
-        the pump stalls on credit. Pace emits to the REQUEST_GRANT cadence
-        rather than burst-pushing."""
+        """Emit one chunk without waiting; ``True`` if it was queued,
+        ``False`` if it was dropped (the bounded queue feeding the response
+        pump is full, or the call is gone). Use :meth:`send_wait` when every
+        chunk must arrive."""
+        ...
+
+    def send_wait(self, body: bytes) -> bool:
+        """Emit one chunk, waiting for queue room instead of dropping it;
+        ``True`` once queued, ``False`` if the call is gone. Blocks the
+        calling thread (GIL released) — for regular ``def`` handlers."""
+        ...
+
+    def asend_wait(self, body: bytes) -> Awaitable[bool]:
+        """:meth:`send_wait` for ``async def`` handlers: an awaitable that
+        resolves ``True`` once queued, ``False`` if the call is gone."""
         ...
 
 class RpcCallEvent:

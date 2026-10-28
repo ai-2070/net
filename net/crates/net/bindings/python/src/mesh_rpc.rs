@@ -885,7 +885,7 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
         let callable = Python::attach(|py| self.callable.clone_ref(py));
         let runtime = self.runtime.clone();
         let stream_inner = Arc::new(Mutex::new(Some(requests)));
-        let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let sink_inner = Arc::new(Mutex::new(Some(Arc::new(responses))));
         let ctx_headers = Arc::new(ctx.headers);
         let fut_result = Python::attach(|py| -> Result<_, PyErr> {
             let stream_obj = Py::new(
@@ -1959,13 +1959,19 @@ impl PyRequestStreamRecv {
     }
 }
 
-/// Outbound response sink for duplex handlers. Emit chunks via
-/// ``sink.send(bytes)``. Non-blocking (SDK try_send under the
-/// hood); returns ``True`` on success, ``False`` if the sink
-/// was already torn down.
+/// A handler's response sink. The inner `Arc` lets a `send_wait` /
+/// `asend_wait` in progress keep the sink alive for the length of its
+/// wait without holding the slot lock (a sync lock) across it.
+pub(crate) type SinkSlot = Arc<Mutex<Option<Arc<InnerRpcResponseSink>>>>;
+
+/// Outbound response sink for streaming and duplex handlers.
+/// ``sink.send(bytes)`` never waits: ``True`` if queued, ``False`` if
+/// dropped (queue full, or the call is gone). ``sink.send_wait(bytes)``
+/// (or ``await sink.asend_wait(bytes)`` in an ``async def`` handler)
+/// waits for room instead, so nothing is dropped.
 #[pyclass(name = "ResponseSinkSend", module = "_net")]
 pub struct PyResponseSinkSend {
-    inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+    inner: SinkSlot,
 }
 
 impl PyResponseSinkSend {
@@ -1980,8 +1986,8 @@ impl PyResponseSinkSend {
     #[cfg(feature = "org")]
     pub(crate) fn from_org_response_sink(
         inner: InnerRpcResponseSink,
-    ) -> (Self, Arc<Mutex<Option<InnerRpcResponseSink>>>) {
-        let holder = Arc::new(Mutex::new(Some(inner)));
+    ) -> (Self, SinkSlot) {
+        let holder = Arc::new(Mutex::new(Some(Arc::new(inner))));
         (
             Self {
                 inner: Arc::clone(&holder),
@@ -2010,6 +2016,47 @@ impl PyResponseSinkSend {
             Some(sink) => sink.try_send(Bytes::copy_from_slice(body.as_bytes())),
             None => false,
         }
+    }
+
+    /// Emit one chunk, **waiting** for room in the per-call queue instead
+    /// of dropping it, so a handler that produces faster than the caller
+    /// reads is paced to the caller and loses nothing. Returns ``True``
+    /// once queued, ``False`` if the call is gone (stop producing).
+    ///
+    /// Blocks the calling thread with the GIL released — use it from a
+    /// regular (``def``) handler. In an ``async def`` handler, ``await
+    /// sink.asend_wait(chunk)`` instead, which does not block the loop.
+    fn send_wait<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> bool {
+        let body = Bytes::copy_from_slice(body.as_bytes());
+        let Some(sink) = self.inner.lock().clone() else {
+            return false;
+        };
+        py.detach(move || match tokio::runtime::Handle::try_current() {
+            // A regular handler runs on the runtime's blocking pool,
+            // where blocking on the runtime is allowed.
+            Ok(handle) => handle.block_on(sink.send_wait(body)).is_ok(),
+            // Outside the runtime (a thread of the caller's own): the
+            // wait is on a channel and needs no reactor.
+            Err(_) => futures::executor::block_on(sink.send_wait(body)).is_ok(),
+        })
+    }
+
+    /// :meth:`send_wait` for an ``async def`` handler: returns an
+    /// awaitable resolving to ``True`` once queued, ``False`` if the call
+    /// is gone.
+    fn asend_wait<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let body = Bytes::copy_from_slice(body.as_bytes());
+        let sink = self.inner.lock().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(match sink {
+                Some(sink) => sink.send_wait(body).await.is_ok(),
+                None => false,
+            })
+        })
     }
 }
 
@@ -2104,7 +2151,7 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
         let callable = Python::attach(|py| self.callable.clone_ref(py));
         let runtime = self.runtime.clone();
         let stream_inner = Arc::new(Mutex::new(Some(requests)));
-        let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let sink_inner = Arc::new(Mutex::new(Some(Arc::new(responses))));
         // PY-2 liveness holder (the org_serve.rs fix's mechanism,
         // 15484b985): the wrapper below drops the sink at Python's
         // argument teardown — BEFORE the spawn_blocking result deposit —
@@ -2201,7 +2248,7 @@ impl RpcStreamingHandler for PyAsyncRpcStreamingHandler {
         sink: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
         let callable = Python::attach(|py| self.callable.clone_ref(py));
-        let sink_inner = Arc::new(Mutex::new(Some(sink)));
+        let sink_inner = Arc::new(Mutex::new(Some(Arc::new(sink))));
         let payload_bytes: Vec<u8> = ctx.payload.body.to_vec();
         let fut_result = Python::attach(|py| -> Result<_, PyErr> {
             let req_obj = PyBytes::new(py, &payload_bytes);
@@ -2279,7 +2326,7 @@ impl RpcStreamingHandler for PyRpcStreamingHandler {
         sink: InnerRpcResponseSink,
     ) -> std::result::Result<(), RpcHandlerError> {
         let callable = Python::attach(|py| self.callable.clone_ref(py));
-        let sink_inner = Arc::new(Mutex::new(Some(sink)));
+        let sink_inner = Arc::new(Mutex::new(Some(Arc::new(sink))));
         // PY-2 liveness holder — same mechanism and window as
         // `PyRpcDuplexHandler`'s: the sink wrapper drops at Python's
         // argument teardown, BEFORE the spawn_blocking result deposit,
