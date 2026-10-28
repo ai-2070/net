@@ -117,20 +117,43 @@ describe.skipIf(!RUN_INTEGRATION_TESTS)('serveTool lifecycle (live)', () => {
     await expect(mesh.shutdown()).resolves.toBeUndefined()
   }, 30_000)
 
-  it('the node stays held until the LAST of several tools is closed', async () => {
-    const mesh = await meshNode()
-    const rpc = TypedMeshRpc.fromMesh(mesh)
+  it('closing one tool keeps the metadata service another still uses', async () => {
+    const { host, agent, agentRpc } = await peers()
+    const rpc = TypedMeshRpc.fromMesh(host)
     const alpha = serveTool(rpc, { name: 'alpha' }, echo)
     const beta = serveToolStreaming(rpc, { name: 'beta' }, oneResult)
 
     alpha.close()
-    rpc.raw.close()
 
-    // `beta` is still served. Its registration — and the metadata service
-    // it shares with `alpha` — must still hold the node.
-    await expect(mesh.shutdown()).rejects.toThrow(/outstanding references/)
+    // `beta` is still served, and so must be the `tool.metadata.fetch`
+    // service it shares with `alpha`. This used to be witnessed as "the
+    // node stays held" (shutdown rejecting), but serve registrations are
+    // node-owned now and `shutdown()` releases whatever is still served
+    // (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 4) — so a peer asking is
+    // the witness. Closing the shared service with `alpha` would make this
+    // call go unanswered.
+    await expect(
+      fetchToolMetadata(agentRpc, host.nodeId(), 'beta'),
+    ).resolves.toMatchObject({ type: 'found' })
+    await expect(
+      fetchToolMetadata(agentRpc, host.nodeId(), 'alpha'),
+    ).resolves.toMatchObject({ type: 'not_found' })
 
     beta.close()
+    rpc.raw.close()
+    await expect(host.shutdown()).resolves.toBeUndefined()
+    agentRpc.raw.close()
+    await expect(agent.shutdown()).resolves.toBeUndefined()
+  }, 30_000)
+
+  it('shutdown releases a tool that is still served', async () => {
+    const mesh = await meshNode()
+    const rpc = TypedMeshRpc.fromMesh(mesh)
+    serveTool(rpc, { name: 'left-open' }, echo)
+    rpc.raw.close()
+
+    // The node owns the registration (Phase 4): a handle the app never
+    // closed does not keep the node from shutting down.
     await expect(mesh.shutdown()).resolves.toBeUndefined()
   }, 30_000)
 
