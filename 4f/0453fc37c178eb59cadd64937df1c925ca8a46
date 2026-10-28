@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_47ad87c4406da7::t_414c037dbb420b 804-807
+net/crates/net/bindings/python/src/lib.rs
+  s_47ad87c4406da7::t_414c037dbb420b 1728-1729
+net/crates/net/sdk/tests/mesh_rpc_streaming_typed.rs
+  s_47ad87c4406da7::t_414c037dbb420b 253-259,262-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f0453fc37c178eb59cadd64937df1c925ca8a46",
+  "prompts": {},
+  "sessions": {
+    "s_47ad87c4406da7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85994f0b-18b4-4897-8573-8fd1c21f2e51",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
