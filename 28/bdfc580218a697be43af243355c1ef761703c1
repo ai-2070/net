@@ -1,0 +1,19 @@
+docs/internal/misc/CODE_REVIEW_2026_10_28_APP_INTEGRATION_BLOCKERS.md
+  s_47ad87c4406da7::t_214efc430a1c91 1-259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "28bdfc580218a697be43af243355c1ef761703c1",
+  "prompts": {},
+  "sessions": {
+    "s_47ad87c4406da7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85994f0b-18b4-4897-8573-8fd1c21f2e51",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
