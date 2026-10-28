@@ -1,6 +1,6 @@
 # App integration blockers plan
 
-Status: decisions settled, Phase 1 in progress (2026-10-28). Branch `LZL0/cetus`.
+Status: decisions settled, Phase 1 in progress (2026-10-28). Branch `LZL0/fix-reconnect-after-restart`.
 
 ## Why
 
@@ -125,6 +125,48 @@ Paths are relative to `net/crates/net/` unless noted.
   calls with the same seed.
 - Re-run PoC `node.ts` (A/B restart, both orders, with and without
   `SESSION_MS`).
+
+### Progress (2026-10-28)
+
+- 1a done: `NoiseStaticKey::derive_from_identity` (core) — a BLAKE3
+  `derive_key` under `NOISE_STATIC_KEY_CONTEXT = "net-noise-static-key-v1"`
+  rather than HKDF, matching how the repo derives its other keys; golden
+  vector pinned in the core unit test (every binding calls this one
+  function, so no separate cross-language fixture). Default-on in the
+  Rust SDK builder, Node/TS (`noiseStaticKey`), Python
+  (`noise_static_key`), C/Go (`noise_static_key_hex` /
+  `NoiseStaticKeyHex`).
+- 1b done: `invalidate_peer_reply_subscriptions` runs on both
+  session-replacement paths (`install_peer_locked`, routed
+  `AcceptRotation`); the failure path now calls it too.
+- `renew` keeps the best-effort attach but names a failed handshake in
+  its error ("unreachable, or its Noise key no longer matches … re-pair").
+- Test: `sdk/tests/restart_reconnect.rs` (auto-discovered by the SDK
+  job). Red without 1b: A→B `timeout after 1010ms`, both timings.
+- **Third defect, found by re-running the app's PoC:** with Net's
+  default 5 s heartbeat the survivor's C3 busy gate defers a restarted
+  peer's handshake for up to 3 heartbeats (15 s) — by design, see
+  `NET_CLI_PLAN_V3.md` "C3 liveness" — and one `connect_via` gives up
+  after 3 × 5 s, just short of it. The CLI rides this out with its link
+  supervisor; SDK users had nothing. Fix: `Mesh::ensure_attached_via`
+  (SDK) — skip the handshake on a live session
+  (`MeshNode::peer_session_is_live`), else re-dial until
+  `MeshNode::session_rotation_defer_window` + 6 s has passed. `renew`
+  uses it, which also stops a renew-right-after-join from sending a
+  msg1 the gate would defer (`connect_via` has no "already connected"
+  short-circuit, contrary to the old comment). Exposed as Node/TS
+  `ensureAttached(rendezvous)` and Python `ensure_attached(rendezvous)`
+  for the case `renew` doesn't cover: a device whose operator restarted
+  while it kept running.
+- PoC `node.ts` against the local build: B restarted under a running A
+  reconnects by `renew` at +15.7 s and both directions work; A then B
+  restarted reconnects at once, both directions. The Rust test runs the
+  default timing (5 s heartbeat) with A calling B through the restart,
+  and failed at 15.4 s before `ensure_attached_via`.
+- App-side note: a survivor-side "re-dial on failure" is still the
+  app's job (call `ensureAttached` when calls to a paired machine fail
+  with `no_route` / timeout). An SDK-level link supervisor like the
+  CLI's is a possible follow-up.
 
 ---
 

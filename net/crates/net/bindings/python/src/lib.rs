@@ -1506,6 +1506,7 @@ mod mesh_bindings {
             subnet_attachment=None,
             subnet_control_channel=None,
             subnet_exports=None,
+            noise_static_key=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1565,6 +1566,11 @@ mod mesh_bindings {
             subnet_attachment: Option<Vec<u32>>,
             subnet_control_channel: Option<&str>,
             subnet_exports: Option<&Bound<'_, PyList>>,
+            // noise_static_key: 32-byte Noise (X25519) private key the
+            // caller stores, keeping `public_key` stable across restarts
+            // independently of the identity. Unset: derived from
+            // `identity_seed`, or fresh per process with no seed.
+            noise_static_key: Option<&[u8]>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1701,6 +1707,29 @@ mod mesh_bindings {
                 }
                 None => EntityKeypair::generate(),
             };
+            // Noise static key: explicit wins; a seeded identity derives
+            // one, so the node's rendezvous address survives a restart;
+            // otherwise core generates a fresh key.
+            let static_key = match noise_static_key {
+                Some(key) => {
+                    let arr: [u8; 32] = key.try_into().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "noise_static_key must be 32 bytes, got {}",
+                            key.len()
+                        ))
+                    })?;
+                    Some(net::adapter::net::NoiseStaticKey::from_private(arr))
+                }
+                None if config.configured_identity => Some(
+                    net::adapter::net::NoiseStaticKey::derive_from_identity(&identity).map_err(
+                        |e| PyValueError::new_err(format!("noise key derivation failed: {e}")),
+                    )?,
+                ),
+                None => None,
+            };
+            if let Some(key) = static_key {
+                config = config.with_static_key(key);
+            }
             let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
@@ -2002,6 +2031,24 @@ mod mesh_bindings {
                 depth,
                 approver,
                 std::time::Duration::from_millis(approve_timeout_ms),
+            )
+        }
+
+        /// Make sure there is a working session to the node a `rendezvous`
+        /// locator names (`addr|noise_pubkey|node_id`, as saved from an
+        /// invite or a `DeviceEnrollment`), re-dialing it only when needed.
+        /// Call it when a paired machine may have restarted — on either side —
+        /// before talking to it again. A live session is used as is;
+        /// otherwise it re-dials until the far side accepts, which after a
+        /// restart can take up to three heartbeat intervals. `renew` already
+        /// does this. (Requires the `delegation` feature.)
+        #[cfg(feature = "delegation")]
+        fn ensure_attached(&self, py: Python<'_>, rendezvous: &str) -> PyResult<()> {
+            crate::enrollment::mesh_ensure_attached(
+                py,
+                self.node_arc_clone()?,
+                &self.runtime,
+                rendezvous,
             )
         }
 

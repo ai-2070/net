@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tokio::runtime::Runtime;
@@ -634,6 +634,24 @@ pub(crate) fn mesh_renew(
         .detach(move || runtime.block_on(mesh.renew(&rendezvous, &chain)))
         .map_err(enroll_err)?;
     Ok(PyDelegationChain::from_inner(renewed))
+}
+
+/// Make sure there is a working session to the node `rendezvous` names,
+/// re-dialing only when needed (see `net_sdk::Mesh::ensure_attached_via`).
+/// Releases the GIL for the handshake.
+pub(crate) fn mesh_ensure_attached(
+    py: Python<'_>,
+    node: Arc<MeshNode>,
+    runtime: &Runtime,
+    rendezvous: &str,
+) -> PyResult<()> {
+    let rv = net_sdk::mesh_enroll::Rendezvous::decode(rendezvous)
+        .ok_or_else(|| PyValueError::new_err("malformed rendezvous locator"))?;
+    let mesh = mesh_over(node, None);
+    py.detach(move || {
+        runtime.block_on(mesh.ensure_attached_via(&rv.addr, &rv.noise_pubkey, rv.node_id))
+    })
+    .map_err(|e| PyRuntimeError::new_err(format!("ensure_attached failed: {e}")))
 }
 
 /// Operator-side: serve the full device lifecycle on the live `node` (auto —

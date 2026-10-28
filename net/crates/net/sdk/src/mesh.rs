@@ -350,7 +350,14 @@ impl MeshBuilder {
 
     /// Keep this node's Noise static key across restarts: nodes that pinned
     /// it (e.g. from an invite or bundle this node issued) can then reach it
-    /// again. Without it every build generates a fresh key.
+    /// again.
+    ///
+    /// Without it, a builder given an [`identity`](Self::identity) derives
+    /// the key from that identity
+    /// ([`NoiseStaticKey::derive_from_identity`](net::adapter::net::NoiseStaticKey::derive_from_identity)),
+    /// so it is stable anyway; a builder with no identity generates a
+    /// fresh key per build. Set this to keep the Noise key independent of
+    /// the identity (rotate one without the other).
     pub fn noise_static_key(mut self, key: net::adapter::net::NoiseStaticKey) -> Self {
         self.static_key = Some(key);
         self
@@ -554,7 +561,19 @@ impl MeshBuilder {
         if let Some(dir) = self.subnet_floor_store {
             config = config.with_subnet_floor_store(dir);
         }
-        if let Some(key) = self.static_key {
+        // A caller-supplied identity gets a Noise key derived from it
+        // unless one was set explicitly, so a node rebuilt from the same
+        // identity keeps its rendezvous address across restarts. A
+        // public-only identity can't derive one and keeps the old
+        // per-build key.
+        let static_key = match self.static_key {
+            Some(key) => Some(key),
+            None if sdk_identity.is_some() => {
+                net::adapter::net::NoiseStaticKey::derive_from_identity(&keypair).ok()
+            }
+            None => None,
+        };
+        if let Some(key) = static_key {
             config = config.with_static_key(key);
         }
         // Review-10 P1-6: the checked map is the NODE's, resolved and
@@ -855,6 +874,49 @@ impl Mesh {
             .connect_via(addr, peer_pubkey, peer_node_id)
             .await?;
         Ok(())
+    }
+
+    /// Make sure there is a working session to `peer_node_id`, dialing it
+    /// through `relay_addr` (typically the peer's own address, from a saved
+    /// rendezvous) only when needed. The call to make after a restart — on
+    /// either side — before talking to a peer again.
+    ///
+    /// - A session that has carried inbound traffic recently
+    ///   ([`MeshNode::peer_session_is_live`](net::adapter::net::MeshNode::peer_session_is_live))
+    ///   is used as is: no handshake. A fresh `msg1` there would only be
+    ///   deferred by the peer's busy gate.
+    /// - Otherwise it keeps re-dialing until a handshake lands or
+    ///   [`MeshNode::session_rotation_defer_window`](net::adapter::net::MeshNode::session_rotation_defer_window)
+    ///   (plus a margin for one more attempt) has passed. That window is how
+    ///   long a peer still holding this node's previous session defers a
+    ///   new handshake, so a single `connect_via` (three attempts) can give
+    ///   up just before the peer would have accepted.
+    ///
+    /// Returns the last handshake error if the window runs out.
+    pub async fn ensure_attached_via(
+        &self,
+        relay_addr: &str,
+        peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
+    ) -> Result<()> {
+        if self.node.peer_session_is_live(peer_node_id) {
+            return Ok(());
+        }
+        const MARGIN: Duration = Duration::from_secs(6);
+        let deadline =
+            tokio::time::Instant::now() + self.node.session_rotation_defer_window() + MARGIN;
+        loop {
+            match self
+                .connect_via(relay_addr, peer_pubkey, peer_node_id)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(SdkError::Config(e)) => return Err(SdkError::Config(e)),
+                Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+                // Not accepted yet (deferred, or the peer is still down).
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
     }
 
     /// Start the receive loop, heartbeat sender, and router.

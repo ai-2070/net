@@ -677,6 +677,24 @@ impl NetMesh {
         Ok(mesh_over(self.node_arc_clone()?, None).rendezvous_string())
     }
 
+    /// Make sure there is a working session to the node a `rendezvous`
+    /// locator names (`addr|noise_pubkey|node_id`, as saved from an invite
+    /// or a `DeviceEnrollment`), re-dialing it only when needed. Call it
+    /// when a paired machine may have restarted — on either side — before
+    /// talking to it again. A live session is used as is; otherwise it
+    /// re-dials until the far side accepts, which after a restart can take
+    /// up to three heartbeat intervals. `renew` already does this.
+    /// (Requires the `delegation` feature.)
+    #[napi]
+    pub async fn ensure_attached(&self, rendezvous: String) -> Result<()> {
+        let rv = net_sdk::mesh_enroll::Rendezvous::decode(&rendezvous)
+            .ok_or_else(|| Error::from_reason("malformed rendezvous locator"))?;
+        mesh_over(self.node_arc_clone()?, None)
+            .ensure_attached_via(&rv.addr, &rv.noise_pubkey, rv.node_id)
+            .await
+            .map_err(|e| Error::from_reason(format!("ensure_attached failed: {e}")))
+    }
+
     /// Device-side enrollment: enroll `device`'s key into the mesh named
     /// by the `invite` string, under `name` + `tags`, returning the
     /// verified `root → device` `DelegationChain`. This node must be

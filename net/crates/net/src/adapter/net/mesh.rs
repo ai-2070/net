@@ -52,9 +52,10 @@ use tokio::time::Instant as UpgradeInstant;
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
 use super::identity::{
-    decode_identity_proof, encode_identity_proof, proof_transcript, verify_proof, EntityId,
-    EntityKeypair, IdentityChallengeStore, IdentityProofMsg, IdentityProofReject, PermissionToken,
-    RevocationRegistry, TokenCache, TokenChain, TokenScope, SUBPROTOCOL_IDENTITY_PROOF,
+    decode_identity_proof, encode_identity_proof, proof_transcript, verify_proof, EntityError,
+    EntityId, EntityKeypair, IdentityChallengeStore, IdentityProofMsg, IdentityProofReject,
+    PermissionToken, RevocationRegistry, TokenCache, TokenChain, TokenScope,
+    SUBPROTOCOL_IDENTITY_PROOF,
 };
 use super::pool::PacketBuilder;
 
@@ -2342,6 +2343,9 @@ struct DispatchCtx {
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
+    /// Cleared when a routed rotation replaces a peer's session.
+    #[cfg(feature = "cortex")]
+    reply_cache: PeerReplyCache,
     /// `0x0D02` intake: the budget and the engine's input. Both
     /// `None` on a node without RTC configured, which is what makes
     /// the dispatch arm inert there.
@@ -3067,6 +3071,11 @@ pub(crate) enum IdentityProofReply {
     },
 }
 
+/// BLAKE3 KDF context for [`NoiseStaticKey::derive_from_identity`].
+/// Changing it changes every derived node's Noise key (and so its
+/// rendezvous address); bump the version instead of editing it.
+pub const NOISE_STATIC_KEY_CONTEXT: &str = "net-noise-static-key-v1";
+
 /// A caller-owned Noise static private key (X25519). The public half is
 /// derived from it, so a stored key can never be paired with the wrong
 /// public key. `Debug` is redacted; the bytes are wiped on drop.
@@ -3077,6 +3086,28 @@ impl NoiseStaticKey {
     /// Wrap a stored private key.
     pub fn from_private(private: [u8; 32]) -> Self {
         Self(private)
+    }
+
+    /// Derive the Noise key from an identity, so a node rebuilt from the
+    /// same identity seed keeps the same Noise key — and therefore the
+    /// same rendezvous address — across restarts, with no second secret
+    /// to store.
+    ///
+    /// A domain-separated BLAKE3 KDF over the ed25519 seed: the result
+    /// never equals the signing secret, and the context string is
+    /// versioned so the derivation can change without colliding. Every
+    /// binding calls this one function; the golden vector in
+    /// `a_derived_noise_key_follows_the_identity_seed` pins it.
+    ///
+    /// Trade-off: rotating this key means rotating the identity. Callers
+    /// who want them independent supply [`Self::from_private`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`EntityError::ReadOnly`] if `identity` is public-only.
+    pub fn derive_from_identity(identity: &EntityKeypair) -> Result<Self, EntityError> {
+        let seed = identity.try_secret_bytes()?;
+        Ok(Self(blake3::derive_key(NOISE_STATIC_KEY_CONTEXT, seed)))
     }
 
     /// The public key peers pin (what a contact's `noise_pubkey` names).
@@ -4882,12 +4913,63 @@ fn evict_failed_peer_channel_state(
     #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
 ) {
     #[cfg(feature = "cortex")]
-    rpc_peer_failure_gen.bump(node_id);
+    invalidate_peer_reply_subscriptions(
+        node_id,
+        rpc_reply_subscriptions,
+        rpc_corrective_announced,
+        rpc_peer_failure_gen,
+    );
     subscriber_chains.retain(|(nid, _), _| *nid != node_id);
-    #[cfg(feature = "cortex")]
+}
+
+/// Forget that we subscribed to `node_id`'s reply channels, so the next
+/// call to it re-subscribes (and may re-announce). The caller-side half
+/// of [`evict_failed_peer_channel_state`], with the same bump-first
+/// ordering and for the same reason (see there).
+///
+/// Also run when a peer's session is REPLACED, not only when it fails:
+/// a peer that restarts and re-handshakes before the failure detector
+/// fires comes back with an empty roster, so a cached "subscribed" entry
+/// makes every call to it skip the re-subscribe and its replies are
+/// dropped — calls time out until the entry is somehow evicted.
+/// Re-subscribing is idempotent at the publisher, so clearing this on a
+/// plain rekey of a live peer costs one extra subscribe and nothing
+/// else. Deliberately NOT the full eviction: a replacement must keep the
+/// peer's retained subscribe credentials (`subscriber_chains`).
+#[cfg(feature = "cortex")]
+fn invalidate_peer_reply_subscriptions(
+    node_id: u64,
+    rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), ReplySubscription>,
+    rpc_corrective_announced: &dashmap::DashSet<u64>,
+    rpc_peer_failure_gen: &PeerFailureGenerations,
+) {
+    rpc_peer_failure_gen.bump(node_id);
     rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
-    #[cfg(feature = "cortex")]
     rpc_corrective_announced.remove(&node_id);
+}
+
+/// The caller-side reply-subscription cache, as one cloneable handle for
+/// the paths that replace a peer's session (the node's install path and
+/// the dispatch-side routed rotation).
+#[cfg(feature = "cortex")]
+#[derive(Clone)]
+struct PeerReplyCache {
+    subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>>,
+    corrective_announced: Arc<dashmap::DashSet<u64>>,
+    failure_gen: Arc<PeerFailureGenerations>,
+}
+
+#[cfg(feature = "cortex")]
+impl PeerReplyCache {
+    /// See [`invalidate_peer_reply_subscriptions`].
+    fn on_session_replaced(&self, node_id: u64) {
+        invalidate_peer_reply_subscriptions(
+            node_id,
+            &self.subscriptions,
+            &self.corrective_announced,
+            &self.failure_gen,
+        );
+    }
 }
 
 /// One caller-side reply subscription, plus the peer-failure generation
@@ -20585,6 +20667,35 @@ impl MeshNode {
             .is_some_and(|p| !p.session.heard_within(self.config.session_timeout))
     }
 
+    /// How long a peer's re-handshake can be deferred by the responder's
+    /// C3 busy gate (`routed_rotation_outcome`): an authenticated inbound
+    /// packet within this window, on a busy session, defers the rotation.
+    /// Three heartbeat intervals, capped at `session_timeout`.
+    ///
+    /// A peer that restarted reaches a survivor that still holds its old
+    /// session only after this much silence, so an initiator re-attaching
+    /// after a restart should keep retrying for at least this long (plus
+    /// one handshake attempt) — assuming the far side runs the same
+    /// heartbeat settings, which is the only estimate it has.
+    pub fn session_rotation_defer_window(&self) -> Duration {
+        self.config
+            .heartbeat_interval
+            .saturating_mul(3)
+            .min(self.config.session_timeout)
+    }
+
+    /// Has the session with `node_id` carried authenticated inbound
+    /// traffic (heartbeats included) within
+    /// [`Self::session_rotation_defer_window`]? `false` when there is no
+    /// session. A caller deciding whether to re-handshake uses this: a
+    /// live session needs none, and a fresh `msg1` would only be deferred.
+    pub fn peer_session_is_live(&self, node_id: u64) -> bool {
+        let window = self.session_rotation_defer_window();
+        self.peers
+            .get(&node_id)
+            .is_some_and(|p| p.session.heard_within(window))
+    }
+
     /// A pending unary call must not outlive its receive incarnation. The
     /// table can retain a retired session (notably on shutdown), so identity
     /// alone is insufficient. Advisory inactivity is deliberately not a fence.
@@ -25430,6 +25541,17 @@ impl MeshNode {
             );
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            // A replaced session may be a restarted peer with an empty
+            // roster: forget our reply subscriptions on it so the next
+            // call re-subscribes instead of waiting for replies that
+            // will never be published.
+            #[cfg(feature = "cortex")]
+            invalidate_peer_reply_subscriptions(
+                peer_node_id,
+                &self.rpc_reply_subscriptions,
+                &self.rpc_corrective_announced,
+                &self.rpc_peer_failure_gen,
+            );
             // X10: a REPLACEMENT is a lifetime end like any other,
             // so the displaced session's partial fragment groups go
             // with it. A late endpoint-close notification is not a
@@ -27516,6 +27638,8 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(feature = "cortex")]
+            reply_cache: self.peer_reply_cache(),
             #[cfg(feature = "webrtc")]
             rtc_signal_budget: self
                 .rtc_driver
@@ -27613,11 +27737,7 @@ impl MeshNode {
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
-            busy_liveness: self
-                .config
-                .heartbeat_interval
-                .saturating_mul(3)
-                .min(self.config.session_timeout),
+            busy_liveness: self.session_rotation_defer_window(),
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
@@ -30447,6 +30567,12 @@ impl MeshNode {
                                         .remove_if(&displaced_session_id, |_, n| {
                                             *n == peer_node_id
                                         });
+                                    // As in `install_peer_locked`: a
+                                    // rotation may be a restarted peer, so
+                                    // our reply subscriptions on it are
+                                    // re-established on the next call.
+                                    #[cfg(feature = "cortex")]
+                                    ctx.reply_cache.on_session_replaced(peer_node_id);
                                     // X10: the displaced session's
                                     // lifetime ends here too, so its
                                     // partial fragment groups are
@@ -36206,6 +36332,15 @@ impl MeshNode {
     /// floor rather than to a fixed zero, which is what lets the
     /// counters be forgotten without opening a hole in the fence. See
     /// [`PeerFailureGenerations`].
+    #[cfg(feature = "cortex")]
+    fn peer_reply_cache(&self) -> PeerReplyCache {
+        PeerReplyCache {
+            subscriptions: self.rpc_reply_subscriptions.clone(),
+            corrective_announced: self.rpc_corrective_announced.clone(),
+            failure_gen: self.rpc_peer_failure_gen.clone(),
+        }
+    }
+
     #[cfg(feature = "cortex")]
     pub(super) fn peer_failure_generation(&self, peer: u64) -> u64 {
         self.rpc_peer_failure_gen.get(peer)
@@ -56780,6 +56915,44 @@ mod heartbeat_aead_tests {
             !first.peer_session_is_silent(0x1234),
             "no session, not silent"
         );
+    }
+
+    /// A node rebuilt from the same identity seed derives the same Noise
+    /// key, so its rendezvous address survives a restart. The derived key
+    /// is never the signing secret, differs per identity, and a
+    /// public-only identity is refused.
+    #[tokio::test]
+    async fn a_derived_noise_key_follows_the_identity_seed() {
+        let seed = [0x5au8; 32];
+        let a = NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap();
+        let b = NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap();
+        assert_eq!(a.public_key(), b.public_key());
+        // Golden vector: a change here moves every seeded node's
+        // rendezvous address. Bump `NOISE_STATIC_KEY_CONTEXT` instead.
+        assert_eq!(
+            hex::encode(a.public_key()),
+            "fee5e2c610d5855966121d70a0ebf579b2ff717f001e6d1e05708a2f4a89dd26"
+        );
+        assert_ne!(a.0, seed, "derived key must not be the signing secret");
+        let other =
+            NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes([0x5bu8; 32])).unwrap();
+        assert_ne!(a.public_key(), other.public_key());
+
+        let public_only =
+            EntityKeypair::public_only(EntityKeypair::from_bytes(seed).entity_id().clone());
+        assert!(NoiseStaticKey::derive_from_identity(&public_only).is_err());
+
+        let build = || async {
+            let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [7u8; 32])
+                .with_static_key(
+                    NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap(),
+                );
+            MeshNode::new(EntityKeypair::from_bytes(seed), cfg)
+                .await
+                .unwrap()
+        };
+        assert_eq!(build().await.public_key(), &a.public_key());
+        assert_eq!(build().await.public_key(), &a.public_key());
     }
 
     /// Every always-compiled subprotocol id is in the control-stream list,

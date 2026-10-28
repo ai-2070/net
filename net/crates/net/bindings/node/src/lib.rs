@@ -178,7 +178,7 @@ use net::config::RedisAdapterConfig;
 use net::config::JetStreamAdapterConfig;
 
 #[cfg(feature = "net")]
-use net::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
+use net::adapter::net::{NetAdapterConfig, NoiseStaticKey, ReliabilityConfig, StaticKeypair};
 
 /// Redis adapter configuration.
 #[napi(object)]
@@ -1354,7 +1354,18 @@ mod mesh_bindings {
         /// keypair (and therefore its `entity_id` + stable
         /// `node_id`) from these bytes instead of generating
         /// ephemeral ones. Treat as secret material.
+        ///
+        /// A seeded node also derives its Noise static key (its
+        /// `publicKey()`, the key in its rendezvous string) from this
+        /// seed unless `noiseStaticKey` is set, so peers that paired
+        /// with it can still reach it after a restart.
         pub identity_seed: Option<Buffer>,
+        /// 32-byte Noise (X25519) static private key — any 32 random
+        /// bytes, stored by the caller. Keeps `publicKey()` stable
+        /// across restarts independently of the identity. Leave unset
+        /// to derive it from `identitySeed` (or, with no seed, to get a
+        /// fresh key per process). Treat as secret material.
+        pub noise_static_key: Option<Buffer>,
         /// Pin this mesh's publicly-advertised reflex to the
         /// supplied external `"ip:port"`. Classification is
         /// skipped; the node starts in `nat:open` and advertises
@@ -1888,6 +1899,31 @@ mod mesh_bindings {
                 }
                 None => EntityKeypair::generate(),
             };
+
+            // Noise static key: explicit wins; a seeded identity derives
+            // one, so the node's rendezvous address survives a restart;
+            // otherwise core generates a fresh key.
+            let static_key = match options.noise_static_key {
+                Some(key) => {
+                    let bytes: &[u8] = key.as_ref();
+                    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                        Error::from_reason(format!(
+                            "noise_static_key must be 32 bytes, got {}",
+                            bytes.len()
+                        ))
+                    })?;
+                    Some(NoiseStaticKey::from_private(arr))
+                }
+                None if config.configured_identity => Some(
+                    NoiseStaticKey::derive_from_identity(&identity).map_err(|e| {
+                        Error::from_reason(format!("noise key derivation failed: {e}"))
+                    })?,
+                ),
+                None => None,
+            };
+            if let Some(key) = static_key {
+                config = config.with_static_key(key);
+            }
 
             let mut node = MeshNode::new(identity, config)
                 .await

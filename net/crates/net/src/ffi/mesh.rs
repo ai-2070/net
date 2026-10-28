@@ -545,8 +545,16 @@ struct MeshNewConfig {
     /// Hex-encoded 32-byte ed25519 seed — when present, the mesh
     /// reproduces the same `entity_id` as
     /// `IdentityFromSeed(sameSeed)`. Leave unset to generate a fresh
-    /// keypair.
+    /// keypair. A seeded mesh also derives its Noise static key from
+    /// this seed (unless `noise_static_key_hex` is set), so its
+    /// rendezvous address survives a restart.
     identity_seed_hex: Option<String>,
+    /// Hex-encoded 32-byte Noise (X25519) static private key the caller
+    /// stores. Keeps the node's public key stable across restarts
+    /// independently of the identity. Unset: derived from
+    /// `identity_seed_hex`, or fresh per process with no seed.
+    #[serde(default)]
+    noise_static_key_hex: Option<String>,
     /// Pin this mesh's publicly-advertised reflex address (an
     /// `"ip:port"` string). Classification is skipped; the node
     /// starts in `nat:open` with this address on its capability
@@ -772,6 +780,28 @@ pub unsafe extern "C" fn net_mesh_new(
         }
         None => EntityKeypair::generate(),
     };
+    // Noise static key: explicit wins; a seeded identity derives one, so
+    // the node's rendezvous address survives a restart; otherwise core
+    // generates a fresh key.
+    let static_key = match cfg.noise_static_key_hex {
+        Some(key_hex) => {
+            let arr: [u8; 32] = match hex::decode(&key_hex).ok().and_then(|b| b.try_into().ok()) {
+                Some(arr) => arr,
+                None => return NET_ERR_MESH_INIT,
+            };
+            Some(crate::adapter::net::NoiseStaticKey::from_private(arr))
+        }
+        None if node_cfg.configured_identity => {
+            match crate::adapter::net::NoiseStaticKey::derive_from_identity(&identity) {
+                Ok(key) => Some(key),
+                Err(_) => return NET_ERR_MESH_INIT,
+            }
+        }
+        None => None,
+    };
+    if let Some(key) = static_key {
+        node_cfg = node_cfg.with_static_key(key);
+    }
     let result = block_on(async move { MeshNode::new(identity, node_cfg).await });
     match result {
         Ok(mut node) => {

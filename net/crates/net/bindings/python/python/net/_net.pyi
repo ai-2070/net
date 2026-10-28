@@ -910,6 +910,7 @@ class NetMesh:
         subnet_attachment: Optional[list] = None,
         subnet_control_channel: Optional[str] = None,
         subnet_exports: Optional[list] = None,
+        noise_static_key: Optional[bytes] = None,
     ) -> None:
         """Construct a new mesh node.
 
@@ -1005,6 +1006,13 @@ class NetMesh:
         its worker thread until it returns, and its late answer is ignored.
         Use a coroutine function for an approver that prompts a human — it
         is cancelled at the timeout. ``approve_timeout_ms`` must be >= 1."""
+        ...
+    def ensure_attached(self, rendezvous: str) -> None:
+        """Make sure there is a working session to the node ``rendezvous``
+        names (``addr|noise_pubkey|node_id``), re-dialing only when needed —
+        call it when a paired machine may have restarted. After a restart the
+        far side can take up to three heartbeat intervals to accept; ``renew``
+        already does this. (Requires the ``delegation`` feature.)"""
         ...
     def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
         """Device-side renewal: refresh the grant carried by ``enrollment`` over

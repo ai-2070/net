@@ -240,6 +240,7 @@ pub use mesh::{
     PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
     SensingRegistrationError, SessionPath, StartRefused, StreamInboundEvent, StreamInboundSink,
     StreamInbox, SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    NOISE_STATIC_KEY_CONTEXT,
 };
 /// Exported only so the fixtures-gated ordered-egress accessors have nameable
 /// types in integration tests; each is `#[doc(hidden)]` at its definition and
