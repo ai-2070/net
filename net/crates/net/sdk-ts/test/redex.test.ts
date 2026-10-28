@@ -121,3 +121,19 @@ describe('RedexFile.tail — AsyncIterable', () => {
     await iter.return!();
   });
 });
+
+describe('Redex constructor', () => {
+  it('refuses a bare directory string, naming the options object', () => {
+    // An untyped caller's `new Redex(dir)` used to build an in-memory
+    // store silently and fail much later at a persistent open.
+    expect(() => new Redex('/tmp/some-dir' as never)).toThrow(
+      /new Redex\(\{ persistentDir: "\/tmp\/some-dir" \}\)/,
+    );
+    expect(() => new Redex(null as never)).toThrow(/got null/);
+  });
+
+  it('still accepts no options and an options object', () => {
+    expect(() => new Redex()).not.toThrow();
+    expect(() => new Redex({})).not.toThrow();
+  });
+});

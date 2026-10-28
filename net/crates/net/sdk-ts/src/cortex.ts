@@ -171,6 +171,18 @@ export class Redex {
   readonly napi: NapiRedex;
 
   constructor(opts?: RedexOptions) {
+    // Untyped callers (plain JS, Bun without a type-check) have passed
+    // the directory itself — `new Redex(dir)`. That used to be read as
+    // "no options", built an in-memory store, and failed much later at
+    // the first `persistent: true` open with a message about the Rust
+    // builder. Refuse it here, naming the fix.
+    if (opts !== undefined && (opts === null || typeof opts !== 'object')) {
+      throw new TypeError(
+        `Redex options must be an object, e.g. new Redex({ persistentDir: ${JSON.stringify(
+          String(opts),
+        )} }); got ${opts === null ? 'null' : typeof opts}`,
+      );
+    }
     this.napi = new NapiRedex(opts?.persistentDir);
   }
 
