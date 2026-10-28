@@ -840,6 +840,12 @@ impl<Resp: Serialize> ResponseSinkTyped<Resp> {
     /// Encode `value` with the captured codec and emit it as one
     /// non-terminal chunk. Returns `Err(message)` if encoding fails;
     /// the chunk is NOT sent in that case.
+    ///
+    /// **Lossy, and silent about it.** Never waits: when the per-call
+    /// queue is full (the handler out-produces the caller) or the call
+    /// has ended, the chunk is dropped and this still returns `Ok(())`.
+    /// Use [`Self::try_send`] to see the drop, or [`Self::send_wait`]
+    /// when every chunk must arrive.
     pub fn send(&self, value: &Resp) -> std::result::Result<(), String> {
         let bytes = self
             .codec
@@ -847,6 +853,19 @@ impl<Resp: Serialize> ResponseSinkTyped<Resp> {
             .map_err(|e| format!("typed streaming sink encode: {e}"))?;
         self.inner.send(bytes);
         Ok(())
+    }
+
+    /// [`Self::send`], reporting a dropped chunk: `Ok(true)` when it was
+    /// queued, `Ok(false)` when it was dropped (queue full, or the call
+    /// has ended), `Err` when encoding failed (nothing was sent). Never
+    /// waits. The Node and Python sinks' `send` return the same
+    /// queued/dropped flag.
+    pub fn try_send(&self, value: &Resp) -> std::result::Result<bool, String> {
+        let bytes = self
+            .codec
+            .encode(value)
+            .map_err(|e| format!("typed streaming sink encode: {e}"))?;
+        Ok(self.inner.try_send(bytes))
     }
 
     /// Backpressured [`Self::send`]: encode `value` and park until the
