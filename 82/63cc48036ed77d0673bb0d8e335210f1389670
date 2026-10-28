@@ -1,0 +1,68 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_aa25bb779f3858::t_cef3657b796b68 1010-1016
+  s_aa25bb779f3858::t_f8a3686c2fe91d 913
+net/crates/net/sdk/src/mesh_enroll.rs
+  s_aa25bb779f3858::t_78bfcf4b8d37aa 249-256,258
+  s_aa25bb779f3858::t_fb04a5bcf6dbe6 257,268-270,274-276
+  s_aa25bb779f3858::t_ab73dce47778e3 271-273
+net/crates/net/bindings/python/src/enrollment.rs
+  s_aa25bb779f3858::t_5f94ee1f8905b2 639-656
+  s_aa25bb779f3858::t_cef3657b796b68 26
+net/crates/net/bindings/node/src/lib.rs
+  s_aa25bb779f3858::t_46b37d7664d663 181,1357-1361,1363-1368,1903-1916,1919,1922-1926
+  s_aa25bb779f3858::t_4da66d21511cb3 1917-1918,1920-1921
+  s_aa25bb779f3858::t_0a78ca3c9fb79f 1927
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_7325f25f03a12c 129-145,170
+  s_aa25bb779f3858::t_6150d661597108 146-169
+  s_aa25bb779f3858::t_c8616608c39cbe 3
+net/crates/net/sdk-ts/test/noise_key_live.test.ts
+  s_aa25bb779f3858::t_a7cf6460ddf213 1-50
+net/crates/net/src/adapter/net/mod.rs
+  s_aa25bb779f3858::t_989994232b9f8c 243
+net/crates/net/sdk/tests/restart_reconnect.rs
+  s_aa25bb779f3858::t_8f013505a84cc2 26,79-85
+  s_aa25bb779f3858::t_0c5a79e35f4b1b 168
+  s_aa25bb779f3858::t_686e8fa973a4e0 1-25,27-42,44-46,49-78,86-115,118-119,123-125,136,150-162,169-183,185-186,190-192,194,196-206,208-237
+  s_aa25bb779f3858::t_e42b0c9636a0d2 43,47-48,137-149,195,207
+  s_aa25bb779f3858::t_38b895d96ada32 116-117,120-122,163-167,184,187-189,193
+  s_aa25bb779f3858::t_4da66d21511cb3 126-135
+net/crates/net/src/ffi/mesh.rs
+  s_aa25bb779f3858::t_091712ada71bdd 548-550,552-557,783-804
+net/crates/net/sdk/src/mesh.rs
+  s_aa25bb779f3858::t_291f1c5226a7bc 353-360,564-576
+  s_aa25bb779f3858::t_80b2713e9920c6 879-908,913-915,918-921
+  s_aa25bb779f3858::t_87a323f0b84163 909-912
+  s_aa25bb779f3858::t_297c5d92d4e880 916-917
+net/crates/net/bindings/python/src/lib.rs
+  s_aa25bb779f3858::t_5f94ee1f8905b2 2037-2054
+  s_aa25bb779f3858::t_091712ada71bdd 1509,1569-1573,1710-1732
+net/crates/net/bindings/node/src/enrollment.rs
+  s_aa25bb779f3858::t_abc396f3a08ebf 680-697
+go/mesh.go
+  s_aa25bb779f3858::t_f8a3686c2fe91d 320-322,325-329
+  s_aa25bb779f3858::t_ef2e5fedeb7b25 330
+net/crates/net/sdk-ts/test/mesh_config_forwarding.test.ts
+  s_aa25bb779f3858::t_494ee0457c2481 42
+net/crates/net/sdk-ts/src/mesh.ts
+  s_aa25bb779f3858::t_c5d9aeb2ba4a15 307-310,313-320,569
+  s_aa25bb779f3858::t_5f94ee1f8905b2 1193-1204
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa25bb779f3858::t_ea7cb5bce74976 55-58,2346-2348,3074-3078,3091-3112,4916-4921,4923-4946,4951-4974,20670-20698,25544-25554,27641-27642,27740,30570-30575,36335-36343,56920-56957
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8263cc48036ed77d0673bb0d8e335210f1389670",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
