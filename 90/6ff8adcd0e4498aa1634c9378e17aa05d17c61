@@ -1,0 +1,37 @@
+net/crates/net/wire/src/session.rs
+  s_aa25bb779f3858::t_b61fc0865e4064 5850,5985,6097
+net/crates/net/wire/src/reliability.rs
+  s_aa25bb779f3858::t_b61fc0865e4064 129-144,1707,2782,2790,2798,2860
+net/crates/net/leaf/src/session.rs
+  s_aa25bb779f3858::t_b61fc0865e4064 754,1319
+net/crates/net/tests/integration_nrpc_streaming.rs
+  s_aa25bb779f3858::t_65646755aebad4 804-808
+  s_aa25bb779f3858::t_89afb95b5fa078 738-797,799,809
+  s_aa25bb779f3858::t_cb527d62abcbd6 798,800-803
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_aa25bb779f3858::t_4cb4f9e6fb6052 4343-4355
+net/crates/net/src/adapter/net/mod.rs
+  s_aa25bb779f3858::t_b61fc0865e4064 1595,1638
+net/crates/net/benches/reliability.rs
+  s_aa25bb779f3858::t_b61fc0865e4064 26
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_b22d62a233229c 349-366
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa25bb779f3858::t_b9a6000d881074 12779-12784,15122-15123,15847-15869,31480-31485,33408-33412,45075-45078,45211-45221,45225-45247,50377,50427-50429,50438,50449,50617
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "906ff8adcd0e4498aa1634c9378e17aa05d17c61",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
