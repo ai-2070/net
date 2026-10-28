@@ -1,0 +1,23 @@
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_47ad87c4406da7::t_592be2b87185fe 840
+net/crates/net/guards/org_api_probe/Cargo.lock
+  s_47ad87c4406da7::t_54b05e629629ed 880
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_47ad87c4406da7::t_e633f06fba75ed 1238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "abb6bde42c79010c53410e8b88d0eef1d907045a",
+  "prompts": {},
+  "sessions": {
+    "s_47ad87c4406da7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85994f0b-18b4-4897-8573-8fd1c21f2e51",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
