@@ -45202,18 +45202,14 @@ impl MeshNode {
             stream_id, seq, events, flags, 0, /* subprotocol_id 0 = event-plane */
         );
 
-        // A session that crosses a relay hop rides a routing header to its
-        // relay; otherwise the legacy next-hop choice stands.
-        let (wire, next_hop) = if route.header.is_some() {
-            (route.frame(&packet), route.addr)
-        } else {
-            let next_hop = self
-                .router
-                .routing_table()
-                .lookup(peer_node_id)
-                .unwrap_or(dest_addr);
-            (std::borrow::Cow::Borrowed(&packet[..]), next_hop)
-        };
+        // Where every per-peer sender sends: the session's own wire route
+        // (a routing header to its relay when it crosses one). The RTO and
+        // NACK paths resend registered packets to that same route, so the
+        // first copy must go there too. This used to fall back to the
+        // routing table's next hop when there was no header: a stale or
+        // different entry there sent the first copy one way and its
+        // retransmits another (CODE_REVIEW_2026_10_28 AIB-4).
+        let (wire, next_hop) = (route.frame(&packet), route.addr);
 
         #[cfg(any(test, feature = "fixtures"))]
         let dropped_for_test = reliable && self.publish_test_should_drop();

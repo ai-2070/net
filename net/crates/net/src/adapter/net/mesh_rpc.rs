@@ -14715,8 +14715,9 @@ mod roster_fallback_tests {
     }
 }
 
+/// Live two-node witnesses for CODE_REVIEW_2026_10_28 (AIB-4, AIB-5).
 #[cfg(test)]
-mod reply_subscribe_rotation_tests {
+mod live_pair_review_tests {
     use super::*;
     use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
     use std::time::Duration;
@@ -14745,27 +14746,78 @@ mod reply_subscribe_rotation_tests {
         }
     }
 
+    /// Two started nodes with a direct session: `(caller, server)`.
+    async fn connected_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+        let caller = node().await;
+        let server = node().await;
+        let caller_id = caller.node_id();
+        let s_pub = *server.public_key();
+        let s_addr = server.local_addr();
+        let s = Arc::clone(&server);
+        let accept = tokio::spawn(async move { s.accept(caller_id).await });
+        caller
+            .connect(s_addr, &s_pub, server.node_id())
+            .await
+            .expect("connect");
+        accept.await.expect("accept task").expect("accept");
+        caller.start();
+        server.start();
+        (caller, server)
+    }
+
+    /// AIB-4 (CODE_REVIEW_2026_10_28): a reliable reply's retransmits are
+    /// sent to the session's own address (`wire_route`), so its FIRST copy
+    /// must go there too. The publish path used to send the first copy to
+    /// the routing table's next hop instead: with a stale entry there, the
+    /// reply only arrived because the retransmit took the other path — and
+    /// had the two been the other way round, it never would have.
+    #[tokio::test]
+    async fn a_reply_goes_first_where_its_retransmits_go() {
+        let (caller, server) = connected_pair().await;
+        let (caller_id, server_id) = (caller.node_id(), server.node_id());
+        let _serve = server.serve_rpc("echo", Arc::new(Echo)).expect("serve");
+
+        // A stale ordinary route on the server for the caller, pointing
+        // at an address nothing listens on.
+        let bogus: crate::adapter::net::PeerAddr = "127.0.0.1:9"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let table = server.router().routing_table();
+        table.remove_destination_all_candidates(caller_id);
+        table.add_route_with_metric(caller_id, bogus, 0);
+        assert_eq!(table.lookup(caller_id), Some(bogus));
+
+        let stats = server.control_plane_stats();
+        let before = stats.retransmit_packets_sent.load(Ordering::SeqCst);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(15),
+            caller.call(
+                server_id,
+                "echo",
+                Bytes::from_static(b"ping"),
+                CallOptions::default(),
+            ),
+        )
+        .await
+        .expect("the call finishes")
+        .expect("the call succeeds");
+        assert_eq!(reply.body.as_ref(), b"ping");
+        assert_eq!(
+            stats.retransmit_packets_sent.load(Ordering::SeqCst),
+            before,
+            "the reply needed a retransmit: its first copy did not go where its retransmits go",
+        );
+    }
+
     /// AIB-5 (CODE_REVIEW_2026_10_28): a session REPLACEMENT that lands
     /// while a first call is subscribing to the reply channel trips the
     /// fence, exactly as a failure does. The peer is still reachable, so
     /// the call must subscribe again and succeed, not fail `NoRoute`.
     #[tokio::test]
     async fn a_rotation_mid_subscribe_does_not_fail_the_call() {
-        let caller = node().await;
-        let server = node().await;
-        let caller_id = caller.node_id();
-        let server_id = server.node_id();
-        let s_pub = *server.public_key();
-        let s_addr = server.local_addr();
-        let s = Arc::clone(&server);
-        let accept = tokio::spawn(async move { s.accept(caller_id).await });
-        caller
-            .connect(s_addr, &s_pub, server_id)
-            .await
-            .expect("connect");
-        accept.await.expect("accept task").expect("accept");
-        caller.start();
-        server.start();
+        let (caller, server) = connected_pair().await;
+        let (caller_id, server_id) = (caller.node_id(), server.node_id());
         let _serve = server.serve_rpc("echo", Arc::new(Echo)).expect("serve");
 
         // The replacement lands after the subscribe succeeded and before
