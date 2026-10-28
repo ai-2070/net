@@ -8614,6 +8614,16 @@ impl MeshNode {
     /// side; on the caller side here, sharing the dispatcher is
     /// the correct behavior because all RESPONSE events route
     /// through the same `RpcClientPending` keyed by `call_id`.
+    ///
+    /// **A fenced pass is retried while the target has a session.** The
+    /// fence (see [`Self::ensure_reply_subscription_pass`]) trips on any
+    /// bump of the target's failure generation, and a session
+    /// REPLACEMENT bumps it too (rekey, routed rotation, direct upgrade —
+    /// so a restarted peer is never left cached as subscribed). A
+    /// replacement mid-subscribe therefore voids the subscribe without
+    /// the peer being unreachable: subscribing again on the session it
+    /// now has is the recovery, not `NoRoute`. Only when no session
+    /// remains does the call fail (CODE_REVIEW_2026_10_28 AIB-5).
     async fn ensure_reply_subscription(
         self: &Arc<Self>,
         target_node_id: u64,
@@ -8621,6 +8631,43 @@ impl MeshNode {
         reply_channel: ChannelName,
         reply_hash: ChannelHash,
     ) -> Result<(), RpcError> {
+        for _ in 0..REPLY_SUBSCRIBE_FENCED_PASSES {
+            if self
+                .ensure_reply_subscription_pass(
+                    target_node_id,
+                    service,
+                    reply_channel.clone(),
+                    reply_hash,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            if !self.has_peer_session(target_node_id) {
+                break;
+            }
+        }
+        Err(RpcError::NoRoute {
+            target: target_node_id,
+            reason: format!(
+                "session with {target_node_id:#x} failed or was replaced while subscribing \
+                 to the reply channel; the target dropped our roster entry, so the \
+                 subscribe did not survive. Retry — the next call re-subscribes."
+            ),
+        })
+    }
+
+    /// One subscribe pass for [`Self::ensure_reply_subscription`].
+    /// `Ok(true)`: subscribed and cached. `Ok(false)`: the target's
+    /// session failed or was replaced during the pass, so the fence rolled
+    /// the entry back and nothing is cached.
+    async fn ensure_reply_subscription_pass(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        reply_channel: ChannelName,
+        reply_hash: ChannelHash,
+    ) -> Result<bool, RpcError> {
         let registry = self.rpc_reply_subscriptions_arc();
         // PERF_AUDIT §3.5 — DashMap keyed by
         // `(target, xxh3_64(service))`. Pre-fix this was a global
@@ -8632,7 +8679,7 @@ impl MeshNode {
         // not collision-free; see `reply_subscription_covers`).
         let service_hash = xxhash_rust::xxh3::xxh3_64(service.as_bytes());
         if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
-            return Ok(());
+            return Ok(true);
         }
         // The failure-generation snapshot the fence at the bottom
         // compares against, recorded by the attempt that SUCCEEDS.
@@ -8872,6 +8919,9 @@ impl MeshNode {
             });
         };
 
+        #[cfg(test)]
+        reply_subscribe_seam::fire(self.node_id());
+
         registry.insert(
             (target_node_id, service_hash),
             ReplySubscription {
@@ -8911,16 +8961,37 @@ impl MeshNode {
             registry.remove_if(&(target_node_id, service_hash), |_, entry| {
                 entry.written_at_generation == gen_before
             });
-            return Err(RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!(
-                    "session with {target_node_id:#x} failed while subscribing to the \
-                     reply channel; the target dropped our roster entry, so the \
-                     subscribe did not survive. Retry — the next call re-subscribes."
-                ),
-            });
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
+    }
+}
+
+/// Test seam for the reply-subscribe fence: run a hook (once) for a given
+/// caller node right after its subscribe succeeded and before the cache
+/// insert — exactly the window a concurrent session replacement or failure
+/// lands in. Keyed by node so parallel tests in one process don't collide.
+#[cfg(test)]
+pub(super) mod reply_subscribe_seam {
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: parking_lot::Mutex<Vec<(u64, Hook)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Run `hook` the next time `node_id` reaches the seam.
+    pub(crate) fn arm(node_id: u64, hook: impl FnOnce() + Send + 'static) {
+        HOOKS.lock().push((node_id, Box::new(hook)));
+    }
+
+    pub(super) fn fire(node_id: u64) {
+        let hook = {
+            let mut hooks = HOOKS.lock();
+            hooks
+                .iter()
+                .position(|(id, _)| *id == node_id)
+                .map(|i| hooks.swap_remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -8966,6 +9037,12 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// the announce + verify + pin round trip without turning a genuine
 /// denial into a long stall.
 const REPLY_SUBSCRIBE_ATTEMPTS: usize = 3;
+
+/// How many fenced subscribe passes `ensure_reply_subscription` makes
+/// while the target still has a session. Each extra pass needs another
+/// replacement to land inside it, so a few bound a rotation storm without
+/// failing a call to a reachable peer.
+const REPLY_SUBSCRIBE_FENCED_PASSES: usize = 3;
 
 /// Base backoff between reply-subscribe attempts; multiplied by the
 /// attempt number, so waits are ~8 ms then ~16 ms.
@@ -14635,5 +14712,84 @@ mod roster_fallback_tests {
             .await,
             "with a slot free the relay lands in the background"
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_subscribe_rotation_tests {
+    use super::*;
+    use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
+    use std::time::Duration;
+
+    async fn node() -> Arc<MeshNode> {
+        let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x5Au8; 32])
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(10))
+            .with_handshake(3, Duration::from_secs(2));
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    struct Echo;
+    #[async_trait::async_trait]
+    impl RpcHandler for Echo {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: ctx.payload.body.clone(),
+            })
+        }
+    }
+
+    /// AIB-5 (CODE_REVIEW_2026_10_28): a session REPLACEMENT that lands
+    /// while a first call is subscribing to the reply channel trips the
+    /// fence, exactly as a failure does. The peer is still reachable, so
+    /// the call must subscribe again and succeed, not fail `NoRoute`.
+    #[tokio::test]
+    async fn a_rotation_mid_subscribe_does_not_fail_the_call() {
+        let caller = node().await;
+        let server = node().await;
+        let caller_id = caller.node_id();
+        let server_id = server.node_id();
+        let s_pub = *server.public_key();
+        let s_addr = server.local_addr();
+        let s = Arc::clone(&server);
+        let accept = tokio::spawn(async move { s.accept(caller_id).await });
+        caller
+            .connect(s_addr, &s_pub, server_id)
+            .await
+            .expect("connect");
+        accept.await.expect("accept task").expect("accept");
+        caller.start();
+        server.start();
+        let _serve = server.serve_rpc("echo", Arc::new(Echo)).expect("serve");
+
+        // The replacement lands after the subscribe succeeded and before
+        // the cache insert — the window the fence guards.
+        let fired = Arc::new(AtomicBool::new(false));
+        let (c, f) = (Arc::clone(&caller), Arc::clone(&fired));
+        reply_subscribe_seam::arm(caller_id, move || {
+            c.simulate_session_replaced_for_test(server_id);
+            f.store(true, Ordering::SeqCst);
+        });
+
+        let reply = tokio::time::timeout(
+            Duration::from_secs(15),
+            caller.call(
+                server_id,
+                "echo",
+                Bytes::from_static(b"ping"),
+                CallOptions::default(),
+            ),
+        )
+        .await
+        .expect("the call finishes")
+        .expect("a rotation of a reachable peer must not fail the call");
+        assert!(fired.load(Ordering::SeqCst), "the seam never ran");
+        assert_eq!(reply.body.as_ref(), b"ping");
     }
 }

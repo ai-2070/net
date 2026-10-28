@@ -36408,6 +36408,13 @@ impl MeshNode {
         self.rpc_peer_failure_gen.get(peer)
     }
 
+    /// Test seam: exactly what a session REPLACEMENT (rekey, routed
+    /// rotation, direct upgrade) does to the caller-side reply cache.
+    #[cfg(all(test, feature = "cortex"))]
+    pub(super) fn simulate_session_replaced_for_test(&self, peer: u64) {
+        self.peer_reply_cache().on_session_replaced(peer);
+    }
+
     /// Bare subscribe that reports the publisher's rejection reason as
     /// a value. Used by `ensure_reply_subscription`, which must
     /// distinguish the one retryable rejection (origin-binding
@@ -49463,14 +49470,15 @@ impl MeshNode {
         self.origin_hash_to_node.get(&origin_hash).map(|v| *v)
     }
 
-    /// Whether a peer entry exists for `node_id`. Once AV-5's production
-    /// caller — a `has_peer_session`-then-`publish_to_peer` pre-check —
-    /// was replaced by the atomic [`Self::try_publish_to_peer`] (R2-6,
-    /// which folds the session-existence check into the single send gate
-    /// with no check-then-act TOCTOU), the only remaining callers are
-    /// tests that assert a node is genuinely disconnected before
-    /// exercising the fallback/drop policies, so this is `#[cfg(test)]`.
-    #[cfg(test)]
+    /// Whether a peer entry exists for `node_id`. Not a send gate: AV-5's
+    /// `has_peer_session`-then-`publish_to_peer` pre-check was replaced by
+    /// the atomic [`Self::try_publish_to_peer`] (R2-6, which folds the
+    /// session-existence check into the single send gate with no
+    /// check-then-act TOCTOU). Its one production use is a retry decision
+    /// in `ensure_reply_subscription`, where a stale answer only costs one
+    /// more subscribe attempt; tests use it to assert a node is genuinely
+    /// disconnected.
+    #[cfg(any(test, feature = "cortex"))]
     pub(super) fn has_peer_session(&self, node_id: u64) -> bool {
         self.peers.contains_key(&node_id)
     }
