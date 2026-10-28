@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/transport.rs
+  s_47ad87c4406da7::t_cbfb262dfdd088 1133,1135-1136,1139-1142
+  s_47ad87c4406da7::t_e46e78311d2793 220-239
+  s_85a709ed755010::t_91a5ca33dae6d2 1143
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_47ad87c4406da7::t_645d582ac764dd 498-531
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_47ad87c4406da7::t_3d7b19732229e5 2066-2069,2102-2105,5604-5606
+  s_47ad87c4406da7::t_fa2ba3b74c72e7 3942-3943
+  s_47ad87c4406da7::t_a8aae964c14d1f 3939-3941
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "42d8cdb9bd7ccdf3c920d5adc444fce4f78576d3",
+  "prompts": {},
+  "sessions": {
+    "s_47ad87c4406da7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85994f0b-18b4-4897-8573-8fd1c21f2e51",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_85a709ed755010": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8beb885-922d-4966-95ba-7e1819461610",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
