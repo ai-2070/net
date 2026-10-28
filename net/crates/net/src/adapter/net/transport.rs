@@ -217,8 +217,26 @@ impl NetSocket {
         // Set non-blocking for tokio
         socket2.set_nonblocking(true)?;
 
-        // Bind
-        socket2.bind(&bind_addr.into())?;
+        // Bind. The port is exclusive, so "in use" has two likely causes;
+        // name the in-process one, which is easy to miss: a mesh dropped
+        // without `shutdown()` keeps its node — and this socket — alive,
+        // because the language bindings hold its serve registrations until
+        // shutdown (CODE_REVIEW_2026_10_28 AIB-7). Same kind, so callers
+        // matching on `AddrInUse` are unaffected.
+        socket2.bind(&bind_addr.into()).map_err(|e| {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "{bind_addr} is already in use, by another process or by a mesh in \
+                         this process that was dropped without shutdown() (a mesh keeps its \
+                         port until shutdown): {e}"
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
 
         // Convert to tokio UdpSocket
         let std_socket: std::net::UdpSocket = socket2.into();
@@ -1112,11 +1130,16 @@ mod tests {
         let first = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = first.local_addr();
 
-        let second = test_socket(addr).await;
+        let second = test_socket(addr).await.err().expect("a held port");
         assert_eq!(
-            second.err().map(|e| e.kind()),
-            Some(io::ErrorKind::AddrInUse),
+            second.kind(),
+            io::ErrorKind::AddrInUse,
             "a second NetSocket must not bind a held port"
+        );
+        // AIB-7: the message names the in-process cause too.
+        assert!(
+            second.to_string().contains("shutdown()"),
+            "the error should point at a mesh dropped without shutdown(): {second}"
         );
 
         // A socket outside Net that opts into reuse is refused too.

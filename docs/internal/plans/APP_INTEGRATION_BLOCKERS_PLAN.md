@@ -495,6 +495,40 @@ Meanwhile the app can: keep every serve handle referenced; take a
 lockfile on its port; move files only through `storeDir`/`fetchDir`;
 expect to re-pair after a restart until Phase 1 lands.
 
+## For the release notes
+
+User-visible changes from this plan and its review fixes
+(`docs/internal/misc/CODE_REVIEW_2026_10_28_APP_INTEGRATION_BLOCKERS.md`),
+to carry into the next release note:
+
+- **Seeded nodes keep their Noise key.** A node built with an identity
+  derives its Noise static key from it (`MeshNode::new`, for every
+  construction path), so its rendezvous address survives a restart. An
+  explicit key still wins.
+- **Node and Python serve handles no longer stop the service when
+  dropped** (nRPC, enrollment, org, A2A). The mesh owns each service until
+  `close()` / `stop()` or the mesh's `shutdown()`. Code that relied on
+  drop must call `close()`: serving the same name again without it fails.
+  A mesh dropped without `shutdown()` keeps its services, its node and its
+  UDP port until the process exits.
+- **The mesh UDP port is exclusive** (no `SO_REUSEADDR`; Windows also sets
+  `SO_EXCLUSIVEADDRUSE`). Re-binding a port in the same process after
+  dropping a mesh without `shutdown()` now fails with `AddrInUse`; the
+  error says so.
+- **A streamed call no longer loses chunks silently.** A chunk that cannot
+  be sent within 30 s ends the call with an `Internal` "response pump
+  failed" terminal instead of leaving a gap. Node and Python `sink.send`
+  return whether the chunk was queued; the Rust SDK adds
+  `ResponseSinkTyped::try_send`. Core `RpcAsyncResponseEmitter` futures
+  now resolve to `bool` (whether the frame was sent) — a breaking change
+  for code that builds that type directly.
+- **`ensure_attached_via` / `ensureAttached` / `ensure_attached` always
+  dial.** A peer that restarted is re-attached at once; a peer still using
+  the existing session keeps it, which takes up to one heartbeat interval
+  to tell.
+- **Directory fetch retries a chunk only when its holder gave up** on it,
+  with a short backoff; a missing chunk or a silent holder fails at once.
+
 ## Decisions (settled 2026-10-28)
 
 - **D1 — derive the Noise key from `identitySeed` by default.** Apps that

@@ -2063,9 +2063,10 @@ class OperatorEnrollment:
     def root_fingerprint(self) -> str: ...
 
 class EnrollmentServeHandle:
-    """Keeps a served enrollment service alive (returned by
-    ``NetMesh.serve_enrollment_auto``). Dropping it or calling :meth:`stop`
-    unregisters the service."""
+    """A served enrollment service (returned by
+    ``NetMesh.serve_enrollment_auto``). The mesh owns the service: it stays
+    up until :meth:`stop` or the mesh's ``shutdown()``, even if this handle
+    is dropped."""
 
     def stop(self) -> None:
         """Stop serving enrollment (unregister the service)."""
@@ -2098,9 +2099,10 @@ class LocalPublicationHandle:
         ...
 
 class A2aServeHandle:
-    """Keeps the served agent-to-agent task services alive (returned by
-    ``NetMesh.serve_a2a`` or ``PaymentProvider.serve_a2a_configured``).
-    Dropping it or calling :meth:`stop` unregisters them."""
+    """The served agent-to-agent task services (returned by
+    ``NetMesh.serve_a2a`` or ``PaymentProvider.serve_a2a_configured``). The
+    mesh owns them: they stay up until :meth:`stop` or the mesh's
+    ``shutdown()``, even if this handle is dropped."""
 
     def stop(self) -> None:
         """Stop accepting A2A tasks (unregister the services)."""
@@ -3934,6 +3936,11 @@ class ServeHandle:
     Returned by ``MeshRpc.serve`` / ``AsyncMeshRpc.serve``. In-flight handlers
     continue to completion on ``close()``, but no new request is dispatched;
     ``close`` is idempotent, and leaving the ``with`` block closes for you.
+
+    The mesh owns the service: dropping this handle (``del``, refcount 0)
+    does NOT unregister it. Serving the same name again without ``close()``
+    raises ``RpcError`` (the name is still being served); the mesh's
+    ``shutdown()`` closes every service it holds.
     """
 
     def close(self) -> None: ...
@@ -5594,7 +5601,9 @@ class AsyncOrgClient:
     def __exit__(self, *exc: object) -> bool: ...
 
 class OrgServeHandle:
-    """Handle for a served organization service. ``close()`` unregisters."""
+    """Handle for a served organization service. ``close()`` unregisters;
+    dropping the handle does not (the mesh owns the service until
+    ``close()`` or its ``shutdown()``)."""
 
     @property
     def is_closed(self) -> bool: ...
