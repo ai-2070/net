@@ -173,6 +173,21 @@ pub enum TransferHeader {
 
 type DoneTx = tokio::sync::oneshot::Sender<Result<Bytes, BlobError>>;
 
+/// What a pending fetch fails with when the holder gave up sending
+/// ([`BlobTransferEngine::on_reset`]). Matched by [`is_holder_gave_up`]
+/// only; keep the two together.
+const HOLDER_GAVE_UP: &str = "transfer: holder reset the stream (it gave up sending)";
+
+/// Whether a fetch failed because the holder gave up mid-chunk (its
+/// reliable layer exhausted retransmits, or it abandoned the stream under
+/// backpressure). That is the one transient fetch failure: the holder has
+/// the chunk and was sending it, so asking again can succeed. A
+/// `NotFound`, an idle timeout or a hash mismatch will not change on a
+/// retry.
+pub(crate) fn is_holder_gave_up(e: &BlobError) -> bool {
+    matches!(e, BlobError::Backend(msg) if msg == HOLDER_GAVE_UP)
+}
+
 /// Outcome of folding one reassembly event. Hoisted to module scope so
 /// both `on_data` (drives the loop) and `process_event` (folds one
 /// event) share it without re-acquiring the DashMap guard across a
@@ -356,12 +371,7 @@ impl BlobTransferEngine {
     /// fail over at once instead of waiting out the idle limit. No-op if
     /// the transfer already settled.
     pub fn on_reset(&self, stream_id: u64) {
-        self.finish(
-            stream_id,
-            Err(BlobError::Backend(
-                "transfer: holder reset the stream (it gave up sending)".into(),
-            )),
-        );
+        self.finish(stream_id, Err(BlobError::Backend(HOLDER_GAVE_UP.into())));
     }
 
     /// Serving side: a `TransferControl::Request` arrived on `stream_id`
@@ -763,5 +773,49 @@ mod tests {
         assert!(engine.cancel_pending_reporting(sid));
         assert!(!engine.cancel_pending_reporting(sid));
         assert!(engine.list_pending().is_empty());
+    }
+
+    /// AIB-6 (CODE_REVIEW_2026_10_28): the directory fetch retries a
+    /// chunk only when the holder gave up mid-send. The error `on_reset`
+    /// fails a pending fetch with must be the one `is_holder_gave_up`
+    /// recognises, and the non-transient failures must not be.
+    #[tokio::test]
+    async fn only_a_holder_reset_counts_as_gave_up() {
+        use crate::adapter::net::identity::EntityKeypair;
+        use crate::adapter::net::redex::Redex;
+        use crate::adapter::net::MeshNodeConfig;
+
+        let addr = "127.0.0.1:0".parse().expect("addr");
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x18u8; 32]),
+            )
+            .await
+            .expect("node"),
+        );
+        let adapter = Arc::new(MeshBlobAdapter::new("t", Arc::new(Redex::new())));
+        let engine = BlobTransferEngine::new(&node, adapter);
+
+        let sid = transfer_stream_id(7);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(sid, 7, [0xCDu8; 32], tx);
+        engine.on_reset(sid);
+        let err = rx.await.expect("settled").expect_err("a reset fails the fetch");
+        assert!(is_holder_gave_up(&err), "reset error not recognised: {err}");
+
+        assert!(!is_holder_gave_up(&BlobError::NotFound(
+            "transfer: holder NotFound".into()
+        )));
+        assert!(!is_holder_gave_up(&BlobError::NotFound(
+            "blob transfer: no data for 15s fetching mesh://00".into()
+        )));
+        assert!(!is_holder_gave_up(&BlobError::HashMismatch {
+            expected: [0; 32],
+            actual: [1; 32],
+        }));
+        assert!(!is_holder_gave_up(&BlobError::Backend(
+            "blob transfer: send request failed: x".into()
+        )));
     }
 }

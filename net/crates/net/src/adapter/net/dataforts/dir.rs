@@ -104,7 +104,13 @@ pub const MAX_CHUNKS_IN_FLIGHT_PER_FILE: usize = 8;
 /// How many times a chunk fetch is attempted before the directory fetch
 /// fails. Chunks are content-addressed, so a retry is always safe; it
 /// rides out a holder that gave up on one stream under backpressure.
+/// Only that failure is retried (see [`fetch_chunk_with_retry`]).
 const CHUNK_FETCH_ATTEMPTS: usize = 3;
+
+/// Pause before retrying a chunk whose holder gave up, multiplied by the
+/// attempt number. The holder gave up because it was overloaded, so
+/// asking again at once would only meet the same full window.
+const CHUNK_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Tuning for [`fetch_dir_with`]. `Default` is what [`fetch_dir`] uses.
 #[derive(Debug, Clone, Copy)]
@@ -912,12 +918,15 @@ async fn transfer_fetch_blob(
     }
 }
 
-/// Fetch one chunk, retrying a failed attempt up to
-/// [`CHUNK_FETCH_ATTEMPTS`] times in all. Chunks are content-addressed
-/// (BLAKE3-verified on arrival), so a retry can never produce different
-/// bytes; it only rides out a transient failure — typically a holder
-/// that gave up on one stream under backpressure — instead of failing
-/// the whole directory on it.
+/// Fetch one chunk, attempting it up to [`CHUNK_FETCH_ATTEMPTS`] times
+/// in all. Chunks are content-addressed (BLAKE3-verified on arrival), so
+/// a retry can never produce different bytes.
+///
+/// Only a holder that gave up mid-chunk is retried, after a short
+/// backoff: it has the chunk and was overloaded. Every other failure
+/// fails at once — a `NotFound` or a hash mismatch won't change, and a
+/// holder that went silent has already cost one full idle timeout, so
+/// waiting out two more would only delay the error.
 async fn fetch_chunk_with_retry(
     node: &Arc<MeshNode>,
     source: u64,
@@ -927,8 +936,12 @@ async fn fetch_chunk_with_retry(
     loop {
         match node.transfer_fetch_chunk(source, hash).await {
             Ok(bytes) => return Ok(bytes),
-            Err(e) if attempt < CHUNK_FETCH_ATTEMPTS => {
-                tracing::debug!(error = %e, attempt, "dir fetch: chunk fetch failed, retrying");
+            Err(e)
+                if attempt < CHUNK_FETCH_ATTEMPTS
+                    && super::blob::transfer::is_holder_gave_up(&e) =>
+            {
+                tracing::debug!(error = %e, attempt, "dir fetch: holder gave up on a chunk, retrying");
+                tokio::time::sleep(CHUNK_RETRY_BACKOFF * attempt as u32).await;
                 attempt += 1;
             }
             Err(e) => return Err(DirError::Blob(e)),
