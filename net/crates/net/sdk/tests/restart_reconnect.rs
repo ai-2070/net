@@ -209,6 +209,101 @@ async fn a_restarted_peer_is_reachable_both_ways_with_a_short_session_timeout() 
     .await;
 }
 
+/// The SURVIVOR's side (CODE_REVIEW_2026_10_28 AIB-1). B restarts and
+/// A calls `ensure_attached_via` at once, while the heartbeats B sent on
+/// the old session before going down still read as recent. That used to
+/// skip the handshake, leaving A on a session B no longer has: A's calls
+/// timed out until A's session timeout fired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_survivor_re_attaches_to_a_peer_that_just_restarted() {
+    let t = Timing {
+        heartbeat_ms: 5_000,
+        session_timeout_ms: 30_000,
+        poll_ms: 1_000,
+    };
+    let a = build("127.0.0.1:0", SEED_A, &t).await;
+    let b = build("127.0.0.1:0", SEED_B, &t).await;
+    let addr_a: SocketAddr = a.inner().local_addr();
+    let addr_b: SocketAddr = b.inner().local_addr();
+    let (nid_a, nid_b) = (a.inner().node_id(), b.inner().node_id());
+    let (pub_a, pub_b) = (*a.inner().public_key(), *b.inner().public_key());
+
+    a.start().expect("start A");
+    b.start().expect("start B");
+    b.connect_via(&addr_a.to_string(), &pub_a, nid_a)
+        .await
+        .expect("B connects to A");
+    let _serve_a = serve_hello(&a, "A");
+    let serve_b = serve_hello(&b, "B");
+    assert_eq!(call(&a, nid_b).await.as_deref(), Ok("B"), "A -> B before");
+
+    drop(serve_b);
+    b.shutdown().await.expect("shut down B");
+    let b = build(&addr_b.to_string(), SEED_B, &t).await;
+    b.start().expect("restart B");
+    let _serve_b = serve_hello(&b, "B");
+
+    assert!(
+        a.inner().peer_session_is_live(nid_b),
+        "precondition: A's old session with B still reads as live"
+    );
+    a.ensure_attached_via(&addr_b.to_string(), &pub_b, nid_b)
+        .await
+        .expect("A re-attaches to the restarted B");
+    assert_eq!(
+        call_until_ok(&a, nid_b, Duration::from_secs(3))
+            .await
+            .as_deref(),
+        Ok("B"),
+        "A -> B right after B restarted: A must not keep the session B lost"
+    );
+}
+
+/// `ensure_attached_via` always dials now; on a healthy pair that must
+/// stay cheap and harmless — it returns promptly and both directions keep
+/// working on whatever session results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ensure_attached_on_a_healthy_pair_is_prompt_and_harmless() {
+    // A session that has carried calls keeps reply streams open, so the
+    // peer's busy gate defers the dial; the answer is the peer's next
+    // heartbeat on the existing session, so keep the interval short.
+    let t = Timing {
+        heartbeat_ms: 1_000,
+        session_timeout_ms: 30_000,
+        poll_ms: 1_000,
+    };
+    let a = build("127.0.0.1:0", SEED_A, &t).await;
+    let b = build("127.0.0.1:0", SEED_B, &t).await;
+    let addr_a: SocketAddr = a.inner().local_addr();
+    let addr_b: SocketAddr = b.inner().local_addr();
+    let (nid_a, nid_b) = (a.inner().node_id(), b.inner().node_id());
+    let (pub_a, pub_b) = (*a.inner().public_key(), *b.inner().public_key());
+    a.start().expect("start A");
+    b.start().expect("start B");
+    b.connect_via(&addr_a.to_string(), &pub_a, nid_a)
+        .await
+        .expect("B connects to A");
+    let _serve_a = serve_hello(&a, "A");
+    let _serve_b = serve_hello(&b, "B");
+    assert_eq!(call(&a, nid_b).await.as_deref(), Ok("B"));
+
+    let started = Instant::now();
+    a.ensure_attached_via(&addr_b.to_string(), &pub_b, nid_b)
+        .await
+        .expect("A ensures B");
+    b.ensure_attached_via(&addr_a.to_string(), &pub_a, nid_a)
+        .await
+        .expect("B ensures A");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "ensuring a healthy pair took {:?}",
+        started.elapsed()
+    );
+    let budget = Duration::from_secs(3);
+    assert_eq!(call_until_ok(&a, nid_b, budget).await.as_deref(), Ok("B"));
+    assert_eq!(call_until_ok(&b, nid_a, budget).await.as_deref(), Ok("A"));
+}
+
 /// An explicit Noise key wins over the derived one, and a builder with
 /// no identity still gets a fresh key per build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

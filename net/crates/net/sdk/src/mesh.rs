@@ -881,10 +881,21 @@ impl Mesh {
     /// rendezvous) only when needed. The call to make after a restart — on
     /// either side — before talking to a peer again.
     ///
-    /// - A session that has carried inbound traffic recently
-    ///   ([`MeshNode::peer_session_is_live`](net::adapter::net::MeshNode::peer_session_is_live))
-    ///   is used as is: no handshake. A fresh `msg1` there would only be
-    ///   deferred by the peer's busy gate.
+    /// It always dials, because recent traffic on the existing session
+    /// does not show the peer still holds it: a peer that has just
+    /// restarted lost it, while what it sent before going down still
+    /// reads as recent for a few heartbeats. While the dial is pending it
+    /// watches the existing session, and whichever answers first settles
+    /// it:
+    ///
+    /// - A peer that restarted (or holds an idle session) accepts the dial
+    ///   at once, and this returns on the fresh session.
+    /// - A peer still USING the existing session defers the handshake (its
+    ///   busy gate will not swap out open streams or unacked data) but keeps
+    ///   heartbeating on that session. The first packet it sends there after
+    ///   the dial began proves it holds the session, and this returns —
+    ///   within about one heartbeat interval — leaving the session in place
+    ///   (the deferred dial finishes or times out on its own).
     /// - Otherwise it keeps re-dialing until a handshake lands or
     ///   [`MeshNode::session_rotation_defer_window`](net::adapter::net::MeshNode::session_rotation_defer_window)
     ///   (plus a margin for one more attempt) has passed. That window is how
@@ -899,22 +910,48 @@ impl Mesh {
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
     ) -> Result<()> {
-        if self.node.peer_session_is_live(peer_node_id) {
-            return Ok(());
-        }
         const MARGIN: Duration = Duration::from_secs(6);
-        let deadline =
-            tokio::time::Instant::now() + self.node.session_rotation_defer_window() + MARGIN;
+        const WATCH: Duration = Duration::from_millis(50);
+        let addr: SocketAddr = relay_addr
+            .parse()
+            .map_err(|e| SdkError::Config(format!("invalid relay address: {}", e)))?;
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.node.session_rotation_defer_window() + MARGIN;
+        // The peer has spoken on our session since we began: it holds that
+        // session (a restarted peer cannot), so the session is the working
+        // one. A session the dial itself installed counts too.
+        let peer_holds_session = || {
+            self.node
+                .peer_session_heard_within(peer_node_id, started.elapsed())
+        };
         loop {
-            match self
-                .connect_via(relay_addr, peer_pubkey, peer_node_id)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(SdkError::Config(e)) => return Err(SdkError::Config(e)),
-                Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+            // Its own task, so abandoning the wait never cancels a dial
+            // part-way through installing a session.
+            let node = Arc::clone(&self.node);
+            let pubkey = *peer_pubkey;
+            let mut dial =
+                tokio::spawn(async move { node.connect_via(addr, &pubkey, peer_node_id).await });
+            let dialed = loop {
+                tokio::select! {
+                    joined = &mut dial => break joined,
+                    () = tokio::time::sleep(WATCH) => {
+                        if peer_holds_session() {
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            match dialed {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(_)) if peer_holds_session() => return Ok(()),
+                Ok(Err(e)) if tokio::time::Instant::now() >= deadline => return Err(e.into()),
                 // Not accepted yet (deferred, or the peer is still down).
-                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(250)).await,
+                Err(join) => {
+                    return Err(SdkError::Adapter(format!(
+                        "ensure_attached_via: dial task failed: {join}"
+                    )))
+                }
             }
         }
     }

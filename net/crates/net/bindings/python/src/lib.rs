@@ -2045,10 +2045,13 @@ mod mesh_bindings {
         /// locator names (`addr|noise_pubkey|node_id`, as saved from an
         /// invite or a `DeviceEnrollment`), re-dialing it only when needed.
         /// Call it when a paired machine may have restarted — on either side —
-        /// before talking to it again. A live session is used as is;
-        /// otherwise it re-dials until the far side accepts, which after a
-        /// restart can take up to three heartbeat intervals. `renew` already
-        /// does this. (Requires the `delegation` feature.)
+        /// before talking to it again. It dials and watches the existing
+        /// session: a peer that restarted accepts and the session is
+        /// replaced, while a peer still using the existing one keeps it
+        /// (telling takes up to one heartbeat interval). A far side still
+        /// holding this node's old session can take up to three heartbeat
+        /// intervals to accept. `renew` already does this. (Requires the
+        /// `delegation` feature.)
         #[cfg(feature = "delegation")]
         fn ensure_attached(&self, py: Python<'_>, rendezvous: &str) -> PyResult<()> {
             crate::enrollment::mesh_ensure_attached(

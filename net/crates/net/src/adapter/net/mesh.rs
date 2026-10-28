@@ -20738,10 +20738,20 @@ impl MeshNode {
     /// Has the session with `node_id` carried authenticated inbound
     /// traffic (heartbeats included) within
     /// [`Self::session_rotation_defer_window`]? `false` when there is no
-    /// session. A caller deciding whether to re-handshake uses this: a
-    /// live session needs none, and a fresh `msg1` would only be deferred.
+    /// session.
+    ///
+    /// Not proof that the peer still holds the session: a peer that has
+    /// just restarted lost it, but the traffic it sent before going down
+    /// keeps this `true` for up to the whole window. To learn whether the
+    /// peer is still using a session, dial it and see whether it keeps
+    /// speaking on the old one meanwhile ([`Self::peer_session_heard_within`]).
     pub fn peer_session_is_live(&self, node_id: u64) -> bool {
-        let window = self.session_rotation_defer_window();
+        self.peer_session_heard_within(node_id, self.session_rotation_defer_window())
+    }
+
+    /// Has the session with `node_id` carried authenticated inbound
+    /// traffic within `window`? `false` when there is no session.
+    pub fn peer_session_heard_within(&self, node_id: u64, window: Duration) -> bool {
         self.peers
             .get(&node_id)
             .is_some_and(|p| p.session.heard_within(window))
