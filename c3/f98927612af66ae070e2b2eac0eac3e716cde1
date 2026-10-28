@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/test/tool_lifecycle_live.test.ts
+  s_47ad87c4406da7::t_63121fb49d40b2 120-122,128-140,143-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c3f98927612af66ae070e2b2eac0eac3e716cde1",
+  "prompts": {},
+  "sessions": {
+    "s_47ad87c4406da7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85994f0b-18b4-4897-8573-8fd1c21f2e51",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
