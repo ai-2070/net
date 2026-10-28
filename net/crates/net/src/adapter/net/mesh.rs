@@ -3083,6 +3083,25 @@ pub(super) fn is_publish_backpressure(e: &AdapterError) -> bool {
     matches!(e, AdapterError::Connection(m) if m.ends_with(PUBLISH_BACKPRESSURED))
 }
 
+/// The error a best-effort roster publish returns when no subscriber got
+/// the payload. When every failure was backpressure, it still reads as
+/// backpressure to [`is_publish_backpressure`]: nothing was delivered, so
+/// waiting and retrying is safe, and a streamed reply that rides the
+/// roster (a caller with no pinned direct route) must wait for the window
+/// like a direct one instead of losing the chunk. The aggregate used to
+/// end in `...backpressured)` and so read as a hard failure.
+fn roster_publish_failure(attempted: usize, errors: &[(u64, AdapterError)]) -> AdapterError {
+    let Some((id, first)) = errors.first() else {
+        return AdapterError::Connection("all peers failed".into());
+    };
+    let mut message = format!("all {attempted} peers failed (first: {id:#x}: {first})");
+    if errors.iter().all(|(_, e)| is_publish_backpressure(e)) {
+        message.push_str("; every peer ");
+        message.push_str(PUBLISH_BACKPRESSURED);
+    }
+    AdapterError::Connection(message)
+}
+
 /// A blob-transfer chunk fetch gives up after this long with no packet
 /// from the holder (`MeshNode::transfer_fetch_chunk`). Progress resets
 /// it, so it bounds a stall, not a transfer.
@@ -44963,17 +44982,7 @@ impl MeshNode {
                     && report.delivered == 0
                     && !report.errors.is_empty()
                 {
-                    let first = report
-                        .errors
-                        .first()
-                        .map(|(id, e)| {
-                            format!(
-                                "all {} peers failed (first: {:#x}: {})",
-                                report.attempted, id, e
-                            )
-                        })
-                        .unwrap_or_else(|| "all peers failed".into());
-                    return Err(AdapterError::Connection(first));
+                    return Err(roster_publish_failure(report.attempted, &report.errors));
                 }
                 Ok(report)
             }
@@ -57085,6 +57094,36 @@ mod heartbeat_aead_tests {
             !first.peer_session_is_silent(0x1234),
             "no session, not silent"
         );
+    }
+
+    /// A best-effort roster publish that reached nobody because every
+    /// peer's window was full is still backpressure: the streamed-reply
+    /// retry waits on it. The aggregate used to end in "...backpressured)"
+    /// and read as a hard failure, so a roster-routed chunk was given up at
+    /// once (the Python streaming-backpressure failure on Linux CI). A
+    /// single hard failure among them keeps the aggregate hard.
+    #[test]
+    fn a_roster_failure_that_is_all_backpressure_still_reads_as_backpressure() {
+        let bp = |stream: u64| {
+            AdapterError::Connection(format!(
+                "publish: stream {stream:#x} {PUBLISH_BACKPRESSURED}"
+            ))
+        };
+        let hard = || AdapterError::Connection("publish send failed: refused".into());
+
+        let one = roster_publish_failure(1, &[(0xA, bp(1))]);
+        assert!(is_publish_backpressure(&one), "{one}");
+        assert!(one.to_string().contains("first: 0xa"), "{one}");
+
+        let all = roster_publish_failure(2, &[(0xA, bp(1)), (0xB, bp(1))]);
+        assert!(is_publish_backpressure(&all), "{all}");
+
+        let mixed = roster_publish_failure(2, &[(0xA, bp(1)), (0xB, hard())]);
+        assert!(!is_publish_backpressure(&mixed), "{mixed}");
+
+        let only_hard = roster_publish_failure(1, &[(0xA, hard())]);
+        assert!(!is_publish_backpressure(&only_hard), "{only_hard}");
+        assert!(!is_publish_backpressure(&roster_publish_failure(0, &[])));
     }
 
     /// A node rebuilt from the same identity seed derives the same Noise

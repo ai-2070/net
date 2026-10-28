@@ -14765,6 +14765,74 @@ mod live_pair_review_tests {
         (caller, server)
     }
 
+    /// A streamed reply that rides the ROSTER path (the caller never
+    /// announced, so the server holds no pinned direct route to it) must
+    /// survive backpressure like a direct one. The caller stops reading
+    /// for a second with 64 chunks of credit out; at 4 KiB each that is
+    /// four times the 64 KiB transport window, so the reply stream's
+    /// window fills and the server's chunk publish meets backpressure. The roster fan-out
+    /// wrapped the per-peer "backpressured" error as "all N peers failed
+    /// (first: ...)", which the chunk retry did not recognise: the chunk
+    /// was given up at once — a silent gap before AIB-3, a `PumpFailed`
+    /// call after (the Python `test_send_wait_delivers_every_chunk_in_order`
+    /// failure on Linux CI).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_roster_routed_stream_survives_backpressure() {
+        let (caller, server) = connected_pair().await;
+        const N: u32 = 3000;
+        struct Producer;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for Producer {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                sink: crate::adapter::net::cortex::RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                for i in 0..N {
+                    let mut chunk = vec![0u8; 1024];
+                    chunk[..4].copy_from_slice(&i.to_be_bytes());
+                    sink.send_wait(chunk)
+                        .await
+                        .map_err(|_| RpcHandlerError::Internal("call gone".into()))?;
+                }
+                Ok(())
+            }
+        }
+        let _serve = server
+            .serve_rpc_streaming("bp", Arc::new(Producer))
+            .expect("serve");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut stream = caller
+            .call_streaming(
+                server.node_id(),
+                "bp",
+                Bytes::from_static(b"go"),
+                CallOptions {
+                    stream_window_initial: Some(64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call_streaming");
+        let mut got = Vec::with_capacity(N as usize);
+        let collect = async {
+            use futures::StreamExt;
+            while let Some(item) = stream.next().await {
+                let chunk = item.expect("no chunk may be given up under backpressure");
+                got.push(u32::from_be_bytes(chunk[..4].try_into().unwrap()));
+                if got.len() % 200 == 0 {
+                    // A consumer that stalls now and then, as a loaded
+                    // Python caller does.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), collect)
+            .await
+            .expect("the stream completes");
+        assert_eq!(got, (0..N).collect::<Vec<_>>(), "every chunk, in order");
+    }
+
     /// AIB-4 (CODE_REVIEW_2026_10_28): a reliable reply's retransmits are
     /// sent to the session's own address (`wire_route`), so its FIRST copy
     /// must go there too. The publish path used to send the first copy to
