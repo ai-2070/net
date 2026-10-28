@@ -1,0 +1,42 @@
+docs/internal/plans/FAIRSCHEDULER_TRANSPORT_PLAN.md
+  s_aa25bb779f3858::t_300e10a3078271 170-180
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_300e10a3078271 234-266
+net/crates/net/tests/dir_transfer.rs
+  s_aa25bb779f3858::t_b6939d6f00112a 894-901,904-914,925-955,959-968,970-983
+  s_aa25bb779f3858::t_1eb9646c1e2a22 26-27,902-903,915-924,969
+  s_aa25bb779f3858::t_f0bb49562ce894 984-1004,1008-1054
+  s_aa25bb779f3858::t_ff21fbfd59a14f 34-36
+  s_aa25bb779f3858::t_300e10a3078271 956-958,1005-1007
+net/crates/net/src/adapter/net/dataforts/dir.rs
+  s_aa25bb779f3858::t_49c034ab8e755e 642-647,664-665
+  s_aa25bb779f3858::t_e46cf64ca0cb06 69-84,121-122
+  s_aa25bb779f3858::t_300e10a3078271 686,975-977
+  s_aa25bb779f3858::t_1eb9646c1e2a22 86-120,542-556,571,597,636,639,648-653,678-683,689-693,890,894,905-940,952-953,955-956,967-974,978-984,986,989-990,999
+  s_aa25bb779f3858::t_70f18143a3a534 85
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_aa25bb779f3858::t_4d3b28921e2e58 210-214,291,296-303,429-431
+  s_aa25bb779f3858::t_ff21fbfd59a14f 606-613
+net/crates/net/tests/transfer_concurrency.rs
+  s_aa25bb779f3858::t_ff21fbfd59a14f 3
+net/crates/net/src/adapter/net/mod.rs
+  s_aa25bb779f3858::t_27eef4f832725c 243
+net/crates/net/src/adapter/net/mesh.rs
+  s_aa25bb779f3858::t_888efa2deac905 3086-3093,47714-47743
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1838bbec383e2de806f8b46f2361988fbade3561",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
