@@ -287,17 +287,33 @@ async fn ensure_attached_on_a_healthy_pair_is_prompt_and_harmless() {
     let _serve_b = serve_hello(&b, "B");
     assert_eq!(call(&a, nid_b).await.as_deref(), Ok("B"));
 
+    // Let the calls' own short-lived tasks finish before counting.
+    const SETTLE: Duration = Duration::from_millis(500);
+    tokio::time::sleep(SETTLE).await;
+    let held_before = std::sync::Arc::strong_count(a.node());
     let started = Instant::now();
     a.ensure_attached_via(&addr_b.to_string(), &pub_b, nid_b)
         .await
         .expect("A ensures B");
+    let took = started.elapsed();
+    // Nothing the call started may still hold the node: a binding's
+    // `shutdown()` needs sole ownership, and a dial left running in the
+    // background held it for a whole handshake timeout (5 s here) after
+    // the call returned ("cannot shutdown: outstanding references exist").
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        std::sync::Arc::strong_count(a.node()) <= held_before,
+        "ensure_attached_via left a reference to the node behind ({} > {held_before})",
+        std::sync::Arc::strong_count(a.node())
+    );
+    let started = Instant::now();
     b.ensure_attached_via(&addr_a.to_string(), &pub_a, nid_a)
         .await
         .expect("B ensures A");
+    let took = took + started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "ensuring a healthy pair took {:?}",
-        started.elapsed()
+        took < Duration::from_secs(5),
+        "ensuring a healthy pair took {took:?}"
     );
     let budget = Duration::from_secs(3);
     assert_eq!(call_until_ok(&a, nid_b, budget).await.as_deref(), Ok("B"));
