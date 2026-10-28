@@ -83,6 +83,16 @@ const BLOCKING_FS_THRESHOLD: u64 = 256 * 1024;
 /// 64 MiB — APP_INTEGRATION_BLOCKERS_PLAN.md Phase 2.)
 pub const DEFAULT_INFLIGHT_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
+/// Byte budget for [`store_dir`]. Deliberately NOT
+/// [`DEFAULT_INFLIGHT_BUDGET_BYTES`]: the store reserves at most one chunk
+/// per file (the same [`in_flight_byte_permits`] as the fetch side) but
+/// reads each file WHOLE before chunking it, so this budget bounds how
+/// many large files are resident at once, not their bytes. At 8 MiB that
+/// is two files past the chunk size, as before the fetch budget was
+/// raised; tying the two together let `store_dir` hold four times as many
+/// whole large files in memory.
+const STORE_INFLIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
 /// How many of ONE file's chunks may be in flight at once in
 /// [`fetch_dir`]. Chunks of a large file used to be fetched strictly one
 /// after another, so a single big file ran at one chunk stream's pace
@@ -290,7 +300,7 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     // and not worth a tokio spawn dispatch.
     use futures::stream::StreamExt;
     let store_concurrency = DEFAULT_FETCH_CONCURRENCY;
-    let store_budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
+    let store_budget = u32::try_from(STORE_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_concurrency));
     let byte_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_budget as usize));
 
@@ -1570,6 +1580,21 @@ mod tests {
         // A budget smaller than the chunk size wins the clamp, so
         // a giant file can still run alone.
         assert_eq!(in_flight_byte_permits(u64::MAX, 64), 64);
+    }
+
+    /// AIB-2 (CODE_REVIEW_2026_10_28): `store_dir` reads every file
+    /// whole but reserves one chunk per file, so its budget decides how
+    /// many large files are resident at once. Raising the FETCH budget
+    /// must not raise that — two large files at a time, as before.
+    #[test]
+    fn store_budget_holds_at_most_two_large_files() {
+        let store_budget = u32::try_from(STORE_INFLIGHT_BUDGET_BYTES).unwrap();
+        let per_large_file = in_flight_byte_permits(u64::MAX, store_budget);
+        assert_eq!(store_budget / per_large_file, 2);
+        assert!(
+            STORE_INFLIGHT_BUDGET_BYTES < DEFAULT_INFLIGHT_BUDGET_BYTES,
+            "store_dir must keep its own, smaller budget"
+        );
     }
 
     #[test]
