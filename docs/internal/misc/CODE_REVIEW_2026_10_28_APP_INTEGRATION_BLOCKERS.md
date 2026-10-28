@@ -325,3 +325,18 @@ root (all features), the SDK and `net-python`, and `rustfmt --check`
 binding test suites (their changes are doc comments and the AIB-9
 removal of the key-derivation copy, covered by core and SDK tests), and
 the Linux-only and Windows-security CI jobs.
+
+## CI follow-up (2026-10-29, PR #1345)
+
+The first CI run on the fixes failed 11 jobs. One failure came from the
+fixes; seven were already failing on this branch, and three on master.
+
+| Failure | Cause | Commit |
+|---|---|---|
+| TypeScript SDK (`mesh_node_live`, `serve_handle_lifetime`) | AIB-1's dial was spawned and outlived `ensure_attached_via`, holding the node, so `shutdown()` refused | `c63bc3ed5` (the dial is dropped; the healthy-pair test checks the strong count) |
+| Python `test_send_wait_delivers_every_chunk_in_order` | A reply routed over the roster (no pinned direct route) met a full window; the roster's aggregate error did not read as backpressure, so the chunk was given up — runs of missing chunks before AIB-3, `PumpFailed` after | `6321e39ff` |
+| FFI clippy (deck, meshos, meshdb) | `TRANSFER_CHUNK_IDLE_POLL` dead outside `dataforts` | `9bdbb7d4d` |
+| Integration guard, WebRTC feature | probe lockfiles stale after the `windows-sys` dependency | `abb6bde42` |
+| Node `tool_lifecycle_live` | asserted `shutdown()` rejects while a tool is served; Phase 4 made shutdown release it | `c3f989276` (witnessed through a peer instead) |
+| C consumers (Linux, Windows), Go | master's fold.query v2 exports missing from the libnet baselines | `8642de554` |
+
