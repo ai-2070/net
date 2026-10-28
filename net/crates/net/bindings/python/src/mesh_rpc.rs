@@ -1984,9 +1984,7 @@ impl PyResponseSinkSend {
     /// result and races the response pump's exit (`0x0006: response pump
     /// failed`).
     #[cfg(feature = "org")]
-    pub(crate) fn from_org_response_sink(
-        inner: InnerRpcResponseSink,
-    ) -> (Self, SinkSlot) {
+    pub(crate) fn from_org_response_sink(inner: InnerRpcResponseSink) -> (Self, SinkSlot) {
         let holder = Arc::new(Mutex::new(Some(Arc::new(inner))));
         (
             Self {
