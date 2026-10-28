@@ -3725,7 +3725,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -3901,7 +3901,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # `sdk-ts` resolves `@net-mesh/core` through a `file:` devDependency,
       # which carries no version — so a peerDependency range that excludes
@@ -5241,7 +5241,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Install Python
         uses: actions/setup-python@v7
@@ -6245,7 +6245,7 @@ jobs:
       - name: Install Node + TypeScript
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
       - name: Install tsc
         run: npm install -g typescript@6
 
@@ -7721,7 +7721,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # `npm install`, not `npm ci`: the repo ignores package-lock.json,
       # so there is no committed lockfile (same as sdk-ts).
@@ -7932,7 +7932,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # The first half of the runner drives `@net-mesh/browser`
       # over the real leaf bundle; both are built here so a witness
@@ -8371,7 +8371,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
@@ -8513,7 +8513,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Install wasm-bindgen-cli 0.2.129
         uses: taiki-e/install-action@v2
