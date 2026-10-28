@@ -3088,7 +3088,10 @@ pub(super) fn is_publish_backpressure(e: &AdapterError) -> bool {
 /// it, so it bounds a stall, not a transfer.
 pub const TRANSFER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How often a pending chunk fetch checks for silence.
+/// How often a pending chunk fetch checks for silence. Read only by the
+/// `dataforts` transfer path, so gated with it (a narrower build would
+/// fail `-D dead-code`).
+#[cfg(feature = "dataforts")]
 const TRANSFER_CHUNK_IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// BLAKE3 KDF context for [`NoiseStaticKey::derive_from_identity`].
