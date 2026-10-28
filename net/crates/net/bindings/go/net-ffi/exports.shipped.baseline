@@ -4,8 +4,9 @@
 # generated-at: 13fe95dbc9c57b4d4e64209f6a299614ad5dcc7f
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi
-# count: 597
+# count: 599
 # edited: net_rpc_request_stream_retire added by hand (intended C-ABI addition, SDK audit 2026-10-11 #8; mirrors exports.baseline)
+# edited: net_fold_query_client_query_group_latest, net_fold_query_client_query_group_summarize_now added by hand (intended C-ABI addition, AGGREGATOR_MULTI_HOST_PLAN.md fold.query.v2; landed on master without a baseline update)
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -191,6 +192,8 @@ net_fold_query_client_free
 net_fold_query_client_invalidate_cache
 net_fold_query_client_invalidate_target
 net_fold_query_client_new
+net_fold_query_client_query_group_latest
+net_fold_query_client_query_group_summarize_now
 net_fold_query_client_query_latest
 net_fold_query_client_query_summarize_now
 net_fold_query_client_set_deadline
