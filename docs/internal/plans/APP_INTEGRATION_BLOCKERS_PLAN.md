@@ -348,6 +348,18 @@ nowhere.
   plain `std` socket with `SO_REUSEADDR` against it, added to the
   `windows-security-tests` job filter (it is the only Windows job).
 
+### Progress (2026-10-28)
+
+Done. `SO_REUSEADDR` dropped on every platform; Windows sets
+`SO_EXCLUSIVEADDRUSE` via a new `cfg(windows)` `windows-sys` dep
+(`Win32_Networking_WinSock`; already in the lock). Witness
+`a_bound_mesh_port_cannot_be_shared` (second `NetSocket` → `AddrInUse`,
+a raw SO_REUSEADDR socket refused, port free after drop) fails on the
+old code and is pinned in the `windows-security-tests` job. The
+restart test re-binds a port right after shutdown and still passes, so
+the port is released promptly. The CLI free-port probe needs no change:
+a plain bind now reports a held mesh port as busy on Windows too.
+
 ---
 
 ## Order and split

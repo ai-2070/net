@@ -206,8 +206,13 @@ impl NetSocket {
         socket2.set_recv_buffer_size(config.recv_buffer_size)?;
         socket2.set_send_buffer_size(config.send_buffer_size)?;
 
-        // Enable address reuse
-        socket2.set_reuse_address(true)?;
+        // The port is this node's alone. No SO_REUSEADDR: for UDP it buys
+        // nothing (no TIME_WAIT), and it let a second process bind the same
+        // port without an error and split the node's traffic. On Windows,
+        // where a socket that sets SO_REUSEADDR can still bind over one
+        // that didn't, also claim the port exclusively.
+        #[cfg(windows)]
+        set_exclusive_addr_use(&socket2)?;
 
         // Set non-blocking for tokio
         socket2.set_nonblocking(true)?;
@@ -1039,6 +1044,32 @@ impl std::fmt::Debug for PacketSender {
     }
 }
 
+/// `SO_EXCLUSIVEADDRUSE`: no other socket may bind this address, even one
+/// that sets `SO_REUSEADDR`. Must be set before `bind`.
+#[cfg(windows)]
+fn set_exclusive_addr_use(socket: &socket2::Socket) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+    let enable: i32 = 1;
+    // SAFETY: `socket` is a live, owned socket for the whole call; the
+    // option value is a valid `i32` whose size is passed alongside it.
+    let rc = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enable as *const i32).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1102,41 @@ mod tests {
             63 - (CAP - 1).leading_zeros(),
             RECV_DRAIN_BUCKETS as u32 - 2
         );
+    }
+
+    /// The mesh port is exclusive: a second node — or any socket that
+    /// asks for SO_REUSEADDR — cannot bind it while the first holds it,
+    /// and the port is free again once the first is dropped.
+    #[tokio::test]
+    async fn a_bound_mesh_port_cannot_be_shared() {
+        let first = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = first.local_addr();
+
+        let second = test_socket(addr).await;
+        assert_eq!(
+            second.err().map(|e| e.kind()),
+            Some(io::ErrorKind::AddrInUse),
+            "a second NetSocket must not bind a held port"
+        );
+
+        // A socket outside Net that opts into reuse is refused too.
+        let raw = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        raw.set_reuse_address(true).unwrap();
+        assert!(
+            raw.bind(&addr.into()).is_err(),
+            "an SO_REUSEADDR socket must not bind over the mesh port"
+        );
+        drop(raw);
+
+        drop(first);
+        test_socket(addr)
+            .await
+            .expect("the port is free once its node lets go of it");
     }
 
     #[tokio::test]
