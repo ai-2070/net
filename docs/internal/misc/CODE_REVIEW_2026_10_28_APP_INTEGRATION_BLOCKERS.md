@@ -16,7 +16,8 @@ and not re-read.
 **Receipts:** none. No `cargo`, nextest, Go, Node or Python run backed this
 review. No finding below has a test that covers it.
 
-**Verdict: HOLD.** AIB-1, AIB-2 and AIB-3 are the must-fixes. AIB-1 breaks
+**Verdict: HOLD** at review time; **all ten findings are now fixed** (see
+Resolution at the end). AIB-1, AIB-2 and AIB-3 were the must-fixes. AIB-1 breaks
 the restart case the branch exists to fix. AIB-2 can run a storing node out
 of memory. AIB-3 leaves the silent mid-stream gap that Phase 3 set out to
 remove.
@@ -257,3 +258,70 @@ per chunk over 30 s. `try_publish_to_peer_bound` already has the same
 **Fix direction:** enable that in-function credit wait for streamed
 chunks (a flag beside `fragment_session`) and drop the outer loop: one
 framing per chunk and one backoff layer.
+
+---
+
+## Resolution (2026-10-28)
+
+Every finding is fixed on `LZL0/fix-reconnect-after-restart`:
+
+| ID | Commit | Test |
+|---|---|---|
+| AIB-1 | `dcbc59f03` | SDK `the_survivor_re_attaches_to_a_peer_that_just_restarted` (fails on the old code: A's calls time out); `ensure_attached_on_a_healthy_pair_is_prompt_and_harmless` |
+| AIB-2 | `46c104d01` | `store_budget_holds_at_most_two_large_files` |
+| AIB-3 | `310f0a380` | `supervisor_stops_at_a_chunk_that_could_not_be_sent` |
+| AIB-4 | `df786bd88` | `a_reply_goes_first_where_its_retransmits_go` (fails on the old code: the reply needed a retransmit) |
+| AIB-5 | `d0067c371` | `a_rotation_mid_subscribe_does_not_fail_the_call` (fails with the retry disabled) |
+| AIB-6 | `4a9d625ad` | `only_a_holder_reset_counts_as_gave_up` |
+| AIB-7 | `42d8cdb9b` | `a_bound_mesh_port_cannot_be_shared` now checks the message |
+| AIB-8 | `16c8da7f7` | SDK `typed_try_send_reports_a_dropped_chunk` |
+| AIB-9 | `23e524043` | `new_derives_the_noise_key_for_a_configured_identity` |
+| AIB-10 | `245d35d90` | covered by the nRPC integration family |
+
+**How AIB-1 was fixed.** `ensure_attached_via` always dials, and while
+the dial is pending it watches the existing session. A restarted (or
+idle) peer accepts and the session is replaced. A peer still using the
+session defers the dial (its busy gate) but keeps heartbeating there; its
+first packet after the dial began proves it holds the session, and the
+call returns without replacing it. The dial runs as its own task, so
+giving up on the wait never cancels a session install. Dialing alone was
+not enough: a session that has carried calls keeps reply streams open,
+so the peer defers the dial and each `connect_via` waits out three
+handshake timeouts (30 s for a healthy pair in the first attempt; 2 s
+now at a 1 s heartbeat).
+
+**How AIB-3 was fixed.** `RpcAsyncResponseEmitter` futures resolve to
+`bool` (was the frame sent). On `false` the server-streaming and duplex
+pumps stop, cancel the handler, and the call ends `PumpFailed`, the
+terminal the fold already used for a pump that lost chunks.
+
+**How AIB-5 was fixed.** The subscribe runs as passes. A fenced pass is
+retried (up to three) while the target still has a session; only a
+target with no session fails the call. The test injects a replacement
+between the subscribe and the cache insert through a `cfg(test)` seam.
+
+**How AIB-4 was fixed.** The publish path sends to `wire_route`, like
+every other per-peer sender, instead of falling back to the routing
+table's next hop. Retransmits already went there.
+
+**Behavior changes.** Listed for the release note in
+`APP_INTEGRATION_BLOCKERS_PLAN.md` ("For the release notes"). The ones
+from this review: a lost streamed chunk ends the call with `Internal`
+"response pump failed"; `RpcAsyncResponseEmitter` is a breaking type
+change for code that builds it directly; `ensure_attached_via` always
+dials (a busy peer costs up to one heartbeat interval); a chunk fetch
+fails at once on `NotFound` or a silent holder; the bind error for a
+held port names `shutdown()`.
+
+**Receipts (local, Windows).** Full lib unit suite 6113/6113; nRPC
+integration family 203/203; routing/relay family 277/277; a further
+191 integration tests (blob/dir transfer, RedEX, cortex, channels,
+streams, sensing, subnet); SDK restart + enrollment 87/87; SDK typed
+streaming + org_streaming 18/18. Clippy strict on lib/bins (default,
+no-default, unit set, all features) and permissive all-targets (root,
+SDK), Node and Python binding clippy, rustdoc `-D warnings` for the
+root (all features), the SDK and `net-python`, and `rustfmt --check`
+(workspace and leaf) are clean. Not run locally: the Node, Python and Go
+binding test suites (their changes are doc comments and the AIB-9
+removal of the key-derivation copy, covered by core and SDK tests), and
+the Linux-only and Windows-security CI jobs.
