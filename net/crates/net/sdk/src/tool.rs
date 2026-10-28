@@ -258,6 +258,8 @@ where
 /// registered for the lifetime of the `Mesh`; it's harmless when
 /// the registry is empty (returns `NotFound` for every request).
 #[cfg(feature = "cortex")]
+#[must_use = "dropping a ToolServeHandle unregisters the tool at once; \
+              bind it (`let _tool = ...`) for as long as the tool should be served"]
 pub struct ToolServeHandle {
     /// Inner handle from `serve_rpc_typed`. Dropping it
     /// unregisters the nRPC handler.

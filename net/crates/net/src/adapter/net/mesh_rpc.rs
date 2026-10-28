@@ -400,6 +400,8 @@ pub enum CodecDirection {
 ///
 /// Outstanding handler executions (already-spawned tokio tasks)
 /// continue to completion regardless.
+#[must_use = "dropping a ServeHandle unregisters the service at once; \
+              bind it (`let _serve = ...`) for as long as the service should run"]
 pub struct ServeHandle {
     /// Channel hash to unregister on Drop.
     channel_hash: ChannelHash,

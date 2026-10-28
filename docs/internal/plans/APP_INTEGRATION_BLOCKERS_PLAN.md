@@ -428,9 +428,11 @@ Suites: Node binding 804, sdk-ts 727, Python 1470, sdk-py 428 (Python
 3.10 locally, so `test_packaging_metadata.py` — needs `tomllib` — not
 run).
 
-Deferred: `#[must_use]` on the Rust `ServeHandle` types. It needs a
-workspace-wide all-targets build to find every existing drop it would
-flag; low value next to the binding fix.
+Rust: core `ServeHandle` and SDK `ToolServeHandle` are `#[must_use]`
+with a message naming the fix. `cargo check --workspace --all-targets
+--all-features` and the leaf build with no new warning: every existing
+caller already binds its handle. (No compile-fail test: the repo has no
+trybuild harness.)
 
 ---
 
