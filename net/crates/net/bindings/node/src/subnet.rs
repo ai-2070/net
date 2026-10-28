@@ -346,6 +346,9 @@ mod gated {
             })?
         };
 
-        Ok(crate::org::OrgServeHandle::from_handle(handle))
+        Ok(crate::org::OrgServeHandle::from_handle(
+            &mesh.node_arc_clone()?,
+            handle,
+        ))
     }
 }

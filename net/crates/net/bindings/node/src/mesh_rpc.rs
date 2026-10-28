@@ -720,10 +720,10 @@ type RpcObserverTsfn = ThreadsafeFunction<
 /// unregisters the service and stops accepting new request
 /// dispatch — in-flight handlers continue to completion.
 ///
-/// Always call `close()` explicitly when done with the service.
-/// V8 GC will eventually drop the napi class (and the inner
-/// ServeHandle) but timing is non-deterministic; relying on it
-/// for production unregister is unsafe.
+/// The service is owned by the node: it stays registered until
+/// `close()` or the mesh's `shutdown()`, whether or not this handle
+/// is kept referenced. (It used to stop whenever V8 finalized the
+/// handle.)
 #[napi]
 pub struct ServeHandle {
     inner: Arc<Mutex<Option<InnerServeHandle>>>,
@@ -736,6 +736,26 @@ pub struct ServeHandle {
     /// can drop the `MeshRpc` and keep the `ServeHandle`; the
     /// association has to survive that.
     runtime: tokio::runtime::Handle,
+    /// The node's hold on this registration (`keepalive`): the service
+    /// lives until `close()` or the node's `shutdown()`, not until V8
+    /// finalizes this wrapper.
+    registration: crate::keepalive::Registration,
+}
+
+impl ServeHandle {
+    fn registered(
+        node: &Arc<MeshNode>,
+        inner: InnerServeHandle,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let inner = Arc::new(Mutex::new(Some(inner)));
+        let registration = crate::keepalive::hold(node, &inner, Some(runtime.clone()));
+        ServeHandle {
+            inner,
+            runtime,
+            registration,
+        }
+    }
 }
 
 #[napi]
@@ -753,12 +773,13 @@ impl ServeHandle {
         // Recover from a poisoned mutex (a thread panicked while
         // holding it) — partial state is fine here, we just want
         // to drop the inner ServeHandle if it's still present.
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 
-    /// `true` once `close()` has been called (or after V8 GC
-    /// finalized the handle). Useful for tests / diagnostics.
+    /// `true` once `close()` has been called (or the mesh shut down).
+    /// Useful for tests / diagnostics.
     #[napi]
     pub fn is_closed(&self) -> bool {
         let guard = self.inner.lock();
@@ -2083,10 +2104,11 @@ impl MeshRpc {
             .node()?
             .serve_rpc(&service, rust_handler)
             .map_err(|e| nrpc_err("serve_failed", e))?;
-        Ok(ServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime: self.runtime.clone(),
-        })
+        Ok(ServeHandle::registered(
+            &self.node()?,
+            inner,
+            self.runtime.clone(),
+        ))
     }
 
     // ---- call -----------------------------------------------------------
@@ -2316,10 +2338,11 @@ impl MeshRpc {
             .node()?
             .serve_rpc_client_stream(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
-        Ok(ServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime: self.runtime.clone(),
-        })
+        Ok(ServeHandle::registered(
+            &self.node()?,
+            inner,
+            self.runtime.clone(),
+        ))
     }
 
     /// Register a duplex handler. JS signature:
@@ -2363,10 +2386,11 @@ impl MeshRpc {
             .node()?
             .serve_rpc_duplex(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
-        Ok(ServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime: self.runtime.clone(),
-        })
+        Ok(ServeHandle::registered(
+            &self.node()?,
+            inner,
+            self.runtime.clone(),
+        ))
     }
 
     /// Register a server-streaming handler. JS signature:
@@ -2415,10 +2439,11 @@ impl MeshRpc {
             .node()?
             .serve_rpc_streaming(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
-        Ok(ServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            runtime: self.runtime.clone(),
-        })
+        Ok(ServeHandle::registered(
+            &self.node()?,
+            inner,
+            self.runtime.clone(),
+        ))
     }
 
     // ---- discovery ------------------------------------------------------

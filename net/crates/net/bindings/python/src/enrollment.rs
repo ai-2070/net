@@ -673,9 +673,10 @@ pub(crate) fn mesh_serve_enrollment_auto(
     let renew = mesh
         .serve_renewal_auto(operator, grant_ttl, max_depth)
         .map_err(enroll_err)?;
-    Ok(PyEnrollmentServeHandle {
-        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll, renew]))),
-    })
+    Ok(PyEnrollmentServeHandle::registered(
+        mesh,
+        vec![enroll, renew],
+    ))
 }
 
 /// Operator-side, **approver-gated** enrollment on the live `node`: every
@@ -705,9 +706,7 @@ pub(crate) fn mesh_serve_enrollment(
     let enroll = mesh
         .serve_enrollment(operator, grant_ttl, max_depth, approve)
         .map_err(enroll_err)?;
-    Ok(PyEnrollmentServeHandle {
-        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll]))),
-    })
+    Ok(PyEnrollmentServeHandle::registered(mesh, vec![enroll]))
 }
 
 type PendingAnswer =
@@ -781,7 +780,27 @@ pub struct PyEnrollmentServeHandle {
     // each `ServeHandle` holds one dispatcher registration (enroll + renew) —
     // all must outlive the services.
     // A lock, not `&mut self` (SDK audit 2026-10-11): see `NetMesh.node`.
-    inner: parking_lot::Mutex<Option<(Mesh, Vec<ServeHandle>)>>,
+    inner: Arc<parking_lot::Mutex<Option<EnrollmentServices>>>,
+    /// The node's hold on the services (`keepalive`): they stay up until
+    /// `stop()` or the mesh's `shutdown()`, not until this handle's
+    /// refcount reaches zero.
+    registration: crate::keepalive::Registration,
+}
+
+/// The mesh the enrollment services registered against, and their
+/// registrations (enroll, and renew on the auto path).
+type EnrollmentServices = (Mesh, Vec<ServeHandle>);
+
+impl PyEnrollmentServeHandle {
+    fn registered(mesh: Mesh, handles: Vec<ServeHandle>) -> Self {
+        let node = Arc::clone(mesh.node());
+        let inner = Arc::new(parking_lot::Mutex::new(Some((mesh, handles))));
+        let registration = crate::keepalive::hold(&node, &inner, None);
+        Self {
+            inner,
+            registration,
+        }
+    }
 }
 
 #[pymethods]
@@ -790,6 +809,7 @@ impl PyEnrollmentServeHandle {
     fn stop(&self) {
         let taken = self.inner.lock().take();
         drop(taken);
+        self.registration.forget();
     }
 
     /// Whether the service is still registered.

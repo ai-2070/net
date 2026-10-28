@@ -320,6 +320,33 @@ Python behaves the same at refcount 0.
 - pytest: same with `del` + `gc.collect()`.
 - `shutdown()` with live handles doesn't leak or hang.
 
+### Progress (2026-10-28)
+
+Done for Node and Python. Each binding has a `keepalive` module (twins:
+not shared through `net_sdk`, because the bindings' base `net`/`cortex`
+builds don't depend on the SDK): a registry keyed by node that holds
+every serve registration — nRPC `ServeHandle` (unary, streaming,
+client-stream, duplex), enrollment, org (incl. subnet-exported) and A2A
+(free and paid) — until `close()`/`stop()` or the mesh's `shutdown()`.
+Keying by node address is safe because each held core `ServeHandle`
+owns an `Arc<MeshNode>`, so a key can't be reused while entries remain.
+Node `shutdown()` releases the node's registrations before its
+sole-ownership wait, so leaving handles open no longer makes shutdown
+fail. Cost by design: a mesh dropped without `shutdown()` keeps its
+services until process exit.
+
+Witnesses (both red with the hold disabled): sdk-ts
+`serve_handle_lifetime.test.ts` (a FinalizationRegistry proves the
+handle was collected; rpc.serve and serveEnrollmentAuto keep serving;
+close() still stops) and Python `test_serve_handle_lifetime.py`.
+Suites: Node binding 804, sdk-ts 727, Python 1470, sdk-py 428 (Python
+3.10 locally, so `test_packaging_metadata.py` — needs `tomllib` — not
+run).
+
+Deferred: `#[must_use]` on the Rust `ServeHandle` types. It needs a
+workspace-wide all-targets build to find every existing drop it would
+flag; low value next to the binding fix.
+
 ---
 
 ## Phase 5 — Exclusive UDP port

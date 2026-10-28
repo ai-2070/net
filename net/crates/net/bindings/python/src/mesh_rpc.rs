@@ -966,11 +966,32 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
 // Supports BOTH `with rpc.serve(...) as h: ...` AND explicit
 // `h.close()`. The context-manager exit path drops the inner
 // ServeHandle (which unregisters); in-flight handlers continue.
+// Dropping the Python object does NOT unregister: the node owns the
+// registration until `close()` or the mesh's `shutdown()`.
 // ============================================================================
 
 #[pyclass(name = "ServeHandle", module = "_net")]
 pub struct PyServeHandle {
     inner: Arc<Mutex<Option<InnerServeHandle>>>,
+    /// The node's hold on this registration (`keepalive`): the service
+    /// lives until `close()` or the mesh's `shutdown()`, not until the
+    /// handle's refcount reaches zero.
+    registration: crate::keepalive::Registration,
+}
+
+impl PyServeHandle {
+    fn registered(
+        node: &Arc<MeshNode>,
+        inner: InnerServeHandle,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let inner = Arc::new(Mutex::new(Some(inner)));
+        let registration = crate::keepalive::hold(node, &inner, Some(runtime));
+        PyServeHandle {
+            inner,
+            registration,
+        }
+    }
 }
 
 #[pymethods]
@@ -979,11 +1000,12 @@ impl PyServeHandle {
     /// no-ops. After close, in-flight handlers continue to
     /// completion but no new requests will be dispatched.
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 
-    /// `True` once `close()` has been called.
+    /// `True` once `close()` has been called (or the mesh shut down).
     fn is_closed(&self) -> bool {
         let guard = self.inner.lock();
         guard.is_none()
@@ -2560,9 +2582,11 @@ impl PyMeshRpc {
             .node
             .serve_rpc(&service, rust_handler)
             .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Direct-addressed unary call. Caller specifies
@@ -2828,9 +2852,11 @@ impl PyMeshRpc {
             .node
             .serve_rpc_client_stream(&service, rust_handler)
             .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Register a Python duplex handler on ``service``. ``handler``
@@ -2856,9 +2882,11 @@ impl PyMeshRpc {
             .node
             .serve_rpc_duplex(&service, rust_handler)
             .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Register a Python server-streaming handler on ``service``.
@@ -2886,9 +2914,11 @@ impl PyMeshRpc {
             .node
             .serve_rpc_streaming(&service, rust_handler)
             .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// All node ids currently advertising `nrpc:<service>` in the
@@ -3055,9 +3085,11 @@ impl PyAsyncMeshRpc {
             )
         }
         .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Register a Python client-streaming handler. Accepts EITHER
@@ -3103,9 +3135,11 @@ impl PyAsyncMeshRpc {
             )
         }
         .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Register a Python duplex handler. Accepts EITHER a sync
@@ -3147,9 +3181,11 @@ impl PyAsyncMeshRpc {
             )
         }
         .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Register a Python server-streaming handler. Accepts EITHER
@@ -3189,9 +3225,11 @@ impl PyAsyncMeshRpc {
             )
         }
         .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
-        Ok(PyServeHandle {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(PyServeHandle::registered(
+            &self.node,
+            inner,
+            self.runtime.handle().clone(),
+        ))
     }
 
     /// Direct-addressed unary call. Returns an awaitable resolving

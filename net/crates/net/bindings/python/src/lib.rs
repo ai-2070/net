@@ -95,6 +95,13 @@ mod a2a_paid;
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
 // handler support lands as a follow-up phase.
+// Node-owned serve registrations: dropping a serve handle no longer stops
+// the service (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 4). `shutdown`
+// always releases; only the serve surfaces (nRPC, enrollment, org, A2A)
+// hold, so a `net`-only build uses part of the module.
+#[cfg(feature = "net")]
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+mod keepalive;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
 // MeshDB query layer (Python SDK slice 1: factory AST +
@@ -3552,6 +3559,9 @@ mod mesh_bindings {
                 let Some(node) = self.node.write().take() else {
                     return Ok(());
                 };
+                // Stop the services this node owns (a dropped handle no
+                // longer stops one), releasing their node references.
+                crate::keepalive::release_all(&node);
                 self.runtime.block_on(node.shutdown())
             })
             .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))
@@ -4220,6 +4230,8 @@ mod mesh_bindings {
         /// an awaitable.
         fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
+            // Stop the services this node owns (see `keepalive`).
+            crate::keepalive::release_all(&node);
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 node.shutdown()
                     .await

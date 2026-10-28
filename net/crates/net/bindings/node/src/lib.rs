@@ -90,6 +90,13 @@ mod transport;
 // cortex / netdb feature unit.
 #[cfg(feature = "net")]
 mod identity;
+// Node-owned serve registrations: a serve handle's GC no longer stops
+// the service (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 4). `shutdown`
+// always releases; only the serve surfaces (nRPC, enrollment, org, A2A)
+// hold, so a `net`-only build uses part of the module.
+#[cfg(feature = "net")]
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+mod keepalive;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
 // MeshDB query layer (Node SDK slice 1: factory AST + in-memory
@@ -2773,6 +2780,14 @@ mod mesh_bindings {
             // serve-task teardown ticks in the race path.
             const DRAIN_ATTEMPTS: u32 = 50;
             const DRAIN_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+            // Stop every service registered on this node first. They are
+            // node-owned (a dropped JS handle no longer stops one), and each
+            // holds a node reference that would otherwise fail the
+            // sole-ownership wait below.
+            if let Some(node) = self.node.load_full() {
+                crate::keepalive::release_all(&node);
+            }
 
             let mut node_arc = self
                 .node

@@ -528,10 +528,12 @@ const ORG_HANDLER_ERROR: u16 = 0x8001;
 pub(crate) type OrgHandlerTsfn =
     ThreadsafeFunction<OrgRequest, Promise<Buffer>, OrgRequest, Status, false>;
 
-/// Handle for a served organization service. `close()` unregisters.
+/// Handle for a served organization service. `close()` unregisters; the
+/// service is node-owned, so it stays up until then (or the mesh's
+/// `shutdown()`) even if this handle is not kept referenced.
 #[napi]
 pub struct OrgServeHandle {
-    inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+    inner: Arc<parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>>,
     /// The runtime the registration ran on, carried forward — exactly the
     /// role `mesh_rpc::ServeHandle`'s `runtime` field plays (`mesh_rpc.rs`
     /// "ServeHandle"): `close()` runs on the JS thread with no reactor in
@@ -540,15 +542,26 @@ pub struct OrgServeHandle {
     /// belongs to. Every org-surface serve registers on
     /// [`org_serve_runtime`], so that is the runtime captured here.
     runtime: tokio::runtime::Handle,
+    /// The node's hold on the service (`keepalive`): it lives until
+    /// `close()` or the mesh's `shutdown()`, not until V8 finalizes this
+    /// wrapper.
+    registration: crate::keepalive::Registration,
 }
 
 impl OrgServeHandle {
     /// Wrap a registered serve handle — shared with the subnet-exported
-    /// serve, which returns the same RAII shape.
-    pub(crate) fn from_handle(handle: net_sdk::mesh_rpc::ServeHandle) -> Self {
+    /// serve, which returns the same shape.
+    pub(crate) fn from_handle(
+        node: &Arc<net::adapter::net::MeshNode>,
+        handle: net_sdk::mesh_rpc::ServeHandle,
+    ) -> Self {
+        let inner = Arc::new(parking_lot::Mutex::new(Some(handle)));
+        let runtime = org_serve_runtime().handle().clone();
+        let registration = crate::keepalive::hold(node, &inner, Some(runtime.clone()));
         OrgServeHandle {
-            inner: parking_lot::Mutex::new(Some(handle)),
-            runtime: org_serve_runtime().handle().clone(),
+            inner,
+            runtime,
+            registration,
         }
     }
 }
@@ -563,7 +576,9 @@ impl OrgServeHandle {
         // Enter the registration's runtime before dropping the inner
         // handle — mirror of `mesh_rpc::ServeHandle::close`.
         let _enter = self.runtime.enter();
-        let _ = self.inner.lock().take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 }
 
@@ -631,7 +646,7 @@ pub fn serve_org(
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
 
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
 
 /// A dedicated multi-thread runtime for the sync `serve_org` registration so the
@@ -1217,7 +1232,7 @@ pub fn serve_org_streaming(
         )
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
 
 /// Serve a protected, privately-discoverable service with a STREAM OF
@@ -1268,7 +1283,7 @@ pub fn serve_org_client_stream(
         )
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
 
 /// Serve a protected, privately-discoverable DUPLEX service (§4.4's
@@ -1319,5 +1334,5 @@ pub fn serve_org_duplex(
         )
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
