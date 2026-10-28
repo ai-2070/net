@@ -1130,7 +1130,9 @@ mod tests {
         let first = test_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = first.local_addr();
 
-        let second = test_socket(addr).await.err().expect("a held port");
+        let Err(second) = test_socket(addr).await else {
+            panic!("a second NetSocket bound a held port");
+        };
         assert_eq!(
             second.kind(),
             io::ErrorKind::AddrInUse,

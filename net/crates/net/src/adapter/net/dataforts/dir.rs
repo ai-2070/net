@@ -1604,10 +1604,12 @@ mod tests {
         let store_budget = u32::try_from(STORE_INFLIGHT_BUDGET_BYTES).unwrap();
         let per_large_file = in_flight_byte_permits(u64::MAX, store_budget);
         assert_eq!(store_budget / per_large_file, 2);
-        assert!(
-            STORE_INFLIGHT_BUDGET_BYTES < DEFAULT_INFLIGHT_BUDGET_BYTES,
-            "store_dir must keep its own, smaller budget"
-        );
+        const {
+            assert!(
+                STORE_INFLIGHT_BUDGET_BYTES < DEFAULT_INFLIGHT_BUDGET_BYTES,
+                "store_dir must keep its own, smaller budget"
+            )
+        };
     }
 
     #[test]

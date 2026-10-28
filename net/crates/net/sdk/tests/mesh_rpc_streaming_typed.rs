@@ -248,10 +248,10 @@ async fn typed_try_send_reports_a_dropped_chunk() {
     handshake(&caller, &server, addr_server).await;
 
     let (refused_tx, refused_rx) = tokio::sync::oneshot::channel::<u32>();
-    let refused_tx = std::sync::Mutex::new(Some(refused_tx));
+    let refused_tx = parking_lot::Mutex::new(Some(refused_tx));
     let _serve = server
         .serve_rpc_streaming_typed("burst", Codec::Json, move |_req: CountRequest, sink| {
-            let tx = refused_tx.lock().unwrap().take();
+            let tx = refused_tx.lock().take();
             async move {
                 let mut refused = 0;
                 for i in 0..BURST {
