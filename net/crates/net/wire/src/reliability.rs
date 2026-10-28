@@ -126,6 +126,22 @@ pub struct RetransmitDescriptor {
     /// unfragmented packet (which is every packet no fragmenting
     /// producer built).
     pub fragment: Option<FragmentStamp>,
+    /// Header routing fields to restamp on a rebuild, or `None` for a
+    /// packet built without them (every stream-path packet). The publish
+    /// path stamps the channel and origin hashes the receiver routes on;
+    /// a resend without them reaches the peer unroutable — dropped as
+    /// surely as the lost original.
+    pub header: Option<HeaderStamp>,
+}
+
+/// Header routing fields a rebuilt packet must carry again
+/// ([`RetransmitDescriptor::header`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderStamp {
+    /// Wire `channel_hash` (the 16-bit fast-path view).
+    pub channel_hash: u16,
+    /// Wire `origin_hash`.
+    pub origin_hash: u64,
 }
 
 /// Trait for reliability mode implementations.
@@ -1688,6 +1704,7 @@ mod tests {
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         })
     }
 
@@ -2762,6 +2779,7 @@ mod tests {
             events: events_a.clone(),
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         }));
         mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 1,
@@ -2769,6 +2787,7 @@ mod tests {
             events: events_b.clone(),
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         }));
         mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 2,
@@ -2776,6 +2795,7 @@ mod tests {
             events: events_c.clone(),
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         }));
 
         // NACK seq=1.
@@ -2837,6 +2857,7 @@ mod tests {
             events: vec![Bytes::from_static(b"event-A")],
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         });
         let original_ptr = Arc::as_ptr(&original);
         mode.on_send(Arc::clone(&original));

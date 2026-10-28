@@ -4340,7 +4340,19 @@ async fn publish_response_to_caller(
     // when the caller's origin is unknown to both the bridge cache AND
     // the global reverse index, OR the resolved node had no live session
     // at send time (nothing was sent).
-    let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
+    // Reliable, like the direct route above: a reply that falls back to
+    // the roster is still a reply, and the default fire-and-forget lost
+    // any datagram the link dropped — silently, mid-stream, while later
+    // chunks still arrived. Both routes use the same reply stream, so
+    // they now also agree on its reliability
+    // (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` 3c).
+    let publisher = ChannelPublisher::new(
+        reply_channel.clone(),
+        PublishConfig {
+            reliability: crate::adapter::net::Reliability::Reliable,
+            ..PublishConfig::default()
+        },
+    );
     mesh.publish(&publisher, payload).await.map(|_| ())
 }
 

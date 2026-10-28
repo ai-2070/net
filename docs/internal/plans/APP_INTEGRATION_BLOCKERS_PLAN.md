@@ -346,8 +346,24 @@ Three loss points, none visible to the handler:
   `server_error 0x0006`, not a silent drop. The PoC's 64 KB chunks hit
   this. Large streamed chunks are out of scope here (files ride blob
   transfer); documented in the test.
-- 3c (retransmit for reply frames) not started; loopback has no loss,
-  so it needs the loss-injection hooks to show.
+- 3c done — and it was three gaps, not one:
+  1. The direct route (`try_publish_to_peer_bound`) flagged packets
+     RELIABLE but never registered them for retransmit. Now registered.
+  2. The roster fallback in `publish_response_to_caller` published with
+     `PublishConfig::default()` — fire-and-forget — so a reply that took
+     it was simply lost on any drop. Now `Reliability::Reliable`, which
+     also makes both routes agree on the shared reply stream.
+  3. A resend rebuilt from its `RetransmitDescriptor` lost the header's
+     `channel_hash` / `origin_hash` (the receiver routes replies on the
+     channel hash), so it arrived unroutable. `RetransmitDescriptor`
+     gains `header: Option<HeaderStamp>` (wire crate; every other
+     producer passes `None`, incl. the leaf); both resend paths restamp
+     it, clearing the pooled builder's sticky channel hash when absent.
+  Witness `rpc_streaming_recovers_lost_reply_packets` with a new
+  fixtures hook `set_publish_drop_every_n_for_test` (drops every 7th
+  reliable publish before the socket; the test asserts drops happened):
+  600 chunks complete in order. Red without the registration (60 s
+  stall) and red without the header restamp.
 - Tests: Node `mesh_rpc_live.test.ts` "streamed-call backpressure"
   (4000 × 1 KB and 2000 × 7 KB with `sendWait` arrive complete and in
   order with `streamWindowInitial: 64`; a raw `send` burst reports

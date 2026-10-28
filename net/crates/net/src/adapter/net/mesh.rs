@@ -12776,6 +12776,12 @@ pub struct MeshNode {
     /// install it on a running node.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_dark_drop_observer: SensingDarkDropSlot,
+    /// Fixtures-only loss injection on the single-packet publish path
+    /// (`try_publish_to_peer_bound`): when `n > 0`, every `n`-th
+    /// RELIABLE packet is treated as sent but never reaches the socket —
+    /// a wire loss as both ends see it. `[n, counter]`.
+    #[cfg(any(test, feature = "fixtures"))]
+    publish_test_drop: [std::sync::atomic::AtomicU64; 2],
     /// Fixtures-only observation of the unary nRPC serve bridge's
     /// hand-off to the fold, in hand-off order. Held on the node
     /// rather than on the handle so a witness may install it before
@@ -15113,6 +15119,8 @@ impl MeshNode {
             #[cfg(any(test, feature = "fixtures"))]
             sensing_dark_drop_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
+            publish_test_drop: Default::default(),
+            #[cfg(any(test, feature = "fixtures"))]
             rpc_dispatch_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_observer: Arc::new(parking_lot::Mutex::new(None)),
@@ -15836,6 +15844,29 @@ impl MeshNode {
     /// receiver's own event, and it is the only thing that can tell those
     /// apart. It acknowledges nothing on the wire: no reply, no retry, no
     /// reliability, and the plane stays dark.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_publish_drop_every_n_for_test(&self, n: u64) {
+        self.publish_test_drop[0].store(n, Ordering::Relaxed);
+        self.publish_test_drop[1].store(0, Ordering::Relaxed);
+    }
+
+    /// Fixtures-only: how many reliable packets the publish-path loss
+    /// injection has seen since it was last armed (so a witness can tell
+    /// "nothing was dropped" from "drops were recovered").
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn publish_drop_seen_for_test(&self) -> u64 {
+        self.publish_test_drop[1].load(Ordering::Relaxed)
+    }
+
+    /// Fixtures-only: see `publish_test_drop`.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn publish_test_should_drop(&self) -> bool {
+        let n = self.publish_test_drop[0].load(Ordering::Relaxed);
+        n > 0 && (self.publish_test_drop[1].fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(n)
+    }
+
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn set_sensing_dark_drop_observer_for_test(&self, observer: SensingDarkDropObserver) {
@@ -31446,6 +31477,12 @@ impl MeshNode {
                     if let Some(f) = d.fragment {
                         builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
                     }
+                    // Restamp the routing header (channel hash is sticky
+                    // on a pooled builder, so clear it when absent).
+                    builder.set_channel_hash(d.header.map_or(0, |h| h.channel_hash));
+                    if let Some(h) = d.header {
+                        builder.set_origin_hash(h.origin_hash);
+                    }
                     let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                     packets.push(p);
                 }
@@ -33367,6 +33404,11 @@ impl MeshNode {
                         // header is a partial payload at the peer.
                         if let Some(f) = d.fragment {
                             builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                        }
+                        // Restamp the routing header (see the NACK path).
+                        builder.set_channel_hash(d.header.map_or(0, |h| h.channel_hash));
+                        if let Some(h) = d.header {
+                            builder.set_origin_hash(h.origin_hash);
                         }
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                         if sink.send(&addr.frame(&packet), addr.addr).await.is_ok() {
@@ -45030,6 +45072,10 @@ impl MeshNode {
         // `DEFAULT_STREAM_WINDOW_BYTES` so publish traffic rides
         // the same v2 byte-credit window as `send_on_stream`.
         session.open_stream_with(stream_id, reliable, 1);
+        // The lifetime this packet belongs to, for the retransmit
+        // registration below (a close+reopen racing this send must not
+        // credit the new lifetime with the old packet).
+        let epoch = session.try_stream(stream_id).map(|s| s.epoch());
 
         // Charge credit on the wire-byte size of the packet we're
         // about to build. The `TxSlotGuard` refunds on Drop unless
@@ -45162,13 +45208,42 @@ impl MeshNode {
             (std::borrow::Cow::Borrowed(&packet[..]), next_hop)
         };
 
-        if let Err(e) = self.sink.send(&wire, next_hop).await {
-            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                "publish send failed: {}",
-                e
-            )));
+        #[cfg(any(test, feature = "fixtures"))]
+        let dropped_for_test = reliable && self.publish_test_should_drop();
+        #[cfg(not(any(test, feature = "fixtures")))]
+        let dropped_for_test = false;
+        if !dropped_for_test {
+            if let Err(e) = self.sink.send(&wire, next_hop).await {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                    "publish send failed: {}",
+                    e
+                )));
+            }
         }
         guard.commit(); // wire-accepted — bytes now belong to the receiver
+
+        // A RELIABLE packet must be recoverable: register it so the
+        // peer's NACK (or the RTO) resends it. This path flagged its
+        // packets RELIABLE and the receiver held gaps for them, but never
+        // registered them — so one lost datagram on, say, a streamed nRPC
+        // reply left a gap nobody could fill: the receiver stalled behind
+        // it, then dropped what queued after it
+        // (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` 3c).
+        if let Some(epoch) = epoch {
+            Self::register_retransmit(
+                &session,
+                stream_id,
+                epoch,
+                seq,
+                events,
+                flags,
+                None,
+                Some(net_wire::reliability::HeaderStamp {
+                    channel_hash: channel_hash as u16,
+                    origin_hash: self.identity.entity_id().origin_hash(),
+                }),
+            );
+        }
 
         drop(builder);
         session.touch();
@@ -50299,6 +50374,7 @@ impl MeshNode {
                         batch,
                         flags,
                         fragment,
+                        None,
                     );
                     *committed_any = true;
                     return Ok(());
@@ -50348,6 +50424,9 @@ impl MeshNode {
     /// scheduler queue is shallow in practice; stamping at dequeue would
     /// need the descriptor visible in the router send loop, which it
     /// isn't, so the enqueue-time stamp is accepted.
+    // Eight plain fields of one descriptor; bundling them would only move
+    // the same list into a struct literal at each of the three callers.
+    #[allow(clippy::too_many_arguments)]
     fn register_retransmit(
         session: &Arc<NetSession>,
         stream_id: u64,
@@ -50356,6 +50435,7 @@ impl MeshNode {
         events: &[Bytes],
         flags: PacketFlags,
         fragment: Option<net_wire::reliability::FragmentStamp>,
+        header: Option<net_wire::reliability::HeaderStamp>,
     ) {
         if !flags.contains(PacketFlags::RELIABLE) {
             return;
@@ -50366,6 +50446,7 @@ impl MeshNode {
             events: events.to_vec(),
             flags,
             fragment,
+            header,
         });
         if let Some(state) = session.try_stream(stream_id) {
             if state.epoch() == epoch {
@@ -50533,6 +50614,7 @@ impl MeshNode {
                             batch,
                             piece_flags,
                             Some(stamp),
+                            None,
                         );
                         *committed_any = true;
                         delivered_bytes = delivered_bytes.saturating_add(piece_bytes);

@@ -5847,6 +5847,7 @@ mod tests {
                 events: vec![Bytes::from_static(b"x")],
                 flags: crate::protocol::PacketFlags::RELIABLE,
                 fragment: None,
+                header: None,
             });
             state.with_reliability(|r| r.on_send(descriptor));
         }
@@ -5981,6 +5982,7 @@ mod tests {
                     events: vec![Bytes::from_static(b"ours")],
                     flags: crate::protocol::PacketFlags::RELIABLE,
                     fragment: None,
+                    header: None,
                 }))
             });
             assert_eq!(old.next_tx_seq(), 0);
@@ -6092,6 +6094,7 @@ mod tests {
                         events: vec![Bytes::from_static(b"payload")],
                         flags: crate::protocol::PacketFlags::RELIABLE,
                         fragment: None,
+                        header: None,
                     }))
                 });
         }
