@@ -1451,37 +1451,54 @@ impl JsRequestStream {
 /// under the hood); drops the chunk on overflow rather than
 /// blocking the handler. Same lifetime contract as
 /// [`JsRequestStream`].
+/// A handler's response sink, shared between the JS wrapper and the
+/// bridge's release guard. The inner `Arc` lets an in-flight `sendWait`
+/// keep the sink alive for the length of its wait without holding the
+/// slot lock across an await; the sink (and with it the stream's
+/// terminal frame) goes once the release guard and any such wait are
+/// done.
+pub(crate) type SinkSlot = Arc<Mutex<Option<Arc<InnerRpcResponseSink>>>>;
+
 #[napi]
 pub struct JsResponseSink {
-    pub(crate) inner: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+    pub(crate) inner: SinkSlot,
 }
 
 #[napi]
 impl JsResponseSink {
-    /// Emit one response chunk. Returns `true` on success.
-    /// Returns `false` if the sink has been closed (handler
-    /// raced with the substrate fold's terminal-frame emission).
+    /// Emit one response chunk without waiting. Returns `true` if the
+    /// chunk was queued, `false` if it was dropped: the sink is closed
+    /// (the handler outlived its call), or the per-call queue is full.
     ///
-    /// **Flow control.** This call is non-blocking — it `try_send`s
-    /// into a bounded 1024-chunk mpsc that feeds the response pump.
-    /// The pump itself awaits per-call credit before publishing to
-    /// the wire (the `stream_window_initial` opt-in). If the pump
-    /// stalls on credit, the mpsc fills, and excess chunks are
-    /// dropped (counted via `streaming_chunks_dropped_total`). To
-    /// honor flow control, JS handlers should pace their emits via
-    /// the protocol's REQUEST_GRANT cadence rather than burst-
-    /// pushing past the credit window. This mirrors the Rust SDK's
-    /// `ResponseSinkTyped::send` contract — both are non-async.
+    /// **Streamed calls are lossy under `send`.** The queue holds 1024
+    /// chunks; a handler that produces faster than the caller consumes
+    /// fills it, and every further `send` drops — now visibly, as
+    /// `false` (counted in `streaming_chunks_dropped_total`). Use
+    /// [`Self::send_wait`] when every chunk must arrive.
     #[napi]
     pub fn send(&self, body: Buffer) -> bool {
         let guard = self.inner.lock();
         match guard.as_ref() {
-            Some(sink) => {
-                sink.send(napi_buffer_to_bytes(body));
-                true
-            }
+            Some(sink) => sink.try_send(napi_buffer_to_bytes(body)),
             None => false,
         }
+    }
+
+    /// Emit one response chunk, **waiting** for room in the per-call
+    /// queue instead of dropping, so backpressure reaches the handler:
+    /// `await sink.sendWait(chunk)` in a loop paces it to the caller.
+    /// Resolves `true` once queued, `false` if the call is gone (stop
+    /// producing).
+    #[napi]
+    pub async fn send_wait(&self, body: Buffer) -> Result<bool> {
+        let body = napi_buffer_to_bytes(body);
+        // Clone the sink out: the slot lock is synchronous and must not
+        // be held across the wait.
+        let sink = self.inner.lock().clone();
+        Ok(match sink {
+            Some(sink) => sink.send_wait(body).await.is_ok(),
+            None => false,
+        })
     }
 }
 
@@ -1505,13 +1522,13 @@ impl JsResponseSink {
 /// runtime instead of blocking a worker here). The sink release is
 /// synchronous either way.
 pub(crate) struct JsHandleRelease {
-    sink: Option<Arc<Mutex<Option<InnerRpcResponseSink>>>>,
+    sink: Option<SinkSlot>,
     requests: Option<Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>>,
 }
 
 impl JsHandleRelease {
     /// Release owner for the response-sink slot alone (server-streaming).
-    pub(crate) fn sink(slot: Arc<Mutex<Option<InnerRpcResponseSink>>>) -> Self {
+    pub(crate) fn sink(slot: SinkSlot) -> Self {
         Self {
             sink: Some(slot),
             requests: None,
@@ -1528,7 +1545,7 @@ impl JsHandleRelease {
 
     /// Release owner for both handler handles (duplex).
     pub(crate) fn both(
-        sink: Arc<Mutex<Option<InnerRpcResponseSink>>>,
+        sink: SinkSlot,
         requests: Arc<tokio::sync::Mutex<Option<InnerRequestStream>>>,
     ) -> Self {
         Self {
@@ -1703,7 +1720,7 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         // `JsHandleRelease` guard releases it at a forced drop too (the
         // supervisor dropping this future), so the release is NEVER
         // V8-GC-quantized (NODE-3).
-        let sink_slot = Arc::new(Mutex::new(Some(sink)));
+        let sink_slot = Arc::new(Mutex::new(Some(Arc::new(sink))));
         let _release = JsHandleRelease::sink(sink_slot.clone());
         let args = StreamingHandlerArgs {
             req: Buffer::from(ctx.payload.body.to_vec()),
@@ -1905,7 +1922,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         // `JsHandleRelease` guard releases BOTH handler handles at a
         // forced drop too (the supervisor dropping this future), so the
         // release is NEVER V8-GC-quantized (NODE-3).
-        let sink_slot = Arc::new(Mutex::new(Some(responses)));
+        let sink_slot = Arc::new(Mutex::new(Some(Arc::new(responses))));
         let requests_slot = Arc::new(tokio::sync::Mutex::new(Some(requests)));
         let args = DuplexHandlerArgs {
             stream: JsRequestStream {

@@ -2394,8 +2394,18 @@ impl RpcResponseSink {
     /// contract: a refused item latches `ResourceExhausted` and retires
     /// the call.
     pub fn send(&self, body: impl Into<bytes::Bytes>) {
+        let _ = self.try_send(body);
+    }
+
+    /// [`Self::send`], reporting whether the chunk was queued: `false`
+    /// when it was dropped (queue full, call torn down, or — for a
+    /// protected record — refused and latched). A binding returns this
+    /// to its caller, so a handler can see that a chunk was lost instead
+    /// of assuming it went out. Never blocks; [`Self::send_wait`] is the
+    /// waiting form.
+    pub fn try_send(&self, body: impl Into<bytes::Bytes>) -> bool {
         if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
-            return;
+            return false;
         }
         let body = body.into();
         let Some(charge) = self.byte_charge.as_ref() else {
@@ -2408,21 +2418,23 @@ impl RpcResponseSink {
                     m.streaming_chunks_dropped_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                return false;
             }
-            return;
+            return true;
         };
-        self.send_charged(charge, body);
+        self.send_charged(charge, body)
     }
 
     /// The protected (void) send: reserve bytes + queue capacity without
     /// ever parking; any refusal latches `ResourceExhausted` and retires
     /// (§2.7 — "it cannot drop an item and subsequently report complete
     /// success").
-    fn send_charged(&self, charge: &RegistryCallRef, body: bytes::Bytes) {
+    /// Returns whether the item was queued.
+    fn send_charged(&self, charge: &RegistryCallRef, body: bytes::Bytes) -> bool {
         let len = body.len();
         if charge.registry.bytes().validate_item(len).is_err() {
             charge.latch_exhausted();
-            return;
+            return false;
         }
         let permit = match charge.registry.bytes().reserve(
             charge.key.clone(),
@@ -2435,13 +2447,13 @@ impl RpcResponseSink {
                 // A full budget cannot be waited out from a void send —
                 // the item is refused, so the call latches.
                 charge.latch_exhausted();
-                return;
+                return false;
             }
         };
         let Ok(slot) = self.inner.try_reserve() else {
             permit.release();
             charge.latch_exhausted();
-            return;
+            return false;
         };
         match charge
             .registry
@@ -2454,11 +2466,13 @@ impl RpcResponseSink {
                         permit: Some(Arc::clone(shared)),
                     });
                 });
+                true
             }
             Err(_) => {
                 // Already terminal / gone: the item is refused by the
                 // call's own disposition (first writer wins at `retire`).
                 permit.release();
+                false
             }
         }
     }

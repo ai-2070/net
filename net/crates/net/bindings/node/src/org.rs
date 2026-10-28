@@ -941,7 +941,7 @@ async fn dispatch_streaming_to_js(
     sink: ::net::adapter::net::cortex::RpcResponseSink,
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
-    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(Arc::new(sink))));
     // NODE-3 — the release owner for the forced-drop path (see the
     // handler-drop contract above).
     let _release = crate::mesh_rpc::JsHandleRelease::sink(sink_slot.clone());
@@ -1098,7 +1098,7 @@ async fn dispatch_duplex_to_js(
     sink: ::net::adapter::net::cortex::RpcResponseSink,
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
-    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(Arc::new(sink))));
     let arg = OrgDuplexHandlerArgs {
         caller: org_caller_js(&caller),
         stream: org_request_stream(requests),

@@ -3071,6 +3071,18 @@ pub(crate) enum IdentityProofReply {
     },
 }
 
+/// Suffix of the error a single-packet publish returns when the stream's
+/// send window is full (`TxAdmit::WindowFull`). That is pressure, not a
+/// fault: the window refills as the peer receives. Matched by
+/// [`is_publish_backpressure`]; keep the two together.
+pub(super) const PUBLISH_BACKPRESSURED: &str = "backpressured";
+
+/// Whether a publish failed only because the stream's send window was
+/// full, so waiting and retrying will succeed once the peer catches up.
+pub(super) fn is_publish_backpressure(e: &AdapterError) -> bool {
+    matches!(e, AdapterError::Connection(m) if m.ends_with(PUBLISH_BACKPRESSURED))
+}
+
 /// BLAKE3 KDF context for [`NoiseStaticKey::derive_from_identity`].
 /// Changing it changes every derived node's Noise key (and so its
 /// rendezvous address); bump the version instead of editing it.
@@ -45053,7 +45065,7 @@ impl MeshNode {
                 }
                 TxAdmit::WindowFull => {
                     return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                        "publish: stream {:#x} backpressured",
+                        "publish: stream {:#x} {PUBLISH_BACKPRESSURED}",
                         stream_id
                     )));
                 }

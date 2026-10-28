@@ -285,6 +285,38 @@ Three loss points, none visible to the handler:
   `tests/transfer_concurrency.rs`): with 3c, all chunks still arrive.
 - Re-run PoC `stream.ts 64 64`.
 
+### Progress (2026-10-28)
+
+- 3a done. Core `RpcResponseSink::try_send` reports whether the chunk
+  was queued (`send` is now `let _ = try_send`). Node: `send()` returns
+  `false` on a drop (not only on a closed sink); new
+  `sendWait(body): Promise<boolean>` waits for queue room (sink slot
+  holds an `Arc`, so an in-flight wait keeps the sink alive without a
+  lock across the await). TS `RawResponseSink` / `TypedResponseSink`
+  gain `sendWait`; `send` stays synchronous. Python: `send()` returns
+  `False` on a drop. **Python `send_wait` deferred:** its handlers run
+  on runtime threads, so a blocking wait needs care to avoid
+  `block_on` inside the runtime.
+- 3b done. The live test showed `sendWait` alone was not enough: with
+  every chunk queued, 1 KB chunks still went missing mid-stream. The
+  pump published each chunk once and dropped it when the reply stream's
+  64 KiB send window was full. `publish_stream_chunk_to_caller` now
+  waits for the window (1 → 32 ms backoff, up to 30 s) and retries,
+  for both streaming and duplex emits; the pump's one-at-a-time order
+  is kept. `is_publish_backpressure` names the error it retries on.
+- Found: a streamed chunk must fit one packet (8104 bytes with its
+  envelope). A larger one ends the call with an explicit
+  `server_error 0x0006`, not a silent drop. The PoC's 64 KB chunks hit
+  this. Large streamed chunks are out of scope here (files ride blob
+  transfer); documented in the test.
+- 3c (retransmit for reply frames) not started; loopback has no loss,
+  so it needs the loss-injection hooks to show.
+- Tests: Node `mesh_rpc_live.test.ts` "streamed-call backpressure"
+  (4000 × 1 KB and 2000 × 7 KB with `sendWait` arrive complete and in
+  order with `streamWindowInitial: 64`; a raw `send` burst reports
+  drops as `false`). Red before 3b. Core streaming/duplex/protected
+  suites 123/123; Node 807, sdk-ts 727.
+
 ---
 
 ## Phase 4 — Handles that stop the service when dropped

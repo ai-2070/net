@@ -1157,6 +1157,9 @@ class StubResponseSink implements RawResponseSink {
     this.sent.push(Buffer.from(body))
     return true
   }
+  async sendWait(body: Buffer): Promise<boolean> {
+    return this.send(body)
+  }
 }
 
 class StubDuplexSink implements RawDuplexSink {

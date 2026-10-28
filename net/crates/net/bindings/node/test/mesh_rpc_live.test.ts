@@ -459,3 +459,75 @@ describe('handlerTimeoutMs: 0 disables the cap without overflowing', () => {
     handle.close()
   }, 30_000)
 })
+
+// Streamed calls must not lose chunks silently
+// (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 3). `sendWait` waits for room
+// instead of dropping, so a handler that produces as fast as it can
+// still delivers every chunk, in order, to a flow-controlled caller.
+//
+// A chunk must fit one packet (8104 bytes with its envelope); a larger
+// one ends the call with an explicit `server_error`, not a silent drop.
+// 7 KB is the largest round size under that.
+describe('streamed-call backpressure', () => {
+  for (const kb of [1, 7]) {
+    it(`sendWait delivers every ${kb} KB chunk in order`, async () => {
+      const { server, serverRpc, clientRpc } = await pair()
+      const n = kb === 1 ? 4000 : 2000
+      const handle = serverRpc.serveStreaming(
+        `live.backpressure.${kb}`,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        async ([, sink]: [Buffer, any]) => {
+          for (let i = 0; i < n; i += 1) {
+            const chunk = Buffer.alloc(kb * 1024)
+            chunk.writeUInt32BE(i, 0)
+            expect(await sink.sendWait(chunk)).toBe(true)
+          }
+          return Buffer.alloc(0)
+        },
+      )
+      const stream = await clientRpc.callStreaming(
+        server.nodeId(),
+        `live.backpressure.${kb}`,
+        Buffer.from('go'),
+        { streamWindowInitial: 64 },
+      )
+      let got = 0
+      for (let c = await stream.next(); c !== null; c = await stream.next()) {
+        expect(c.readUInt32BE(0)).toBe(got)
+        got += 1
+      }
+      expect(got).toBe(n)
+      stream.close()
+      handle.close()
+    }, 60_000)
+  }
+
+  it('send reports a dropped chunk as false', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    let refused = 0
+    const handle = serverRpc.serveStreaming(
+      'live.backpressure.drop',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ([, sink]: [Buffer, any]) => {
+        // A burst well past the 1024-chunk queue with the caller granting
+        // only 8: some sends must be refused, and say so.
+        for (let i = 0; i < 4096; i += 1) {
+          if (!sink.send(Buffer.alloc(16))) refused += 1
+        }
+        return Buffer.alloc(0)
+      },
+    )
+    const stream = await clientRpc.callStreaming(
+      server.nodeId(),
+      'live.backpressure.drop',
+      Buffer.from('go'),
+      { streamWindowInitial: 8 },
+    )
+    let got = 0
+    for (let c = await stream.next(); c !== null; c = await stream.next()) got += 1
+    expect(refused).toBeGreaterThan(0)
+    expect(got).toBeLessThanOrEqual(4096 - refused)
+    stream.close()
+    handle.close()
+  }, 60_000)
+})

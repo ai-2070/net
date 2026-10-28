@@ -1993,24 +1993,21 @@ impl PyResponseSinkSend {
 
 #[pymethods]
 impl PyResponseSinkSend {
-    /// Emit one chunk. Returns ``True`` on success.
+    /// Emit one chunk. Returns ``True`` if it was queued, ``False`` if
+    /// it was dropped: the call is gone, or the per-call queue is full.
     ///
     /// Non-blocking by design — this is `try_send` into a bounded
     /// 1024-chunk mpsc feeding the response pump. The pump itself
     /// awaits per-call credit (`stream_window_initial` opt-in)
     /// before publishing to the wire; if the pump stalls on
     /// credit, the mpsc fills and excess chunks are dropped (and
-    /// counted via `streaming_chunks_dropped_total`). Handlers
-    /// honor flow control by pacing their emits to the protocol's
-    /// REQUEST_GRANT cadence rather than burst-pushing. Matches
-    /// the Rust SDK's `ResponseSinkTyped::send` contract.
+    /// counted via `streaming_chunks_dropped_total`) — reported as
+    /// ``False``, so a handler can back off and retry rather than
+    /// lose the chunk unknowingly.
     fn send<'py>(&self, body: &Bound<'py, PyBytes>) -> bool {
         let guard = self.inner.lock();
         match guard.as_ref() {
-            Some(sink) => {
-                sink.send(Bytes::copy_from_slice(body.as_bytes()));
-                true
-            }
+            Some(sink) => sink.try_send(Bytes::copy_from_slice(body.as_bytes())),
             None => false,
         }
     }

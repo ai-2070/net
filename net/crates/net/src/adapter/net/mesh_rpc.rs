@@ -4062,6 +4062,66 @@ fn take_lp(bytes: &[u8]) -> Option<&[u8]> {
     rest.get(len..)
 }
 
+/// How long a streamed chunk waits for a full reply-stream send window
+/// to drain before it is given up on. Generous: a caller that stops
+/// reading is already paced by flow-control credit, and giving up here
+/// loses a chunk mid-stream.
+const STREAM_CHUNK_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`publish_response_to_caller`] for one non-terminal streamed chunk:
+/// when the reply stream's send window is full, wait for it to refill
+/// and retry, instead of dropping the chunk.
+///
+/// The window is 64 KiB of bytes in flight, and it refills only as the
+/// caller receives. A handler that out-produces the caller (or sends
+/// chunks large enough that a few fill the window) used to lose every
+/// chunk that met a full window — silently, mid-stream, with later
+/// chunks still arriving
+/// (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` Phase 3).
+/// The pump emits one chunk at a time, so waiting here also keeps order.
+#[allow(clippy::too_many_arguments)]
+async fn publish_stream_chunk_to_caller(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    call_id: u64,
+    receiving_session_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    reply_stream_id: u64,
+    payload: Bytes,
+    fallback: ResponseRouteFallback,
+) -> Result<(), AdapterError> {
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(32);
+    let deadline = tokio::time::Instant::now() + STREAM_CHUNK_WINDOW_WAIT;
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match publish_response_to_caller(
+            mesh,
+            caller_origin,
+            call_id,
+            receiving_session_id,
+            target_hint,
+            reply_channel,
+            reply_channel_hash,
+            reply_stream_id,
+            payload.clone(),
+            fallback,
+        )
+        .await
+        {
+            Err(e)
+                if super::mesh::is_publish_backpressure(&e)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            result => return result,
+        }
+    }
+}
+
 // The reply-channel triple (`reply_channel`, `reply_channel_hash`,
 // `reply_stream_id`) is deliberately passed pre-split rather than bundled:
 // PERF_AUDIT §3.10 computes and caches the hash + stream_id per caller so
@@ -5713,7 +5773,7 @@ impl MeshNode {
                             return;
                         }
                     }
-                    if let Err(e) = publish_response_to_caller(
+                    if let Err(e) = publish_stream_chunk_to_caller(
                         &mesh,
                         caller_origin,
                         call_id,
@@ -6907,7 +6967,7 @@ impl MeshNode {
                             return;
                         }
                     }
-                    if let Err(e) = publish_response_to_caller(
+                    if let Err(e) = publish_stream_chunk_to_caller(
                         &mesh,
                         caller_origin,
                         call_id,
