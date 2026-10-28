@@ -4066,8 +4066,10 @@ fn take_lp(bytes: &[u8]) -> Option<&[u8]> {
 
 /// How long a streamed chunk waits for a full reply-stream send window
 /// to drain before it is given up on. Generous: a caller that stops
-/// reading is already paced by flow-control credit, and giving up here
-/// loses a chunk mid-stream.
+/// reading is already paced by flow-control credit. Giving up ends the
+/// call: the emitter reports the chunk unsent, the pump stops, and the
+/// caller gets a `PumpFailed` terminal instead of a stream with a hole
+/// (CODE_REVIEW_2026_10_28 AIB-3).
 const STREAM_CHUNK_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// [`publish_response_to_caller`] for one non-terminal streamed chunk:
@@ -5729,7 +5731,7 @@ impl MeshNode {
                         Err(e) => {
                             tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_streaming: invalid reply channel name");
-                            return;
+                            return false;
                         }
                     };
                     let meta = EventMeta::new(
@@ -5783,8 +5785,9 @@ impl MeshNode {
                                      protected terminal; the peer observes interruption or its \
                                      deadline (§2.8)"
                                 );
+                                return false;
                             }
-                            return;
+                            return true;
                         }
                     }
                     if let Err(e) = publish_stream_chunk_to_caller(
@@ -5805,7 +5808,9 @@ impl MeshNode {
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_streaming: chunk publish failed");
+                        return false;
                     }
+                    true
                 })
             });
 
@@ -6930,7 +6935,7 @@ impl MeshNode {
                         Err(e) => {
                             tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_duplex: invalid reply channel name");
-                            return;
+                            return false;
                         }
                     };
                     let meta = EventMeta::new(
@@ -6977,8 +6982,9 @@ impl MeshNode {
                                      protected terminal; the peer observes interruption or its \
                                      deadline (§2.8)"
                                 );
+                                return false;
                             }
-                            return;
+                            return true;
                         }
                     }
                     if let Err(e) = publish_stream_chunk_to_caller(
@@ -6999,7 +7005,9 @@ impl MeshNode {
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_duplex: chunk publish failed");
+                        return false;
                     }
+                    true
                 })
             });
 
