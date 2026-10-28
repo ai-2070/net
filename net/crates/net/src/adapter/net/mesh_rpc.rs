@@ -4083,6 +4083,11 @@ const STREAM_CHUNK_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_
 /// chunks still arriving
 /// (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` Phase 3).
 /// The pump emits one chunk at a time, so waiting here also keeps order.
+///
+/// The frame is prepared once ([`prepare_response_to_caller`]: bounding,
+/// the route discriminator, enrollment bookkeeping) and only the send is
+/// retried, re-resolving the route each time so a session replaced
+/// mid-wait is picked up (CODE_REVIEW_2026_10_28 AIB-10).
 #[allow(clippy::too_many_arguments)]
 async fn publish_stream_chunk_to_caller(
     mesh: &MeshNode,
@@ -4097,19 +4102,29 @@ async fn publish_stream_chunk_to_caller(
     fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
     const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(32);
+    let prepared = prepare_response_to_caller(
+        mesh,
+        caller_origin,
+        call_id,
+        receiving_session_id,
+        target_hint,
+        reply_channel,
+        reply_channel_hash,
+        payload,
+        fallback,
+    )?;
     let deadline = tokio::time::Instant::now() + STREAM_CHUNK_WINDOW_WAIT;
     let mut backoff = std::time::Duration::from_millis(1);
     loop {
-        match publish_response_to_caller(
+        match send_prepared_response(
             mesh,
             caller_origin,
-            call_id,
             receiving_session_id,
             target_hint,
             reply_channel,
             reply_channel_hash,
             reply_stream_id,
-            payload.clone(),
+            &prepared,
             fallback,
         )
         .await
@@ -4137,15 +4152,8 @@ async fn publish_stream_chunk_to_caller(
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
-    // R2: which call this response answers. Enrollment promotion
-    // may consume only this call's own reservation. Read on the
-    // `webrtc` path; the parameter stays so every caller keeps
-    // threading the fact rather than re-deriving it later.
-    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] call_id: u64,
-    // R2-A: the incarnation that received the request this response
-    // answers. Enrollment promotion consumes that exact
-    // `(node, session, call)` reservation or nothing.
-    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] receiving_session_id: u64,
+    call_id: u64,
+    receiving_session_id: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
     reply_channel_hash: ChannelHash,
@@ -4153,6 +4161,85 @@ async fn publish_response_to_caller(
     payload: Bytes,
     fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
+    let prepared = prepare_response_to_caller(
+        mesh,
+        caller_origin,
+        call_id,
+        receiving_session_id,
+        target_hint,
+        reply_channel,
+        reply_channel_hash,
+        payload,
+        fallback,
+    )?;
+    send_prepared_response(
+        mesh,
+        caller_origin,
+        receiving_session_id,
+        target_hint,
+        reply_channel,
+        reply_channel_hash,
+        reply_stream_id,
+        &prepared,
+        fallback,
+    )
+    .await
+}
+
+/// A server->caller frame made ready to send: bounded to one packet, the
+/// RpcRouteV1 discriminator inserted, and its enrollment side effects
+/// applied. Built once per frame; [`send_prepared_response`] may then be
+/// retried without redoing any of that.
+struct PreparedResponse {
+    payload: Bytes,
+    /// A large-response fragment: session-bound, never roster-routed.
+    fragmented: bool,
+}
+
+/// Where a response to `caller_origin` goes. A `DirectOnly` frame trusts
+/// ONLY the explicit `target_hint` (the AEAD-authenticated session peer):
+/// it must never resolve a destination through the origin reverse-index,
+/// which could point at a different node claiming this origin (NC2). A
+/// normal RESPONSE may resolve the caller's node via the reverse-index
+/// when no hint is cached.
+fn resolve_response_target(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    target_hint: Option<u64>,
+    fallback: ResponseRouteFallback,
+) -> Option<u64> {
+    match fallback {
+        ResponseRouteFallback::DirectOnly => target_hint,
+        ResponseRouteFallback::RosterOnStaleDirect => {
+            target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
+        }
+    }
+}
+
+/// The once-per-frame half of [`publish_response_to_caller`]: see
+/// [`PreparedResponse`].
+///
+/// Everything but `reply_channel_hash` and `payload` feeds the `webrtc`
+/// enrollment bookkeeping only; the parameters stay so every caller keeps
+/// threading those facts rather than re-deriving them later.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "webrtc"), allow(unused_variables))]
+fn prepare_response_to_caller(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    // R2: which call this response answers. Enrollment promotion
+    // may consume only this call's own reservation.
+    call_id: u64,
+    // R2-A: the incarnation that received the request this response
+    // answers. Enrollment promotion consumes that exact
+    // `(node, session, call)` reservation or nothing.
+    receiving_session_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    payload: Bytes,
+    fallback: ResponseRouteFallback,
+) -> Result<PreparedResponse, AdapterError> {
     let payload = bound_response_packet(payload)?;
     let fragmented = EventMeta::from_bytes(&payload)
         .is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
@@ -4182,18 +4269,9 @@ async fn publish_response_to_caller(
     // security defect: a rejected enrollment (wrong nonce, expired
     // invite) would have been admitted to the mesh by the very
     // message that refused it.
-    // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
-    // AEAD-authenticated session peer): it must never resolve a
-    // destination through the origin reverse-index, which could point at
-    // a different node claiming this origin (NC2). A normal RESPONSE may
-    // resolve the caller's node via the reverse-index when no hint is
-    // cached.
-    let resolved = match fallback {
-        ResponseRouteFallback::DirectOnly => target_hint,
-        ResponseRouteFallback::RosterOnStaleDirect => {
-            target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
-        }
-    };
+    // See `resolve_response_target` for the NC2 routing rule.
+    #[cfg(feature = "webrtc")]
+    let resolved = resolve_response_target(mesh, caller_origin, target_hint, fallback);
     // §12 step 4: an enrollment RESPONSE leaving this anchor
     // promotes the session that asked for it — the exact
     // incarnation captured when the REQUEST was decoded, re-checked
@@ -4286,6 +4364,29 @@ async fn publish_response_to_caller(
         }
     }
 
+    Ok(PreparedResponse {
+        payload,
+        fragmented,
+    })
+}
+
+/// The retryable half of [`publish_response_to_caller`]: resolve the
+/// route (afresh, each call) and send a [`PreparedResponse`].
+#[allow(clippy::too_many_arguments)]
+async fn send_prepared_response(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    receiving_session_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    reply_stream_id: u64,
+    prepared: &PreparedResponse,
+    fallback: ResponseRouteFallback,
+) -> Result<(), AdapterError> {
+    let payload = &prepared.payload;
+    let fragmented = prepared.fragmented;
+    let resolved = resolve_response_target(mesh, caller_origin, target_hint, fallback);
     // R2-6: attempt the direct send and branch on the ATOMIC typed
     // outcome, eliminating the `has_peer_session`-then-`publish` TOCTOU
     // that AV-5 used. `try_publish_to_peer` makes the session-existence
@@ -4303,7 +4404,7 @@ async fn publish_response_to_caller(
                 reply_channel_hash,
                 reply_stream_id,
                 /* reliable */ true,
-                std::slice::from_ref(&payload),
+                std::slice::from_ref(payload),
                 fragmented.then_some(receiving_session_id),
             )
             .await
@@ -4357,7 +4458,7 @@ async fn publish_response_to_caller(
             ..PublishConfig::default()
         },
     );
-    mesh.publish(&publisher, payload).await.map(|_| ())
+    mesh.publish(&publisher, payload.clone()).await.map(|_| ())
 }
 
 /// Preserve the call identity while replacing a response this publish path
