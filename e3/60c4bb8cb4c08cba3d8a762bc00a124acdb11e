@@ -1,0 +1,72 @@
+net/crates/net/bindings/python/src/keepalive.rs
+  s_aa25bb779f3858::t_4b9fcf57db6c3b 1-118
+net/crates/net/sdk-ts/test/serve_handle_lifetime.test.ts
+  s_aa25bb779f3858::t_40da4e2193051c 1-146
+net/crates/net/bindings/python/src/org_serve.rs
+  s_aa25bb779f3858::t_981a281847f319 48-52,57-63,65-66,76-78,165-168,711-714,773-776,837-840
+net/crates/net/bindings/python/src/subnet.rs
+  s_aa25bb779f3858::t_981a281847f319 378-381
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_aa25bb779f3858::t_4907767636cc0c 723-726,739-741,745-751,753-758,776-778,2107-2111,2341-2345,2389-2393,2442-2446
+  s_aa25bb779f3858::t_eb096f5e2def6e 781
+  s_aa25bb779f3858::t_1c82e5f8c33086 782
+  s_aa25bb779f3858::t_b86b9144e7a083 742,752
+  s_aa25bb779f3858::t_294c6a0e4b9c27 743-744
+net/crates/net/bindings/node/src/org.rs
+  s_aa25bb779f3858::t_b86b9144e7a083 548,560
+  s_aa25bb779f3858::t_30313d006b4d3f 555
+  s_aa25bb779f3858::t_0d3b0fa4de2b10 531-533,536,545-547,553-554,556-559,562-564,579-581,649,1235,1286,1337
+net/crates/net/bindings/node/src/enrollment.rs
+  s_aa25bb779f3858::t_3eb3eeb3b3b8b1 645-648,658,662-665,667-671,679-681,773,829
+  s_aa25bb779f3858::t_ebd586a9d8b0df 641-644,657
+  s_aa25bb779f3858::t_b86b9144e7a083 659,666
+  s_aa25bb779f3858::t_86c92ad109f235 660-661
+net/crates/net/bindings/python/src/a2a.rs
+  s_aa25bb779f3858::t_981a281847f319 362-364,371-375,411-413,415-416,428
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_efe5fb7264b3f7 323-349
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_aa25bb779f3858::t_4b9fcf57db6c3b 969-970,976-994,1003-1005,1008,2585-2589,2855-2859,2885-2889,2917-2921,3088-3092,3138-3142,3184-3188,3228-3232
+net/crates/net/bindings/python/src/enrollment.rs
+  s_aa25bb779f3858::t_efe5fb7264b3f7 676-679
+  s_aa25bb779f3858::t_981a281847f319 709,783-803,812
+net/crates/net/bindings/node/src/subnet.rs
+  s_aa25bb779f3858::t_0d3b0fa4de2b10 349-352
+net/crates/net/bindings/node/src/lib.rs
+  s_aa25bb779f3858::t_b86b9144e7a083 93-99,2789
+  s_aa25bb779f3858::t_4907767636cc0c 2784-2788,2790
+  s_aa25bb779f3858::t_7c8578053ccd64 2791
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_aa25bb779f3858::t_b333ab7ac50726 171,191-194,224,667-674,682-684,699-700
+net/crates/net/bindings/python/src/lib.rs
+  s_aa25bb779f3858::t_4b9fcf57db6c3b 98-104,3562-3564
+  s_aa25bb779f3858::t_981a281847f319 4233-4234
+net/crates/net/bindings/node/src/a2a.rs
+  s_aa25bb779f3858::t_242aa449a71b36 342-345,357-359,365-366,369-370,394-396
+  s_aa25bb779f3858::t_b86b9144e7a083 360,367
+net/crates/net/bindings/node/src/keepalive.rs
+  s_aa25bb779f3858::t_1c95529cce631e 106
+  s_aa25bb779f3858::t_c663afcc1fd346 115
+  s_aa25bb779f3858::t_b86b9144e7a083 1,3-7,9-14
+  s_aa25bb779f3858::t_21e41636b5065f 2,8,15-105,107-114,116-118
+net/crates/net/bindings/python/tests/test_serve_handle_lifetime.py
+  s_aa25bb779f3858::t_fece43617ebf47 1-78
+net/crates/net/sdk-py/tests/test_mesh_node_surface.py
+  s_aa25bb779f3858::t_011872ad889dcd 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e360c4bb8cb4c08cba3d8a762bc00a124acdb11e",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
