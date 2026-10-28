@@ -167,6 +167,17 @@ The other extreme: fewer files but much larger (compiled artifacts, multi-hundre
 
 Pass criteria: 2 GB Cargo `target/` transfers in under 5 minutes on localhost-paired nodes. Memory under 500 MB. Resume on interruption works.
 
+**MEASURED (2026-10-28, single large file, Windows 11 loopback, default socket buffers).** `tests/dir_transfer.rs` `bench_single_large_file` (`NET_BENCH_FILE_MB`, `NET_BENCH_INFLIGHT_MB`), one 190 MiB file of distinct 1 MiB blocks:
+
+| Fetch path | Time | Rate |
+|---|---|---|
+| Chunks one after another (before) | 48.9 s | 3.9 MiB/s |
+| Up to 8 chunks in flight, 8 MiB budget | 24.7 s | 7.7 MiB/s |
+| Up to 8 chunks in flight, 32 MiB budget (new default) | 6.1 s | 31.0 MiB/s |
+| Same, 64 MiB budget | 6.2 s | 30.8 MiB/s |
+
+One chunk stream is paced by its ~256 KB transfer window, so a lone file ran at one stream's rate while a directory of small files ran 16 wide. The fix (`APP_INTEGRATION_BLOCKERS_PLAN.md` Phase 2) fetches a file's chunks in parallel, written in order, under the shared byte budget; the old 8 MiB budget only ever admitted two 4 MiB chunks. Through the Node binding (debug build) an app's folder script moved the same 190 MB file in 9.6 s (21 MB/s; before: ~4 MB/s, and the run failed), 2,000 small files in 0.7 s, and both together in 9.0 s. **Not yet measured:** the 2 GB `target/` run, peak memory, resume, and Linux numbers.
+
 ## What the demo materials must say
 
 The framing matters as much as the numbers. The demo materials should anchor on these architectural claims, each supported by specific test results:

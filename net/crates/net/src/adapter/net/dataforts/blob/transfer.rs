@@ -207,6 +207,11 @@ struct PendingInbound {
     reorder: BTreeMap<u64, Vec<Bytes>>,
     /// Taken and fired once on completion (success / NotFound / error).
     done: Option<DoneTx>,
+    /// When this transfer last made progress: registration, then every
+    /// packet that arrives for it. The requester times a fetch out on
+    /// silence (`idle_for`), not on total duration, so a slow but moving
+    /// chunk is never cut off and a dead one fails promptly.
+    last_progress: std::time::Instant,
 }
 
 impl PendingInbound {
@@ -283,8 +288,17 @@ impl BlobTransferEngine {
                 next_seq: 0,
                 reorder: BTreeMap::new(),
                 done: Some(done),
+                last_progress: std::time::Instant::now(),
             },
         );
+    }
+
+    /// How long the pending transfer on `stream_id` has gone without a
+    /// packet. `None` once it has settled (or was never registered).
+    pub fn idle_for(&self, stream_id: u64) -> Option<std::time::Duration> {
+        self.pending
+            .get(&stream_id)
+            .map(|p| p.last_progress.elapsed())
     }
 
     /// Drop a pending transfer (timeout / give-up). Idempotent. Closes the
@@ -412,6 +426,9 @@ impl BlobTransferEngine {
                 Some(e) => e,
                 None => return, // already completed / cancelled
             };
+            // Any packet for a live transfer is progress — duplicates and
+            // out-of-order ones included: the holder is still sending.
+            entry.last_progress = std::time::Instant::now();
             // Dedup + bound: ignore already-consumed sequences, duplicate
             // buffered ones, and anything beyond the reorder horizon.
             if seq < entry.next_seq
@@ -586,13 +603,14 @@ async fn serve_chunk(
                 .await
                 .is_ok()
             {
-                // One reliable event per ~8 KiB frame. Because
-                // `TRANSFER_STREAM_WINDOW_BYTES` covers a whole chunk's
-                // on-wire size, the per-event credit never runs dry
-                // mid-chunk, so these sends don't stall into
-                // `send_with_retry`'s backoff (the 64 KiB default window
-                // exhausted every ~8 frames and each stall paid ≥5 ms
-                // even though the receiver's grant lands in <1 ms).
+                // One reliable event per ~8 KiB frame.
+                // `TRANSFER_STREAM_WINDOW_BYTES` (~256 KB) is a sixteenth
+                // of a 4 MiB chunk, so the per-event credit does run dry
+                // mid-chunk and a send waits in `send_with_retry` until
+                // the receiver's grant lands. One chunk stream is
+                // therefore paced by that window; a large file gets its
+                // throughput from several chunk streams at once
+                // (`dataforts::dir::MAX_CHUNKS_IN_FLIGHT_PER_FILE`).
                 // Per-event (not batched) keeps each `send_with_retry`
                 // independently safe: a one-packet call can't partially
                 // commit and then resend a duplicate under a fresh

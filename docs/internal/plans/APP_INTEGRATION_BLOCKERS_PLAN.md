@@ -231,6 +231,39 @@ at least the many-small-files rate; RSS stays under the plan's 500 MB.
 Also add a non-ignored test with a ~64 MiB file (16 chunks) so the
 parallel path runs in CI. Re-run PoC `dir.ts 0 190` and `one.ts`.
 
+### Progress (2026-10-28)
+
+- Parallel chunks: `fetch_blob_to_file` fetches up to
+  `MAX_CHUNKS_IN_FLIGHT_PER_FILE` (8) of a file's chunks at once
+  (`buffered`, written in manifest order, no seeking). Each chunk
+  reserves its bytes from the shared budget while in flight and until
+  written; deadlock-free because the semaphore is FIFO and `buffered`
+  enqueues in order. Small files unchanged.
+- Budget: `DEFAULT_INFLIGHT_BUDGET_BYTES` 8 → 32 MiB. The old value was
+  sized when a transfer stream's window covered a whole chunk; it is
+  ~256 KB now, so 32 MiB of reservations is ≤ ~2 MB on the wire.
+  `fetch_dir_with(FetchDirOptions { concurrency, inflight_bytes })`
+  exposes both knobs in Rust (bindings keep the defaults).
+- Time limit follows progress: `transfer_fetch_chunk` fails after
+  `TRANSFER_CHUNK_IDLE_TIMEOUT` (15 s) with no packet, instead of a
+  fixed 30 s per chunk (`BlobTransferEngine::idle_for`, stamped on every
+  packet).
+- Retries: each chunk is attempted up to 3 times before the directory
+  fetch fails (content-addressed, so always safe). The holder-side
+  give-up still sends no reset; with the idle limit and retries the
+  requester recovers within ~15 s, so that stays a follow-up.
+- Measured (in `FAIRSCHEDULER_TRANSPORT_PLAN.md` Phase 4): 190 MiB file
+  3.9 → 31.0 MiB/s in Rust; 21 MB/s through the Node binding's debug
+  build (was ~4 MB/s and failed).
+- Tests: `directory_transfer_fetches_a_large_file_s_chunks_in_parallel`
+  (24 MiB, 6 distinct chunks, byte-for-byte) and
+  `a_chunk_fetch_from_a_silent_holder_fails_on_the_idle_limit` (15.5 s;
+  the old code took 30 s). Transfer family 32/32.
+- Not done: the 2 GB / memory / resume rows of FairScheduler Phase 4;
+  exposing `FetchDirOptions` in the bindings; the PoC's `persistent`
+  mode fails at `store` (a `Redex` without a persistent dir — looks
+  like the script's options, not this change; unverified).
+
 ---
 
 ## Phase 3 — Streamed calls must not lose chunks silently

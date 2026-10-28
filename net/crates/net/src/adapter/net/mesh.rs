@@ -3083,6 +3083,14 @@ pub(super) fn is_publish_backpressure(e: &AdapterError) -> bool {
     matches!(e, AdapterError::Connection(m) if m.ends_with(PUBLISH_BACKPRESSURED))
 }
 
+/// A blob-transfer chunk fetch gives up after this long with no packet
+/// from the holder (`MeshNode::transfer_fetch_chunk`). Progress resets
+/// it, so it bounds a stall, not a transfer.
+pub const TRANSFER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often a pending chunk fetch checks for silence.
+const TRANSFER_CHUNK_IDLE_POLL: Duration = Duration::from_millis(500);
+
 /// BLAKE3 KDF context for [`NoiseStaticKey::derive_from_identity`].
 /// Changing it changes every derived node's Noise key (and so its
 /// rendezvous address); bump the version instead of editing it.
@@ -47703,20 +47711,36 @@ impl MeshNode {
             )));
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_canceled)) => {
-                engine.cancel_pending(stream_id);
-                Err(BlobError::Backend(
-                    "blob transfer: engine dropped the reply".into(),
-                ))
-            }
-            Err(_elapsed) => {
-                engine.cancel_pending(stream_id);
-                Err(BlobError::NotFound(format!(
-                    "blob transfer: timed out fetching mesh://{}",
-                    Self::blob_hex(&hash)
-                )))
+        // Time out on SILENCE, not total duration: a chunk that keeps
+        // arriving is never cut off however slow the link, and one whose
+        // holder went quiet fails after `TRANSFER_CHUNK_IDLE_TIMEOUT`.
+        // (A fixed 30 s per chunk failed large files on slow links and
+        // still waited the full 30 s for a dead one.)
+        let mut rx = rx;
+        loop {
+            match tokio::time::timeout(TRANSFER_CHUNK_IDLE_POLL, &mut rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_canceled)) => {
+                    engine.cancel_pending(stream_id);
+                    return Err(BlobError::Backend(
+                        "blob transfer: engine dropped the reply".into(),
+                    ));
+                }
+                Err(_poll) => {
+                    // `None`: settled between the poll and this check; the
+                    // reply is about to land, so wait for it.
+                    if engine
+                        .idle_for(stream_id)
+                        .is_some_and(|idle| idle >= TRANSFER_CHUNK_IDLE_TIMEOUT)
+                    {
+                        engine.cancel_pending(stream_id);
+                        return Err(BlobError::NotFound(format!(
+                            "blob transfer: no data for {}s fetching mesh://{}",
+                            TRANSFER_CHUNK_IDLE_TIMEOUT.as_secs(),
+                            Self::blob_hex(&hash)
+                        )));
+                    }
+                }
             }
         }
     }

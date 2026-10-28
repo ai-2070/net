@@ -23,16 +23,17 @@ use net::adapter::net::dataforts::blob::{
     chunk_payload, BlobAdapter, BlobRef, Encoding, MeshBlobAdapter,
 };
 use net::adapter::net::dataforts::dir::{
-    fetch_dir, store_dir, DirEntry, DirManifest, EntryKind, DIR_MANIFEST_VERSION,
+    fetch_dir, fetch_dir_with, store_dir, DirEntry, DirManifest, EntryKind, FetchDirOptions,
+    DIR_MANIFEST_VERSION,
 };
 use net::adapter::net::redex::Redex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 use net::adapter::Adapter;
 
 const PSK: [u8; 32] = [0x42u8; 32];
-// 16 MiB so a few concurrent large-file transfers (5 MiB tx window each)
-// don't overflow the kernel recv buffer — the flow-control window is
-// per-stream, so aggregate in-flight scales with concurrency. Small-file
+// 16 MiB of socket buffer for headroom. Each transfer stream holds at most
+// `TRANSFER_STREAM_WINDOW_BYTES` (~256 KB) unacknowledged, so aggregate
+// in-flight scales with the number of concurrent chunk streams. Small-file
 // workloads never approach this.
 const SOCKET_BUF: usize = 16 * 1024 * 1024;
 
@@ -889,4 +890,165 @@ async fn serving_a_transfer_releases_the_holder_node_promptly() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// One large file, pulled whole by `fetch_dir` — the shape of a project
+/// folder with a big asset in it
+/// (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` Phase 2,
+/// FAIRSCHEDULER_TRANSPORT_PLAN Phase 4). Uses the node's DEFAULT socket
+/// buffers, as the bindings do, not this file's raised test buffers.
+///
+/// `NET_BENCH_FILE_MB` (default 190) sets the size; `NET_BENCH_PASSES`
+/// (default 1) repeats it; `NET_BENCH_INFLIGHT_MB` sets the in-flight
+/// budget. Prints MiB/s; report-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "large-file benchmark — run with --ignored --nocapture"]
+async fn bench_single_large_file() {
+    let mb: usize = std::env::var("NET_BENCH_FILE_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(190);
+    let passes: usize = std::env::var("NET_BENCH_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    // `NET_BENCH_INFLIGHT_MB` overrides the aggregate in-flight budget
+    // (0 / unset = the default).
+    let inflight_mb: usize = std::env::var("NET_BENCH_INFLIGHT_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let options = FetchDirOptions {
+        inflight_bytes: inflight_mb * 1024 * 1024,
+        ..FetchDirOptions::default()
+    };
+
+    let default_buffers = || {
+        let mut cfg = test_config();
+        cfg.socket_buffers = SocketBufferConfig::default();
+        cfg
+    };
+    let node_a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), default_buffers())
+            .await
+            .unwrap(),
+    );
+    let node_b = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), default_buffers())
+            .await
+            .unwrap(),
+    );
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+
+    // Every MiB distinct, so nothing dedupes inside the file.
+    let src = TempDir::new("big-src");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(src.path().join("big.bin")).unwrap();
+        let mut block = vec![0u8; 1024 * 1024];
+        for i in 0..mb {
+            for (j, b) in block.iter_mut().enumerate() {
+                *b = (j as u32)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(i as u32) as u8;
+            }
+            block[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            f.write_all(&block).unwrap();
+        }
+    }
+    let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
+
+    for pass in 0..passes {
+        let dest = TempDir::new("big-dest");
+        let start = Instant::now();
+        let result = fetch_dir_with(&node_b, a_id, &manifest_ref, dest.path(), options).await;
+        let elapsed = start.elapsed();
+        match result {
+            Ok(stats) => {
+                let mib = stats.bytes as f64 / (1024.0 * 1024.0);
+                println!(
+                    "  pass {pass}: {mb} MiB file in {elapsed:.2?} = {:.1} MiB/s",
+                    mib / elapsed.as_secs_f64()
+                );
+                assert_eq!(stats.bytes, (mb * 1024 * 1024) as u64);
+            }
+            Err(e) => println!("  pass {pass}: {mb} MiB file FAILED after {elapsed:.2?}: {e}"),
+        }
+    }
+}
+
+/// A file of several chunks arrives byte-for-byte through the parallel
+/// chunk path (several chunks in flight, written in manifest order),
+/// within the default in-flight budget. Each MiB differs, so no chunk
+/// dedupes and order mistakes can't hide
+/// (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` Phase 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_transfer_fetches_a_large_file_s_chunks_in_parallel() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+
+    // 24 MiB = 6 chunks; every MiB tagged with its index.
+    let mut big = vec![0u8; 24 * 1024 * 1024];
+    for (mib, block) in big.chunks_mut(1024 * 1024).enumerate() {
+        for (j, b) in block.iter_mut().enumerate() {
+            *b = (j as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(mib as u32) as u8;
+        }
+        block[..8].copy_from_slice(&(mib as u64).to_le_bytes());
+    }
+    let src = TempDir::new("par-src");
+    write(src.path(), "big.bin", &big);
+    write(src.path(), "note.txt", b"beside the big one");
+
+    let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
+    let dest = TempDir::new("par-dest");
+    let stats = fetch_dir(&node_b, a_id, &manifest_ref, dest.path(), 0)
+        .await
+        .expect("fetch_dir");
+    assert_eq!(stats.files, 2);
+    assert_eq!(
+        read_tree(dest.path()),
+        read_tree(src.path()),
+        "chunks fetched in parallel must be written in manifest order"
+    );
+}
+
+/// A chunk fetch from a holder that never answers fails on SILENCE
+/// (`TRANSFER_CHUNK_IDLE_TIMEOUT`, 15 s), not after the old fixed 30 s —
+/// and a slow but moving fetch is never cut off by it (the 190 MiB
+/// benchmark runs well past 15 s at the old rate and completes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chunk_fetch_from_a_silent_holder_fails_on_the_idle_limit() {
+    use net::adapter::net::TRANSFER_CHUNK_IDLE_TIMEOUT;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    // A serves nothing: no blob-transfer engine, so it drops the request.
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new())));
+    node_b.serve_blob_transfer(adapter_b);
+
+    let start = Instant::now();
+    let err = node_b
+        .transfer_fetch_chunk(node_a.node_id(), [0x5a; 32])
+        .await
+        .expect_err("a silent holder must not produce bytes");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= TRANSFER_CHUNK_IDLE_TIMEOUT && elapsed < Duration::from_secs(25),
+        "should fail at the idle limit, took {elapsed:?}: {err}"
+    );
+    assert!(err.to_string().contains("no data for"), "{err}");
 }
