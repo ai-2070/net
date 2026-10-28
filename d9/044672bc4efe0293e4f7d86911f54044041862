@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/transport.rs
+  s_aa25bb779f3858::t_13b41b6e13ea30 209-215,1047-1070
+  s_aa25bb779f3858::t_63af175ca02a66 1107-1141
+  s_aa25bb779f3858::t_4e5292443d1e07 1071-1072
+.github/workflows/ci.yml
+  s_aa25bb779f3858::t_5254881cd5ebfd 6569-6579
+net/crates/net/Cargo.toml
+  s_aa25bb779f3858::t_13b41b6e13ea30 465-470
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_fb0d59b0565f0a 351-362
+net/crates/net/Cargo.lock
+  s_aa25bb779f3858::t_20720da27c8fe5 3305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d9044672bc4efe0293e4f7d86911f54044041862",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
