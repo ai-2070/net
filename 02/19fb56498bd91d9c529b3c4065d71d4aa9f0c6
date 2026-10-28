@@ -1,0 +1,21 @@
+net/crates/net/sdk-ts/test/redex.test.ts
+  s_aa25bb779f3858::t_635a3850d5b313 124-139
+net/crates/net/sdk-ts/src/cortex.ts
+  s_aa25bb779f3858::t_de85444b0d4276 174-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0219fb56498bd91d9c529b3c4065d71d4aa9f0c6",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
