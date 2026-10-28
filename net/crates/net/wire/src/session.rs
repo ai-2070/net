@@ -699,6 +699,20 @@ impl NetSession {
         out
     }
 
+    /// This side's SEND half of `stream_id` is giving up on purpose: the
+    /// next retransmit tick sends the peer a `StreamReset` (the frame
+    /// that announces exactly that), so its pending read fails fast.
+    /// Returns `false` when no such stream is open.
+    pub fn abandon_stream_send(&self, stream_id: u64) -> bool {
+        match self.streams.get(&stream_id) {
+            Some(stream) => {
+                stream.value().with_reliability(|r| r.abandon_send());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Record that `stream_id`'s RECEIVE half ended locally, so the
     /// peer is told instead of waiting on data that will never come
     /// (NR2/NR4).

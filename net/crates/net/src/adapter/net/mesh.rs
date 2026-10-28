@@ -47664,6 +47664,18 @@ impl MeshNode {
         engine
     }
 
+    /// Give up sending on `stream_id` to `peer` on purpose, and tell the
+    /// peer: the next retransmit tick sends it a `StreamReset`, so a read
+    /// it has pending on that stream fails now rather than at its own
+    /// timeout. Returns `false` when there is no session or no such
+    /// stream. Used by the blob-transfer holder when it cannot push the
+    /// rest of a chunk.
+    pub fn abandon_stream_send(&self, peer: u64, stream_id: u64) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|p| p.value().session.abandon_stream_send(stream_id))
+    }
+
     /// Fetch the chunk addressed by `hash` from `holder` over a
     /// reliable, scheduled transfer stream — bytes move over the
     /// FairScheduler-managed stream transport, not RedEX replication or

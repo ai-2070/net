@@ -349,16 +349,17 @@ impl BlobTransferEngine {
         self.remove_and_close(stream_id)
     }
 
-    /// The holder's reliable layer gave up retransmitting this transfer
-    /// stream (STREAM_RETRANSMIT H-3 reset). Fail the pending read now
-    /// with a distinct error so the caller can fail over to another
-    /// holder immediately instead of waiting for the 30 s timeout.
-    /// No-op if the transfer already settled.
+    /// The holder gave up sending on this transfer stream — its reliable
+    /// layer exhausted retransmits (STREAM_RETRANSMIT H-3), or it stopped
+    /// mid-chunk on purpose (`MeshNode::abandon_stream_send`). Fail the
+    /// pending read now with a distinct error so the caller can retry or
+    /// fail over at once instead of waiting out the idle limit. No-op if
+    /// the transfer already settled.
     pub fn on_reset(&self, stream_id: u64) {
         self.finish(
             stream_id,
             Err(BlobError::Backend(
-                "transfer: holder reset stream (retransmit exhausted)".into(),
+                "transfer: holder reset the stream (it gave up sending)".into(),
             )),
         );
     }
@@ -632,10 +633,16 @@ async fn serve_chunk(
                         .await
                         .is_err()
                     {
+                        // Giving up mid-chunk: tell the requester, so it
+                        // retries now instead of waiting out its idle
+                        // limit on bytes that will never come.
+                        mesh.abandon_stream_send(requester, stream_id);
                         break;
                     }
                     offset = end;
                 }
+            } else {
+                mesh.abandon_stream_send(requester, stream_id);
             }
         }
         Err(_) => {

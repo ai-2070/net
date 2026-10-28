@@ -201,6 +201,15 @@ pub trait ReliabilityMode: Send + Sync {
         false
     }
 
+    /// The SENDER is giving up on this stream on purpose — the
+    /// application stopped mid-send (e.g. a blob holder that could not
+    /// push the rest of a chunk). Raises the same flag a retransmit
+    /// give-up does, so the next retransmit tick tells the peer with a
+    /// `StreamReset` and its pending read fails now instead of waiting
+    /// out a timeout. Default no-op: fire-and-forget never promised
+    /// delivery, so there is nothing to retract.
+    fn abandon_send(&mut self) {}
+
     /// The receiver's cumulative ack — the lowest sequence not yet
     /// contiguously received (`next_expected`). The peer piggybacks this
     /// on its window grants so the sender can prune (H-9). Default 0
@@ -1371,6 +1380,10 @@ impl ReliabilityMode for ReliableStream {
 
     fn take_failed(&mut self) -> bool {
         std::mem::take(&mut self.failed)
+    }
+
+    fn abandon_send(&mut self) {
+        self.failed = true;
     }
 
     #[inline]

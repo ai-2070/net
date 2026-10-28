@@ -1052,3 +1052,55 @@ async fn a_chunk_fetch_from_a_silent_holder_fails_on_the_idle_limit() {
     );
     assert!(err.to_string().contains("no data for"), "{err}");
 }
+
+/// A holder that gives up mid-chunk tells the requester
+/// (`MeshNode::abandon_stream_send` → `StreamReset`), so the pending fetch
+/// fails at once — for a retry — instead of waiting out the 15 s idle
+/// limit on bytes that will never come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_that_gives_up_resets_the_requester_s_fetch_at_once() {
+    use net::adapter::net::{Reliability, StreamConfig, TRANSFER_CHUNK_IDLE_TIMEOUT};
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let (a_id, b_id) = (node_a.node_id(), node_b.node_id());
+    // A serves nothing, so the request goes unanswered until A gives up.
+    let engine_b =
+        node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    let fetch = {
+        let node_b = node_b.clone();
+        tokio::spawn(async move {
+            let start = Instant::now();
+            let result = node_b.transfer_fetch_chunk(a_id, [0x6b; 32]).await;
+            (result, start.elapsed())
+        })
+    };
+    // The transfer's stream id, once B has registered it.
+    let stream_id = loop {
+        if let Some(status) = engine_b.list_pending().first() {
+            break status.stream_id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // A opens its send half of that stream and gives up on it.
+    node_a
+        .open_stream(
+            b_id,
+            stream_id,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .expect("open A's half of the transfer stream");
+    assert!(node_a.abandon_stream_send(b_id, stream_id));
+
+    let (result, elapsed) = fetch.await.unwrap();
+    let err = result.expect_err("an abandoned transfer must not produce bytes");
+    assert!(err.to_string().contains("gave up sending"), "{err}");
+    assert!(
+        elapsed < TRANSFER_CHUNK_IDLE_TIMEOUT / 3,
+        "the reset should fail the fetch well before the idle limit, took {elapsed:?}"
+    );
+    assert!(!node_a.abandon_stream_send(b_id, 0xdead), "no such stream");
+}
