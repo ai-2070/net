@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_aa25bb779f3858::t_bdcd30aeb6bc56 403-404
+net/crates/net/sdk/src/tool.rs
+  s_aa25bb779f3858::t_09cd32c4ec0a98 261-262
+docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md
+  s_aa25bb779f3858::t_54ba714b85084a 431-435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4351de8e884aef5d6924796de7caa966a832ef10",
+  "prompts": {},
+  "sessions": {
+    "s_aa25bb779f3858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a47efe3-b92b-48a8-8b94-b2caeb8e7bce",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
