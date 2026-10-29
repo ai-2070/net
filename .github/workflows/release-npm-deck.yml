@@ -119,7 +119,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
           registry-url: "https://registry.npmjs.org"
 
       - name: Install Rust
@@ -243,7 +243,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
           registry-url: "https://registry.npmjs.org"
 
       - name: Verify parent version matches tag
