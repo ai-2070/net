@@ -1,0 +1,73 @@
+.github/workflows/skills.yml
+  s_258b0a291f4d09::t_c3d53b15479298 263,374
+net/crates/net/bindings/go/net-ffi/exports.shipped.baseline
+  s_258b0a291f4d09::t_c3d53b15479298 9
+.github/workflows/release-npm-sdk.yml
+  s_258b0a291f4d09::t_c3d53b15479298 42
+renovate.json
+  s_258b0a291f4d09::t_c3d53b15479298 3-5,8-26
+.github/workflows/release-npm.yml
+  s_258b0a291f4d09::t_c3d53b15479298 55,200
+net/crates/net/bindings/go/net-ffi/exports.baseline
+  s_258b0a291f4d09::t_c3d53b15479298 15
+.github/workflows/natsim.yml
+  s_258b0a291f4d09::t_c3d53b15479298 187
+.github/workflows/release-npm-deck.yml
+  s_258b0a291f4d09::t_c3d53b15479298 122,246
+net/crates/net/browser-ts/demo/package.json
+  s_258b0a291f4d09::t_c3d53b15479298 11
+net/crates/net/Cargo.toml
+  s_258b0a291f4d09::t_c3d53b15479298 377,421
+.github/workflows/web.yml
+  s_258b0a291f4d09::t_c3d53b15479298 99,279
+.github/workflows/ci.yml
+  s_258b0a291f4d09::t_c3d53b15479298 3728,3904,5244,6248,7735,7946,8385,8527
+net/crates/net/bindings/node/package.json
+  s_258b0a291f4d09::t_c3d53b15479298 91
+net/crates/net/sdk-ts/package.json
+  s_258b0a291f4d09::t_c3d53b15479298 57
+net/crates/net/tests/c_abi/SURFACE.md
+  s_258b0a291f4d09::t_8993d1a33a8cb6 14,257-258
+.github/workflows/release-npm-browser.yml
+  s_258b0a291f4d09::t_c3d53b15479298 86
+.github/workflows/release-npm-cli.yml
+  s_258b0a291f4d09::t_c3d53b15479298 132,268
+web/package.json
+  s_258b0a291f4d09::t_c3d53b15479298 60-61,65-68,70,84-85,114,125,133
+net/crates/net/Cargo.lock
+  s_258b0a291f4d09::t_a10d814ce9b531 279,281,1180,1182,1242,1244,1369,1371,1579,1581,1662,1664,1667,1710,1775-1794,2770,3834,3836,4029,4031,4034,4040,4042,4050,4052,4063,4065,4070-4079,4335,4358,4711,4713,4886,4906,4908,4912-4913,4954,4956,4962,5028,5152,5308,5310,5744,6014,6016,6024,6026-6027,6653
+net/crates/net/examples/browser-demo/host/Cargo.lock
+  s_258b0a291f4d09::t_04835dfcacb89e 915-934,2270,2272,2276-2277
+net/crates/net/fuzz/Cargo.lock
+  s_258b0a291f4d09::t_c88f0e698f3da7 192,194,366,368,510-529,1484,1486,1490-1491,1609,1611
+net/crates/net/guards/fixtures_off_probe/Cargo.lock
+  s_258b0a291f4d09::t_0d4ad9c71b12c0 180,182,351,353,478-497,1141,1143,1147-1148,1266,1268
+net/crates/net/guards/org_api_probe/Cargo.lock
+  s_258b0a291f4d09::t_42ffd9dc8f7242 180,182,351,353,499-518,1221,1223,1227-1228,1346,1348
+net/crates/net/leaf/Cargo.lock
+  s_258b0a291f4d09::t_3e2b0e2cc98a87 169,171,343,345,1088,1090
+net/crates/net/tests/feature_consumer/Cargo.lock
+  s_258b0a291f4d09::t_091983da8bf326 782-801,1736,1738,1742-1743
+net/crates/net/tests/natsim/browser/Cargo.lock
+  s_258b0a291f4d09::t_87103f6f856afa 915-934,2269,2271,2275-2276
+net/crates/net/tests/rtc_browser/runner/Cargo.lock
+  s_258b0a291f4d09::t_263880ed9fb499 930-949,2313,2315,2319-2320
+web/bun.lock
+  s_258b0a291f4d09::t_d2d5a2541e323c 46-47,51-54,56,70-71,100,111,119,150,158,164,324,418,420,424,586,588,590,592,594,596,598,600,602,604,606,608,610,612,614,616,618,620,622,624,626,628,630,632,634,638,640,642,644,646,648,650,652,654,658,660,662,664,666,668,670,672,774,776,778,780,830,848,850,852,854,856,858,860,862,864,866,980,990,1002,1146,1186,1274,1282,1570,1574,1698,1700,1702,1704,1734,1836,1838,1950,2102,2120,2122,2176,2226,2232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "505bbba28a01bd4ec32274cfb979a8751b1da0c8",
+  "prompts": {},
+  "sessions": {
+    "s_258b0a291f4d09": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1930a-5af4-7ad0-a7cc-794aaf86680b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
