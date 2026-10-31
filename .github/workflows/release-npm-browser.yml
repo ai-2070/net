@@ -66,12 +66,12 @@ jobs:
         with:
           shared-key: leaf-wasm
           workspaces: net/crates/net/leaf -> target
-      # Exactly the leaf's pinned `wasm-bindgen = "=0.2.129"`; a mismatched
+      # Exactly the leaf's pinned `wasm-bindgen = "=0.2.130"`; a mismatched
       # CLI is a hard error.
-      - name: Install wasm-bindgen-cli 0.2.129
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       - name: Build the leaf bundle
         working-directory: net/crates/net/leaf
