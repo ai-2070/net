@@ -374,7 +374,7 @@ foldhash = "0.2"
 # Capability-fold inverted-index buckets (CAPABILITY_FOLD_SCALE_PLAN.md
 # Slice 7): compressed bitmaps over dense per-entry slots. `std` only; the
 # nightly `simd` feature stays off. Receiver-local, never a wire format.
-roaring = { version = "0.11", default-features = false, features = ["std"] }
+roaring = { version = "0.12", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"], optional = true }
 # X25519 DH for the `IdentityEnvelope` sealed-box construction used
 # by daemon migration. We derive an ephemeral pubkey, DH against the
@@ -418,7 +418,7 @@ igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # JetStream adapter (optional)
-async-nats = { version = "0.50", optional = true }
+async-nats = { version = "0.51", optional = true }
 
 # RedEX adapter (optional)
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
