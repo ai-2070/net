@@ -162,7 +162,7 @@ Bump to 0.46.0 and rebuild.
 
 ---
 
-Released 2026-11-01.
+Released 2026-10-31.
 
 ## License
 
