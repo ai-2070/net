@@ -1,0 +1,35 @@
+.github/scripts/check-c-abi.py
+  s_d8b00bedd146e9::t_f2df7effb1bcbb 66
+.github/workflows/ci.yml
+  s_d8b00bedd146e9::t_0af7d1539f4754 5446,5453
+net/crates/net/docs/releases/RELEASE_v0.46_HERE_I_GO_AGAIN.md
+  s_d8b00bedd146e9::t_8e57d03e5e5de8 161
+net/crates/net/tests/c_abi/breaks.toml
+  s_d8b00bedd146e9::t_6be89f679b337f 5
+web/src/content/docs/releases/RELEASE_v0.46_HERE_I_GO_AGAIN.md
+  s_d8b00bedd146e9::t_07122599749267 165
+web/src/content/docs/start/install/_shared.md
+  s_d8b00bedd146e9::t_077a300bbeb2cd 29
+web/src/content/docs/start/install/python.md
+  s_d8b00bedd146e9::t_221ee4c049c1d8 8
+web/src/content/docs/start/install/rust.md
+  s_d8b00bedd146e9::t_9a40fe52e3886c 11,15-16,56
+web/src/content/docs/start/install/typescript.md
+  s_d8b00bedd146e9::t_263c326b297fd1 8,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "046de73aaadf57c2b428041b0be7739c79ea6d26",
+  "prompts": {},
+  "sessions": {
+    "s_d8b00bedd146e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a30cecd-cb1a-43c7-8982-6b2e60556baa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
