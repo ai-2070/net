@@ -1,0 +1,20 @@
+.github/workflows/natsim.yml
+  s_258b0a291f4d09::t_2fd10787219a06 185-190,192,229-232
+  s_258b0a291f4d09::t_804cd57792ac59 233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b3d73c955d03a8aa2e4aa0fa5c17ac5b77f2a389",
+  "prompts": {},
+  "sessions": {
+    "s_258b0a291f4d09": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1930a-5af4-7ad0-a7cc-794aaf86680b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
