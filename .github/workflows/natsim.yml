@@ -182,9 +182,14 @@ jobs:
         with:
           tool: wasm-bindgen-cli@0.2.129
 
-      - uses: actions/setup-node@v7
+      # Playwright 1.56 uses a zip extractor that hangs on Node 26 after
+      # downloading a browser (microsoft/playwright#40724). Keep the pinned
+      # browser builds used by the NAT rows; install them under Node 22,
+      # then restore Node 26 before executing the scenario matrix.
+      - name: Use Node 22 for the pinned browser installer
+        uses: actions/setup-node@v7
         with:
-          node-version: "26"
+          node-version: "22"
 
       - name: Build the leaf bundle
         working-directory: net/crates/net/leaf
@@ -220,6 +225,11 @@ jobs:
           pinned=$(node -p "require('./package.json').dependencies['playwright-core']")
           echo "driver pins playwright-core $pinned"
           npx --yes "playwright@$pinned" install --with-deps chromium firefox
+
+      - name: Use Node 26 for the scenario matrix
+        uses: actions/setup-node@v7
+        with:
+          node-version: "26"
 
       - name: Build helper + test binaries
         working-directory: net/crates/net
