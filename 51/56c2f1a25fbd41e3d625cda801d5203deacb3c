@@ -1,0 +1,19 @@
+docs/internal/plans/POST_QUANTUM_ENCRYPTION_PLAN.md
+  s_7bc7fc4f33302c::t_b98a2f8152ce37 1-587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5156c2f1a25fbd41e3d625cda801d5203deacb3c",
+  "prompts": {},
+  "sessions": {
+    "s_7bc7fc4f33302c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19357-74ee-7ed1-b650-f43405efd37a",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
