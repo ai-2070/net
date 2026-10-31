@@ -52,9 +52,10 @@ use tokio::time::Instant as UpgradeInstant;
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
 use super::identity::{
-    decode_identity_proof, encode_identity_proof, proof_transcript, verify_proof, EntityId,
-    EntityKeypair, IdentityChallengeStore, IdentityProofMsg, IdentityProofReject, PermissionToken,
-    RevocationRegistry, TokenCache, TokenChain, TokenScope, SUBPROTOCOL_IDENTITY_PROOF,
+    decode_identity_proof, encode_identity_proof, proof_transcript, verify_proof, EntityError,
+    EntityId, EntityKeypair, IdentityChallengeStore, IdentityProofMsg, IdentityProofReject,
+    PermissionToken, RevocationRegistry, TokenCache, TokenChain, TokenScope,
+    SUBPROTOCOL_IDENTITY_PROOF,
 };
 use super::pool::PacketBuilder;
 
@@ -2342,6 +2343,9 @@ struct DispatchCtx {
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
+    /// Cleared when a routed rotation replaces a peer's session.
+    #[cfg(feature = "cortex")]
+    reply_cache: PeerReplyCache,
     /// `0x0D02` intake: the budget and the engine's input. Both
     /// `None` on a node without RTC configured, which is what makes
     /// the dispatch arm inert there.
@@ -3067,6 +3071,53 @@ pub(crate) enum IdentityProofReply {
     },
 }
 
+/// Suffix of the error a single-packet publish returns when the stream's
+/// send window is full (`TxAdmit::WindowFull`). That is pressure, not a
+/// fault: the window refills as the peer receives. Matched by
+/// [`is_publish_backpressure`]; keep the two together.
+pub(super) const PUBLISH_BACKPRESSURED: &str = "backpressured";
+
+/// Whether a publish failed only because the stream's send window was
+/// full, so waiting and retrying will succeed once the peer catches up.
+pub(super) fn is_publish_backpressure(e: &AdapterError) -> bool {
+    matches!(e, AdapterError::Connection(m) if m.ends_with(PUBLISH_BACKPRESSURED))
+}
+
+/// The error a best-effort roster publish returns when no subscriber got
+/// the payload. When every failure was backpressure, it still reads as
+/// backpressure to [`is_publish_backpressure`]: nothing was delivered, so
+/// waiting and retrying is safe, and a streamed reply that rides the
+/// roster (a caller with no pinned direct route) must wait for the window
+/// like a direct one instead of losing the chunk. The aggregate used to
+/// end in `...backpressured)` and so read as a hard failure.
+fn roster_publish_failure(attempted: usize, errors: &[(u64, AdapterError)]) -> AdapterError {
+    let Some((id, first)) = errors.first() else {
+        return AdapterError::Connection("all peers failed".into());
+    };
+    let mut message = format!("all {attempted} peers failed (first: {id:#x}: {first})");
+    if errors.iter().all(|(_, e)| is_publish_backpressure(e)) {
+        message.push_str("; every peer ");
+        message.push_str(PUBLISH_BACKPRESSURED);
+    }
+    AdapterError::Connection(message)
+}
+
+/// A blob-transfer chunk fetch gives up after this long with no packet
+/// from the holder (`MeshNode::transfer_fetch_chunk`). Progress resets
+/// it, so it bounds a stall, not a transfer.
+pub const TRANSFER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often a pending chunk fetch checks for silence. Read only by the
+/// `dataforts` transfer path, so gated with it (a narrower build would
+/// fail `-D dead-code`).
+#[cfg(feature = "dataforts")]
+const TRANSFER_CHUNK_IDLE_POLL: Duration = Duration::from_millis(500);
+
+/// BLAKE3 KDF context for [`NoiseStaticKey::derive_from_identity`].
+/// Changing it changes every derived node's Noise key (and so its
+/// rendezvous address); bump the version instead of editing it.
+pub const NOISE_STATIC_KEY_CONTEXT: &str = "net-noise-static-key-v1";
+
 /// A caller-owned Noise static private key (X25519). The public half is
 /// derived from it, so a stored key can never be paired with the wrong
 /// public key. `Debug` is redacted; the bytes are wiped on drop.
@@ -3077,6 +3128,29 @@ impl NoiseStaticKey {
     /// Wrap a stored private key.
     pub fn from_private(private: [u8; 32]) -> Self {
         Self(private)
+    }
+
+    /// Derive the Noise key from an identity, so a node rebuilt from the
+    /// same identity seed keeps the same Noise key — and therefore the
+    /// same rendezvous address — across restarts, with no second secret
+    /// to store.
+    ///
+    /// A domain-separated BLAKE3 KDF over the ed25519 seed: the result
+    /// never equals the signing secret, and the context string is
+    /// versioned so the derivation can change without colliding. Every
+    /// construction path gets it from [`MeshNode::new`] (for a node whose
+    /// [`MeshNodeConfig::configured_identity`] is set); the golden vector in
+    /// `a_derived_noise_key_follows_the_identity_seed` pins it.
+    ///
+    /// Trade-off: rotating this key means rotating the identity. Callers
+    /// who want them independent supply [`Self::from_private`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`EntityError::ReadOnly`] if `identity` is public-only.
+    pub fn derive_from_identity(identity: &EntityKeypair) -> Result<Self, EntityError> {
+        let seed = identity.try_secret_bytes()?;
+        Ok(Self(blake3::derive_key(NOISE_STATIC_KEY_CONTEXT, seed)))
     }
 
     /// The public key peers pin (what a contact's `noise_pubkey` names).
@@ -3361,10 +3435,14 @@ pub struct MeshNodeConfig {
     /// its apply reports success. `None` keeps floors in memory only — a
     /// restart then forgets them until they are redelivered.
     pub subnet_floor_store: Option<std::path::PathBuf>,
-    /// The node's Noise static key. `None` (the default) generates a fresh
-    /// one per [`MeshNode::new`]; a node whose key other nodes pin (e.g. an
-    /// enrolling node, whose invites and bundles name it) must supply its
-    /// stored key, or every restart strands the nodes that pinned it.
+    /// The node's Noise static key. `None` (the default): [`MeshNode::new`]
+    /// derives one from the identity when [`Self::configured_identity`] is
+    /// set ([`NoiseStaticKey::derive_from_identity`]), so a node restarted
+    /// with the same identity answers on the same rendezvous, and otherwise
+    /// generates a fresh one per start. A node whose key other nodes pin
+    /// (e.g. an enrolling node, whose invites and bundles name it) and
+    /// whose identity is not configured must supply its stored key here,
+    /// or every restart strands the nodes that pinned it.
     pub static_key: Option<NoiseStaticKey>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
@@ -4882,12 +4960,63 @@ fn evict_failed_peer_channel_state(
     #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
 ) {
     #[cfg(feature = "cortex")]
-    rpc_peer_failure_gen.bump(node_id);
+    invalidate_peer_reply_subscriptions(
+        node_id,
+        rpc_reply_subscriptions,
+        rpc_corrective_announced,
+        rpc_peer_failure_gen,
+    );
     subscriber_chains.retain(|(nid, _), _| *nid != node_id);
-    #[cfg(feature = "cortex")]
+}
+
+/// Forget that we subscribed to `node_id`'s reply channels, so the next
+/// call to it re-subscribes (and may re-announce). The caller-side half
+/// of [`evict_failed_peer_channel_state`], with the same bump-first
+/// ordering and for the same reason (see there).
+///
+/// Also run when a peer's session is REPLACED, not only when it fails:
+/// a peer that restarts and re-handshakes before the failure detector
+/// fires comes back with an empty roster, so a cached "subscribed" entry
+/// makes every call to it skip the re-subscribe and its replies are
+/// dropped — calls time out until the entry is somehow evicted.
+/// Re-subscribing is idempotent at the publisher, so clearing this on a
+/// plain rekey of a live peer costs one extra subscribe and nothing
+/// else. Deliberately NOT the full eviction: a replacement must keep the
+/// peer's retained subscribe credentials (`subscriber_chains`).
+#[cfg(feature = "cortex")]
+fn invalidate_peer_reply_subscriptions(
+    node_id: u64,
+    rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), ReplySubscription>,
+    rpc_corrective_announced: &dashmap::DashSet<u64>,
+    rpc_peer_failure_gen: &PeerFailureGenerations,
+) {
+    rpc_peer_failure_gen.bump(node_id);
     rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
-    #[cfg(feature = "cortex")]
     rpc_corrective_announced.remove(&node_id);
+}
+
+/// The caller-side reply-subscription cache, as one cloneable handle for
+/// the paths that replace a peer's session (the node's install path and
+/// the dispatch-side routed rotation).
+#[cfg(feature = "cortex")]
+#[derive(Clone)]
+struct PeerReplyCache {
+    subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>>,
+    corrective_announced: Arc<dashmap::DashSet<u64>>,
+    failure_gen: Arc<PeerFailureGenerations>,
+}
+
+#[cfg(feature = "cortex")]
+impl PeerReplyCache {
+    /// See [`invalidate_peer_reply_subscriptions`].
+    fn on_session_replaced(&self, node_id: u64) {
+        invalidate_peer_reply_subscriptions(
+            node_id,
+            &self.subscriptions,
+            &self.corrective_announced,
+            &self.failure_gen,
+        );
+    }
 }
 
 /// One caller-side reply subscription, plus the peer-failure generation
@@ -12674,6 +12803,12 @@ pub struct MeshNode {
     /// install it on a running node.
     #[cfg(any(test, feature = "fixtures"))]
     sensing_dark_drop_observer: SensingDarkDropSlot,
+    /// Fixtures-only loss injection on the single-packet publish path
+    /// (`try_publish_to_peer_bound`): when `n > 0`, every `n`-th
+    /// RELIABLE packet is treated as sent but never reaches the socket —
+    /// a wire loss as both ends see it. `[n, counter]`.
+    #[cfg(any(test, feature = "fixtures"))]
+    publish_test_drop: [std::sync::atomic::AtomicU64; 2],
     /// Fixtures-only observation of the unary nRPC serve bridge's
     /// hand-off to the fold, in hand-off order. Held on the node
     /// rather than on the handle so a witness may install it before
@@ -13995,8 +14130,26 @@ impl MeshNode {
             }
         };
 
+        // The Noise static key, decided once here for every construction
+        // path (SDK, bindings, FFI, CLI): an explicit key wins; a
+        // caller-configured identity derives one, so the node answers on
+        // the same rendezvous after a restart; otherwise a fresh key.
         let static_keypair = match &config.static_key {
             Some(key) => key.keypair(),
+            None if config.configured_identity => {
+                match NoiseStaticKey::derive_from_identity(&identity) {
+                    Ok(key) => key.keypair(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "noise static key: cannot derive from the configured identity; \
+                             using a fresh key, so peers that pinned this node's key must \
+                             re-pair after a restart"
+                        );
+                        StaticKeypair::generate()
+                    }
+                }
+            }
             None => StaticKeypair::generate(),
         };
 
@@ -15011,6 +15164,8 @@ impl MeshNode {
             #[cfg(any(test, feature = "fixtures"))]
             sensing_dark_drop_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
+            publish_test_drop: Default::default(),
+            #[cfg(any(test, feature = "fixtures"))]
             rpc_dispatch_observer: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             org_egress_send_observer: Arc::new(parking_lot::Mutex::new(None)),
@@ -15734,6 +15889,29 @@ impl MeshNode {
     /// receiver's own event, and it is the only thing that can tell those
     /// apart. It acknowledges nothing on the wire: no reply, no retry, no
     /// reliability, and the plane stays dark.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn set_publish_drop_every_n_for_test(&self, n: u64) {
+        self.publish_test_drop[0].store(n, Ordering::Relaxed);
+        self.publish_test_drop[1].store(0, Ordering::Relaxed);
+    }
+
+    /// Fixtures-only: how many reliable packets the publish-path loss
+    /// injection has seen since it was last armed (so a witness can tell
+    /// "nothing was dropped" from "drops were recovered").
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn publish_drop_seen_for_test(&self) -> u64 {
+        self.publish_test_drop[1].load(Ordering::Relaxed)
+    }
+
+    /// Fixtures-only: see `publish_test_drop`.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn publish_test_should_drop(&self) -> bool {
+        let n = self.publish_test_drop[0].load(Ordering::Relaxed);
+        n > 0 && (self.publish_test_drop[1].fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(n)
+    }
+
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn set_sensing_dark_drop_observer_for_test(&self, observer: SensingDarkDropObserver) {
@@ -20585,6 +20763,45 @@ impl MeshNode {
             .is_some_and(|p| !p.session.heard_within(self.config.session_timeout))
     }
 
+    /// How long a peer's re-handshake can be deferred by the responder's
+    /// C3 busy gate (`routed_rotation_outcome`): an authenticated inbound
+    /// packet within this window, on a busy session, defers the rotation.
+    /// Three heartbeat intervals, capped at `session_timeout`.
+    ///
+    /// A peer that restarted reaches a survivor that still holds its old
+    /// session only after this much silence, so an initiator re-attaching
+    /// after a restart should keep retrying for at least this long (plus
+    /// one handshake attempt) — assuming the far side runs the same
+    /// heartbeat settings, which is the only estimate it has.
+    pub fn session_rotation_defer_window(&self) -> Duration {
+        self.config
+            .heartbeat_interval
+            .saturating_mul(3)
+            .min(self.config.session_timeout)
+    }
+
+    /// Has the session with `node_id` carried authenticated inbound
+    /// traffic (heartbeats included) within
+    /// [`Self::session_rotation_defer_window`]? `false` when there is no
+    /// session.
+    ///
+    /// Not proof that the peer still holds the session: a peer that has
+    /// just restarted lost it, but the traffic it sent before going down
+    /// keeps this `true` for up to the whole window. To learn whether the
+    /// peer is still using a session, dial it and see whether it keeps
+    /// speaking on the old one meanwhile ([`Self::peer_session_heard_within`]).
+    pub fn peer_session_is_live(&self, node_id: u64) -> bool {
+        self.peer_session_heard_within(node_id, self.session_rotation_defer_window())
+    }
+
+    /// Has the session with `node_id` carried authenticated inbound
+    /// traffic within `window`? `false` when there is no session.
+    pub fn peer_session_heard_within(&self, node_id: u64, window: Duration) -> bool {
+        self.peers
+            .get(&node_id)
+            .is_some_and(|p| p.session.heard_within(window))
+    }
+
     /// A pending unary call must not outlive its receive incarnation. The
     /// table can retain a retired session (notably on shutdown), so identity
     /// alone is insufficient. Advisory inactivity is deliberately not a fence.
@@ -25430,6 +25647,17 @@ impl MeshNode {
             );
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            // A replaced session may be a restarted peer with an empty
+            // roster: forget our reply subscriptions on it so the next
+            // call re-subscribes instead of waiting for replies that
+            // will never be published.
+            #[cfg(feature = "cortex")]
+            invalidate_peer_reply_subscriptions(
+                peer_node_id,
+                &self.rpc_reply_subscriptions,
+                &self.rpc_corrective_announced,
+                &self.rpc_peer_failure_gen,
+            );
             // X10: a REPLACEMENT is a lifetime end like any other,
             // so the displaced session's partial fragment groups go
             // with it. A late endpoint-close notification is not a
@@ -27516,6 +27744,8 @@ impl MeshNode {
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(feature = "cortex")]
+            reply_cache: self.peer_reply_cache(),
             #[cfg(feature = "webrtc")]
             rtc_signal_budget: self
                 .rtc_driver
@@ -27613,11 +27843,7 @@ impl MeshNode {
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
-            busy_liveness: self
-                .config
-                .heartbeat_interval
-                .saturating_mul(3)
-                .min(self.config.session_timeout),
+            busy_liveness: self.session_rotation_defer_window(),
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
@@ -30447,6 +30673,12 @@ impl MeshNode {
                                         .remove_if(&displaced_session_id, |_, n| {
                                             *n == peer_node_id
                                         });
+                                    // As in `install_peer_locked`: a
+                                    // rotation may be a restarted peer, so
+                                    // our reply subscriptions on it are
+                                    // re-established on the next call.
+                                    #[cfg(feature = "cortex")]
+                                    ctx.reply_cache.on_session_replaced(peer_node_id);
                                     // X10: the displaced session's
                                     // lifetime ends here too, so its
                                     // partial fragment groups are
@@ -31299,6 +31531,12 @@ impl MeshNode {
                     // reassembly exists to prevent.
                     if let Some(f) = d.fragment {
                         builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                    }
+                    // Restamp the routing header (channel hash is sticky
+                    // on a pooled builder, so clear it when absent).
+                    builder.set_channel_hash(d.header.map_or(0, |h| h.channel_hash));
+                    if let Some(h) = d.header {
+                        builder.set_origin_hash(h.origin_hash);
                     }
                     let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                     packets.push(p);
@@ -33221,6 +33459,11 @@ impl MeshNode {
                         // header is a partial payload at the peer.
                         if let Some(f) = d.fragment {
                             builder.set_fragment(f.fragment_id, f.fragment_offset, f.frag_flags);
+                        }
+                        // Restamp the routing header (see the NACK path).
+                        builder.set_channel_hash(d.header.map_or(0, |h| h.channel_hash));
+                        if let Some(h) = d.header {
+                            builder.set_origin_hash(h.origin_hash);
                         }
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
                         if sink.send(&addr.frame(&packet), addr.addr).await.is_ok() {
@@ -36207,8 +36450,24 @@ impl MeshNode {
     /// counters be forgotten without opening a hole in the fence. See
     /// [`PeerFailureGenerations`].
     #[cfg(feature = "cortex")]
+    fn peer_reply_cache(&self) -> PeerReplyCache {
+        PeerReplyCache {
+            subscriptions: self.rpc_reply_subscriptions.clone(),
+            corrective_announced: self.rpc_corrective_announced.clone(),
+            failure_gen: self.rpc_peer_failure_gen.clone(),
+        }
+    }
+
+    #[cfg(feature = "cortex")]
     pub(super) fn peer_failure_generation(&self, peer: u64) -> u64 {
         self.rpc_peer_failure_gen.get(peer)
+    }
+
+    /// Test seam: exactly what a session REPLACEMENT (rekey, routed
+    /// rotation, direct upgrade) does to the caller-side reply cache.
+    #[cfg(all(test, feature = "cortex"))]
+    pub(super) fn simulate_session_replaced_for_test(&self, peer: u64) {
+        self.peer_reply_cache().on_session_replaced(peer);
     }
 
     /// Bare subscribe that reports the publisher's rejection reason as
@@ -44723,17 +44982,7 @@ impl MeshNode {
                     && report.delivered == 0
                     && !report.errors.is_empty()
                 {
-                    let first = report
-                        .errors
-                        .first()
-                        .map(|(id, e)| {
-                            format!(
-                                "all {} peers failed (first: {:#x}: {})",
-                                report.attempted, id, e
-                            )
-                        })
-                        .unwrap_or_else(|| "all peers failed".into());
-                    return Err(AdapterError::Connection(first));
+                    return Err(roster_publish_failure(report.attempted, &report.errors));
                 }
                 Ok(report)
             }
@@ -44875,6 +45124,10 @@ impl MeshNode {
         // `DEFAULT_STREAM_WINDOW_BYTES` so publish traffic rides
         // the same v2 byte-credit window as `send_on_stream`.
         session.open_stream_with(stream_id, reliable, 1);
+        // The lifetime this packet belongs to, for the retransmit
+        // registration below (a close+reopen racing this send must not
+        // credit the new lifetime with the old packet).
+        let epoch = session.try_stream(stream_id).map(|s| s.epoch());
 
         // Charge credit on the wire-byte size of the packet we're
         // about to build. The `TxSlotGuard` refunds on Drop unless
@@ -44918,7 +45171,7 @@ impl MeshNode {
                 }
                 TxAdmit::WindowFull => {
                     return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                        "publish: stream {:#x} backpressured",
+                        "publish: stream {:#x} {PUBLISH_BACKPRESSURED}",
                         stream_id
                     )));
                 }
@@ -44994,26 +45247,51 @@ impl MeshNode {
             stream_id, seq, events, flags, 0, /* subprotocol_id 0 = event-plane */
         );
 
-        // A session that crosses a relay hop rides a routing header to its
-        // relay; otherwise the legacy next-hop choice stands.
-        let (wire, next_hop) = if route.header.is_some() {
-            (route.frame(&packet), route.addr)
-        } else {
-            let next_hop = self
-                .router
-                .routing_table()
-                .lookup(peer_node_id)
-                .unwrap_or(dest_addr);
-            (std::borrow::Cow::Borrowed(&packet[..]), next_hop)
-        };
+        // Where every per-peer sender sends: the session's own wire route
+        // (a routing header to its relay when it crosses one). The RTO and
+        // NACK paths resend registered packets to that same route, so the
+        // first copy must go there too. This used to fall back to the
+        // routing table's next hop when there was no header: a stale or
+        // different entry there sent the first copy one way and its
+        // retransmits another (CODE_REVIEW_2026_10_28 AIB-4).
+        let (wire, next_hop) = (route.frame(&packet), route.addr);
 
-        if let Err(e) = self.sink.send(&wire, next_hop).await {
-            return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
-                "publish send failed: {}",
-                e
-            )));
+        #[cfg(any(test, feature = "fixtures"))]
+        let dropped_for_test = reliable && self.publish_test_should_drop();
+        #[cfg(not(any(test, feature = "fixtures")))]
+        let dropped_for_test = false;
+        if !dropped_for_test {
+            if let Err(e) = self.sink.send(&wire, next_hop).await {
+                return PeerPublishOutcome::SendFailed(AdapterError::Connection(format!(
+                    "publish send failed: {}",
+                    e
+                )));
+            }
         }
         guard.commit(); // wire-accepted — bytes now belong to the receiver
+
+        // A RELIABLE packet must be recoverable: register it so the
+        // peer's NACK (or the RTO) resends it. This path flagged its
+        // packets RELIABLE and the receiver held gaps for them, but never
+        // registered them — so one lost datagram on, say, a streamed nRPC
+        // reply left a gap nobody could fill: the receiver stalled behind
+        // it, then dropped what queued after it
+        // (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` 3c).
+        if let Some(epoch) = epoch {
+            Self::register_retransmit(
+                &session,
+                stream_id,
+                epoch,
+                seq,
+                events,
+                flags,
+                None,
+                Some(net_wire::reliability::HeaderStamp {
+                    channel_hash: channel_hash as u16,
+                    origin_hash: self.identity.entity_id().origin_hash(),
+                }),
+            );
+        }
 
         drop(builder);
         session.touch();
@@ -47509,6 +47787,18 @@ impl MeshNode {
         engine
     }
 
+    /// Give up sending on `stream_id` to `peer` on purpose, and tell the
+    /// peer: the next retransmit tick sends it a `StreamReset`, so a read
+    /// it has pending on that stream fails now rather than at its own
+    /// timeout. Returns `false` when there is no session or no such
+    /// stream. Used by the blob-transfer holder when it cannot push the
+    /// rest of a chunk.
+    pub fn abandon_stream_send(&self, peer: u64, stream_id: u64) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|p| p.value().session.abandon_stream_send(stream_id))
+    }
+
     /// Fetch the chunk addressed by `hash` from `holder` over a
     /// reliable, scheduled transfer stream — bytes move over the
     /// FairScheduler-managed stream transport, not RedEX replication or
@@ -47556,20 +47846,36 @@ impl MeshNode {
             )));
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_canceled)) => {
-                engine.cancel_pending(stream_id);
-                Err(BlobError::Backend(
-                    "blob transfer: engine dropped the reply".into(),
-                ))
-            }
-            Err(_elapsed) => {
-                engine.cancel_pending(stream_id);
-                Err(BlobError::NotFound(format!(
-                    "blob transfer: timed out fetching mesh://{}",
-                    Self::blob_hex(&hash)
-                )))
+        // Time out on SILENCE, not total duration: a chunk that keeps
+        // arriving is never cut off however slow the link, and one whose
+        // holder went quiet fails after `TRANSFER_CHUNK_IDLE_TIMEOUT`.
+        // (A fixed 30 s per chunk failed large files on slow links and
+        // still waited the full 30 s for a dead one.)
+        let mut rx = rx;
+        loop {
+            match tokio::time::timeout(TRANSFER_CHUNK_IDLE_POLL, &mut rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_canceled)) => {
+                    engine.cancel_pending(stream_id);
+                    return Err(BlobError::Backend(
+                        "blob transfer: engine dropped the reply".into(),
+                    ));
+                }
+                Err(_poll) => {
+                    // `None`: settled between the poll and this check; the
+                    // reply is about to land, so wait for it.
+                    if engine
+                        .idle_for(stream_id)
+                        .is_some_and(|idle| idle >= TRANSFER_CHUNK_IDLE_TIMEOUT)
+                    {
+                        engine.cancel_pending(stream_id);
+                        return Err(BlobError::NotFound(format!(
+                            "blob transfer: no data for {}s fetching mesh://{}",
+                            TRANSFER_CHUNK_IDLE_TIMEOUT.as_secs(),
+                            Self::blob_hex(&hash)
+                        )));
+                    }
+                }
             }
         }
     }
@@ -49205,14 +49511,15 @@ impl MeshNode {
         self.origin_hash_to_node.get(&origin_hash).map(|v| *v)
     }
 
-    /// Whether a peer entry exists for `node_id`. Once AV-5's production
-    /// caller — a `has_peer_session`-then-`publish_to_peer` pre-check —
-    /// was replaced by the atomic [`Self::try_publish_to_peer`] (R2-6,
-    /// which folds the session-existence check into the single send gate
-    /// with no check-then-act TOCTOU), the only remaining callers are
-    /// tests that assert a node is genuinely disconnected before
-    /// exercising the fallback/drop policies, so this is `#[cfg(test)]`.
-    #[cfg(test)]
+    /// Whether a peer entry exists for `node_id`. Not a send gate: AV-5's
+    /// `has_peer_session`-then-`publish_to_peer` pre-check was replaced by
+    /// the atomic [`Self::try_publish_to_peer`] (R2-6, which folds the
+    /// session-existence check into the single send gate with no
+    /// check-then-act TOCTOU). Its one production use is a retry decision
+    /// in `ensure_reply_subscription`, where a stale answer only costs one
+    /// more subscribe attempt; tests use it to assert a node is genuinely
+    /// disconnected.
+    #[cfg(any(test, feature = "cortex"))]
     pub(super) fn has_peer_session(&self, node_id: u64) -> bool {
         self.peers.contains_key(&node_id)
     }
@@ -50116,6 +50423,7 @@ impl MeshNode {
                         batch,
                         flags,
                         fragment,
+                        None,
                     );
                     *committed_any = true;
                     return Ok(());
@@ -50165,6 +50473,9 @@ impl MeshNode {
     /// scheduler queue is shallow in practice; stamping at dequeue would
     /// need the descriptor visible in the router send loop, which it
     /// isn't, so the enqueue-time stamp is accepted.
+    // Eight plain fields of one descriptor; bundling them would only move
+    // the same list into a struct literal at each of the three callers.
+    #[allow(clippy::too_many_arguments)]
     fn register_retransmit(
         session: &Arc<NetSession>,
         stream_id: u64,
@@ -50173,6 +50484,7 @@ impl MeshNode {
         events: &[Bytes],
         flags: PacketFlags,
         fragment: Option<net_wire::reliability::FragmentStamp>,
+        header: Option<net_wire::reliability::HeaderStamp>,
     ) {
         if !flags.contains(PacketFlags::RELIABLE) {
             return;
@@ -50183,6 +50495,7 @@ impl MeshNode {
             events: events.to_vec(),
             flags,
             fragment,
+            header,
         });
         if let Some(state) = session.try_stream(stream_id) {
             if state.epoch() == epoch {
@@ -50350,6 +50663,7 @@ impl MeshNode {
                             batch,
                             piece_flags,
                             Some(stamp),
+                            None,
                         );
                         *committed_any = true;
                         delivered_bytes = delivered_bytes.saturating_add(piece_bytes);
@@ -56779,6 +57093,113 @@ mod heartbeat_aead_tests {
         assert!(
             !first.peer_session_is_silent(0x1234),
             "no session, not silent"
+        );
+    }
+
+    /// A best-effort roster publish that reached nobody because every
+    /// peer's window was full is still backpressure: the streamed-reply
+    /// retry waits on it. The aggregate used to end in "...backpressured)"
+    /// and read as a hard failure, so a roster-routed chunk was given up at
+    /// once (the Python streaming-backpressure failure on Linux CI). A
+    /// single hard failure among them keeps the aggregate hard.
+    #[test]
+    fn a_roster_failure_that_is_all_backpressure_still_reads_as_backpressure() {
+        let bp = |stream: u64| {
+            AdapterError::Connection(format!(
+                "publish: stream {stream:#x} {PUBLISH_BACKPRESSURED}"
+            ))
+        };
+        let hard = || AdapterError::Connection("publish send failed: refused".into());
+
+        let one = roster_publish_failure(1, &[(0xA, bp(1))]);
+        assert!(is_publish_backpressure(&one), "{one}");
+        assert!(one.to_string().contains("first: 0xa"), "{one}");
+
+        let all = roster_publish_failure(2, &[(0xA, bp(1)), (0xB, bp(1))]);
+        assert!(is_publish_backpressure(&all), "{all}");
+
+        let mixed = roster_publish_failure(2, &[(0xA, bp(1)), (0xB, hard())]);
+        assert!(!is_publish_backpressure(&mixed), "{mixed}");
+
+        let only_hard = roster_publish_failure(1, &[(0xA, hard())]);
+        assert!(!is_publish_backpressure(&only_hard), "{only_hard}");
+        assert!(!is_publish_backpressure(&roster_publish_failure(0, &[])));
+    }
+
+    /// A node rebuilt from the same identity seed derives the same Noise
+    /// key, so its rendezvous address survives a restart. The derived key
+    /// is never the signing secret, differs per identity, and a
+    /// public-only identity is refused.
+    #[tokio::test]
+    async fn a_derived_noise_key_follows_the_identity_seed() {
+        let seed = [0x5au8; 32];
+        let a = NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap();
+        let b = NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap();
+        assert_eq!(a.public_key(), b.public_key());
+        // Golden vector: a change here moves every seeded node's
+        // rendezvous address. Bump `NOISE_STATIC_KEY_CONTEXT` instead.
+        assert_eq!(
+            hex::encode(a.public_key()),
+            "fee5e2c610d5855966121d70a0ebf579b2ff717f001e6d1e05708a2f4a89dd26"
+        );
+        assert_ne!(a.0, seed, "derived key must not be the signing secret");
+        let other =
+            NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes([0x5bu8; 32])).unwrap();
+        assert_ne!(a.public_key(), other.public_key());
+
+        let public_only =
+            EntityKeypair::public_only(EntityKeypair::from_bytes(seed).entity_id().clone());
+        assert!(NoiseStaticKey::derive_from_identity(&public_only).is_err());
+
+        let build = || async {
+            let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [7u8; 32])
+                .with_static_key(
+                    NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap(),
+                );
+            MeshNode::new(EntityKeypair::from_bytes(seed), cfg)
+                .await
+                .unwrap()
+        };
+        assert_eq!(build().await.public_key(), &a.public_key());
+        assert_eq!(build().await.public_key(), &a.public_key());
+    }
+
+    /// AIB-9 (CODE_REVIEW_2026_10_28): `MeshNode::new` itself derives the
+    /// Noise key for a node whose identity is configured, so every
+    /// construction path (SDK, bindings, FFI, CLI) gets the stable key
+    /// without copying the rule. An explicit key still wins, and an
+    /// unconfigured identity still gets a fresh key per start.
+    #[tokio::test]
+    async fn new_derives_the_noise_key_for_a_configured_identity() {
+        let seed = [0x5cu8; 32];
+        let derived =
+            NoiseStaticKey::derive_from_identity(&EntityKeypair::from_bytes(seed)).unwrap();
+        let build = |configured: bool, key: Option<NoiseStaticKey>| async move {
+            let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [7u8; 32]);
+            cfg.configured_identity = configured;
+            if let Some(key) = key {
+                cfg = cfg.with_static_key(key);
+            }
+            MeshNode::new(EntityKeypair::from_bytes(seed), cfg)
+                .await
+                .unwrap()
+        };
+        assert_eq!(build(true, None).await.public_key(), &derived.public_key());
+        assert_eq!(build(true, None).await.public_key(), &derived.public_key());
+
+        let explicit = NoiseStaticKey::from_private([0x43; 32]);
+        assert_eq!(
+            build(true, Some(explicit.clone())).await.public_key(),
+            &explicit.public_key(),
+            "an explicit key wins over the derived one"
+        );
+
+        let unconfigured = build(false, None).await;
+        assert_ne!(unconfigured.public_key(), &derived.public_key());
+        assert_ne!(
+            unconfigured.public_key(),
+            build(false, None).await.public_key(),
+            "an unconfigured identity gets a fresh key per start"
         );
     }
 

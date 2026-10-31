@@ -400,6 +400,8 @@ pub enum CodecDirection {
 ///
 /// Outstanding handler executions (already-spawned tokio tasks)
 /// continue to completion regardless.
+#[must_use = "dropping a ServeHandle unregisters the service at once; \
+              bind it (`let _serve = ...`) for as long as the service should run"]
 pub struct ServeHandle {
     /// Channel hash to unregister on Drop.
     channel_hash: ChannelHash,
@@ -4062,6 +4064,83 @@ fn take_lp(bytes: &[u8]) -> Option<&[u8]> {
     rest.get(len..)
 }
 
+/// How long a streamed chunk waits for a full reply-stream send window
+/// to drain before it is given up on. Generous: a caller that stops
+/// reading is already paced by flow-control credit. Giving up ends the
+/// call: the emitter reports the chunk unsent, the pump stops, and the
+/// caller gets a `PumpFailed` terminal instead of a stream with a hole
+/// (CODE_REVIEW_2026_10_28 AIB-3).
+const STREAM_CHUNK_WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`publish_response_to_caller`] for one non-terminal streamed chunk:
+/// when the reply stream's send window is full, wait for it to refill
+/// and retry, instead of dropping the chunk.
+///
+/// The window is 64 KiB of bytes in flight, and it refills only as the
+/// caller receives. A handler that out-produces the caller (or sends
+/// chunks large enough that a few fill the window) used to lose every
+/// chunk that met a full window — silently, mid-stream, with later
+/// chunks still arriving
+/// (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` Phase 3).
+/// The pump emits one chunk at a time, so waiting here also keeps order.
+///
+/// The frame is prepared once ([`prepare_response_to_caller`]: bounding,
+/// the route discriminator, enrollment bookkeeping) and only the send is
+/// retried, re-resolving the route each time so a session replaced
+/// mid-wait is picked up (CODE_REVIEW_2026_10_28 AIB-10).
+#[allow(clippy::too_many_arguments)]
+async fn publish_stream_chunk_to_caller(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    call_id: u64,
+    receiving_session_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    reply_stream_id: u64,
+    payload: Bytes,
+    fallback: ResponseRouteFallback,
+) -> Result<(), AdapterError> {
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(32);
+    let prepared = prepare_response_to_caller(
+        mesh,
+        caller_origin,
+        call_id,
+        receiving_session_id,
+        target_hint,
+        reply_channel,
+        reply_channel_hash,
+        payload,
+        fallback,
+    )?;
+    let deadline = tokio::time::Instant::now() + STREAM_CHUNK_WINDOW_WAIT;
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match send_prepared_response(
+            mesh,
+            caller_origin,
+            receiving_session_id,
+            target_hint,
+            reply_channel,
+            reply_channel_hash,
+            reply_stream_id,
+            &prepared,
+            fallback,
+        )
+        .await
+        {
+            Err(e)
+                if super::mesh::is_publish_backpressure(&e)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            result => return result,
+        }
+    }
+}
+
 // The reply-channel triple (`reply_channel`, `reply_channel_hash`,
 // `reply_stream_id`) is deliberately passed pre-split rather than bundled:
 // PERF_AUDIT §3.10 computes and caches the hash + stream_id per caller so
@@ -4073,15 +4152,8 @@ fn take_lp(bytes: &[u8]) -> Option<&[u8]> {
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
-    // R2: which call this response answers. Enrollment promotion
-    // may consume only this call's own reservation. Read on the
-    // `webrtc` path; the parameter stays so every caller keeps
-    // threading the fact rather than re-deriving it later.
-    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] call_id: u64,
-    // R2-A: the incarnation that received the request this response
-    // answers. Enrollment promotion consumes that exact
-    // `(node, session, call)` reservation or nothing.
-    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))] receiving_session_id: u64,
+    call_id: u64,
+    receiving_session_id: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
     reply_channel_hash: ChannelHash,
@@ -4089,6 +4161,85 @@ async fn publish_response_to_caller(
     payload: Bytes,
     fallback: ResponseRouteFallback,
 ) -> Result<(), AdapterError> {
+    let prepared = prepare_response_to_caller(
+        mesh,
+        caller_origin,
+        call_id,
+        receiving_session_id,
+        target_hint,
+        reply_channel,
+        reply_channel_hash,
+        payload,
+        fallback,
+    )?;
+    send_prepared_response(
+        mesh,
+        caller_origin,
+        receiving_session_id,
+        target_hint,
+        reply_channel,
+        reply_channel_hash,
+        reply_stream_id,
+        &prepared,
+        fallback,
+    )
+    .await
+}
+
+/// A server->caller frame made ready to send: bounded to one packet, the
+/// RpcRouteV1 discriminator inserted, and its enrollment side effects
+/// applied. Built once per frame; [`send_prepared_response`] may then be
+/// retried without redoing any of that.
+struct PreparedResponse {
+    payload: Bytes,
+    /// A large-response fragment: session-bound, never roster-routed.
+    fragmented: bool,
+}
+
+/// Where a response to `caller_origin` goes. A `DirectOnly` frame trusts
+/// ONLY the explicit `target_hint` (the AEAD-authenticated session peer):
+/// it must never resolve a destination through the origin reverse-index,
+/// which could point at a different node claiming this origin (NC2). A
+/// normal RESPONSE may resolve the caller's node via the reverse-index
+/// when no hint is cached.
+fn resolve_response_target(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    target_hint: Option<u64>,
+    fallback: ResponseRouteFallback,
+) -> Option<u64> {
+    match fallback {
+        ResponseRouteFallback::DirectOnly => target_hint,
+        ResponseRouteFallback::RosterOnStaleDirect => {
+            target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
+        }
+    }
+}
+
+/// The once-per-frame half of [`publish_response_to_caller`]: see
+/// [`PreparedResponse`].
+///
+/// Everything but `reply_channel_hash` and `payload` feeds the `webrtc`
+/// enrollment bookkeeping only; the parameters stay so every caller keeps
+/// threading those facts rather than re-deriving them later.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "webrtc"), allow(unused_variables))]
+fn prepare_response_to_caller(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    // R2: which call this response answers. Enrollment promotion
+    // may consume only this call's own reservation.
+    call_id: u64,
+    // R2-A: the incarnation that received the request this response
+    // answers. Enrollment promotion consumes that exact
+    // `(node, session, call)` reservation or nothing.
+    receiving_session_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    payload: Bytes,
+    fallback: ResponseRouteFallback,
+) -> Result<PreparedResponse, AdapterError> {
     let payload = bound_response_packet(payload)?;
     let fragmented = EventMeta::from_bytes(&payload)
         .is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
@@ -4118,18 +4269,9 @@ async fn publish_response_to_caller(
     // security defect: a rejected enrollment (wrong nonce, expired
     // invite) would have been admitted to the mesh by the very
     // message that refused it.
-    // A `DirectOnly` frame trusts ONLY the explicit `target_hint` (the
-    // AEAD-authenticated session peer): it must never resolve a
-    // destination through the origin reverse-index, which could point at
-    // a different node claiming this origin (NC2). A normal RESPONSE may
-    // resolve the caller's node via the reverse-index when no hint is
-    // cached.
-    let resolved = match fallback {
-        ResponseRouteFallback::DirectOnly => target_hint,
-        ResponseRouteFallback::RosterOnStaleDirect => {
-            target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))
-        }
-    };
+    // See `resolve_response_target` for the NC2 routing rule.
+    #[cfg(feature = "webrtc")]
+    let resolved = resolve_response_target(mesh, caller_origin, target_hint, fallback);
     // §12 step 4: an enrollment RESPONSE leaving this anchor
     // promotes the session that asked for it — the exact
     // incarnation captured when the REQUEST was decoded, re-checked
@@ -4222,6 +4364,29 @@ async fn publish_response_to_caller(
         }
     }
 
+    Ok(PreparedResponse {
+        payload,
+        fragmented,
+    })
+}
+
+/// The retryable half of [`publish_response_to_caller`]: resolve the
+/// route (afresh, each call) and send a [`PreparedResponse`].
+#[allow(clippy::too_many_arguments)]
+async fn send_prepared_response(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    receiving_session_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    reply_stream_id: u64,
+    prepared: &PreparedResponse,
+    fallback: ResponseRouteFallback,
+) -> Result<(), AdapterError> {
+    let payload = &prepared.payload;
+    let fragmented = prepared.fragmented;
+    let resolved = resolve_response_target(mesh, caller_origin, target_hint, fallback);
     // R2-6: attempt the direct send and branch on the ATOMIC typed
     // outcome, eliminating the `has_peer_session`-then-`publish` TOCTOU
     // that AV-5 used. `try_publish_to_peer` makes the session-existence
@@ -4239,7 +4404,7 @@ async fn publish_response_to_caller(
                 reply_channel_hash,
                 reply_stream_id,
                 /* reliable */ true,
-                std::slice::from_ref(&payload),
+                std::slice::from_ref(payload),
                 fragmented.then_some(receiving_session_id),
             )
             .await
@@ -4280,8 +4445,20 @@ async fn publish_response_to_caller(
     // when the caller's origin is unknown to both the bridge cache AND
     // the global reverse index, OR the resolved node had no live session
     // at send time (nothing was sent).
-    let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
-    mesh.publish(&publisher, payload).await.map(|_| ())
+    // Reliable, like the direct route above: a reply that falls back to
+    // the roster is still a reply, and the default fire-and-forget lost
+    // any datagram the link dropped — silently, mid-stream, while later
+    // chunks still arrived. Both routes use the same reply stream, so
+    // they now also agree on its reliability
+    // (`docs/internal/plans/APP_INTEGRATION_BLOCKERS_PLAN.md` 3c).
+    let publisher = ChannelPublisher::new(
+        reply_channel.clone(),
+        PublishConfig {
+            reliability: crate::adapter::net::Reliability::Reliable,
+            ..PublishConfig::default()
+        },
+    );
+    mesh.publish(&publisher, payload.clone()).await.map(|_| ())
 }
 
 /// Preserve the call identity while replacing a response this publish path
@@ -5655,7 +5832,7 @@ impl MeshNode {
                         Err(e) => {
                             tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_streaming: invalid reply channel name");
-                            return;
+                            return false;
                         }
                     };
                     let meta = EventMeta::new(
@@ -5709,11 +5886,12 @@ impl MeshNode {
                                      protected terminal; the peer observes interruption or its \
                                      deadline (§2.8)"
                                 );
+                                return false;
                             }
-                            return;
+                            return true;
                         }
                     }
-                    if let Err(e) = publish_response_to_caller(
+                    if let Err(e) = publish_stream_chunk_to_caller(
                         &mesh,
                         caller_origin,
                         call_id,
@@ -5731,7 +5909,9 @@ impl MeshNode {
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_streaming: chunk publish failed");
+                        return false;
                     }
+                    true
                 })
             });
 
@@ -6856,7 +7036,7 @@ impl MeshNode {
                         Err(e) => {
                             tracing::warn!(error = %e, channel = %reply_channel_name,
                                 "rpc serve_rpc_duplex: invalid reply channel name");
-                            return;
+                            return false;
                         }
                     };
                     let meta = EventMeta::new(
@@ -6903,11 +7083,12 @@ impl MeshNode {
                                      protected terminal; the peer observes interruption or its \
                                      deadline (§2.8)"
                                 );
+                                return false;
                             }
-                            return;
+                            return true;
                         }
                     }
-                    if let Err(e) = publish_response_to_caller(
+                    if let Err(e) = publish_stream_chunk_to_caller(
                         &mesh,
                         caller_origin,
                         call_id,
@@ -6925,7 +7106,9 @@ impl MeshNode {
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
                             "rpc serve_rpc_duplex: chunk publish failed");
+                        return false;
                     }
+                    true
                 })
             });
 
@@ -8431,6 +8614,16 @@ impl MeshNode {
     /// side; on the caller side here, sharing the dispatcher is
     /// the correct behavior because all RESPONSE events route
     /// through the same `RpcClientPending` keyed by `call_id`.
+    ///
+    /// **A fenced pass is retried while the target has a session.** The
+    /// fence (see [`Self::ensure_reply_subscription_pass`]) trips on any
+    /// bump of the target's failure generation, and a session
+    /// REPLACEMENT bumps it too (rekey, routed rotation, direct upgrade —
+    /// so a restarted peer is never left cached as subscribed). A
+    /// replacement mid-subscribe therefore voids the subscribe without
+    /// the peer being unreachable: subscribing again on the session it
+    /// now has is the recovery, not `NoRoute`. Only when no session
+    /// remains does the call fail (CODE_REVIEW_2026_10_28 AIB-5).
     async fn ensure_reply_subscription(
         self: &Arc<Self>,
         target_node_id: u64,
@@ -8438,6 +8631,43 @@ impl MeshNode {
         reply_channel: ChannelName,
         reply_hash: ChannelHash,
     ) -> Result<(), RpcError> {
+        for _ in 0..REPLY_SUBSCRIBE_FENCED_PASSES {
+            if self
+                .ensure_reply_subscription_pass(
+                    target_node_id,
+                    service,
+                    reply_channel.clone(),
+                    reply_hash,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            if !self.has_peer_session(target_node_id) {
+                break;
+            }
+        }
+        Err(RpcError::NoRoute {
+            target: target_node_id,
+            reason: format!(
+                "session with {target_node_id:#x} failed or was replaced while subscribing \
+                 to the reply channel; the target dropped our roster entry, so the \
+                 subscribe did not survive. Retry — the next call re-subscribes."
+            ),
+        })
+    }
+
+    /// One subscribe pass for [`Self::ensure_reply_subscription`].
+    /// `Ok(true)`: subscribed and cached. `Ok(false)`: the target's
+    /// session failed or was replaced during the pass, so the fence rolled
+    /// the entry back and nothing is cached.
+    async fn ensure_reply_subscription_pass(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        service: &str,
+        reply_channel: ChannelName,
+        reply_hash: ChannelHash,
+    ) -> Result<bool, RpcError> {
         let registry = self.rpc_reply_subscriptions_arc();
         // PERF_AUDIT §3.5 — DashMap keyed by
         // `(target, xxh3_64(service))`. Pre-fix this was a global
@@ -8449,7 +8679,7 @@ impl MeshNode {
         // not collision-free; see `reply_subscription_covers`).
         let service_hash = xxhash_rust::xxh3::xxh3_64(service.as_bytes());
         if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
-            return Ok(());
+            return Ok(true);
         }
         // The failure-generation snapshot the fence at the bottom
         // compares against, recorded by the attempt that SUCCEEDS.
@@ -8689,6 +8919,9 @@ impl MeshNode {
             });
         };
 
+        #[cfg(test)]
+        reply_subscribe_seam::fire(self.node_id());
+
         registry.insert(
             (target_node_id, service_hash),
             ReplySubscription {
@@ -8728,16 +8961,37 @@ impl MeshNode {
             registry.remove_if(&(target_node_id, service_hash), |_, entry| {
                 entry.written_at_generation == gen_before
             });
-            return Err(RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!(
-                    "session with {target_node_id:#x} failed while subscribing to the \
-                     reply channel; the target dropped our roster entry, so the \
-                     subscribe did not survive. Retry — the next call re-subscribes."
-                ),
-            });
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
+    }
+}
+
+/// Test seam for the reply-subscribe fence: run a hook (once) for a given
+/// caller node right after its subscribe succeeded and before the cache
+/// insert — exactly the window a concurrent session replacement or failure
+/// lands in. Keyed by node so parallel tests in one process don't collide.
+#[cfg(test)]
+pub(super) mod reply_subscribe_seam {
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: parking_lot::Mutex<Vec<(u64, Hook)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Run `hook` the next time `node_id` reaches the seam.
+    pub(crate) fn arm(node_id: u64, hook: impl FnOnce() + Send + 'static) {
+        HOOKS.lock().push((node_id, Box::new(hook)));
+    }
+
+    pub(super) fn fire(node_id: u64) {
+        let hook = {
+            let mut hooks = HOOKS.lock();
+            hooks
+                .iter()
+                .position(|(id, _)| *id == node_id)
+                .map(|i| hooks.swap_remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -8783,6 +9037,12 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// the announce + verify + pin round trip without turning a genuine
 /// denial into a long stall.
 const REPLY_SUBSCRIBE_ATTEMPTS: usize = 3;
+
+/// How many fenced subscribe passes `ensure_reply_subscription` makes
+/// while the target still has a session. Each extra pass needs another
+/// replacement to land inside it, so a few bound a rotation storm without
+/// failing a call to a reachable peer.
+const REPLY_SUBSCRIBE_FENCED_PASSES: usize = 3;
 
 /// Base backoff between reply-subscribe attempts; multiplied by the
 /// attempt number, so waits are ~8 ms then ~16 ms.
@@ -14452,5 +14712,204 @@ mod roster_fallback_tests {
             .await,
             "with a slot free the relay lands in the background"
         );
+    }
+}
+
+/// Live two-node witnesses for CODE_REVIEW_2026_10_28 (AIB-4, AIB-5).
+#[cfg(test)]
+mod live_pair_review_tests {
+    use super::*;
+    use crate::adapter::net::{EntityKeypair, MeshNodeConfig};
+    use std::time::Duration;
+
+    async fn node() -> Arc<MeshNode> {
+        let cfg = MeshNodeConfig::new("127.0.0.1:0".parse().unwrap(), [0x5Au8; 32])
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(10))
+            .with_handshake(3, Duration::from_secs(2));
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    struct Echo;
+    #[async_trait::async_trait]
+    impl RpcHandler for Echo {
+        async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: ctx.payload.body.clone(),
+            })
+        }
+    }
+
+    /// Two started nodes with a direct session: `(caller, server)`.
+    async fn connected_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+        let caller = node().await;
+        let server = node().await;
+        let caller_id = caller.node_id();
+        let s_pub = *server.public_key();
+        let s_addr = server.local_addr();
+        let s = Arc::clone(&server);
+        let accept = tokio::spawn(async move { s.accept(caller_id).await });
+        caller
+            .connect(s_addr, &s_pub, server.node_id())
+            .await
+            .expect("connect");
+        accept.await.expect("accept task").expect("accept");
+        caller.start();
+        server.start();
+        (caller, server)
+    }
+
+    /// A streamed reply that rides the ROSTER path (the caller never
+    /// announced, so the server holds no pinned direct route to it) must
+    /// survive backpressure like a direct one. The caller stops reading
+    /// for a second with 64 chunks of credit out; at 4 KiB each that is
+    /// four times the 64 KiB transport window, so the reply stream's
+    /// window fills and the server's chunk publish meets backpressure. The roster fan-out
+    /// wrapped the per-peer "backpressured" error as "all N peers failed
+    /// (first: ...)", which the chunk retry did not recognise: the chunk
+    /// was given up at once — a silent gap before AIB-3, a `PumpFailed`
+    /// call after (the Python `test_send_wait_delivers_every_chunk_in_order`
+    /// failure on Linux CI).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_roster_routed_stream_survives_backpressure() {
+        let (caller, server) = connected_pair().await;
+        const N: u32 = 3000;
+        struct Producer;
+        #[async_trait::async_trait]
+        impl RpcStreamingHandler for Producer {
+            async fn call(
+                &self,
+                _ctx: RpcContext,
+                sink: crate::adapter::net::cortex::RpcResponseSink,
+            ) -> Result<(), RpcHandlerError> {
+                for i in 0..N {
+                    let mut chunk = vec![0u8; 1024];
+                    chunk[..4].copy_from_slice(&i.to_be_bytes());
+                    sink.send_wait(chunk)
+                        .await
+                        .map_err(|_| RpcHandlerError::Internal("call gone".into()))?;
+                }
+                Ok(())
+            }
+        }
+        let _serve = server
+            .serve_rpc_streaming("bp", Arc::new(Producer))
+            .expect("serve");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut stream = caller
+            .call_streaming(
+                server.node_id(),
+                "bp",
+                Bytes::from_static(b"go"),
+                CallOptions {
+                    stream_window_initial: Some(64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("call_streaming");
+        let mut got = Vec::with_capacity(N as usize);
+        let collect = async {
+            use futures::StreamExt;
+            while let Some(item) = stream.next().await {
+                let chunk = item.expect("no chunk may be given up under backpressure");
+                got.push(u32::from_be_bytes(chunk[..4].try_into().unwrap()));
+                if got.len() % 200 == 0 {
+                    // A consumer that stalls now and then, as a loaded
+                    // Python caller does.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), collect)
+            .await
+            .expect("the stream completes");
+        assert_eq!(got, (0..N).collect::<Vec<_>>(), "every chunk, in order");
+    }
+
+    /// AIB-4 (CODE_REVIEW_2026_10_28): a reliable reply's retransmits are
+    /// sent to the session's own address (`wire_route`), so its FIRST copy
+    /// must go there too. The publish path used to send the first copy to
+    /// the routing table's next hop instead: with a stale entry there, the
+    /// reply only arrived because the retransmit took the other path — and
+    /// had the two been the other way round, it never would have.
+    #[tokio::test]
+    async fn a_reply_goes_first_where_its_retransmits_go() {
+        let (caller, server) = connected_pair().await;
+        let (caller_id, server_id) = (caller.node_id(), server.node_id());
+        let _serve = server.serve_rpc("echo", Arc::new(Echo)).expect("serve");
+
+        // A stale ordinary route on the server for the caller, pointing
+        // at an address nothing listens on.
+        let bogus: crate::adapter::net::PeerAddr = "127.0.0.1:9"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let table = server.router().routing_table();
+        table.remove_destination_all_candidates(caller_id);
+        table.add_route_with_metric(caller_id, bogus, 0);
+        assert_eq!(table.lookup(caller_id), Some(bogus));
+
+        let stats = server.control_plane_stats();
+        let before = stats.retransmit_packets_sent.load(Ordering::SeqCst);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(15),
+            caller.call(
+                server_id,
+                "echo",
+                Bytes::from_static(b"ping"),
+                CallOptions::default(),
+            ),
+        )
+        .await
+        .expect("the call finishes")
+        .expect("the call succeeds");
+        assert_eq!(reply.body.as_ref(), b"ping");
+        assert_eq!(
+            stats.retransmit_packets_sent.load(Ordering::SeqCst),
+            before,
+            "the reply needed a retransmit: its first copy did not go where its retransmits go",
+        );
+    }
+
+    /// AIB-5 (CODE_REVIEW_2026_10_28): a session REPLACEMENT that lands
+    /// while a first call is subscribing to the reply channel trips the
+    /// fence, exactly as a failure does. The peer is still reachable, so
+    /// the call must subscribe again and succeed, not fail `NoRoute`.
+    #[tokio::test]
+    async fn a_rotation_mid_subscribe_does_not_fail_the_call() {
+        let (caller, server) = connected_pair().await;
+        let (caller_id, server_id) = (caller.node_id(), server.node_id());
+        let _serve = server.serve_rpc("echo", Arc::new(Echo)).expect("serve");
+
+        // The replacement lands after the subscribe succeeded and before
+        // the cache insert — the window the fence guards.
+        let fired = Arc::new(AtomicBool::new(false));
+        let (c, f) = (Arc::clone(&caller), Arc::clone(&fired));
+        reply_subscribe_seam::arm(caller_id, move || {
+            c.simulate_session_replaced_for_test(server_id);
+            f.store(true, Ordering::SeqCst);
+        });
+
+        let reply = tokio::time::timeout(
+            Duration::from_secs(15),
+            caller.call(
+                server_id,
+                "echo",
+                Bytes::from_static(b"ping"),
+                CallOptions::default(),
+            ),
+        )
+        .await
+        .expect("the call finishes")
+        .expect("a rotation of a reachable peer must not fail the call");
+        assert!(fired.load(Ordering::SeqCst), "the seam never ran");
+        assert_eq!(reply.body.as_ref(), b"ping");
     }
 }

@@ -1672,8 +1672,14 @@ pub type RpcResponseEmitter =
 /// handler emitted them. The unary fold emits one logical response;
 /// negotiated fragments may arrive in any order and are assembled before
 /// completion, so it retains the synchronous `RpcResponseEmitter`.
+///
+/// The future resolves `true` when the frame left (or was deliberately
+/// dropped by routing policy, e.g. its peer is gone), and `false` when it
+/// could NOT be sent — the stream now has a gap. On `false` for a chunk,
+/// the pump stops and the call ends `PumpFailed` rather than publishing
+/// later chunks over the hole (CODE_REVIEW_2026_10_28 AIB-3).
 pub type RpcAsyncResponseEmitter = Arc<
-    dyn Fn(u64, u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, ()>
+    dyn Fn(u64, u64, u64, RpcResponsePayload) -> futures::future::BoxFuture<'static, bool>
         + Send
         + Sync
         + 'static,
@@ -2394,8 +2400,18 @@ impl RpcResponseSink {
     /// contract: a refused item latches `ResourceExhausted` and retires
     /// the call.
     pub fn send(&self, body: impl Into<bytes::Bytes>) {
+        let _ = self.try_send(body);
+    }
+
+    /// [`Self::send`], reporting whether the chunk was queued: `false`
+    /// when it was dropped (queue full, call torn down, or — for a
+    /// protected record — refused and latched). A binding returns this
+    /// to its caller, so a handler can see that a chunk was lost instead
+    /// of assuming it went out. Never blocks; [`Self::send_wait`] is the
+    /// waiting form.
+    pub fn try_send(&self, body: impl Into<bytes::Bytes>) -> bool {
         if self.gate.as_ref().is_some_and(|g| g.is_finished()) {
-            return;
+            return false;
         }
         let body = body.into();
         let Some(charge) = self.byte_charge.as_ref() else {
@@ -2408,21 +2424,23 @@ impl RpcResponseSink {
                     m.streaming_chunks_dropped_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                return false;
             }
-            return;
+            return true;
         };
-        self.send_charged(charge, body);
+        self.send_charged(charge, body)
     }
 
     /// The protected (void) send: reserve bytes + queue capacity without
     /// ever parking; any refusal latches `ResourceExhausted` and retires
     /// (§2.7 — "it cannot drop an item and subsequently report complete
     /// success").
-    fn send_charged(&self, charge: &RegistryCallRef, body: bytes::Bytes) {
+    /// Returns whether the item was queued.
+    fn send_charged(&self, charge: &RegistryCallRef, body: bytes::Bytes) -> bool {
         let len = body.len();
         if charge.registry.bytes().validate_item(len).is_err() {
             charge.latch_exhausted();
-            return;
+            return false;
         }
         let permit = match charge.registry.bytes().reserve(
             charge.key.clone(),
@@ -2435,13 +2453,13 @@ impl RpcResponseSink {
                 // A full budget cannot be waited out from a void send —
                 // the item is refused, so the call latches.
                 charge.latch_exhausted();
-                return;
+                return false;
             }
         };
         let Ok(slot) = self.inner.try_reserve() else {
             permit.release();
             charge.latch_exhausted();
-            return;
+            return false;
         };
         match charge
             .registry
@@ -2454,11 +2472,13 @@ impl RpcResponseSink {
                         permit: Some(Arc::clone(shared)),
                     });
                 });
+                true
             }
             Err(_) => {
                 // Already terminal / gone: the item is refused by the
                 // call's own disposition (first writer wins at `retire`).
                 permit.release();
+                false
             }
         }
     }
@@ -6146,6 +6166,8 @@ async fn run_stream_call_supervisor(
     let pump_flow = flow_sem.clone();
     let pump_gate = gate.clone();
     let pump_record = Arc::clone(&record);
+    // Resolves `true` when a chunk could not be sent: the stream has a
+    // gap, so the pump stops there and the call ends `PumpFailed`.
     let pump_task = tokio::spawn(async move {
         loop {
             // After the producer half closes (protected only), drain
@@ -6205,7 +6227,7 @@ async fn run_stream_call_supervisor(
             let chunk_permit = chunk.permit;
             // Await per-chunk publish so chunks for one call_id reach
             // the network in send order.
-            pump_emit(from_node, caller_origin, call_id, resp).await;
+            let sent = pump_emit(from_node, caller_origin, call_id, resp).await;
             // §2.7: publishing releases the item's byte reservation —
             // the bytes left the queue, they were not merely counted.
             if let Some(shared) = chunk_permit {
@@ -6213,7 +6235,11 @@ async fn run_stream_call_supervisor(
                     permit.release();
                 }
             }
+            if !sent {
+                return true;
+            }
         }
+        false
     });
     tokio::pin!(pump_task);
 
@@ -6226,7 +6252,9 @@ async fn run_stream_call_supervisor(
     let mut handler_panicked = false;
     let mut pump_done = false;
     // A `JoinError` from the pump inside the loop is a panic: the pump is
-    // only aborted after the loop, on the forced path.
+    // only aborted after the loop, on the forced path. A pump that
+    // stopped because a chunk could not be sent failed the same way:
+    // chunks were lost either way.
     let mut pump_failed = false;
 
     let sleep = async {
@@ -6274,7 +6302,7 @@ async fn run_stream_call_supervisor(
 
             joined = &mut pump_task, if !pump_done => {
                 pump_done = true;
-                pump_failed = joined.is_err();
+                pump_failed = joined.unwrap_or(true);
             }
         }
     };
@@ -6358,11 +6386,14 @@ async fn run_stream_call_supervisor(
             let _ = pump_task.as_mut().await;
         }
     } else if pump_failed {
-        // The pump PANICKED: items it held or had queued were lost, so the
-        // call did not complete, whatever the handler returned. Pre-audit
-        // this path mapped a `Draining` handler result to `Completed` — a
-        // success terminal over lost chunks.
+        // The pump PANICKED, or stopped on a chunk it could not send:
+        // items were lost, so the call did not complete, whatever the
+        // handler returned. Pre-audit this path mapped a `Draining`
+        // handler result to `Completed` — a success terminal over lost
+        // chunks. A handler still producing is told to stop: nothing it
+        // sends can reach the caller now.
         record.lock().retire(StreamTerminalReason::PumpFailed);
+        cancel_token.cancel();
     } else {
         // A clean pump exit is classified by the state machine:
         // `Completed(result)` once the handler has returned (CORE-1's
@@ -8510,6 +8541,10 @@ impl RpcDuplexFold {
                 let pump_emit = emit.clone();
                 let pump_metrics = metrics.clone();
                 let pump_flow = flow_sem.clone();
+                // Resolves `true` when a chunk could not be sent (AIB-3):
+                // the pump stops there, tells the handler to stop, and the
+                // call ends `PumpFailed` instead of publishing over a gap.
+                let pump_cancel = cancellation.clone();
                 let pump = tokio::spawn(async move {
                     while let Some(chunk) = resp_rx.recv().await {
                         if let Some(sem) = pump_flow.as_ref() {
@@ -8534,7 +8569,7 @@ impl RpcDuplexFold {
                             body: chunk.body,
                         };
                         let chunk_permit = chunk.permit;
-                        pump_emit(from_node, caller_origin, call_id, resp).await;
+                        let sent = pump_emit(from_node, caller_origin, call_id, resp).await;
                         // §2.7: publishing releases the item's byte
                         // reservation (none today — the duplex response
                         // sink is public — but the discipline is shared).
@@ -8543,7 +8578,12 @@ impl RpcDuplexFold {
                                 permit.release();
                             }
                         }
+                        if !sent {
+                            pump_cancel.cancel();
+                            return true;
+                        }
                     }
+                    false
                 });
 
                 tokio::spawn(async move {
@@ -8608,8 +8648,9 @@ impl RpcDuplexFold {
                     };
                     // Handler dropped the sink — let the pump
                     // drain any final in-flight chunks before we
-                    // emit the terminal frame.
-                    let _ = pump.await;
+                    // emit the terminal frame. A pump that lost a chunk
+                    // (or panicked) means the call did not complete.
+                    let pump_lost = pump.await.unwrap_or(true);
                     if let Some(m) = metrics.as_ref() {
                         m.handler_in_flight
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -8623,8 +8664,11 @@ impl RpcDuplexFold {
                     // token fired during execution, override the
                     // handler's terminal with Cancelled. C7 (Q3): a
                     // deadline expiry that no caller CANCEL preceded is
-                    // typed `Timeout`.
-                    let terminal = if let Some(message) = deadline_expired {
+                    // typed `Timeout`. A lost chunk outranks both: the
+                    // pump's own cancel is what stopped the handler.
+                    let terminal = if pump_lost {
+                        stream_terminal_payload(&StreamTerminalReason::PumpFailed)
+                    } else if let Some(message) = deadline_expired {
                         RpcResponsePayload {
                             status: RpcStatus::Timeout,
                             headers: vec![],
@@ -10870,6 +10914,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     panic!("injected chunk-emit failure");
                 }
+                true
             })
         });
         let (record, sup) = spawn_supervised(Arc::new(TwoChunkHandler), emit);
@@ -10881,6 +10926,43 @@ mod tests {
             record.lock().terminal_reason(),
             Some(StreamTerminalReason::PumpFailed),
             "a panicked pump lost chunks; the call may not report Completed",
+        );
+    }
+
+    /// AIB-3 (CODE_REVIEW_2026_10_28): a chunk the emitter could not
+    /// send leaves a gap. The pump must stop there — no later chunk is
+    /// published over the hole — and the call must end `PumpFailed`, not
+    /// `Completed`.
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_stops_at_a_chunk_that_could_not_be_sent() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_in_emit = Arc::clone(&attempts);
+        let emit: RpcAsyncResponseEmitter = Arc::new(move |_from_node, _origin, _call_id, resp| {
+            let attempts = Arc::clone(&attempts_in_emit);
+            Box::pin(async move {
+                if is_continue_chunk(&resp) {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    // Every chunk fails to send (a window that never
+                    // drained).
+                    return false;
+                }
+                true
+            })
+        });
+        let (record, sup) = spawn_supervised(Arc::new(TwoChunkHandler), emit);
+        tokio::time::timeout(Duration::from_secs(5), sup)
+            .await
+            .expect("the call ends at the lost chunk")
+            .expect("the supervisor itself does not panic");
+        assert_eq!(
+            record.lock().terminal_reason(),
+            Some(StreamTerminalReason::PumpFailed),
+            "a lost chunk means the call did not complete",
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "nothing may be published after the first lost chunk",
         );
     }
 
@@ -13229,6 +13311,7 @@ mod tests {
             let captured_clone = captured_clone.clone();
             Box::pin(async move {
                 captured_clone.lock().push((origin, call_id, resp));
+                true
             })
         });
         (emit, captured)

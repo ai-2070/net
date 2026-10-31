@@ -95,6 +95,13 @@ mod a2a_paid;
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit. Sync handler API; async-Python
 // handler support lands as a follow-up phase.
+// Node-owned serve registrations: dropping a serve handle no longer stops
+// the service (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 4). `shutdown`
+// always releases; only the serve surfaces (nRPC, enrollment, org, A2A)
+// hold, so a `net`-only build uses part of the module.
+#[cfg(feature = "net")]
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+mod keepalive;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
 // MeshDB query layer (Python SDK slice 1: factory AST +
@@ -1506,6 +1513,7 @@ mod mesh_bindings {
             subnet_attachment=None,
             subnet_control_channel=None,
             subnet_exports=None,
+            noise_static_key=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1565,6 +1573,11 @@ mod mesh_bindings {
             subnet_attachment: Option<Vec<u32>>,
             subnet_control_channel: Option<&str>,
             subnet_exports: Option<&Bound<'_, PyList>>,
+            // noise_static_key: 32-byte Noise (X25519) private key the
+            // caller stores, keeping `public_key` stable across restarts
+            // independently of the identity. Unset: derived from
+            // `identity_seed`, or fresh per process with no seed.
+            noise_static_key: Option<&[u8]>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1701,6 +1714,20 @@ mod mesh_bindings {
                 }
                 None => EntityKeypair::generate(),
             };
+            // Noise static key: an explicit one wins. Without it,
+            // `MeshNode::new` derives one from a seeded (configured)
+            // identity, so the node's rendezvous address survives a
+            // restart, and otherwise generates a fresh key.
+            if let Some(key) = noise_static_key {
+                let arr: [u8; 32] = key.try_into().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "noise_static_key must be 32 bytes, got {}",
+                        key.len()
+                    ))
+                })?;
+                config =
+                    config.with_static_key(net::adapter::net::NoiseStaticKey::from_private(arr));
+            }
             let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
@@ -2002,6 +2029,27 @@ mod mesh_bindings {
                 depth,
                 approver,
                 std::time::Duration::from_millis(approve_timeout_ms),
+            )
+        }
+
+        /// Make sure there is a working session to the node a `rendezvous`
+        /// locator names (`addr|noise_pubkey|node_id`, as saved from an
+        /// invite or a `DeviceEnrollment`), re-dialing it only when needed.
+        /// Call it when a paired machine may have restarted — on either side —
+        /// before talking to it again. It dials and watches the existing
+        /// session: a peer that restarted accepts and the session is
+        /// replaced, while a peer still using the existing one keeps it
+        /// (telling takes up to one heartbeat interval). A far side still
+        /// holding this node's old session can take up to three heartbeat
+        /// intervals to accept. `renew` already does this. (Requires the
+        /// `delegation` feature.)
+        #[cfg(feature = "delegation")]
+        fn ensure_attached(&self, py: Python<'_>, rendezvous: &str) -> PyResult<()> {
+            crate::enrollment::mesh_ensure_attached(
+                py,
+                self.node_arc_clone()?,
+                &self.runtime,
+                rendezvous,
             )
         }
 
@@ -3505,6 +3553,9 @@ mod mesh_bindings {
                 let Some(node) = self.node.write().take() else {
                     return Ok(());
                 };
+                // Stop the services this node owns (a dropped handle no
+                // longer stops one), releasing their node references.
+                crate::keepalive::release_all(&node);
                 self.runtime.block_on(node.shutdown())
             })
             .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))
@@ -4173,6 +4224,8 @@ mod mesh_bindings {
         /// an awaitable.
         fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
+            // Stop the services this node owns (see `keepalive`).
+            crate::keepalive::release_all(&node);
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 node.shutdown()
                     .await

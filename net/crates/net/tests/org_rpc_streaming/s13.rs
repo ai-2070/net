@@ -46,7 +46,7 @@ pub(crate) fn capturing_async_emitter() -> (RpcAsyncResponseEmitter, CapturedFra
     let sink = Arc::clone(&captured);
     let emit: RpcAsyncResponseEmitter = Arc::new(move |_from, _origin, _call, resp| {
         sink.lock().push(resp);
-        Box::pin(async move {})
+        Box::pin(async move { true })
     });
     (emit, captured)
 }

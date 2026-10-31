@@ -317,7 +317,16 @@ type MeshConfig struct {
 	// IdentitySeedHex reproduces a mesh keypair from a 32-byte seed
 	// (64 hex chars). Matches `IdentityFromSeed(sameSeed)` so tokens
 	// issued to that identity's `EntityID` work for this mesh.
+	// A seeded mesh also derives its Noise static key from the seed
+	// (unless NoiseStaticKeyHex is set), so its rendezvous address
+	// survives a restart.
 	IdentitySeedHex string `json:"identity_seed_hex,omitempty"`
+
+	// NoiseStaticKeyHex is a 32-byte Noise (X25519) static private key
+	// (64 hex chars) the caller stores. It keeps the node's public key
+	// stable across restarts independently of the identity. Unset:
+	// derived from IdentitySeedHex, or fresh per process with no seed.
+	NoiseStaticKeyHex string `json:"noise_static_key_hex,omitempty"`
 
 	// ReflexOverride pins this mesh's publicly-advertised reflex
 	// to the supplied external "ip:port". Classification is

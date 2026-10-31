@@ -638,9 +638,14 @@ pub(crate) fn mesh_over(node: Arc<MeshNode>, identity: Option<SdkIdentity>) -> S
     SdkMesh::from_node_arc(node, Arc::new(ChannelConfigRegistry::new()), identity)
 }
 
-/// Keeps the served enrollment services alive (returned by
-/// `NetMesh.serveEnrollmentAuto`). Dropping it or calling
-/// [`stop`](Self::stop) unregisters them.
+/// The mesh the enrollment services registered against, and their
+/// registrations (enroll, and renew on the auto path).
+type EnrollmentServices = (SdkMesh, Vec<ServeHandle>);
+
+/// The served enrollment services (returned by
+/// `NetMesh.serveEnrollmentAuto` / `serveEnrollment`). They are owned by
+/// the node: they stay up until [`stop`](Self::stop) or the mesh's
+/// `shutdown()`, whether or not this handle is kept referenced.
 #[napi]
 pub struct EnrollmentServeHandle {
     // The `Mesh` holds the channel registry the services registered against
@@ -649,7 +654,21 @@ pub struct EnrollmentServeHandle {
     // hands out `&self`; a `#[napi]` class is GC-finalized, not
     // scope-dropped, so `stop()` is the deterministic release
     // (the `close()` gotcha in `bindings.md`).
-    inner: Mutex<Option<(SdkMesh, Vec<ServeHandle>)>>,
+    inner: Arc<Mutex<Option<EnrollmentServices>>>,
+    /// The node's hold on the services (`keepalive`).
+    registration: crate::keepalive::Registration,
+}
+
+impl EnrollmentServeHandle {
+    fn registered(mesh: SdkMesh, handles: Vec<ServeHandle>) -> Self {
+        let node = Arc::clone(mesh.node());
+        let inner = Arc::new(Mutex::new(Some((mesh, handles))));
+        let registration = crate::keepalive::hold(&node, &inner, None);
+        Self {
+            inner,
+            registration,
+        }
+    }
 }
 
 #[napi]
@@ -657,7 +676,9 @@ impl EnrollmentServeHandle {
     /// Stop serving enrollment (unregister the services). Idempotent.
     #[napi]
     pub fn stop(&self) {
-        let _ = self.inner.lock().take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 
     /// Whether the services are still registered.
@@ -675,6 +696,27 @@ impl NetMesh {
     #[napi]
     pub fn rendezvous_string(&self) -> Result<String> {
         Ok(mesh_over(self.node_arc_clone()?, None).rendezvous_string())
+    }
+
+    /// Make sure there is a working session to the node a `rendezvous`
+    /// locator names (`addr|noise_pubkey|node_id`, as saved from an invite
+    /// or a `DeviceEnrollment`), re-dialing it only when needed. Call it
+    /// when a paired machine may have restarted — on either side — before
+    /// talking to it again. It dials and watches the existing session: a
+    /// peer that restarted accepts and the session is replaced, while a
+    /// peer still using the existing one keeps it (telling takes up to one
+    /// heartbeat interval). A far side still holding this node's old
+    /// session can take up to three heartbeat intervals to accept.
+    /// `renew` already does this.
+    /// (Requires the `delegation` feature.)
+    #[napi]
+    pub async fn ensure_attached(&self, rendezvous: String) -> Result<()> {
+        let rv = net_sdk::mesh_enroll::Rendezvous::decode(&rendezvous)
+            .ok_or_else(|| Error::from_reason("malformed rendezvous locator"))?;
+        mesh_over(self.node_arc_clone()?, None)
+            .ensure_attached_via(&rv.addr, &rv.noise_pubkey, rv.node_id)
+            .await
+            .map_err(|e| Error::from_reason(format!("ensure_attached failed: {e}")))
     }
 
     /// Device-side enrollment: enroll `device`'s key into the mesh named
@@ -731,9 +773,7 @@ impl NetMesh {
         let renew = mesh
             .serve_renewal_auto(op, ttl, depth)
             .map_err(enroll_err)?;
-        Ok(EnrollmentServeHandle {
-            inner: Mutex::new(Some((mesh, vec![enroll, renew]))),
-        })
+        Ok(EnrollmentServeHandle::registered(mesh, vec![enroll, renew]))
     }
 
     /// Operator-side, **approver-gated** enrollment: every valid join
@@ -789,9 +829,7 @@ impl NetMesh {
             let enroll = mesh
                 .serve_enrollment(op, ttl, depth, approve)
                 .map_err(enroll_err)?;
-            Ok(EnrollmentServeHandle {
-                inner: Mutex::new(Some((mesh, vec![enroll]))),
-            })
+            Ok(EnrollmentServeHandle::registered(mesh, vec![enroll]))
         })
     }
 

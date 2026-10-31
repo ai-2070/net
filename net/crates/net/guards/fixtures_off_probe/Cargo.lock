@@ -857,6 +857,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "unicode-normalization",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "xxhash-rust",
 ]

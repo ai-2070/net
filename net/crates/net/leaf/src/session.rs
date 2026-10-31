@@ -751,6 +751,7 @@ impl LeafSession {
             // reservation with nothing to count. The field is the
             // NATIVE sender's carrier, where no such table exists.
             fragment: None,
+            header: None,
         });
         let Some(stream) = self.session.try_stream(stream_id) else {
             return;
@@ -1315,6 +1316,7 @@ mod tests {
             events: vec![Bytes::from_static(b"x")],
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         });
         assert_eq!(
             leaf.rebuild(&[owned]).len(),

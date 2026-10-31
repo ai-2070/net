@@ -6566,6 +6566,17 @@ jobs:
           cargo nextest run --features net --lib --no-tests=fail
           -E 'test(/^adapter::net::behavior::enrollment_storage::/)'
 
+      # The mesh UDP port is exclusive. On Windows that rests on
+      # `SO_EXCLUSIVEADDRUSE` (`#[cfg(windows)]` in `transport.rs`), which no
+      # ubuntu job compiles: without it a second process — or any socket
+      # asking for SO_REUSEADDR — bound the node's port without an error and
+      # split its traffic. Solo filter for the same reason as the step above.
+      - name: Exclusive mesh port unit test
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --features net --lib --no-tests=fail
+          -E 'test(=adapter::net::transport::tests::a_bound_mesh_port_cannot_be_shared)'
+
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
       # case-variant `--out` names the SAME file as the org key — the exact

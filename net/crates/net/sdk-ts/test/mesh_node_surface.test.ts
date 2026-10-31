@@ -49,6 +49,7 @@ const ROWS: [string, unknown[]][] = [
   ['describeA2a', [S('target')]],
   ['submitTaskPaid', [S('prepared'), S('proof')]],
   ['publishTools', [S('tools'), S('handler'), S('options')]],
+  ['ensureAttached', [S('rendezvous')]],
   ['rendezvousString', []],
   ['serveEnrollment', [S('operator'), S('approver'), S('ttl'), S('depth'), S('approveTimeoutMs')]],
   ['serveEnrollmentAuto', [S('operator'), S('ttl'), S('depth')]],

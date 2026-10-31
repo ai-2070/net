@@ -469,12 +469,18 @@ export interface RawDuplexStream {
 }
 
 /**
- * Raw napi `JsResponseSink` — outbound side surfaced to duplex
- * server handlers. Non-async (try_send under the hood; drops on
- * mpsc overflow). Returns `false` if the sink has been closed.
+ * Raw napi `JsResponseSink` — outbound side surfaced to streaming and
+ * duplex server handlers.
+ *
+ * - `send` never waits: `true` if the chunk was queued, `false` if it
+ *   was dropped (the per-call queue is full, or the call is gone).
+ * - `sendWait` waits for queue room instead of dropping; it resolves
+ *   `false` only once the call is gone. Use it when every chunk must
+ *   arrive.
  */
 export interface RawResponseSink {
   send(body: Buffer): boolean
+  sendWait(body: Buffer): Promise<boolean>
 }
 
 /** Raw napi `RpcStream` — minimal shape consumed by `TypedRpcStream`. */
@@ -1593,17 +1599,18 @@ export class TypedDuplexStream<Resp = unknown>
 }
 
 /**
- * Typed outbound response sink for duplex server handlers.
- * Non-async — mirrors `RawResponseSink.send`. Returns `true`
- * when the chunk was enqueued; `false` if the underlying sink
- * is closed. Encode failure throws `nrpc:codec_encode:` and the
- * chunk is NOT sent.
+ * Typed outbound response sink for streaming and duplex server
+ * handlers. Encode failure throws `nrpc:codec_encode:` and the chunk is
+ * NOT sent.
  *
- * Flow control: the underlying sink `try_send`s into a bounded
- * 1024-chunk mpsc; bursts past the credit window are dropped
- * (counted by `streaming_chunks_dropped_total`). Pace your
- * `send` calls via REQUEST_GRANT cadence for lossless flow
- * control.
+ * Two ways to emit:
+ * - `send(value)` never waits. The per-call queue holds 1024 chunks; a
+ *   handler that outruns its caller fills it, and `send` then DROPS
+ *   the chunk and returns `false` (counted by
+ *   `streaming_chunks_dropped_total`).
+ * - `await sendWait(value)` waits for room instead, so nothing is
+ *   dropped and the handler runs at the caller's pace. Resolves
+ *   `false` once the call is gone.
  */
 export class TypedResponseSink<Resp = unknown> {
   private readonly _raw: RawResponseSink
@@ -1618,13 +1625,24 @@ export class TypedResponseSink<Resp = unknown> {
   }
 
   /**
-   * Encode + emit one response chunk. Returns `true` on
-   * successful enqueue; `false` if the sink has been closed.
-   * Throws `nrpc:codec_encode:` on encoding failure.
+   * Encode + emit one response chunk without waiting. Returns `true`
+   * if it was queued, `false` if it was dropped (queue full, or the
+   * call is gone). Throws `nrpc:codec_encode:` on encoding failure.
    */
   send(value: Resp): boolean {
     const buf = jsonEncode(value)
     return this._raw.send(buf)
+  }
+
+  /**
+   * Encode + emit one response chunk, waiting for queue room instead
+   * of dropping. Resolves `true` once queued, `false` if the call is
+   * gone (stop producing). Throws `nrpc:codec_encode:` on encoding
+   * failure.
+   */
+  sendWait(value: Resp): Promise<boolean> {
+    const buf = jsonEncode(value)
+    return this._raw.sendWait(buf)
   }
 }
 

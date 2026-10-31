@@ -350,7 +350,14 @@ impl MeshBuilder {
 
     /// Keep this node's Noise static key across restarts: nodes that pinned
     /// it (e.g. from an invite or bundle this node issued) can then reach it
-    /// again. Without it every build generates a fresh key.
+    /// again.
+    ///
+    /// Without it, a builder given an [`identity`](Self::identity) derives
+    /// the key from that identity
+    /// ([`NoiseStaticKey::derive_from_identity`](net::adapter::net::NoiseStaticKey::derive_from_identity)),
+    /// so it is stable anyway; a builder with no identity generates a
+    /// fresh key per build. Set this to keep the Noise key independent of
+    /// the identity (rotate one without the other).
     pub fn noise_static_key(mut self, key: net::adapter::net::NoiseStaticKey) -> Self {
         self.static_key = Some(key);
         self
@@ -554,6 +561,9 @@ impl MeshBuilder {
         if let Some(dir) = self.subnet_floor_store {
             config = config.with_subnet_floor_store(dir);
         }
+        // An explicit Noise key wins. Without one, `MeshNode::new` derives
+        // it from the identity (`configured_identity` above), so a node
+        // rebuilt from the same identity keeps its rendezvous address.
         if let Some(key) = self.static_key {
             config = config.with_static_key(key);
         }
@@ -855,6 +865,83 @@ impl Mesh {
             .connect_via(addr, peer_pubkey, peer_node_id)
             .await?;
         Ok(())
+    }
+
+    /// Make sure there is a working session to `peer_node_id`, dialing it
+    /// through `relay_addr` (typically the peer's own address, from a saved
+    /// rendezvous) only when needed. The call to make after a restart — on
+    /// either side — before talking to a peer again.
+    ///
+    /// It always dials, because recent traffic on the existing session
+    /// does not show the peer still holds it: a peer that has just
+    /// restarted lost it, while what it sent before going down still
+    /// reads as recent for a few heartbeats. While the dial is pending it
+    /// watches the existing session, and whichever answers first settles
+    /// it:
+    ///
+    /// - A peer that restarted (or holds an idle session) accepts the dial
+    ///   at once, and this returns on the fresh session.
+    /// - A peer still USING the existing session defers the handshake (its
+    ///   busy gate will not swap out open streams or unacked data) but keeps
+    ///   heartbeating on that session. The first packet it sends there after
+    ///   the dial began proves it holds the session, and this returns —
+    ///   within about one heartbeat interval — leaving the session in place
+    ///   (the deferred dial is dropped).
+    /// - Otherwise it keeps re-dialing until a handshake lands or
+    ///   [`MeshNode::session_rotation_defer_window`](net::adapter::net::MeshNode::session_rotation_defer_window)
+    ///   (plus a margin for one more attempt) has passed. That window is how
+    ///   long a peer still holding this node's previous session defers a
+    ///   new handshake, so a single `connect_via` (three attempts) can give
+    ///   up just before the peer would have accepted.
+    ///
+    /// Returns the last handshake error if the window runs out.
+    pub async fn ensure_attached_via(
+        &self,
+        relay_addr: &str,
+        peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
+    ) -> Result<()> {
+        const MARGIN: Duration = Duration::from_secs(6);
+        const WATCH: Duration = Duration::from_millis(50);
+        let addr: SocketAddr = relay_addr
+            .parse()
+            .map_err(|e| SdkError::Config(format!("invalid relay address: {}", e)))?;
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.node.session_rotation_defer_window() + MARGIN;
+        // The peer has spoken on our session since we began: it holds that
+        // session (a restarted peer cannot), so the session is the working
+        // one. A session the dial itself installed counts too.
+        let peer_holds_session = || {
+            self.node
+                .peer_session_heard_within(peer_node_id, started.elapsed())
+        };
+        loop {
+            // The dial is dropped, not left running, when the watch settles
+            // first: nothing may keep the node alive past this call (a
+            // binding's `shutdown()` needs sole ownership). Dropping it is
+            // safe — it only ever waits inside a handshake attempt, whose
+            // pending state cleans itself up on drop, or between attempts;
+            // the session install after the handshake does not await.
+            let dial = self.node.connect_via(addr, peer_pubkey, peer_node_id);
+            tokio::pin!(dial);
+            let dialed = loop {
+                tokio::select! {
+                    result = &mut dial => break result,
+                    () = tokio::time::sleep(WATCH) => {
+                        if peer_holds_session() {
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            match dialed {
+                Ok(_) => return Ok(()),
+                Err(_) if peer_holds_session() => return Ok(()),
+                Err(e) if tokio::time::Instant::now() >= deadline => return Err(e.into()),
+                // Not accepted yet (deferred, or the peer is still down).
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
     }
 
     /// Start the receive loop, heartbeat sender, and router.

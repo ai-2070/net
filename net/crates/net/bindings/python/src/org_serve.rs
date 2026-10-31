@@ -45,15 +45,25 @@ pub(crate) fn caller_dict<'py>(
 /// Handle for a served organization service. `close()` unregisters.
 #[pyclass(name = "OrgServeHandle", module = "_net")]
 pub struct PyOrgServeHandle {
-    inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+    inner: Arc<parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>>,
+    /// The node's hold on the service (`keepalive`): it lives until
+    /// `close()` or the mesh's `shutdown()`, not until this handle's
+    /// refcount reaches zero.
+    registration: crate::keepalive::Registration,
 }
 
 impl PyOrgServeHandle {
     /// Wrap a registered serve handle — shared with the subnet-exported
-    /// serve, which returns the same RAII shape.
-    pub(crate) fn from_handle(handle: net_sdk::mesh_rpc::ServeHandle) -> Self {
+    /// serve, which returns the same shape.
+    pub(crate) fn from_handle(
+        node: &Arc<::net::adapter::net::MeshNode>,
+        handle: net_sdk::mesh_rpc::ServeHandle,
+    ) -> Self {
+        let inner = Arc::new(parking_lot::Mutex::new(Some(handle)));
+        let registration = crate::keepalive::hold(node, &inner, None);
         PyOrgServeHandle {
-            inner: parking_lot::Mutex::new(Some(handle)),
+            inner,
+            registration,
         }
     }
 }
@@ -63,7 +73,9 @@ impl PyOrgServeHandle {
     /// Unregister the service. Idempotent. In-flight handlers run to
     /// completion.
     fn close(&self) {
-        let _ = self.inner.lock().take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 
     #[getter]
@@ -150,9 +162,10 @@ pub fn serve_org(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(org_serve_error(&e)))?
     };
 
-    Ok(PyOrgServeHandle {
-        inner: parking_lot::Mutex::new(Some(handle)),
-    })
+    Ok(PyOrgServeHandle::from_handle(
+        &mesh.node_arc_clone()?,
+        handle,
+    ))
 }
 
 /// Invoke the Python handler with the verified caller and request bytes.
@@ -695,9 +708,10 @@ pub fn serve_org_streaming(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(org_serve_error(&e)))?
     };
 
-    Ok(PyOrgServeHandle {
-        inner: parking_lot::Mutex::new(Some(handle)),
-    })
+    Ok(PyOrgServeHandle::from_handle(
+        &mesh.node_arc_clone()?,
+        handle,
+    ))
 }
 
 /// Serve a protected, privately-discoverable service with a STREAM OF
@@ -756,9 +770,10 @@ pub fn serve_org_client_stream(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(org_serve_error(&e)))?
     };
 
-    Ok(PyOrgServeHandle {
-        inner: parking_lot::Mutex::new(Some(handle)),
-    })
+    Ok(PyOrgServeHandle::from_handle(
+        &mesh.node_arc_clone()?,
+        handle,
+    ))
 }
 
 /// Serve a protected, privately-discoverable service BIDIRECTIONALLY (OSDK
@@ -819,7 +834,8 @@ pub fn serve_org_duplex(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(org_serve_error(&e)))?
     };
 
-    Ok(PyOrgServeHandle {
-        inner: parking_lot::Mutex::new(Some(handle)),
-    })
+    Ok(PyOrgServeHandle::from_handle(
+        &mesh.node_arc_clone()?,
+        handle,
+    ))
 }

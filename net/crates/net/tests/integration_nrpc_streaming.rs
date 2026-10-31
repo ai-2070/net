@@ -735,3 +735,75 @@ async fn a_live_peers_rehandshake_does_not_cut_a_streaming_response() {
     let expected: Vec<String> = (0..20).map(|i| format!("paced-{i}")).collect();
     assert_eq!(collected, expected, "the response must arrive whole");
 }
+
+/// A streamed reply survives packet loss: every chunk arrives, in order,
+/// when the server's link drops one reliable reply packet in seven.
+/// Reply frames used to be flagged RELIABLE without being registered for
+/// retransmit, so one lost datagram left a gap the caller held on and
+/// then dropped behind (`APP_INTEGRATION_BLOCKERS_PLAN.md` 3c).
+#[cfg(feature = "fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_streaming_recovers_lost_reply_packets() {
+    let server = build_node().await;
+    let caller = build_node().await;
+    handshake_pair(&caller, &server).await;
+
+    const N: usize = 600;
+    struct EmitWaiting;
+    #[async_trait::async_trait]
+    impl RpcStreamingHandler for EmitWaiting {
+        async fn call(
+            &self,
+            _ctx: RpcContext,
+            sink: RpcResponseSink,
+        ) -> Result<(), RpcHandlerError> {
+            for i in 0..N as u32 {
+                let mut chunk = vec![0u8; 512];
+                chunk[..4].copy_from_slice(&i.to_be_bytes());
+                sink.send_wait(chunk)
+                    .await
+                    .map_err(|_| RpcHandlerError::Internal("call gone".into()))?;
+            }
+            Ok(())
+        }
+    }
+    let _serve = server
+        .serve_rpc_streaming("lossy", Arc::new(EmitWaiting))
+        .expect("serve_rpc_streaming");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.set_publish_drop_every_n_for_test(7);
+
+    let mut stream = caller
+        .call_streaming(
+            server.node_id(),
+            "lossy",
+            Bytes::from_static(b""),
+            CallOptions {
+                stream_window_initial: Some(64),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_streaming");
+    let mut got = Vec::with_capacity(N);
+    let collect = async {
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk");
+            got.push(u32::from_be_bytes(chunk[..4].try_into().unwrap()));
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), collect)
+        .await
+        .expect("a lossy stream must still complete");
+    let seen = server.publish_drop_seen_for_test();
+    server.set_publish_drop_every_n_for_test(0);
+    assert!(
+        seen >= 7 * 10,
+        "the loss injection must actually have dropped reply packets (saw {seen})"
+    );
+    assert_eq!(
+        got,
+        (0..N as u32).collect::<Vec<_>>(),
+        "every chunk, in order"
+    );
+}

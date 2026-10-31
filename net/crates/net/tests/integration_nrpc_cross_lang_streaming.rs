@@ -364,6 +364,7 @@ impl DuplexLoopback {
                     .lock()
                     .apply(&ev, &mut ())
                     .expect("client fold apply");
+                true
             })
         });
         let server_fold = Arc::new(Mutex::new(RpcDuplexFold::new(

@@ -785,16 +785,16 @@ class TypedDuplexStream:
 class TypedResponseSink:
     """Typed outbound response sink for duplex server handlers.
 
-    Non-async (mirrors the raw ``ResponseSinkSend.send``). Returns
-    ``True`` when the chunk was enqueued; ``False`` if the
-    underlying sink is closed. Encode failure raises
-    :class:`RpcCodecError` and the chunk is NOT sent.
+    Encode failure raises :class:`RpcCodecError` and the chunk is NOT
+    sent. Two ways to emit:
 
-    Flow control: the underlying sink ``try_send``\\ s into a
-    bounded 1024-chunk mpsc. Bursts past the credit window are
-    dropped (counted by ``streaming_chunks_dropped_total``). Pace
-    your :meth:`send` calls to the protocol's REQUEST_GRANT
-    cadence for lossless flow control.
+    - :meth:`send` never waits. The underlying queue holds 1024 chunks;
+      a handler that outruns its caller fills it, and ``send`` then
+      DROPS the chunk and returns ``False`` (counted by
+      ``streaming_chunks_dropped_total``).
+    - :meth:`send_wait` (or ``await`` :meth:`asend_wait` in an
+      ``async def`` handler) waits for room instead, so nothing is
+      dropped. Returns ``False`` only once the call is gone.
     """
 
     def __init__(self, raw: Any) -> None:
@@ -806,11 +806,23 @@ class TypedResponseSink:
         return self._raw
 
     def send(self, value: Any) -> bool:
-        """Encode + emit one response chunk. Returns ``True`` on
-        successful enqueue; ``False`` if the sink has been closed.
-        Raises :class:`RpcCodecError` on encode failure.
+        """Encode + emit one response chunk without waiting. Returns
+        ``True`` if queued; ``False`` if it was dropped (queue full, or
+        the call is gone). Raises :class:`RpcCodecError` on encode
+        failure.
         """
         return bool(self._raw.send(_json_encode(value)))
+
+    def send_wait(self, value: Any) -> bool:
+        """Encode + emit one chunk, waiting for queue room instead of
+        dropping it (blocks; GIL released). ``False`` once the call is
+        gone. Raises :class:`RpcCodecError` on encode failure.
+        """
+        return bool(self._raw.send_wait(_json_encode(value)))
+
+    async def asend_wait(self, value: Any) -> bool:
+        """:meth:`send_wait` for ``async def`` handlers."""
+        return bool(await self._raw.asend_wait(_json_encode(value)))
 
 
 # ---------------------------------------------------------------------------

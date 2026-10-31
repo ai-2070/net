@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tokio::runtime::Runtime;
@@ -636,6 +636,24 @@ pub(crate) fn mesh_renew(
     Ok(PyDelegationChain::from_inner(renewed))
 }
 
+/// Make sure there is a working session to the node `rendezvous` names,
+/// re-dialing only when needed (see `net_sdk::Mesh::ensure_attached_via`).
+/// Releases the GIL for the handshake.
+pub(crate) fn mesh_ensure_attached(
+    py: Python<'_>,
+    node: Arc<MeshNode>,
+    runtime: &Runtime,
+    rendezvous: &str,
+) -> PyResult<()> {
+    let rv = net_sdk::mesh_enroll::Rendezvous::decode(rendezvous)
+        .ok_or_else(|| PyValueError::new_err("malformed rendezvous locator"))?;
+    let mesh = mesh_over(node, None);
+    py.detach(move || {
+        runtime.block_on(mesh.ensure_attached_via(&rv.addr, &rv.noise_pubkey, rv.node_id))
+    })
+    .map_err(|e| PyRuntimeError::new_err(format!("ensure_attached failed: {e}")))
+}
+
 /// Operator-side: serve the full device lifecycle on the live `node` (auto —
 /// the invite is the authorization): **enroll** (join) + **renew**. Returns a
 /// handle that must be held to keep the services open.
@@ -655,9 +673,10 @@ pub(crate) fn mesh_serve_enrollment_auto(
     let renew = mesh
         .serve_renewal_auto(operator, grant_ttl, max_depth)
         .map_err(enroll_err)?;
-    Ok(PyEnrollmentServeHandle {
-        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll, renew]))),
-    })
+    Ok(PyEnrollmentServeHandle::registered(
+        mesh,
+        vec![enroll, renew],
+    ))
 }
 
 /// Operator-side, **approver-gated** enrollment on the live `node`: every
@@ -687,9 +706,7 @@ pub(crate) fn mesh_serve_enrollment(
     let enroll = mesh
         .serve_enrollment(operator, grant_ttl, max_depth, approve)
         .map_err(enroll_err)?;
-    Ok(PyEnrollmentServeHandle {
-        inner: parking_lot::Mutex::new(Some((mesh, vec![enroll]))),
-    })
+    Ok(PyEnrollmentServeHandle::registered(mesh, vec![enroll]))
 }
 
 type PendingAnswer =
@@ -763,7 +780,27 @@ pub struct PyEnrollmentServeHandle {
     // each `ServeHandle` holds one dispatcher registration (enroll + renew) —
     // all must outlive the services.
     // A lock, not `&mut self` (SDK audit 2026-10-11): see `NetMesh.node`.
-    inner: parking_lot::Mutex<Option<(Mesh, Vec<ServeHandle>)>>,
+    inner: Arc<parking_lot::Mutex<Option<EnrollmentServices>>>,
+    /// The node's hold on the services (`keepalive`): they stay up until
+    /// `stop()` or the mesh's `shutdown()`, not until this handle's
+    /// refcount reaches zero.
+    registration: crate::keepalive::Registration,
+}
+
+/// The mesh the enrollment services registered against, and their
+/// registrations (enroll, and renew on the auto path).
+type EnrollmentServices = (Mesh, Vec<ServeHandle>);
+
+impl PyEnrollmentServeHandle {
+    fn registered(mesh: Mesh, handles: Vec<ServeHandle>) -> Self {
+        let node = Arc::clone(mesh.node());
+        let inner = Arc::new(parking_lot::Mutex::new(Some((mesh, handles))));
+        let registration = crate::keepalive::hold(&node, &inner, None);
+        Self {
+            inner,
+            registration,
+        }
+    }
 }
 
 #[pymethods]
@@ -772,6 +809,7 @@ impl PyEnrollmentServeHandle {
     fn stop(&self) {
         let taken = self.inner.lock().take();
         drop(taken);
+        self.registration.forget();
     }
 
     /// Whether the service is still registered.

@@ -66,22 +66,76 @@ pub const DEFAULT_FETCH_CONCURRENCY: usize = 16;
 /// of file size).
 const BLOCKING_FS_THRESHOLD: u64 = 256 * 1024;
 
-/// Aggregate in-flight byte budget across concurrent leaf fetches in
-/// [`fetch_dir`]. The per-stream tx window is large (≈ a whole chunk),
-/// so the file-count cap alone does NOT bound how many bytes are in
-/// flight at once: N concurrent large files put ≈ N × chunk bytes on the
-/// wire, and once that exceeds what the receiver's single recv loop can
-/// drain, the kernel recv buffer overflows, packets drop, and (today)
-/// the transfer can't recover. This budget caps aggregate in-flight: a
-/// file reserves ≈ its current chunk's worth, so many tiny files run
-/// wide while large files run only a couple at a time. 8 MiB matches the
-/// concurrency that transfers cleanly in the diagnostic sweep against an
-/// 8-16 MiB socket recv buffer; deployments that size their recv buffer
-/// higher can raise this constant for more large-file parallelism.
-pub const DEFAULT_INFLIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+/// Aggregate in-flight byte budget across concurrent leaf and chunk
+/// fetches in [`fetch_dir`]: every chunk being fetched reserves its size
+/// (≤ one 4 MiB chunk) until it is written. This bounds receiver MEMORY
+/// (chunks fetched but not yet written), and with it how many chunk
+/// streams run at once.
+///
+/// Bytes actually on the wire are far smaller: each chunk stream is held
+/// to `TRANSFER_STREAM_WINDOW_BYTES` (~256 KB) in flight, so 32 MiB of
+/// reservations is at most ~8 streams × 256 KB ≈ 2 MB unacknowledged —
+/// well inside the default socket buffers. (This used to be 8 MiB, sized
+/// when each stream's window covered a whole chunk, so N chunks really
+/// were N × 4 MiB on the wire. With the window shrunk, 8 MiB only ever
+/// allowed two chunks at once: a single 190 MiB file ran at 7.7 MiB/s
+/// with chunks fetched in parallel, 31 MiB/s at 32 MiB, and no faster at
+/// 64 MiB — APP_INTEGRATION_BLOCKERS_PLAN.md Phase 2.)
+pub const DEFAULT_INFLIGHT_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
-/// Byte-semaphore permits a file reserves while in flight: ≈ its
-/// current chunk's worth (chunks move sequentially), clamped to
+/// Byte budget for [`store_dir`]. Deliberately NOT
+/// [`DEFAULT_INFLIGHT_BUDGET_BYTES`]: the store reserves at most one chunk
+/// per file (the same [`in_flight_byte_permits`] as the fetch side) but
+/// reads each file WHOLE before chunking it, so this budget bounds how
+/// many large files are resident at once, not their bytes. At 8 MiB that
+/// is two files past the chunk size, as before the fetch budget was
+/// raised; tying the two together let `store_dir` hold four times as many
+/// whole large files in memory.
+const STORE_INFLIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many of ONE file's chunks may be in flight at once in
+/// [`fetch_dir`]. Chunks of a large file used to be fetched strictly one
+/// after another, so a single big file ran at one chunk stream's pace
+/// (~4 MB/s on loopback) while many small files ran 16 wide. The
+/// aggregate byte budget still bounds the total, so this only lets a big
+/// file use the parallelism a directory of small files already gets.
+pub const MAX_CHUNKS_IN_FLIGHT_PER_FILE: usize = 8;
+
+/// How many times a chunk fetch is attempted before the directory fetch
+/// fails. Chunks are content-addressed, so a retry is always safe; it
+/// rides out a holder that gave up on one stream under backpressure.
+/// Only that failure is retried (see [`fetch_chunk_with_retry`]).
+const CHUNK_FETCH_ATTEMPTS: usize = 3;
+
+/// Pause before retrying a chunk whose holder gave up, multiplied by the
+/// attempt number. The holder gave up because it was overloaded, so
+/// asking again at once would only meet the same full window.
+const CHUNK_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Tuning for [`fetch_dir_with`]. `Default` is what [`fetch_dir`] uses.
+#[derive(Debug, Clone, Copy)]
+pub struct FetchDirOptions {
+    /// Files fetched concurrently. `0` means
+    /// [`DEFAULT_FETCH_CONCURRENCY`].
+    pub concurrency: usize,
+    /// Aggregate bytes in flight across all files and chunks. `0` means
+    /// [`DEFAULT_INFLIGHT_BUDGET_BYTES`]. Raise it together with the
+    /// node's socket receive buffer, never past it (see the default's
+    /// doc for why).
+    pub inflight_bytes: usize,
+}
+
+impl Default for FetchDirOptions {
+    fn default() -> Self {
+        Self {
+            concurrency: DEFAULT_FETCH_CONCURRENCY,
+            inflight_bytes: DEFAULT_INFLIGHT_BUDGET_BYTES,
+        }
+    }
+}
+
+/// Byte-semaphore permits one fetch reserves while in flight: a whole
+/// small file, or one chunk of a large one, clamped to
 /// `[1, budget]` so a file larger than the whole budget can still
 /// run (alone). Shared by `store_dir` and `fetch_dir` so both
 /// sides reserve identically.
@@ -252,7 +306,7 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     // and not worth a tokio spawn dispatch.
     use futures::stream::StreamExt;
     let store_concurrency = DEFAULT_FETCH_CONCURRENCY;
-    let store_budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
+    let store_budget = u32::try_from(STORE_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_concurrency));
     let byte_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_budget as usize));
 
@@ -502,6 +556,21 @@ pub async fn fetch_dir(
     dest: &Path,
     concurrency: usize,
 ) -> Result<DirStats, DirError> {
+    let options = FetchDirOptions {
+        concurrency,
+        ..FetchDirOptions::default()
+    };
+    fetch_dir_with(node, source, manifest_ref, dest, options).await
+}
+
+/// [`fetch_dir`] with explicit [`FetchDirOptions`].
+pub async fn fetch_dir_with(
+    node: &Arc<MeshNode>,
+    source: u64,
+    manifest_ref: &BlobRef,
+    dest: &Path,
+    options: FetchDirOptions,
+) -> Result<DirStats, DirError> {
     let manifest_bytes = transfer_fetch_blob(node, source, manifest_ref).await?;
     let manifest: DirManifest = postcard::from_bytes(&manifest_bytes)
         .map_err(|e| DirError::Manifest(format!("decode: {e}")))?;
@@ -515,7 +584,7 @@ pub async fn fetch_dir(
     let dest = dest.to_path_buf();
     // Reconstruct into a sibling temp dir, then install it atomically.
     let work = alloc_temp_dir(&dest).await?;
-    let stats = match reconstruct_tree(node, source, &manifest, &work, concurrency).await {
+    let stats = match reconstruct_tree(node, source, &manifest, &work, options).await {
         Ok(stats) => stats,
         Err(e) => {
             // Best-effort cleanup so no `.<base>.fetch_*` orphan lingers;
@@ -541,7 +610,7 @@ async fn reconstruct_tree(
     source: u64,
     manifest: &DirManifest,
     root: &Path,
-    concurrency: usize,
+    options: FetchDirOptions,
 ) -> Result<DirStats, DirError> {
     let root = root.to_path_buf();
     let mut stats = DirStats::default();
@@ -580,18 +649,24 @@ async fn reconstruct_tree(
     .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
 
     // Pass 2: fetch + write files with bounded concurrency.
-    let concurrency = if concurrency == 0 {
+    let concurrency = if options.concurrency == 0 {
         DEFAULT_FETCH_CONCURRENCY
     } else {
-        concurrency
+        options.concurrency
     };
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    // Aggregate in-flight byte budget (permits = bytes). A file reserves
-    // ≈ its current chunk's worth, so large files self-limit to a couple
-    // concurrent while small files stay bounded only by the count cap.
-    // Capped at u32 (the budget fits) and clamped to [1, budget] so even
-    // a file larger than the budget can run (alone).
-    let budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
+    // Aggregate in-flight byte budget (permits = bytes). A small file
+    // reserves its size; a large file reserves per chunk while each is in
+    // flight (`fetch_blob_to_file`), so many small files run wide and a
+    // big file's chunks share the same bound. Capped at u32 (the budget
+    // fits) and clamped to [1, budget] so even a fetch larger than the
+    // budget can run (alone).
+    let inflight = if options.inflight_bytes == 0 {
+        DEFAULT_INFLIGHT_BUDGET_BYTES
+    } else {
+        options.inflight_bytes
+    };
+    let budget = u32::try_from(inflight).unwrap_or(u32::MAX);
     let byte_sem = Arc::new(tokio::sync::Semaphore::new(budget as usize));
     let mut tasks = Vec::new();
     for entry in &manifest.entries {
@@ -602,8 +677,8 @@ async fn reconstruct_tree(
         let blob_ref = BlobRef::decode(blob)
             .map_err(DirError::Blob)?
             .ok_or_else(|| DirError::Manifest(format!("entry {} has no blob ref", entry.path)))?;
-        // Bytes this file can have in flight at once ≈ its current chunk
-        // (chunks pull sequentially), bounded by the budget.
+        // A small file's reservation (≤ one chunk, bounded by the budget);
+        // a large file reserves per chunk instead.
         let in_flight = in_flight_byte_permits(blob_ref.size(), budget);
         let node = node.clone();
         let sem = sem.clone();
@@ -616,21 +691,22 @@ async fn reconstruct_tree(
             let _permit = sem.acquire().await.map_err(|_| {
                 DirError::Blob(BlobError::Backend("dir fetch: semaphore closed".into()))
             })?;
-            let _bytes_permit = byte_sem.acquire_many(in_flight).await.map_err(|_| {
-                DirError::Blob(BlobError::Backend(
-                    "dir fetch: byte semaphore closed".into(),
-                ))
-            })?;
-            // A multi-chunk (Manifest) leaf streams straight to disk one
-            // chunk at a time, so a large single file never spikes memory to
-            // its full size — peak is ~one chunk. A single-chunk (Small)
-            // leaf is ≤ one chunk anyway, so it takes the buffered
-            // inline/offloaded write fast path.
+            // A multi-chunk (Manifest) leaf fetches several chunks at once
+            // and streams them to disk in order; each chunk reserves its
+            // own bytes from the shared budget while it is in flight (and
+            // until written), so peak memory stays bounded by the budget,
+            // not the file size. A single-chunk (Small) leaf is ≤ one chunk
+            // anyway: it reserves once and takes the buffered write path.
             match &blob_ref {
                 BlobRef::Manifest { chunks, .. } => {
-                    fetch_blob_to_file(&node, source, chunks, &safe, mode).await
+                    fetch_blob_to_file(&node, source, chunks, &safe, mode, &byte_sem, budget).await
                 }
                 _ => {
+                    let _bytes_permit = byte_sem.acquire_many(in_flight).await.map_err(|_| {
+                        DirError::Blob(BlobError::Backend(
+                            "dir fetch: byte semaphore closed".into(),
+                        ))
+                    })?;
                     let bytes = transfer_fetch_blob(&node, source, &blob_ref).await?;
                     let len = bytes.len() as u64;
                     // Offload only large writes (T-3); small files write inline.
@@ -827,11 +903,11 @@ async fn transfer_fetch_blob(
     blob_ref: &BlobRef,
 ) -> Result<bytes::Bytes, DirError> {
     match blob_ref {
-        BlobRef::Small { hash, .. } => Ok(node.transfer_fetch_chunk(source, *hash).await?),
+        BlobRef::Small { hash, .. } => fetch_chunk_with_retry(node, source, *hash).await,
         BlobRef::Manifest { chunks, .. } => {
             let mut buf = BytesMut::with_capacity(blob_ref.size() as usize);
             for chunk in chunks {
-                let bytes = node.transfer_fetch_chunk(source, chunk.hash).await?;
+                let bytes = fetch_chunk_with_retry(node, source, chunk.hash).await?;
                 buf.put_slice(&bytes);
             }
             Ok(buf.freeze())
@@ -842,10 +918,49 @@ async fn transfer_fetch_blob(
     }
 }
 
-/// Stream a multi-chunk leaf straight to `path`, fetching and writing one
-/// chunk at a time so a large leaf is never buffered whole (peak ~one
-/// chunk). Returns the bytes written. Mirrors [`write_file`]'s mode
-/// application.
+/// Fetch one chunk, attempting it up to [`CHUNK_FETCH_ATTEMPTS`] times
+/// in all. Chunks are content-addressed (BLAKE3-verified on arrival), so
+/// a retry can never produce different bytes.
+///
+/// Only a holder that gave up mid-chunk is retried, after a short
+/// backoff: it has the chunk and was overloaded. Every other failure
+/// fails at once — a `NotFound` or a hash mismatch won't change, and a
+/// holder that went silent has already cost one full idle timeout, so
+/// waiting out two more would only delay the error.
+async fn fetch_chunk_with_retry(
+    node: &Arc<MeshNode>,
+    source: u64,
+    hash: [u8; 32],
+) -> Result<bytes::Bytes, DirError> {
+    let mut attempt = 1;
+    loop {
+        match node.transfer_fetch_chunk(source, hash).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e)
+                if attempt < CHUNK_FETCH_ATTEMPTS
+                    && super::blob::transfer::is_holder_gave_up(&e) =>
+            {
+                tracing::debug!(error = %e, attempt, "dir fetch: holder gave up on a chunk, retrying");
+                tokio::time::sleep(CHUNK_RETRY_BACKOFF * attempt as u32).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(DirError::Blob(e)),
+        }
+    }
+}
+
+/// Stream a multi-chunk leaf to `path`, with up to
+/// [`MAX_CHUNKS_IN_FLIGHT_PER_FILE`] of its chunks in flight at once.
+/// Returns the bytes written. Mirrors [`write_file`]'s mode application.
+///
+/// Chunks are fetched concurrently but written strictly in manifest
+/// order (`buffered`), so the file is written front to back with no
+/// seeking. Each chunk reserves its size from the directory's shared
+/// `byte_sem` before its fetch and holds it until written, so bytes in
+/// flight or waiting in memory never exceed the budget. Deadlock-free:
+/// the semaphore is FIFO, and `buffered` polls (so enqueues) chunks in
+/// order, so the head chunk always gets its bytes ahead of this file's
+/// later chunks, and no permit is held while waiting for another.
 ///
 /// The substrate's tokio build has no `fs` feature (file I/O is sync
 /// `std::fs` offloaded to the blocking pool — see [`write_file`]), so each
@@ -857,7 +972,11 @@ async fn fetch_blob_to_file(
     chunks: &[ChunkRef],
     path: &Path,
     mode: u32,
+    byte_sem: &Arc<tokio::sync::Semaphore>,
+    budget: u32,
 ) -> Result<u64, DirError> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
     let create_path = path.to_path_buf();
     // LINUX-04: request the final mode up front. This handle stays open
     // across every chunk fetch, so `File::create`'s umask-derived 0644
@@ -868,12 +987,30 @@ async fn fetch_blob_to_file(
         tokio::task::spawn_blocking(move || create_file_with_final_mode(&create_path, mode))
             .await
             .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+
+    let mut fetched = stream::iter(chunks.iter().copied())
+        .map(|chunk| {
+            let node = Arc::clone(node);
+            let byte_sem = Arc::clone(byte_sem);
+            async move {
+                let permits = in_flight_byte_permits(u64::from(chunk.size), budget);
+                let permit = byte_sem.acquire_many_owned(permits).await.map_err(|_| {
+                    DirError::Blob(BlobError::Backend(
+                        "dir fetch: byte semaphore closed".into(),
+                    ))
+                })?;
+                let bytes = fetch_chunk_with_retry(&node, source, chunk.hash).await?;
+                Ok::<_, DirError>((bytes, permit))
+            }
+        })
+        .buffered(MAX_CHUNKS_IN_FLIGHT_PER_FILE);
+
     let mut written: u64 = 0;
-    for chunk in chunks {
-        let bytes = node.transfer_fetch_chunk(source, chunk.hash).await?;
+    while let Some((bytes, permit)) = fetched.try_next().await? {
         written += bytes.len() as u64;
         // Offload the blocking write, moving the handle in and back out so
-        // the next chunk writes to the same file.
+        // the next chunk writes to the same file. The chunk's bytes stay
+        // reserved until written.
         file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
             use std::io::Write as _;
             let mut f = file;
@@ -882,6 +1019,7 @@ async fn fetch_blob_to_file(
         })
         .await
         .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+        drop(permit);
     }
     // Flush + close on the blocking pool, then apply the mode.
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -1455,6 +1593,23 @@ mod tests {
         // A budget smaller than the chunk size wins the clamp, so
         // a giant file can still run alone.
         assert_eq!(in_flight_byte_permits(u64::MAX, 64), 64);
+    }
+
+    /// AIB-2 (CODE_REVIEW_2026_10_28): `store_dir` reads every file
+    /// whole but reserves one chunk per file, so its budget decides how
+    /// many large files are resident at once. Raising the FETCH budget
+    /// must not raise that — two large files at a time, as before.
+    #[test]
+    fn store_budget_holds_at_most_two_large_files() {
+        let store_budget = u32::try_from(STORE_INFLIGHT_BUDGET_BYTES).unwrap();
+        let per_large_file = in_flight_byte_permits(u64::MAX, store_budget);
+        assert_eq!(store_budget / per_large_file, 2);
+        const {
+            assert!(
+                STORE_INFLIGHT_BUDGET_BYTES < DEFAULT_INFLIGHT_BUDGET_BYTES,
+                "store_dir must keep its own, smaller budget"
+            )
+        };
     }
 
     #[test]

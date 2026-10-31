@@ -3322,6 +3322,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "windows-sys 0.61.2",
  "x25519-dalek 3.0.0",
  "xxhash-rust",
 ]

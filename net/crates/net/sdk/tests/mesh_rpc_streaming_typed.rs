@@ -234,3 +234,64 @@ async fn typed_streaming_chunk_decode_failure_terminates_stream() {
         "stream must close after decode error"
     );
 }
+
+/// AIB-8 (CODE_REVIEW_2026_10_28): `send` drops silently once the
+/// per-call queue is full; `try_send` must report each drop as
+/// `Ok(false)`, the same flag the Node and Python sinks return. The
+/// caller grants 8 chunks of credit while the handler bursts well past
+/// the 1024-chunk queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_try_send_reports_a_dropped_chunk() {
+    const BURST: u32 = 4096;
+    let psk = [0x42u8; 32];
+    let (caller, server, addr_server) = two_meshes(&psk).await;
+    handshake(&caller, &server, addr_server).await;
+
+    let (refused_tx, refused_rx) = tokio::sync::oneshot::channel::<u32>();
+    let refused_tx = parking_lot::Mutex::new(Some(refused_tx));
+    let _serve = server
+        .serve_rpc_streaming_typed("burst", Codec::Json, move |_req: CountRequest, sink| {
+            let tx = refused_tx.lock().take();
+            async move {
+                let mut refused = 0;
+                for i in 0..BURST {
+                    if !sink.try_send(&i)? {
+                        refused += 1;
+                    }
+                }
+                if let Some(tx) = tx {
+                    let _ = tx.send(refused);
+                }
+                Ok(())
+            }
+        })
+        .expect("serve_rpc_streaming_typed");
+
+    let mut opts = CallOptionsTyped::default();
+    opts.raw.stream_window_initial = Some(8);
+    let mut stream = caller
+        .call_streaming_typed::<CountRequest, u32>(
+            server.inner().node_id(),
+            "burst",
+            &CountRequest { n: BURST },
+            opts,
+        )
+        .await
+        .expect("call_streaming_typed");
+    let mut got = 0u32;
+    while let Some(item) = stream.next().await {
+        item.expect("chunk must decode + be Ok");
+        got += 1;
+    }
+
+    let refused = tokio::time::timeout(Duration::from_secs(10), refused_rx)
+        .await
+        .expect("handler finished")
+        .expect("handler reported");
+    assert!(refused > 0, "a burst past the queue must report drops");
+    assert!(
+        got <= BURST - refused,
+        "{got} chunks arrived but only {} were queued",
+        BURST - refused
+    );
+}

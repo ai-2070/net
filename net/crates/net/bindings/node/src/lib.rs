@@ -90,6 +90,13 @@ mod transport;
 // cortex / netdb feature unit.
 #[cfg(feature = "net")]
 mod identity;
+// Node-owned serve registrations: a serve handle's GC no longer stops
+// the service (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 4). `shutdown`
+// always releases; only the serve surfaces (nRPC, enrollment, org, A2A)
+// hold, so a `net`-only build uses part of the module.
+#[cfg(feature = "net")]
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+mod keepalive;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
 // MeshDB query layer (Node SDK slice 1: factory AST + in-memory
@@ -178,7 +185,7 @@ use net::config::RedisAdapterConfig;
 use net::config::JetStreamAdapterConfig;
 
 #[cfg(feature = "net")]
-use net::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
+use net::adapter::net::{NetAdapterConfig, NoiseStaticKey, ReliabilityConfig, StaticKeypair};
 
 /// Redis adapter configuration.
 #[napi(object)]
@@ -1354,7 +1361,18 @@ mod mesh_bindings {
         /// keypair (and therefore its `entity_id` + stable
         /// `node_id`) from these bytes instead of generating
         /// ephemeral ones. Treat as secret material.
+        ///
+        /// A seeded node also derives its Noise static key (its
+        /// `publicKey()`, the key in its rendezvous string) from this
+        /// seed unless `noiseStaticKey` is set, so peers that paired
+        /// with it can still reach it after a restart.
         pub identity_seed: Option<Buffer>,
+        /// 32-byte Noise (X25519) static private key — any 32 random
+        /// bytes, stored by the caller. Keeps `publicKey()` stable
+        /// across restarts independently of the identity. Leave unset
+        /// to derive it from `identitySeed` (or, with no seed, to get a
+        /// fresh key per process). Treat as secret material.
+        pub noise_static_key: Option<Buffer>,
         /// Pin this mesh's publicly-advertised reflex to the
         /// supplied external `"ip:port"`. Classification is
         /// skipped; the node starts in `nat:open` and advertises
@@ -1888,6 +1906,21 @@ mod mesh_bindings {
                 }
                 None => EntityKeypair::generate(),
             };
+
+            // Noise static key: an explicit one wins. Without it,
+            // `MeshNode::new` derives one from a seeded (configured)
+            // identity, so the node's rendezvous address survives a
+            // restart, and otherwise generates a fresh key.
+            if let Some(key) = options.noise_static_key {
+                let bytes: &[u8] = key.as_ref();
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                    Error::from_reason(format!(
+                        "noise_static_key must be 32 bytes, got {}",
+                        bytes.len()
+                    ))
+                })?;
+                config = config.with_static_key(NoiseStaticKey::from_private(arr));
+            }
 
             let mut node = MeshNode::new(identity, config)
                 .await
@@ -2737,6 +2770,14 @@ mod mesh_bindings {
             // serve-task teardown ticks in the race path.
             const DRAIN_ATTEMPTS: u32 = 50;
             const DRAIN_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+            // Stop every service registered on this node first. They are
+            // node-owned (a dropped JS handle no longer stops one), and each
+            // holds a node reference that would otherwise fail the
+            // sole-ownership wait below.
+            if let Some(node) = self.node.load_full() {
+                crate::keepalive::release_all(&node);
+            }
 
             let mut node_arc = self
                 .node
