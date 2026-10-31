@@ -177,10 +177,10 @@ jobs:
 
       # Pinned, like ci.yml's browser-package job: wasm-bindgen's CLI and
       # the crate must agree exactly or the bundle is unloadable.
-      - name: Install wasm-bindgen-cli 0.2.129
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       # Playwright 1.56 uses a zip extractor that hangs on Node 26 after
       # downloading a browser (microsoft/playwright#40724). Keep the pinned
