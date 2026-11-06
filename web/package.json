@@ -119,7 +119,7 @@
   "devDependencies": {
     "@next/bundle-analyzer": "16.4.5",
     "@next/eslint-plugin-next": "16.4.5",
-    "@tailwindcss/postcss": "4.3.4",
+    "@tailwindcss/postcss": "4.3.5",
     "@tailwindcss/typography": "0.5.20",
     "@tanstack/react-query-devtools": "5.106.1",
     "@types/node": "26.6.6",
@@ -137,7 +137,7 @@
     "prettier-plugin-tailwindcss": "0.8.1",
     "prisma": "7.10.1",
     "sharp": "0.35.5",
-    "tailwindcss": "4.3.4",
+    "tailwindcss": "4.3.5",
     "typescript": "6.0.3"
   },
   "engines": {
