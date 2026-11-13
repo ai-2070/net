@@ -1,0 +1,19 @@
+net/crates/net/Cargo.lock
+  s_afe23678f287ca::t_8f6fbb808bf658 1692,3032,3034,3055,3057,3069,3071,4929,4995,5728,6644
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b9cc3d7184b8127133840483bb1c36a01790f0c8",
+  "prompts": {},
+  "sessions": {
+    "s_afe23678f287ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce25fdda-9469-4e75-b074-93072ea0579f",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
