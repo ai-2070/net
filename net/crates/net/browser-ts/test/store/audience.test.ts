@@ -529,8 +529,47 @@ describe('a projection that cannot be taken is deferred, never refused', () => {
     projectable.value = true;
     deliver(owner.resumeDeferred().out);
 
-    expect(audiences).toEqual([['crew'], ['deck']]);
+    // Asked at the join, at the control, and again at completion: the
+    // projection is a read taken now (STORE-02).
+    expect(audiences).toEqual([['crew'], ['deck'], ['deck']]);
     expect(core.getState()).toEqual({ crew: {}, deck: { hoist: 2 } });
+  });
+
+  it('re-authorizes on completion: a read revoked meanwhile is refused, never installed (STORE-02)', () => {
+    const readable = { value: true };
+    const keys: unknown[] = [];
+    const { owner, replica, joined, projectable, deliver, core } = pair({
+      authorize: request => {
+        if (request.type !== 'read') return true;
+        keys.push((request as { key?: unknown }).key);
+        return readable.value;
+      },
+    });
+    joined();
+
+    projectable.value = false;
+    const answered = owner.receive(replica.setAudience(['deck'])[0]!.frame, PEER);
+    expect(answered.refused).toBe(null);
+    expect(owner.deferredCount).toBe(1);
+
+    // Revoked while the projection was unavailable, with no commit.
+    readable.value = false;
+    projectable.value = true;
+    const emitted = owner.resumeDeferred();
+
+    expect(refusalOf(emitted.out)).toBe('forbidden');
+    const kinds = emitted.out.map(frame => {
+      const decoded = decodeMessage(frame.frame, { maxBytes: MAX_EVENT_BYTES, as: 'replica' });
+      return decoded.ok ? decoded.message.k : null;
+    });
+    expect(kinds).not.toContain('man');
+    expect(kinds).not.toContain('snap');
+    expect(owner.deferredCount).toBe(0);
+    expect(owner.handleCount).toBe(0);
+    deliver(emitted.out);
+    expect(core.getState()).toEqual(world.empty());
+    // Asked under the join's own key, like every other read.
+    expect(keys).toEqual(['ada', 'ada', 'ada']);
   });
 });
 

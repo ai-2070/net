@@ -1362,6 +1362,19 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
         this.counters[`deferred-${bound}`] = (this.counters[`deferred-${bound}`] ?? 0) + 1;
         continue;
       }
+      // The control was authorized when it ARRIVED; the projection is
+      // taken now, and permission does not carry forward across time
+      // (STORE-02). A policy that revoked the read while projection was
+      // unavailable refuses it here, under the join's own key. The handle
+      // goes with the refusal, as on the capacity path below: it was
+      // already rebound to the deferred audience and has no installed
+      // view of it, so there is nothing truthful left to feed it.
+      if (!this.permitsRead(bound.peer, bound.audience, bound.key)) {
+        this.counters['deferred-forbidden'] = (this.counters['deferred-forbidden'] ?? 0) + 1;
+        this.forget(h, 'refused');
+        out.push(this.no(pending.peer, h, 'forbidden', pending.q));
+        continue;
+      }
       const frames = this.install(bound, pending.q);
       if (frames === null) {
         this.forget(h);
@@ -1839,9 +1852,9 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
    * A new interest set: the entities entering it arrive, the ones leaving
    * go, in one delta — the view never blanks — and then `ok`.
    *
-   * Interest is a filter, not a permission: nothing here asks `authorize`,
-   * because the audience (which is) is unchanged and every entity sent
-   * was already readable under it.
+   * Interest is a filter, not a permission: the audience (which is) is
+   * unchanged. But the entities it brings in are read NOW, so the read
+   * is re-authorized for that audience before anything is projected.
    */
   private interestChange(
     message: Extract<CallerMessage, { k: 'int' }>,
@@ -1849,6 +1862,17 @@ export class StoreOwner<S extends object, A extends ActionSpec, I extends InputS
     peer: string,
     now: number,
   ): Dispatched {
+    // Interest is not a permission, but WIDENING it projects entities
+    // this replica was never sent — a fresh read, taken now. Permission
+    // does not carry forward across time (the rule `resync`, `aud` and
+    // the delta feed hold to), so a policy that revoked this peer with no
+    // commit since must refuse it here, under the join's own key
+    // (STORE-02). As with `resync`, the REQUEST is refused, not the
+    // subscription: the handle and its current interest stay as they
+    // were, and the feed / `reauthorize` retire the subscription itself.
+    if (!this.permitsRead(peer, bound.audience, bound.key)) {
+      return this.refuse('int-forbidden', [this.no(peer, bound.h, 'forbidden', message.q)]);
+    }
     const next: OwnerHandle = { ...bound, interest: [...message.int], lastSeen: now };
     this.handles.set(next.h, next);
     const ok: Outbound = { peer, h: bound.h, frame: encodeMessage({ k: 'ok', q: message.q, h: bound.h }) };
