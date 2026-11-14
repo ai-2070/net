@@ -608,4 +608,4 @@ __all__ += [
     "subnet_policy",
 ]
 
-__version__ = "0.46.0"
+__version__ = "0.47.0"
