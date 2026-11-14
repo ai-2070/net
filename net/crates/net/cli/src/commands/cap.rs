@@ -22,6 +22,7 @@ use net_sdk::capabilities::{
 };
 use serde::Serialize;
 
+use crate::commands::org::{publish_beside, refuse_aliased_paths, SeedArtifact};
 use crate::context::{load_identity_keypair, resolve_profile, CliContext};
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
@@ -448,7 +449,7 @@ async fn run_announce(
     //    `CapabilityAnnouncement::from_bytes` and folds via
     //    `CapabilityIndex::index`.
     let bytes = ann.to_bytes();
-    write_announcement_output(args.out.as_deref(), &bytes).await?;
+    write_announcement_output(args.out.as_deref(), &args.key, &bytes).await?;
     Ok(())
 }
 
@@ -534,11 +535,31 @@ fn parse_groups(values: &[String]) -> Result<Vec<GroupId>, CliError> {
         .collect()
 }
 
-async fn write_announcement_output(out: Option<&Path>, bytes: &[u8]) -> Result<(), CliError> {
+/// Write the announcement to `--out` (or stdout).
+///
+/// CLI-05: `--out` used to be a bare `tokio::fs::write`, so `--key ID --out
+/// ID` — or an `--out` that was a symlink or hard link to the identity —
+/// truncated the private signing seed in place and exited 0. `--out` keeps
+/// its replace-an-older-announcement semantics (there is no `--force`, and
+/// re-announcing with a bumped `--version` to the same file is normal), but
+/// now:
+///
+/// - `--out` may not spell the same path as `--key`;
+/// - the bytes are staged in an exclusively created sibling and atomically
+///   `rename`d into place, so a leaf symlink is replaced, never written
+///   through, and a hard-link alias keeps its other name's content;
+/// - the replace refuses to land on ANY seed-bearing file (content-based, so
+///   case variants and links of `--key` or of any other key file are caught).
+async fn write_announcement_output(
+    out: Option<&Path>,
+    key: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
     match out {
-        Some(path) => tokio::fs::write(path, bytes)
-            .await
-            .map_err(|e| generic(format!("write {}: {e}", path.display()))),
+        Some(path) => {
+            refuse_aliased_paths(&[("--key", key), ("--out", path)])?;
+            publish_beside(path, bytes, false, true, SeedArtifact::None).await
+        }
         None => {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();

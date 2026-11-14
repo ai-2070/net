@@ -25,6 +25,11 @@ and output shape.
   variant, symlink or hard link included). It no longer truncates a
   `<out>.tmp-channel-grant` sibling: staging is a fresh, exclusively
   created `.<name>.stage.*` file.
+- `cap announce --out` refuses an `--out` that names `--key`, and refuses
+  to replace any seed-bearing file (case variant, symlink or hard link
+  included) instead of truncating it. Replacing an older announcement at
+  `--out` still works; it is now an atomic staged rename, so a symlinked
+  `--out` is replaced rather than written through.
 
 ## Unreleased — managed nodes, join links, relations and leave
 
