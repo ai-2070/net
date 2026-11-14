@@ -20,6 +20,11 @@ and output shape.
   not only at its existence pre-check: two concurrent runs to one absent
   `--out` can no longer both succeed with the second replacing the first's
   seed. The loser exits 2 ("publication is no-clobber").
+- `channel issue-grant` refuses an `--out` that names `--root-identity`,
+  and with `--force` refuses to replace any seed-bearing file (case
+  variant, symlink or hard link included). It no longer truncates a
+  `<out>.tmp-channel-grant` sibling: staging is a fresh, exclusively
+  created `.<name>.stage.*` file.
 
 ## Unreleased — managed nodes, join links, relations and leave
 

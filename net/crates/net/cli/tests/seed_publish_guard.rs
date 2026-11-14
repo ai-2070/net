@@ -244,3 +244,124 @@ fn org_keygen_does_not_write_through_a_symlink() {
         "keygen wrote through the symlink and replaced the target org key",
     );
 }
+
+// ===========================================================================
+// CLI-04 — `channel issue-grant --out` must never replace the root seed it
+// loads, nor truncate whatever sits at a predictable staging name.
+// ===========================================================================
+
+/// Run `channel issue-grant` with `root` as the channel root and a second,
+/// distinct identity as the issuer, writing to `out` (plus `extra` flags).
+fn issue_grant(dir: &Path, root: &Path, out: &Path, extra: &[&str]) -> assert_cmd::assert::Assert {
+    let issuer = dir.join("issuer-node.toml");
+    if !issuer.exists() {
+        gen_identity(dir, "issuer-node.toml");
+    }
+    let issuer_hex = toml_field(&issuer, "public_key_hex").expect("identity has public_key_hex");
+    net()
+        .args(["channel", "issue-grant", "--root-identity"])
+        .arg(root)
+        .args([
+            "--issuer",
+            &issuer_hex,
+            "--channel",
+            "fleet.telemetry",
+            "--out",
+        ])
+        .arg(out)
+        .args(extra)
+        .assert()
+}
+
+/// The audit's exact trigger: `--root-identity ROOT --out ROOT --force`
+/// used to replace the loaded private root with public grant JSON.
+#[test]
+fn issue_grant_force_refuses_to_replace_its_own_root_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = gen_identity(dir.path(), "root.toml");
+    let seed_before = toml_field(&root, "seed_hex").expect("root has seed_hex");
+
+    let assert = issue_grant(dir.path(), &root, &root, &["--force"]).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("--root-identity and --out"),
+        "the refusal must name the aliased flags; got: {stderr}"
+    );
+    assert_eq!(
+        toml_field(&root, "seed_hex").as_deref(),
+        Some(seed_before.as_str()),
+        "the channel root seed was replaced by the grant",
+    );
+    assert!(!has_stage_temp(dir.path()), "refusal left a staging temp");
+}
+
+/// A spelling the lexical alias check cannot see (here a hard link; on a
+/// case-insensitive filesystem a case variant behaves the same) is caught by
+/// the content-based foreign-seed guard on the forced path.
+#[test]
+fn issue_grant_force_refuses_to_replace_any_seed_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = gen_identity(dir.path(), "root.toml");
+    let seed_before = toml_field(&root, "seed_hex").expect("root has seed_hex");
+    let alias = dir.path().join("grant-alias.json");
+    std::fs::hard_link(&root, &alias).expect("hard link");
+
+    let assert = issue_grant(dir.path(), &root, &alias, &["--force"]).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("operator identity key material"),
+        "the refusal must name what it found; got: {stderr}"
+    );
+    assert_eq!(
+        toml_field(&alias, "seed_hex").as_deref(),
+        Some(seed_before.as_str()),
+        "--out over a seed file replaced it",
+    );
+    assert_eq!(
+        toml_field(&root, "seed_hex").as_deref(),
+        Some(seed_before.as_str()),
+    );
+}
+
+/// The old publish truncated the deterministic `<out>.tmp-channel-grant`
+/// sibling (whatever it held — here a copy of a root seed) and renamed it
+/// away, even with `--out` absent and no `--force`.
+#[test]
+fn issue_grant_never_touches_a_file_at_the_old_staging_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = gen_identity(dir.path(), "root.toml");
+    let out = dir.path().join("grant.json");
+    let squatter = dir.path().join("grant.tmp-channel-grant");
+    std::fs::copy(&root, &squatter).expect("copy");
+    let seed = toml_field(&root, "seed_hex").expect("root has seed_hex");
+
+    issue_grant(dir.path(), &root, &out, &[]).code(0);
+
+    assert_eq!(
+        toml_field(&squatter, "seed_hex").as_deref(),
+        Some(seed.as_str()),
+        "the file at the old staging name was truncated or moved",
+    );
+    let grant = std::fs::read_to_string(&out).expect("grant published");
+    assert!(grant.contains("grant_hex"), "{grant}");
+    assert!(!has_stage_temp(dir.path()), "publish left a staging temp");
+}
+
+/// Positive control: `--force` still replaces an older grant atomically.
+#[test]
+fn issue_grant_force_still_replaces_an_older_grant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = gen_identity(dir.path(), "root.toml");
+    let out = dir.path().join("grant.json");
+    issue_grant(dir.path(), &root, &out, &[]).code(0);
+    let first = std::fs::read_to_string(&out).expect("first grant");
+
+    // Without --force the second issue is refused and the first survives.
+    issue_grant(dir.path(), &root, &out, &[]).failure();
+    assert_eq!(std::fs::read_to_string(&out).expect("read"), first);
+
+    issue_grant(dir.path(), &root, &out, &["--force"]).code(0);
+    let second = std::fs::read_to_string(&out).expect("second grant");
+    assert!(second.contains("grant_hex"), "{second}");
+    assert!(!has_stage_temp(dir.path()), "replace left a staging temp");
+}
