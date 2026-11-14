@@ -32357,13 +32357,10 @@ impl MeshNode {
                             // peer. The forwarded ack keeps the same
                             // bytes — `from_peer` still points at the
                             // original sender, which is what the
-                            // recipient correlates on.
-                            Self::forward_punch_ack(
-                                ack,
-                                #[cfg(feature = "webrtc")]
-                                from_node,
-                                ctx,
-                            );
+                            // recipient correlates on — so it is only
+                            // forwarded when that claim is the
+                            // authenticated sender (NAT-08).
+                            Self::forward_punch_ack(ack, from_node, ctx);
                         }
                     }
                     rendezvous::RendezvousMsg::PunchReject(rej) => {
@@ -43612,13 +43609,32 @@ impl MeshNode {
     /// Wire bytes are preserved intact: `from_peer` still names
     /// the original sender so the recipient can correlate
     /// against its `pending_punch_acks` map.
+    ///
+    /// `from_node` is the authenticated session peer the ack arrived
+    /// from, and the ack is forwarded only when it is the `from_peer`
+    /// the ack claims (NAT-08). The recipient binds the ack to its
+    /// recorded coordinator, not to `from_peer` — this hop is the only
+    /// place the claim can be checked. Unchecked, any session peer of
+    /// the coordinator could send `PunchAck { from_peer: B, to_peer: A }`
+    /// and have it laundered into an authentic-looking coordinator
+    /// forward: A's waiter for B resolves early, a direct handshake
+    /// starts before B has punched, and B's real ack finds no waiter.
     #[cfg(feature = "nat-traversal")]
     fn forward_punch_ack(
         ack: super::traversal::rendezvous::PunchAck,
-        #[cfg(feature = "webrtc")] from_node: u64,
+        from_node: u64,
         ctx: &DispatchCtx,
     ) {
         use super::traversal::rendezvous::RendezvousMsg;
+
+        if ack.from_peer != from_node {
+            tracing::trace!(
+                from = format!("{:#x}", from_node),
+                claimed = format!("{:#x}", ack.from_peer),
+                "rendezvous: PunchAck origin is not its sender; not forwarding"
+            );
+            return;
+        }
 
         // **§12 F6, by the authenticated requester (R1).** This arm
         // used to gate `ack.to_peer` — the *recipient* — so an
@@ -58536,6 +58552,97 @@ mod committed_flush_stall_tests {
             Err(e) => panic!("under deadline must continue (Ok), got {e}"),
         }
         assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod punch_ack_forward_origin_tests {
+    //! NAT-08: the coordinator forwards a `PunchAck` only when its
+    //! claimed `from_peer` is the authenticated session peer it came
+    //! from.
+    use super::*;
+    use crate::adapter::net::traversal::rendezvous::PunchAck;
+    use std::net::SocketAddr;
+
+    const PEER_A: u64 = 0x0A0A;
+    const PEER_B: u64 = 0x0B0B;
+    const MALLORY: u64 = 0x0BAD;
+
+    fn install_peer_at(ctx: &DispatchCtx, peer: u64, addr: SocketAddr) {
+        ctx.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: peer,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
+    /// A session peer of the coordinator (MALLORY) sends it an ack
+    /// claiming to be B, addressed to A. Forwarding it would launder the
+    /// claim into a coordinator-authenticated frame that A's recorded-
+    /// coordinator binding accepts, resolving A's waiter for B before B
+    /// has punched. It must not be relayed; B's own ack still is.
+    ///
+    /// Inverse: drop the `from_peer == from_node` check — the forged ack
+    /// reaches A's socket and the first assertion fails.
+    #[tokio::test]
+    async fn a_punch_ack_whose_origin_is_not_its_sender_is_not_forwarded() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(
+            EntityKeypair::generate(),
+            MeshNodeConfig::new(addr, [0x62u8; 32]),
+        )
+        .await
+        .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let a_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        install_peer_at(&ctx, PEER_A, a_socket.local_addr().expect("local_addr"));
+        install_peer_at(&ctx, PEER_B, "127.0.0.1:9".parse().unwrap());
+        install_peer_at(&ctx, MALLORY, "127.0.0.1:9".parse().unwrap());
+
+        let ack = PunchAck {
+            from_peer: PEER_B,
+            to_peer: PEER_A,
+            punch_id: 0,
+        };
+        MeshNode::forward_punch_ack(ack, MALLORY, &ctx);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            a_socket.try_recv(&mut buf).is_err(),
+            "an ack claiming B but sent by another peer must not be relayed to A"
+        );
+
+        // Positive control: B's own ack is relayed.
+        MeshNode::forward_punch_ack(ack, PEER_B, &ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), a_socket.recv(&mut buf))
+                .await
+                .is_ok(),
+            "an ack from its claimed origin is relayed"
+        );
     }
 }
 
