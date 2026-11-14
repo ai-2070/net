@@ -97,7 +97,15 @@ def corpus_key(corpus):
 
 
 def read_sources():
-    """One read of the tree: (joined corpus, {enum name: (variants, path)})."""
+    """One read of the tree: (joined corpus, {enum name: [(variants, path)]}).
+
+    One entry PER DEFINITION, not one merged dict per name: the same enum name
+    can be defined in more than one crate with different shapes (`RpcError` is
+    a struct-variant `Timeout { elapsed_ms }` in core `mesh_rpc.rs` and a unit
+    `Timeout` in `leaf/src/error.rs`). Merging them let whichever file
+    `rglob` visited last overwrite the other's shapes, so the verdict depended
+    on filesystem order and flaked between runners.
+    """
     corpus, enums = [], {}
     for root in SOURCE_ROOTS:
         if not root.exists():
@@ -132,7 +140,7 @@ def read_sources():
                 ):
                     shape = {"(": "tuple", "{": "struct"}.get(vm.group(2), "unit")
                     found[vm.group(1)] = shape
-                enums.setdefault(m.group(1), [{}, str(path)])[0].update(found)
+                enums.setdefault(m.group(1), []).append((found, str(path)))
     return "\n".join(corpus), enums
 
 
@@ -186,26 +194,32 @@ def main():
         # An unknown name is a struct, trait, or non-Rust type — not our business.
         if enum not in enums:
             continue
-        if var not in enums[enum][0]:
-            have = ", ".join(sorted(enums[enum][0])) or "(none)"
+        defs = enums[enum]
+        holders = [(found, path) for found, path in defs if var in found]
+        if not holders:
+            have = ", ".join(sorted(set().union(*(f for f, _ in defs)))) or "(none)"
+            where = ", ".join(path for _, path in defs)
             print(
                 f"{enum}::{var} is not a variant of {enum} "
-                f"({enums[enum][1]}) — actual: {have}"
+                f"({where}) — actual: {have}"
             )
             bad += 1
             continue
         # Shape, when the citation shows one. A bare `Enum::Variant` says
         # nothing about shape and is left alone.
-        want = enums[enum][0][var]
+        # Same-named enums in different crates may legitimately disagree, so
+        # the citation is wrong only if NO definition has it in that shape.
         shown = (
             "struct" if trailing.lstrip().startswith("{")
             else "tuple" if trailing.lstrip().startswith("(")
             else None
         )
-        if shown and shown != want:
+        if shown and all(found[var] != shown for found, _ in holders):
+            want = "/".join(sorted({found[var] for found, _ in holders}))
+            where = ", ".join(path for _, path in holders)
             print(
                 f"{enum}::{var} is a {want} variant but is written as a "
-                f"{shown} variant ({enums[enum][1]})"
+                f"{shown} variant ({where})"
             )
             bad += 1
 

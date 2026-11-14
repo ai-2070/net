@@ -110,10 +110,7 @@ impl PrimaryCapabilities {
 
     /// Quick check if this matches a filter
     pub fn matches_basic(&self, filter: &CapabilityFilter) -> bool {
-        if filter.require_gpu && !self.gpu {
-            return false;
-        }
-        true
+        !filter.require_gpu || self.gpu
     }
 }
 
