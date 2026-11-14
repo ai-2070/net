@@ -30422,12 +30422,27 @@ impl MeshNode {
 
         // Case 1: msg2 for an in-flight initiator. Look up pending state
         // by routing id (that's how it was keyed on insert).
-        if let Some((_, pending)) = ctx.pending_handshakes.remove(&peer_routing_id) {
-            let PendingHandshake { mut noise, tx } = pending;
-            let result = (|| -> Result<(SessionKeys, [u8; 32]), CryptoError> {
-                noise.read_message(&parsed.payload)?;
-                noise.into_session_keys_with_binding()
-            })();
+        //
+        // NHS-03: the entry is consumed only once `read_message` has
+        // AUTHENTICATED msg2. Anyone who can put a routed HANDSHAKE on
+        // the wire naming this source can make this lookup hit; removing
+        // first let one forged datagram end the attempt and leave the
+        // genuine msg2 with no initiator. A rejected message leaves the
+        // state exactly as it was (snow restores the symmetric state and
+        // does not advance on a failed read — the direct inbox loop relies
+        // on the same property), so the attempt keeps waiting.
+        if let dashmap::mapref::entry::Entry::Occupied(mut slot) =
+            ctx.pending_handshakes.entry(peer_routing_id)
+        {
+            if let Err(e) = slot.get_mut().noise.read_message(&parsed.payload) {
+                tracing::debug!(
+                    error = %e,
+                    "routed handshake: msg2 rejected; pending initiation kept"
+                );
+                return;
+            }
+            let PendingHandshake { noise, tx } = slot.remove();
+            let result = noise.into_session_keys_with_binding();
             let _ = tx
                 .send(result.map(|(keys, handshake_hash)| {
                     (keys, handshake_hash, routing_header.hop_count)
@@ -58521,6 +58536,94 @@ mod committed_flush_stall_tests {
             Err(e) => panic!("under deadline must continue (Ok), got {e}"),
         }
         assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
+#[cfg(test)]
+mod routed_handshake_pending_tests {
+    //! NHS-03: a routed msg2 that fails Noise verification must not
+    //! consume the pending initiation it names.
+    use super::*;
+    use crate::adapter::net::crypto::StaticKeypair;
+    use std::net::SocketAddr;
+
+    const PSK: [u8; 32] = [0x6Eu8; 32];
+    const RESPONDER_ID: u64 = 0x0B0B_0000_0000_0B0B;
+
+    fn routed(noise_bytes: &[u8], src: u64, dest: u64) -> (ParsedPacket, RoutingHeader, PeerAddr) {
+        let source = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        let inner = builder.build_handshake(noise_bytes);
+        let parsed = ParsedPacket::parse(inner, source).expect("handshake packet parses");
+        let header = RoutingHeader::new(dest, src as u32, DEFAULT_HANDSHAKE_TTL);
+        (parsed, header, source)
+    }
+
+    /// One forged datagram — the right shape, the right routing source,
+    /// bytes that fail Noise authentication — used to remove the pending
+    /// entry before `read_message` ran, failing the waiter and leaving
+    /// the genuine msg2 with no initiator. It must now be dropped with
+    /// the state intact, and the genuine msg2 must still complete.
+    ///
+    /// Inverse: restore the remove-first lookup — the first assertion
+    /// fails (the entry is gone and the waiter holds an error).
+    #[tokio::test]
+    async fn a_forged_routed_msg2_leaves_the_pending_initiation_intact() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let responder_static = StaticKeypair::generate();
+        let key = routing_id(RESPONDER_ID);
+
+        // The initiator half, registered exactly as `try_connect_via_once`
+        // does.
+        let prologue = handshake_prologue(routing_id(node.node_id), key);
+        let mut noise =
+            NoiseHandshake::initiator_with_prologue(&PSK, &responder_static.public, &prologue)
+                .unwrap();
+        let msg1 = noise.write_message(&node.node_id.to_le_bytes()).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        node.pending_handshakes
+            .insert(key, PendingHandshake { noise, tx });
+
+        // The genuine responder's msg2.
+        let mut responder =
+            NoiseHandshake::responder_with_prologue(&PSK, &responder_static, &prologue).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        let (resp_keys, resp_binding) = responder.into_session_keys_with_binding().unwrap();
+
+        // Forged: same length and ephemeral prefix, broken tag.
+        let mut forged = msg2.clone();
+        *forged.last_mut().unwrap() ^= 0x01;
+        let (parsed, header, source) = routed(&forged, RESPONDER_ID, node.node_id);
+        MeshNode::handle_routed_handshake(&parsed, &header, source, &ctx);
+
+        assert!(
+            node.pending_handshakes.contains_key(&key),
+            "a msg2 that fails Noise verification must not consume the pending initiation"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "the waiter must not be resolved by a rejected msg2"
+        );
+
+        // The genuine reply still finds its initiator and completes.
+        let (parsed, header, source) = routed(&msg2, RESPONDER_ID, node.node_id);
+        MeshNode::handle_routed_handshake(&parsed, &header, source, &ctx);
+        let (keys, binding, _hops) = rx
+            .try_recv()
+            .expect("the genuine msg2 resolves the waiter")
+            .expect("the genuine msg2 completes the handshake");
+        assert_eq!(binding, resp_binding);
+        assert_eq!(keys.tx_key, resp_keys.rx_key);
+        assert_eq!(keys.rx_key, resp_keys.tx_key);
+        assert!(
+            !node.pending_handshakes.contains_key(&key),
+            "a completed initiation is consumed"
+        );
     }
 }
 
