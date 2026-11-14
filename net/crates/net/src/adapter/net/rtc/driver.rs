@@ -2542,12 +2542,47 @@ fn session_for(sessions: &mut HashMap<u32, Session>, peer: RtcPeerId) -> Option<
     sessions.get_mut(&peer.slot).filter(|s| s.id == peer)
 }
 
+/// A fresh `Rtc` whose ICE agent already has a clock.
+///
+/// str0m's ICE agent (`is`) reports **no** timeout until its first
+/// `handle_timeout` — it has no "now" to schedule against — and str0m
+/// only calls that from `Input::Timeout`. This driver feeds
+/// `Input::Timeout` only when a session's reported timeout is due, so
+/// without a first tick an engine whose only pending work is ICE
+/// sleeps forever: after `accept_offer` the answerer reported a
+/// deadline ~10 years out and never sent a connectivity check.
+///
+/// Under str0m 0.24 an unrelated ~1 s timer happened to deliver that
+/// first tick; 0.25 does not, which is what broke the natsim
+/// NAT'd-anchor rows. Against an open network the answerer still
+/// connected, because the offerer's checks reached it and the replies
+/// drove it. Behind an address-restricted NAT nothing reaches the
+/// answerer until it has sent first, so it never connected.
+///
+/// One `Input::Timeout(now)` at creation gives the agent its clock, so
+/// every later `poll_output` schedules the first check as soon as pairs
+/// exist. It cannot fail on a fresh engine; an error would surface at
+/// the first real input anyway. Rule 2 still holds: the tick is
+/// drained, and on an engine with no candidates or SDP the drain can
+/// only yield the next `Output::Timeout`.
+fn new_rtc(now: Instant) -> Rtc {
+    let mut rtc = Rtc::new(now);
+    if rtc.handle_input(Input::Timeout(now)).is_ok() {
+        while let Ok(output) = rtc.poll_output() {
+            if matches!(output, Output::Timeout(_)) {
+                break;
+            }
+        }
+    }
+    rtc
+}
+
 fn new_session(
     config: &RtcConfig,
     transport: &Arc<RtcTransport>,
     sockets: &RtcSockets,
 ) -> Result<Session, super::transport::RtcError> {
-    let mut rtc = Rtc::new(Instant::now());
+    let mut rtc = new_rtc(Instant::now());
     // One host candidate per family: on a dual-stack anchor the
     // browser pairs with whichever its network can reach.
     for advertised in sockets.advertised() {
@@ -2574,4 +2609,188 @@ fn new_session(
         open_by: Instant::now() + config.ice_deadline,
         open_waiters: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! `new_rtc` against the failure it exists for: a native answerer
+    //! behind an address-restricted cone NAT (the natsim NAT'd-anchor
+    //! rows), modelled in memory with a simulated clock so it runs on
+    //! every OS and never flakes on timing.
+
+    use std::collections::HashSet;
+
+    use super::*;
+
+    const ANCHOR: &str = "10.99.0.2:7101";
+    const CLIENT: &str = "10.99.0.12:40000";
+
+    /// Datagrams in flight: `(source, destination, contents)`.
+    type Wire = Vec<(SocketAddr, SocketAddr, Vec<u8>)>;
+
+    struct Peer {
+        rtc: Rtc,
+        addr: SocketAddr,
+        timeout: Instant,
+        open: bool,
+    }
+
+    impl Peer {
+        fn new(addr: &str, now: Instant) -> Self {
+            let addr: SocketAddr = addr.parse().expect("addr");
+            let mut rtc = new_rtc(now);
+            rtc.add_local_candidate(Candidate::host(addr, "udp").expect("host candidate"));
+            Self {
+                rtc,
+                addr,
+                timeout: now,
+                open: false,
+            }
+        }
+
+        /// Rule 2: drain to `Output::Timeout`, collecting transmits.
+        fn drain(&mut self, wire: &mut Wire) {
+            loop {
+                match self.rtc.poll_output().expect("poll_output") {
+                    Output::Timeout(t) => {
+                        self.timeout = t;
+                        return;
+                    }
+                    Output::Transmit(t) => {
+                        wire.push((t.source, t.destination, t.contents.to_vec()));
+                    }
+                    Output::Event(Event::ChannelOpen(..)) => self.open = true,
+                    Output::Event(_) => {}
+                }
+            }
+        }
+    }
+
+    /// Offer from the client, answer from the anchor, both drained, as
+    /// `RtcSignal::CreateOffer` / `AcceptOffer` / `AcceptAnswer` do.
+    fn negotiate(now: Instant) -> (Peer, Peer, Wire) {
+        let mut wire = Vec::new();
+        let mut client = Peer::new(CLIENT, now);
+        let mut api = client.rtc.sdp_api();
+        api.add_channel("net".into());
+        let (offer, pending) = api.apply().expect("offer");
+        client.drain(&mut wire);
+        let offer = SdpOffer::from_sdp_string(&offer.to_sdp_string()).expect("offer sdp");
+
+        let mut anchor = Peer::new(ANCHOR, now);
+        let answer = anchor
+            .rtc
+            .sdp_api()
+            .accept_offer(offer)
+            .expect("accept_offer");
+        anchor.drain(&mut wire);
+        let answer = SdpAnswer::from_sdp_string(&answer.to_sdp_string()).expect("answer sdp");
+        client
+            .rtc
+            .sdp_api()
+            .accept_answer(pending, answer)
+            .expect("accept_answer");
+        client.drain(&mut wire);
+        (client, anchor, wire)
+    }
+
+    fn is_binding_request(datagram: &[u8]) -> bool {
+        datagram.len() >= 20
+            && datagram[..2] == [0x00, 0x01]
+            && datagram[4..8] == [0x21, 0x12, 0xa4, 0x42]
+    }
+
+    /// The property that broke: with NOTHING arriving from the offerer,
+    /// the answerer must still start its own connectivity checks, since
+    /// behind a restricted NAT its outbound check is what opens the
+    /// mapping the offerer's checks need. Unprimed, str0m 0.25 reported
+    /// a deadline ~10 years out after `accept_offer` and never sent one.
+    #[test]
+    fn an_answerer_sends_its_own_check_with_nothing_inbound() {
+        let start = Instant::now();
+        let (_client, mut anchor, _wire) = negotiate(start);
+        assert!(
+            anchor.timeout <= start + Duration::from_secs(5),
+            "after accept_offer the answerer must schedule ICE work, not park until {:?} from now",
+            anchor.timeout.saturating_duration_since(start),
+        );
+
+        let client: SocketAddr = CLIENT.parse().expect("addr");
+        let mut wire = Vec::new();
+        let mut now = start;
+        while now < start + Duration::from_secs(5) {
+            now = anchor.timeout.max(now + Duration::from_millis(1));
+            anchor
+                .rtc
+                .handle_input(Input::Timeout(now))
+                .expect("timeout");
+            anchor.drain(&mut wire);
+            if wire
+                .iter()
+                .any(|(_, dst, data)| *dst == client && is_binding_request(data))
+            {
+                return;
+            }
+        }
+        panic!("the answerer sent no binding request to the offerer within 5s of simulated time");
+    }
+
+    /// End to end through the NAT model: client->anchor datagrams are
+    /// dropped until the anchor has sent to that client address (an
+    /// address-restricted cone, as `setup.sh` installs for the RTC
+    /// port). Both sides must end with an open DataChannel.
+    #[test]
+    fn a_session_opens_through_an_address_restricted_nat_in_front_of_the_answerer() {
+        let start = Instant::now();
+        let (mut client, mut anchor, mut wire) = negotiate(start);
+        let mut opened: HashSet<SocketAddr> = HashSet::new();
+        let deadline = start + Duration::from_secs(30);
+        let mut now = start;
+        while now < deadline && !(client.open && anchor.open) {
+            while !wire.is_empty() {
+                for (src, dst, data) in std::mem::take(&mut wire) {
+                    let to = if dst == anchor.addr {
+                        if !opened.contains(&src) {
+                            continue; // unsolicited inbound: dropped by the NAT
+                        }
+                        &mut anchor
+                    } else if dst == client.addr {
+                        opened.insert(dst);
+                        &mut client
+                    } else {
+                        continue;
+                    };
+                    let input = Input::Receive(
+                        now,
+                        Receive {
+                            proto: Protocol::Udp,
+                            source: src,
+                            destination: dst,
+                            contents: data.as_slice().try_into().expect("datagram"),
+                        },
+                    );
+                    to.rtc.handle_input(input).expect("receive");
+                    to.drain(&mut wire);
+                }
+            }
+            now = client
+                .timeout
+                .min(anchor.timeout)
+                .max(now + Duration::from_millis(1))
+                .min(deadline);
+            for peer in [&mut client, &mut anchor] {
+                if peer.timeout <= now {
+                    peer.rtc.handle_input(Input::Timeout(now)).expect("timeout");
+                    peer.drain(&mut wire);
+                }
+            }
+        }
+        assert!(
+            client.open && anchor.open,
+            "the DataChannel must open behind the answerer's restricted NAT within 30s of \
+             simulated time (client open: {}, anchor open: {})",
+            client.open,
+            anchor.open,
+        );
+    }
 }
