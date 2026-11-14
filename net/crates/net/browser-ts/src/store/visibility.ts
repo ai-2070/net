@@ -265,7 +265,24 @@ function rebuild(node: unknown, edits: Edit): unknown {
   return out;
 }
 
-const SEP = '\u0000';
+/**
+ * Whether a strict ancestor of `keys` is already hidden. The hidden
+ * locations are exactly the nodes of `edits` that carry a `value`, so the
+ * edit tree doubles as a trie keyed by the real path segments. (A set of
+ * delimiter-joined paths aliased: an entity id `target\u0000nested`
+ * encoded the same as `target` → `nested`, so hiding the former's field
+ * made a deeper rule on the latter see a hidden "ancestor" and skip
+ * redaction — STORE-01.)
+ */
+function underHidden(edits: Edit, keys: readonly (string | number)[]): boolean {
+  let node: Edit | undefined = edits;
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    node = node.children.get(keys[i]!);
+    if (node === undefined) return false;
+    if ('value' in node) return true;
+  }
+  return false;
+}
 
 /**
  * Apply compiled rules for one viewer (`null`: nobody in particular —
@@ -273,10 +290,10 @@ const SEP = '\u0000';
  */
 export function applyVisibility<S>(compiled: CompiledVisibility, state: S, viewer: Viewer | null): S {
   if (compiled.rules.length === 0) return state;
+  // Pending edits. Every node carrying a `value` is a hidden location,
+  // so "is this under a hidden ancestor" walks the real path segments —
+  // one map lookup per segment, and no string encoding to alias.
   const edits: Edit = { children: new Map() };
-  // Every hidden location, by its joined path, so "is this under a
-  // hidden ancestor" is a lookup per prefix, not a scan of all of them.
-  const hidden = new Set<string>();
   let touched = false;
 
   for (const rule of compiled.rules) {
@@ -291,20 +308,13 @@ export function applyVisibility<S>(compiled: CompiledVisibility, state: S, viewe
     // Last pattern segment a wildcard: an entry of a collection, removed.
     const entry = rule.segments[rule.segments.length - 1] === '*';
     for (const match of matches(state, rule.segments)) {
-      let prefix = '';
-      let under = false;
-      for (let i = 0; i < match.keys.length - 1 && !under; i += 1) {
-        prefix = i === 0 ? String(match.keys[0]) : `${prefix}${SEP}${String(match.keys[i])}`;
-        under = hidden.has(prefix);
-      }
-      if (under) continue;
+      if (underHidden(edits, match.keys)) continue;
       if (allows(rule.rule, match.captures, viewer)) continue;
       let replacement: unknown = entry ? DROP : HIDDEN;
       if (countRule !== undefined && Array.isArray(match.value) && allows(countRule.rule, match.captures, viewer)) {
         replacement = match.value.map(() => HIDDEN);
       }
       record(edits, match.keys, replacement);
-      hidden.add(match.keys.map(String).join(SEP));
       touched = true;
     }
   }

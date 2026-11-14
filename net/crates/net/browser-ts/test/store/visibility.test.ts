@@ -216,6 +216,27 @@ describe('visibility rules', () => {
     });
   });
 
+  it('keeps path segments apart: a key containing NUL cannot alias a hidden ancestor (STORE-01)', () => {
+    // `target\u0000nested`.secret is hidden by the first rule. Joined with
+    // a NUL separator its path read as `target` → `nested` → `secret`, so
+    // the deeper rule on the real `target` saw a hidden "ancestor" and
+    // skipped redacting its nested secret.
+    const aliased = {
+      entities: {
+        'target\u0000nested': { secret: 'decoy' },
+        target: { nested: { secret: { value: 'TOP-SECRET' } } },
+      },
+    };
+    const seen = projectVisible(
+      { visibility: { 'entities.*.secret': 'nobody', 'entities.*.nested.secret.value': 'nobody' } },
+      aliased,
+      { peer: 'a', audience: [] },
+    );
+    expect(seen.entities['target\u0000nested']?.secret).toBe(HIDDEN);
+    expect((seen.entities.target as { nested: { secret: { value: unknown } } }).nested.secret.value).toBe(HIDDEN);
+    expect(JSON.stringify(seen)).not.toContain('TOP-SECRET');
+  });
+
   it('takes a preset with overrides', () => {
     const definition = { visibility: { preset: 'card-game', 'players.*.score': 'nobody' } as Visibility };
     const seen = projectVisible(definition, dealt, { peer: ALICE, audience: [] });

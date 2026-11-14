@@ -174,6 +174,13 @@ describe('entity writes', () => {
     expect(() => host.setEntity('toString' as never, 'x', 1 as never)).toThrow(/no per-entity parser/);
   });
 
+  it('refuse an id containing NUL with nothing published (STORE-01 defense in depth)', () => {
+    const { host } = serve();
+    const before = host.getState();
+    expect(() => host.setEntity('ships', 's0_0\u0000x', { x: 1, z: 1 })).toThrow(/NUL/);
+    expect(host.getState()).toBe(before);
+  });
+
   it('store an id of __proto__ as data, not as a prototype', () => {
     const { host } = serve();
     host.setEntity('ships', '__proto__', { x: 1, z: 1 });

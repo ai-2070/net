@@ -307,6 +307,16 @@ export class StoreCore<S extends object, A extends ActionSpec, I extends InputSp
       if (id.length === 0) {
         throw new StoreError('invalid-data', `store '${this.#definition.id}': an entity id in '${collection}' is empty`);
       }
+      // Defense in depth (STORE-01): NUL is no plausible id character and
+      // was once the separator of encoded visibility paths. The encoding
+      // no longer joins keys, but an id that cannot be a path segment
+      // anywhere stays out of the store.
+      if (id.includes('\u0000')) {
+        throw new StoreError(
+          'invalid-data',
+          `store '${this.#definition.id}': an entity id in '${collection}' contains a NUL character`,
+        );
+      }
       const raw = changes[id];
       if (raw === undefined) {
         parsed.push([id, undefined]);
