@@ -207,6 +207,16 @@ impl SubnetContextStore {
         self.by_peer.remove(&node_id);
     }
 
+    /// Drop `node_id`'s context only if it is still exactly `ctx` — the
+    /// admission fence's rollback, which must never remove a newer
+    /// context a concurrent admission installed. Returns whether one was
+    /// dropped.
+    pub fn forget_if_same(&self, node_id: u64, ctx: &VerifiedSubnetContext) -> bool {
+        self.by_peer
+            .remove_if(&node_id, |_, held| held == ctx)
+            .is_some()
+    }
+
     /// Drop `node_id`'s context only if it is the admission at exactly
     /// `attachment` under `authority` (a peer's self-withdrawal names one
     /// admission; any other stays). Returns whether one was dropped.

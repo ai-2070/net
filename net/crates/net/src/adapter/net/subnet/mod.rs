@@ -35,11 +35,11 @@ pub mod route_hop {
 pub use admission::{SubnetChallengeStore, SubnetContextStore};
 pub use assignment::{SubnetPolicy, SubnetRule};
 pub use auth::{
-    build_gateway_context_set, compile_gateway_context, ExpectedBinding, ForwardDenial,
-    SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet,
-    SubnetCredentialSet, SubnetExportBinding, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant,
-    SubnetRef, SubnetRevocationFloor, SubnetRights, SubnetSubjectFloor, TransitionDecision,
-    VerifiedGatewayContext, VerifiedGatewayContextSet, VerifiedSubnetAuthority,
+    build_gateway_context_set, compile_gateway_context, ExpectedBinding, FloorAcceptance,
+    ForwardDenial, SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig,
+    SubnetBoundarySet, SubnetCredentialSet, SubnetExportBinding, SubnetFloorRegistry, SubnetGrant,
+    SubnetIssuerGrant, SubnetRef, SubnetRevocationFloor, SubnetRights, SubnetSubjectFloor,
+    TransitionDecision, VerifiedGatewayContext, VerifiedGatewayContextSet, VerifiedSubnetAuthority,
     VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_LOOKUPS,
 };
 pub use control::{

@@ -2875,6 +2875,9 @@ struct DispatchCtx {
     /// [`SubnetGatewayAuthorityState`] for why the two must not
     /// publish independently.
     subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Serializes gateway-member publication against a subject floor's
+    /// withdrawal of it (SUBNET-05) — see `MeshNode::subnet_gateway_publish`.
+    subnet_gateway_publish: Arc<parking_lot::Mutex<()>>,
     /// Typed protected-relay telemetry: envelopes forwarded, and
     /// authority denials split by exact [`ForwardDenial`] reason.
     ///
@@ -4241,6 +4244,29 @@ pub(crate) struct SubnetGatewayAuthorityState {
     /// The declared protected boundaries (S4B), or `None` — which
     /// denies every protected transition and every subnet export.
     pub(crate) boundaries: Option<Arc<SubnetBoundarySet>>,
+}
+
+/// Borrowed handles a subject floor uses to withdraw this node's own
+/// gateway authority (SUBNET-05). One shape for both arrival paths —
+/// the `&MeshNode` API and the dispatch context — so they cannot drift.
+struct LocalGatewayHandles<'a> {
+    /// This node's own entity: only a floor naming it reaches the
+    /// local gateway member.
+    entity: &'a EntityId,
+    /// The published gateway authority aggregate.
+    authority: &'a arc_swap::ArcSwap<SubnetGatewayAuthorityState>,
+    /// The gateway publication lock (`MeshNode::subnet_gateway_publish`).
+    publish: &'a parking_lot::Mutex<()>,
+}
+
+/// What committing one floor fact requires of the caller
+/// (`MeshNode::commit_floor_fact`).
+struct FloorCommitOutcome {
+    /// Live authority the fact covers must be invalidated.
+    enforce: bool,
+    /// `Err(StateNotPersisted)` while anything accepted is not durable —
+    /// reported only after the invalidation `enforce` demands.
+    persisted: Result<(), SubnetAuthError>,
 }
 
 /// How this node reaches a peer, and what the recorded address proves.
@@ -13778,6 +13804,13 @@ pub struct MeshNode {
     /// [`SubnetGatewayAuthorityState`] for the torn-view hazard two
     /// independent publications carried.
     subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Serializes the gateway member's compile-and-publish
+    /// ([`Self::install_subnet_gateway_credentials`]) against a subject
+    /// floor withdrawing it (SUBNET-05). Without it an install that
+    /// compiled before a floor landed could publish AFTER the floor's
+    /// withdrawal scan, re-publishing the removed rights. Never held
+    /// across I/O; the boundaries writer does not take it.
+    subnet_gateway_publish: Arc<parking_lot::Mutex<()>>,
     /// Typed protected-relay telemetry: envelopes forwarded, and
     /// authority denials split by exact
     /// [`ForwardDenial`](super::subnet::ForwardDenial) reason.
@@ -15401,6 +15434,7 @@ impl MeshNode {
                     boundaries: None,
                 },
             )),
+            subnet_gateway_publish: Arc::new(parking_lot::Mutex::new(())),
             protected_relay_stats: Arc::new(ProtectedRelayStats::new()),
             subnet_local_attachment,
             peer_subnets,
@@ -20715,6 +20749,18 @@ impl MeshNode {
         &self.subnet_floors
     }
 
+    /// Test-only (fixtures): the durable floor log, when configured — the
+    /// seam a witness uses to inject a refused write
+    /// ([`SubnetFloorStore::set_fail_writes`]).
+    ///
+    /// [`SubnetFloorStore::set_fail_writes`]: super::subnet::floor_store::SubnetFloorStore::set_fail_writes
+    #[cfg(feature = "fixtures")]
+    pub fn test_subnet_floor_store(
+        &self,
+    ) -> Option<&Arc<super::subnet::floor_store::SubnetFloorStore>> {
+        self.subnet_floor_store.as_ref()
+    }
+
     /// Session id of the live incarnation for `node_id`, or `None`
     /// when no session exists. A subnet presentation binds to this
     /// value, so a replaced incarnation invalidates outstanding
@@ -20946,6 +20992,24 @@ impl MeshNode {
         })?;
 
         self.subnet_contexts.install(from_node, ctx.clone());
+        // SUBNET-01 publication fence. Verification captured the auth
+        // epoch before it read any floor, so a floor raised since then
+        // has moved the epoch past `ctx`'s. Re-read it AFTER the install:
+        // either it still matches (any later floor's invalidation scan
+        // runs after this install and sees the context), or a revocation
+        // landed mid-admission and this context must not be reported
+        // admitted. Removal is conditional on the context still being
+        // exactly this one, so a concurrent re-admission is never undone.
+        let topology_now = self.subnet_topology_epoch.load(Ordering::Acquire);
+        let auth_now = self.subnet_floors.auth_epoch(&ctx.authority);
+        if ctx.topology_epoch != topology_now || ctx.subnet_auth_epoch != auth_now {
+            self.subnet_contexts.forget_if_same(from_node, &ctx);
+            return Err(if ctx.topology_epoch != topology_now {
+                SubnetAuthError::WrongTopologyEpoch
+            } else {
+                SubnetAuthError::Revoked
+            });
+        }
         Ok(ctx)
     }
 
@@ -21013,11 +21077,12 @@ impl MeshNode {
         contexts: &SubnetContextStore,
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
     ) -> Result<bool, SubnetAuthError> {
-        let changed = floors.apply(floor, config)?;
-        if changed {
-            if let Some(store) = store {
-                store.append(&SubnetControlFact::RevocationFloor(floor.clone()).to_bytes())?;
-            }
+        let commit = Self::commit_floor_fact(
+            store,
+            || SubnetControlFact::RevocationFloor(floor.clone()).to_bytes(),
+            || floors.apply_tracked(floor, config),
+        )?;
+        if commit.enforce {
             let epoch = floors.auth_epoch(&floor.scope.authority);
             let dropped = contexts.invalidate_stale_epoch(&floor.scope.authority, epoch);
             tracing::info!(
@@ -21026,7 +21091,103 @@ impl MeshNode {
                 "subnet: revocation floor accepted; invalidated stale session contexts"
             );
         }
-        Ok(changed)
+        // Invalidation above ran BEFORE a persistence failure is
+        // reported (SUBNET-04): the registry already enforces the floor,
+        // so nothing it revokes may stay live because the disk refused.
+        commit.persisted?;
+        Ok(commit.enforce)
+    }
+
+    /// Accept one floor fact into the registry and make it durable, as
+    /// ONE ordered step (SUBNET-03/04/07).
+    ///
+    /// With a store, acceptance runs under the store's commit lock, so
+    /// the order facts are accepted in is the order a restart replays
+    /// them in; every ACCEPTED fact is logged — including one that only
+    /// advances a revision watermark — and a fact whose write failed
+    /// stays pending, so a retry of the same signed fact persists it even
+    /// though the registry sees nothing new. Without a store there is no
+    /// durable order to keep.
+    ///
+    /// `enforce` is whether live authority must be invalidated: this call
+    /// changed enforceable state, or it is the retry of an earlier
+    /// enforceable acceptance whose write failed (invalidation is
+    /// idempotent, so repeating it is the safe direction). `persisted` is
+    /// `Err(StateNotPersisted)` while anything accepted is not durable.
+    fn commit_floor_fact(
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        fact_bytes: impl FnOnce() -> Vec<u8>,
+        accept: impl FnOnce() -> Result<super::subnet::FloorAcceptance, SubnetAuthError>,
+    ) -> Result<FloorCommitOutcome, SubnetAuthError> {
+        let Some(store) = store else {
+            let acceptance = accept()?;
+            return Ok(FloorCommitOutcome {
+                enforce: acceptance.changed,
+                persisted: Ok(()),
+            });
+        };
+        let commit = store.commit(&fact_bytes(), accept)?;
+        let enforce = commit.acceptance.changed || commit.was_pending_enforceable;
+        let involved = commit.acceptance.accepted || commit.was_pending;
+        let persisted = if involved && !commit.durable {
+            tracing::warn!(
+                "subnet: floor accepted and enforced in memory but NOT durably logged; \
+                 re-apply the same fact to retry persistence"
+            );
+            Err(SubnetAuthError::StateNotPersisted)
+        } else {
+            Ok(())
+        };
+        Ok(FloorCommitOutcome { enforce, persisted })
+    }
+
+    /// SUBNET-05: withdraw this node's published gateway member when a
+    /// subject floor for the LOCAL entity covers a right it holds.
+    ///
+    /// A subject floor does not advance the authority-wide auth epoch,
+    /// so the epoch comparison that darkens a gateway set on a subtree
+    /// floor never fires for one; without this, rights removed from the
+    /// local entity stayed published, and exported registrations stayed
+    /// authorized. Withdrawal replaces the aggregate, so every export
+    /// stability stamp pinned to the old one is stale too. Coverage is
+    /// conservative (generation and delegation ignored, exactly as for
+    /// remote contexts): re-installing the credentials then decides
+    /// exactly, through [`compile_gateway_context`]'s subject-floor
+    /// check.
+    ///
+    /// Runs under the gateway publication lock, so an install that
+    /// compiled before the floor landed either published first (and is
+    /// withdrawn here) or compiles after it.
+    ///
+    /// [`compile_gateway_context`]: super::subnet::compile_gateway_context
+    fn withdraw_covered_local_gateway(
+        gateway: &LocalGatewayHandles<'_>,
+        authority: &EntityId,
+        floors: &SubnetFloorRegistry,
+    ) -> bool {
+        let _publication = gateway.publish.lock();
+        let covered = gateway
+            .authority
+            .load()
+            .gateway
+            .as_deref()
+            .is_some_and(|set| set.authority() == authority && set.subject_floor_covers(floors));
+        if covered {
+            // The gateway member cannot change while the publication
+            // lock is held; the rcu only preserves a concurrent
+            // boundaries publication.
+            gateway
+                .authority
+                .rcu(|current| SubnetGatewayAuthorityState {
+                    gateway: None,
+                    boundaries: current.boundaries.clone(),
+                });
+            tracing::warn!(
+                "subnet: a subject floor removed rights this node's own gateway credentials \
+                 held; local gateway authority withdrawn until credentials are re-installed"
+            );
+        }
+        covered
     }
 
     /// Apply a signed subject floor (NET_CLI_PLAN_V3 §6.1a): remove one
@@ -21046,7 +21207,18 @@ impl MeshNode {
             &self.subnet_floors,
             &self.subnet_contexts,
             self.subnet_floor_store.as_deref(),
+            &self.local_gateway_handles(),
         )
+    }
+
+    /// The handles a subject floor needs to withdraw this node's own
+    /// gateway authority (SUBNET-05).
+    fn local_gateway_handles(&self) -> LocalGatewayHandles<'_> {
+        LocalGatewayHandles {
+            entity: self.entity_id(),
+            authority: &self.subnet_gateway_authority,
+            publish: &self.subnet_gateway_publish,
+        }
     }
 
     fn apply_subject_floor_with(
@@ -21055,23 +21227,32 @@ impl MeshNode {
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        gateway: &LocalGatewayHandles<'_>,
     ) -> Result<bool, SubnetAuthError> {
-        let changed = floors.apply_subject(floor, config)?;
-        if changed {
-            // Durable before anything reports it committed (§6.1a item 2).
-            // On failure the stricter in-memory state stays; the caller
-            // sees `StateNotPersisted`, never success.
-            if let Some(store) = store {
-                store.append(&SubnetControlFact::SubjectFloor(floor.clone()).to_bytes())?;
-            }
+        // Durable before anything reports it committed (§6.1a item 2);
+        // acceptance and log order are one order (SUBNET-03). On a write
+        // failure the stricter in-memory state stays and the caller sees
+        // `StateNotPersisted`, never success — but only AFTER the
+        // invalidation below, which an I/O failure must not skip
+        // (SUBNET-04).
+        let commit = Self::commit_floor_fact(
+            store,
+            || SubnetControlFact::SubjectFloor(floor.clone()).to_bytes(),
+            || floors.apply_subject_tracked(floor, config),
+        )?;
+        if commit.enforce {
             let dropped =
                 contexts.invalidate_subject(&floor.scope.authority, &floor.subject, floors);
+            let withdrew_gateway = &floor.subject == gateway.entity
+                && Self::withdraw_covered_local_gateway(gateway, &floor.scope.authority, floors);
             tracing::info!(
                 dropped,
+                withdrew_gateway,
                 "subnet: subject floor accepted; dropped only the removed subject's contexts"
             );
         }
-        Ok(changed)
+        commit.persisted?;
+        Ok(commit.enforce)
     }
 
     /// Answer one authenticated floor readback request (V3-4 slice 2): it
@@ -21116,6 +21297,10 @@ impl MeshNode {
             Some(floor) => match self.apply_subnet_subject_floor(&floor) {
                 Ok(true) => FloorApplyOutcome::Applied,
                 Ok(false) => FloorApplyOutcome::Unchanged,
+                // Accepted and enforced in memory, but not durable: the
+                // honest answer is "applied" with `persisted: false`
+                // below, not a refusal of a floor that IS enforced.
+                Err(SubnetAuthError::StateNotPersisted) => FloorApplyOutcome::Applied,
                 Err(e) => FloorApplyOutcome::Refused(e),
             },
         };
@@ -21125,13 +21310,22 @@ impl MeshNode {
             request.scope.path,
             &request.subject,
         );
+        // SUBNET-04: `persisted` attests actual durable coverage, not
+        // merely that a store is configured. Read AFTER the state above:
+        // a commit that changed that state either finished before this
+        // check (and its outcome is reported) or is still pending (and
+        // the answer is "not persisted").
+        let persisted = self
+            .subnet_floor_store
+            .as_deref()
+            .is_some_and(|store| store.is_durable());
         FloorStatusAttestation::sign(
             self.entity_keypair(),
             request.digest(),
             apply,
             revision,
             generations,
-            self.subnet_floor_store.is_some(),
+            persisted,
         )
     }
 
@@ -21221,6 +21415,7 @@ impl MeshNode {
             &self.subnet_floors,
             &self.subnet_contexts,
             self.subnet_floor_store.as_deref(),
+            &self.local_gateway_handles(),
         )
     }
 
@@ -21258,6 +21453,7 @@ impl MeshNode {
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        gateway: &LocalGatewayHandles<'_>,
     ) -> Result<SubnetControlOutcome, SubnetAuthError> {
         let fact = SubnetControlFact::from_bytes(bytes)?;
         let config = authorities
@@ -21269,7 +21465,7 @@ impl MeshNode {
                 Self::apply_floor_with(floor, config, floors, contexts, store)?
             }
             SubnetControlFact::SubjectFloor(floor) => {
-                Self::apply_subject_floor_with(floor, config, floors, contexts, store)?
+                Self::apply_subject_floor_with(floor, config, floors, contexts, store, gateway)?
             }
             _ => control.apply(
                 &fact,
@@ -21327,6 +21523,10 @@ impl MeshNode {
         sets: &[SubnetCredentialSet],
         after_capture: &(dyn Fn() + Sync),
     ) -> Result<(), SubnetAuthError> {
+        // Compile and publish as one step against a subject floor's
+        // withdrawal (SUBNET-05): a floor landing mid-compile either is
+        // seen by the compile below or withdraws what this publishes.
+        let _publication = self.subnet_gateway_publish.lock();
         if sets.is_empty() {
             self.publish_gateway_member_paced(None, after_capture);
             return Ok(());
@@ -27886,6 +28086,7 @@ impl MeshNode {
             peer_subnets: self.peer_subnets.clone(),
             subnet_contexts: self.subnet_contexts.clone(),
             subnet_gateway_authority: self.subnet_gateway_authority.clone(),
+            subnet_gateway_publish: self.subnet_gateway_publish.clone(),
             protected_relay_stats: self.protected_relay_stats.clone(),
             subnet_floors: self.subnet_floors.clone(),
             subnet_floor_store: self.subnet_floor_store.clone(),
@@ -32502,6 +32703,11 @@ impl MeshNode {
                     &ctx.subnet_floors,
                     &ctx.subnet_contexts,
                     ctx.subnet_floor_store.as_deref(),
+                    &LocalGatewayHandles {
+                        entity: ctx.signing_identity.entity_id(),
+                        authority: &ctx.subnet_gateway_authority,
+                        publish: &ctx.subnet_gateway_publish,
+                    },
                 ) {
                     Ok(outcome) if outcome.applied => tracing::info!(
                         from_node = format!("{from_node:#x}"),
