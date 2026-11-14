@@ -23,6 +23,16 @@
         "node"
       ],
       "enabled": false
+    },
+    {
+      "description": "str0m is held below 0.25: under 0.25 a native answerer behind an address-restricted NAT never starts its own ICE checks, which broke the natsim NAT'd-anchor rows (two natsim_natted_anchor_* tests). Lift this only with those rows green on the natsim job.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "str0m"
+      ],
+      "allowedVersions": "<0.25"
     }
   ]
 }
