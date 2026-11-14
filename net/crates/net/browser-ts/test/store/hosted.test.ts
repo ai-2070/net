@@ -604,17 +604,17 @@ describe('a joiner installs the host’s world', () => {
   it('drops a frame that arrives on another stream', async () => {
     // The label cannot be compared against an event — the event
     // carries the id the LEAF derived from it, and that derivation
-    // lives in Rust. So the host LEARNS the id from the first store
-    // frame and pins it. This asserts the pinned behaviour; the
-    // one-frame window before it is pinned is asserted below, named
-    // rather than hidden.
+    // lives in Rust. So the host LEARNS the id from a peer's first
+    // accepted store frame and pins it FOR THAT PEER (STORE-04). This
+    // asserts the pinned behaviour; the one-frame window before it is
+    // pinned is asserted below, named rather than hidden.
     const { net, host, joined } = wired();
     await joined.ready();
     const hull = host.getState().hull;
 
     net.injectLabelled(
       HOST_NODE,
-      OTHER_NODE,
+      CALLER_NODE,
       derivedStreamId('store/other'),
       encodeMessage({ k: 'join', q: '5'.repeat(16) as Hex, def: 'ship', ver: 1, store: 'ship', key: 'x', aud: ['crew'] }),
     );
@@ -654,6 +654,68 @@ describe('a joiner installs the host’s world', () => {
     await flush();
 
     expect(host.counts().handles).toBe(1);
+    expect(host.counters()['foreign-stream']).toBe(1);
+    await host.close();
+  });
+
+  it('lets no peer pin the stream for another: a first join on a chosen label denies no later join (STORE-04)', async () => {
+    // An ADMITTED peer joins first, on a stream labelled as it pleases.
+    // Its acceptance proves who it is and which store it named — not
+    // that it rode the configured label — so what the host learns from
+    // it binds that peer alone. One global pin dropped every later
+    // join on the configured label as `foreign-stream`.
+    const net = mesh();
+    const time = timeline();
+    const host = hostStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(HOST_NODE),
+      initialState: FULL,
+      maxEventBytes: MAX_EVENT_BYTES,
+      authorize: () => true,
+      project: state => state,
+      actions: { fire: (_input, context) => ({ shot: context.getState().hull }) },
+      inputs: { helm: () => {} },
+      now: time.now,
+      schedule: time.schedule,
+    });
+    const join = (q: string) =>
+      encodeMessage({ k: 'join', q: q.repeat(16) as Hex, def: 'ship', ver: 1, store: 'ship', key: 'x', aud: ['crew'] });
+
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/chosen'), join('1'));
+    await flush();
+    expect(host.counts().handles).toBe(1);
+
+    const joined = joinStore<Ship, Actions, Inputs>({
+      definition: ship,
+      transport: net.node(CALLER_NODE),
+      host: HOST_NODE,
+      audience: ['crew'],
+      key: 'ada',
+      maxEventBytes: MAX_EVENT_BYTES,
+      now: time.now,
+      schedule: time.schedule,
+    });
+    await flush();
+    // Checked before awaiting: a dropped join would hang `ready()`.
+    expect(host.counts().handles).toBe(2);
+    await joined.ready();
+    expect(joined.getStatus().phase).toBe('ready');
+    expect(host.counters()['foreign-stream']).toBeUndefined();
+
+    // The pin still binds the peer that set it…
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/ship'), join('2'));
+    await flush();
+    expect(host.counts().handles).toBe(2);
+    expect(host.counters()['foreign-stream']).toBe(1);
+
+    // …and goes with its last handle, so the table is bounded by live peers.
+    const h = net.learnedHandle(OTHER_NODE);
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/chosen'), encodeMessage({ k: 'leave', q: '3'.repeat(16) as Hex, h }));
+    await flush();
+    expect(host.counts().handles).toBe(1);
+    net.injectLabelled(HOST_NODE, OTHER_NODE, derivedStreamId('store/ship'), join('4'));
+    await flush();
+    expect(host.counts().handles).toBe(2);
     expect(host.counters()['foreign-stream']).toBe(1);
     await host.close();
   });
