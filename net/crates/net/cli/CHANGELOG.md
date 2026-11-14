@@ -8,6 +8,15 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — local file-safety fixes
+
+- `transfer recv-blob` stages into a fresh, exclusively created
+  `<out>.partial.<nonce>` instead of truncating a shared `<out>.partial`.
+  Concurrent receives to one `--out` no longer corrupt each other, and a
+  pre-existing file or symlink at the old staging name is never truncated.
+  Scripts that cleaned up a failed receive by the exact `<out>.partial` name
+  should match `<out>.partial.*`.
+
 ## Unreleased — managed nodes, join links, relations and leave
 
 **Browsers for your games (`anchor serve`)**

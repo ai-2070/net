@@ -33,7 +33,7 @@ For `wrap`, startup also includes child MCP initialization, tool discovery and p
 
 For `mcp serve`, the budget ends when the shim is ready to process protocol input. It covers identity loading and mesh attachment, not waiting for the client's initialize request or the running session. Startup failure emits no protocol output; a started shim continues until EOF or operator shutdown.
 
-Blob receive applies the same deadline to attachment and each network wait. Disk writes count toward elapsed budget but are not cancelled; final rename proceeds normally after the complete stream is acquired. Timeout leaves the destination unchanged but may leave `<out>.partial` staging bytes. This is not a resumable download or a guarantee that total wall-clock time stays within the budget.
+Blob receive applies the same deadline to attachment and each network wait. Disk writes count toward elapsed budget but are not cancelled; final rename proceeds normally after the complete stream is acquired. Timeout leaves the destination unchanged but may leave `<out>.partial.<nonce>` staging bytes. This is not a resumable download or a guarantee that total wall-clock time stays within the budget.
 
 One-shot output defaults to table on a TTY and JSON otherwise; streams default to text/NDJSON. ICE commits emit one `{preview, commit}` result; the pre-confirmation preview goes to stderr, and failure/refusal emits no success payload on stdout. `--yes` skips the ICE prompt in TTY and non-TTY use without bypassing signature or policy checks. Without it, TTY use requires typed `YES` and unattended commits exit 8. Dry-run retains its preview-only shape without confirmation. `mcp serve` stdout is protocol traffic, not ordinary command JSON.
 
@@ -294,7 +294,7 @@ Fetch verified chunks into a file:
 net-mesh transfer recv-blob --blob-ref <REF> --out <PATH> [--from <NODE>] [REMOTE FLAGS]
 ```
 
-Writes go to `<PATH>.partial`, then flush/close and rename to the final path. A failed fetch leaves the previous final file untouched and may leave the partial file for inspection. Local I/O failures and SDK failures need not have the same exit code.
+Writes go to a fresh, exclusively created `<PATH>.partial.<nonce>`, then flush/close and rename to the final path, so concurrent receives to one path never share a staging file. A failed fetch leaves the previous final file untouched and may leave the partial file for inspection. Local I/O failures and SDK failures need not have the same exit code.
 
 ### `send-blob`
 

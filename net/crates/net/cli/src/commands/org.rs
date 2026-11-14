@@ -2020,15 +2020,19 @@ fn serialize_json<T: Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
     serde_json::to_vec_pretty(value).map_err(|e| generic(format!("failed to serialize: {e}")))
 }
 
-/// A per-run stage nonce (pid + wall-clock nanos) so a stale temp left by a
-/// crashed prior run never blocks a fresh `create_new`.
-fn stage_nonce() -> String {
+/// A per-run stage nonce (pid + wall-clock nanos + a process-local sequence)
+/// so a stale temp left by a crashed prior run never blocks a fresh
+/// `create_new`, and two stagings in one process never collide even when the
+/// clock's granularity hands them the same nanos.
+pub(crate) fn stage_nonce() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{pid}.{nanos}")
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{pid}.{nanos}.{seq}")
 }
 
 /// Stage `bytes` as a temp file in the SAME directory as `final_path`

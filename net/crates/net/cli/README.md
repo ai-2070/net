@@ -190,7 +190,7 @@ For `wrap`, startup also includes child MCP initialization, tool discovery and p
 
 For `mcp serve`, the budget ends when the shim is ready to process protocol input. It covers identity loading and mesh attachment, not waiting for the client's initialize request or the running session. Startup failure emits no protocol output; a started shim continues until EOF or operator shutdown.
 
-Blob receive applies the same deadline to attachment and each network wait. Disk writes count toward elapsed budget but are not cancelled; final rename proceeds normally after the complete stream is acquired. Timeout leaves the destination unchanged but may leave `<out>.partial` staging bytes. This is not a resumable download or a guarantee that total wall-clock time stays within the budget.
+Blob receive applies the same deadline to attachment and each network wait. Disk writes count toward elapsed budget but are not cancelled; final rename proceeds normally after the complete stream is acquired. Timeout leaves the destination unchanged but may leave `<out>.partial.<nonce>` staging bytes. This is not a resumable download or a guarantee that total wall-clock time stays within the budget.
 
 Errors are plain `net-mesh: ...` messages on stderr. ICE commits emit one result containing `preview` and `commit`; the pre-confirmation preview is diagnostic output on stderr. Refusal or failure emits no success payload on stdout. ICE `--yes` skips prompting on both interactive and noninteractive stdin, but does not bypass signature or policy checks. Without it, interactive stdin requires typed `YES`; unattended commits refuse with exit 8. Dry-run needs no confirmation and retains its preview-only shape. `mcp serve` stdout is protocol traffic.
 

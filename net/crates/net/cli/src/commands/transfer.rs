@@ -83,7 +83,8 @@ pub struct RecvBlobArgs {
     /// encoded `BlobRef` hex that `send-blob` prints for chunked content.
     #[arg(long = "blob-ref")]
     pub blob_ref: String,
-    /// Destination file. Written atomically via `<out>.partial` + rename.
+    /// Destination file. Written atomically via a fresh
+    /// `<out>.partial.<nonce>` + rename.
     #[arg(long)]
     pub out: PathBuf,
 
@@ -323,7 +324,7 @@ async fn run_recv_blob(
 }
 
 /// Bound acquisition only, preserving the destination until the complete
-/// stream succeeds. A failure leaves the existing `.partial` staging file.
+/// stream succeeds. A failure leaves this invocation's `.partial.<nonce>` staging file.
 async fn write_blob_stream<B: AsRef<[u8]>>(
     stream: impl futures::Stream<Item = Result<B, CliError>>,
     mut writer: AtomicFileWriter,
@@ -742,12 +743,21 @@ async fn persistent_adapter(
     ))
 }
 
-/// Streaming temp-and-rename atomic writer: open `<out>.partial`, append
-/// chunks as they arrive, then flush + rename over `<out>` on
-/// [`Self::commit`]. A reader never observes a half-written target; on any
-/// failure (the writer is dropped without committing) the `.partial` is
-/// left in place for inspection — matching `fetch_dir`'s temp-and-rename
-/// semantics and `TRANSFER.md` §5.
+/// Streaming temp-and-rename atomic writer: exclusively create a fresh
+/// `<out>.partial.<nonce>` sibling, append chunks as they arrive, then
+/// flush + rename over `<out>` on [`Self::commit`]. A reader never observes a
+/// half-written target; on any failure (the writer is dropped without
+/// committing) the partial is left in place for inspection — matching
+/// `fetch_dir`'s temp-and-rename semantics and `TRANSFER.md` §5.
+///
+/// The staging name is unique per invocation and opened `create_new`
+/// (CLI-02). A deterministic `<out>.partial` opened with a truncating
+/// `File::create` let two concurrent receives to the same `--out` write
+/// through independent handles into ONE staging file — interleaving verified
+/// chunks, so one invocation could publish corrupted bytes while the other was
+/// still writing — and followed a pre-existing staging symlink, truncating its
+/// target even if acquisition later failed. Each writer now owns its staging
+/// file exclusively and publishes only that file.
 struct AtomicFileWriter {
     partial: PathBuf,
     out: PathBuf,
@@ -755,9 +765,9 @@ struct AtomicFileWriter {
 }
 
 impl AtomicFileWriter {
-    /// Create the parent directory (if any) and open `<out>.partial`.
+    /// Create the parent directory (if any) and exclusively create a fresh
+    /// `<out>.partial.<nonce>` staging file.
     async fn create(out: &std::path::Path) -> Result<Self, CliError> {
-        let partial = partial_path(out);
         if let Some(parent) = out.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent)
@@ -765,7 +775,17 @@ impl AtomicFileWriter {
                     .map_err(|e| generic(format!("create out dir {}: {e}", parent.display())))?;
             }
         }
-        let file = tokio::fs::File::create(&partial)
+        Self::create_at(out, partial_path(out)).await
+    }
+
+    /// Open `partial` with `create_new` — it must not exist. Never truncates
+    /// or follows anything already at that name (an `AlreadyExists` is someone
+    /// else's file, so it is not removed either).
+    async fn create_at(out: &std::path::Path, partial: PathBuf) -> Result<Self, CliError> {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
             .await
             .map_err(|e| generic(format!("create {}: {e}", partial.display())))?;
         Ok(Self {
@@ -806,10 +826,13 @@ impl AtomicFileWriter {
     }
 }
 
-/// `<out>.partial` sibling path for the atomic write.
+/// A fresh `<out>.partial.<nonce>` sibling path for the atomic write. The
+/// nonce (pid + wall-clock nanos) makes it unique per invocation; it is still
+/// opened `create_new`, so a collision fails closed rather than sharing.
 fn partial_path(out: &std::path::Path) -> PathBuf {
     let mut name = out.file_name().unwrap_or_default().to_os_string();
-    name.push(".partial");
+    name.push(".partial.");
+    name.push(crate::commands::org::stage_nonce());
     out.with_file_name(name)
 }
 
@@ -1012,6 +1035,7 @@ mod tests {
         let out = dir.path().join("blob");
         std::fs::write(&out, b"original").unwrap();
         let writer = AtomicFileWriter::create(&out).await.unwrap();
+        let partial = writer.partial.clone();
         let progress = Progress::start("test", false);
         let stream = futures::stream::once(async { Ok(b"first chunk".as_slice()) })
             .chain(futures::stream::pending());
@@ -1022,10 +1046,72 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), crate::error::ExitCodeKind::Timeout);
         assert_eq!(std::fs::read(&out).unwrap(), b"original");
-        assert_eq!(
-            tokio::fs::read(partial_path(&out)).await.unwrap(),
-            b"first chunk"
-        );
+        assert_eq!(tokio::fs::read(&partial).await.unwrap(), b"first chunk");
+    }
+
+    /// CLI-02: two receives to the same `--out` each own a distinct staging
+    /// file, so neither truncates nor interleaves into the other's bytes and
+    /// both commits publish an intact payload. With the old deterministic
+    /// `<out>.partial` + truncating `File::create`, both handles shared one
+    /// file: the second create truncated the first's bytes, the writes
+    /// overlapped, and the second commit failed (its partial had already been
+    /// renamed away by the first).
+    #[tokio::test]
+    async fn concurrent_blob_writers_to_one_out_never_share_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("blob");
+        let mut a = AtomicFileWriter::create(&out).await.unwrap();
+        let mut b = AtomicFileWriter::create(&out).await.unwrap();
+        assert_ne!(a.partial, b.partial, "the staging pathname must be unique");
+        a.write_chunk(b"AAAAAAAAAAAAAAAA").await.unwrap();
+        b.write_chunk(b"BB").await.unwrap();
+        a.write_chunk(b"aaaa").await.unwrap();
+        b.write_chunk(b"bb").await.unwrap();
+        a.commit().await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AAAAAAAAAAAAAAAAaaaa");
+        b.commit().await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"BBbb");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "blob")
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    }
+
+    /// CLI-02: the staging file is created exclusively. Something already at
+    /// the staging name (another invocation's partial, or a planted file) is
+    /// refused, never truncated. The old `File::create` truncated it.
+    #[tokio::test]
+    async fn blob_writer_never_truncates_an_existing_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("blob");
+        let occupied = dir.path().join("blob.partial");
+        std::fs::write(&occupied, b"someone else's bytes").unwrap();
+        assert!(AtomicFileWriter::create_at(&out, occupied.clone())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"someone else's bytes");
+        // The production path never even names the deterministic sibling.
+        let writer = AtomicFileWriter::create(&out).await.unwrap();
+        assert_ne!(writer.partial, occupied);
+        drop(writer);
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"someone else's bytes");
+    }
+
+    /// CLI-02: a symlink at the staging name is not followed — its target is
+    /// neither created nor truncated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blob_writer_never_follows_a_staging_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("blob");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let link = dir.path().join("blob.partial");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(AtomicFileWriter::create_at(&out, link).await.is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
     }
 
     #[test]
