@@ -2698,9 +2698,9 @@ mod tests {
         }
         let expected_total: u64 = (1..=IN_FLIGHT_STRIPE_SLOTS as u64).sum();
         assert_eq!(counter.sum(), expected_total, "sum must cover every slot");
-        for slot in 0..IN_FLIGHT_STRIPE_SLOTS {
+        for (slot, cell) in counter.slots.iter().enumerate() {
             assert_eq!(
-                counter.slots[slot].load(AtomicOrdering::SeqCst),
+                cell.load(AtomicOrdering::SeqCst),
                 slot as u64 + 1,
                 "slot {slot} must hold exactly its own count (no aliasing)"
             );

@@ -1974,10 +1974,7 @@ impl<'a> AuditQuery<'a> {
                         return false;
                     }
                 }
-                if self.force_only && !r.event.is_ice() {
-                    return false;
-                }
-                true
+                !self.force_only || r.event.is_ice()
             })
             .cloned()
             .collect();
@@ -2036,10 +2033,7 @@ impl AuditFilter {
                 return false;
             }
         }
-        if self.force_only && !record.event.is_ice() {
-            return false;
-        }
-        true
+        !self.force_only || record.event.is_ice()
     }
 }
 
