@@ -137,6 +137,16 @@ produces a different binding, so state signed for one establishment cannot ride 
 next — which is what lets a protected streaming opening bind its proof to the exact
 session it arrived on.
 
+The four keys are expanded from the Noise `Split()` outputs — the secret the
+handshake's DH results feed through the chaining key — one output per direction,
+each under its own direction-named label, with the handshake hash appended to the
+KDF info purely as channel binding. The handshake hash is never key material on its
+own: it is public transcript (anyone holding the PSK can recompute it from the
+handshake messages), so keys derived from it alone would be readable by every PSK
+holder and would lose forward secrecy. The prologue tag `net-handshake-v2` versions
+this derivation; a peer on the earlier hash-only derivation (`net-handshake-v1`)
+fails the handshake at msg1 rather than establishing a session it cannot decrypt.
+
 `PacketCipher` wraps the AEAD primitive with the per-session monotonic counter for
 nonce generation.
 
