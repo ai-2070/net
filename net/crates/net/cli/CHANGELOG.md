@@ -16,6 +16,10 @@ and output shape.
   pre-existing file or symlink at the old staging name is never truncated.
   Scripts that cleaned up a failed receive by the exact `<out>.partial` name
   should match `<out>.partial.*`.
+- `identity generate` without `--force` is now no-clobber at publication,
+  not only at its existence pre-check: two concurrent runs to one absent
+  `--out` can no longer both succeed with the second replacing the first's
+  seed. The loser exits 2 ("publication is no-clobber").
 
 ## Unreleased — managed nodes, join links, relations and leave
 

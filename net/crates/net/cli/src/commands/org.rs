@@ -2249,15 +2249,44 @@ async fn publish_json_artifact(
     json: &[u8],
     force: bool,
 ) -> Result<(), CliError> {
-    if force {
-        // Only the forced path needs this: without `--force` the no-clobber
+    // A certificate / revocation bundle / grant envelope is not seed-bearing,
+    // so on the forced path it may replace nothing seed-bearing.
+    publish_beside(final_path, json, false, force, SeedArtifact::None).await
+}
+
+/// The ONE stage-then-publish pipeline for a verb that writes a whole file at
+/// `final_path`, carrying the verb's overwrite policy all the way to the
+/// publish instead of leaving it in a pre-check.
+///
+/// - The payload is staged in an exclusively created (`create_new`), uniquely
+///   named sibling ([`stage_beside`]), so no pre-existing file or symlink at a
+///   predictable staging name is ever truncated or followed, and two concurrent
+///   invocations never share a staging file.
+/// - `replace == false`: no-clobber hard-link ([`publish_staged`]). This is the
+///   real "does not exist" boundary — a file that appears after any
+///   `try_exists` pre-check still makes the publish fail closed.
+/// - `replace == true`: refuse to replace a DIFFERENT kind of seed than
+///   `publishing` ([`refuse_replacing_foreign_seed`] — content-based, so it
+///   catches a case variant, symlink, hard link or `..` spelling of a seed
+///   file), then atomically `rename` ([`publish_staged_replace`]), which
+///   replaces a leaf symlink rather than writing through it.
+///
+/// `secret` selects the staged file's Unix creation mode (0600 vs 0644).
+pub(crate) async fn publish_beside(
+    final_path: &Path,
+    bytes: &[u8],
+    secret: bool,
+    replace: bool,
+    publishing: SeedArtifact,
+) -> Result<(), CliError> {
+    if replace {
+        // Only the replacing path needs this: without it the no-clobber
         // hard-link already refuses anything that exists at the destination,
-        // whatever it contains. A certificate / revocation bundle / grant
-        // envelope is not seed-bearing, so it may replace nothing seed-bearing.
-        refuse_replacing_foreign_seed(final_path, SeedArtifact::None).await?;
+        // whatever it contains.
+        refuse_replacing_foreign_seed(final_path, publishing).await?;
     }
-    let tmp = stage_beside(final_path, json, false).await?;
-    if force {
+    let tmp = stage_beside(final_path, bytes, secret).await?;
+    if replace {
         publish_staged_replace(&tmp, final_path).await
     } else {
         publish_staged(&tmp, final_path).await
