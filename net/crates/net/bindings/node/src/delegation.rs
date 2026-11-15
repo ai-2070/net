@@ -48,8 +48,7 @@ fn delegation_err(msg: impl std::fmt::Display) -> Error {
 /// Decode a 32-byte entity-id `Buffer` into the typed `EntityId`.
 /// Shared with the enrollment module (same shape as the Python
 /// `entity_id_from_bytes`).
-pub(crate) fn entity_id_from_buffer(buf: &Buffer) -> Result<EntityId> {
-    let bytes: &[u8] = buf.as_ref();
+pub(crate) fn entity_id_from_buffer(bytes: &[u8]) -> Result<EntityId> {
     if bytes.len() != 32 {
         return Err(delegation_err(format!(
             "entity_id must be 32 bytes, got {}",

@@ -2070,7 +2070,11 @@ mod mesh_bindings {
 
         /// Send raw bytes to a direct peer.
         #[napi]
-        pub async fn push_to(&self, peer_addr: String, data: Buffer) -> Result<bool> {
+        pub async fn push_to(
+            &self,
+            peer_addr: String,
+            #[napi(ts_arg_type = "Buffer")] data: crate::common::JsBytes,
+        ) -> Result<bool> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let addr: std::net::SocketAddr = peer_addr
@@ -2363,7 +2367,11 @@ mod mesh_bindings {
         /// discover it by being refused. Nothing in the batch is
         /// sent; the check runs before the peer is resolved.
         #[napi]
-        pub async fn send_on_stream(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
+        pub async fn send_on_stream(
+            &self,
+            stream: &NetStream,
+            #[napi(ts_arg_type = "Array<Buffer>")] events: Vec<crate::common::JsBytes>,
+        ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let payloads: Vec<bytes::Bytes> = events
@@ -2384,7 +2392,7 @@ mod mesh_bindings {
         pub async fn send_with_retry(
             &self,
             stream: &NetStream,
-            events: Vec<Buffer>,
+            #[napi(ts_arg_type = "Array<Buffer>")] events: Vec<crate::common::JsBytes>,
             max_retries: u32,
         ) -> Result<()> {
             let guard = self.load_node()?;
@@ -2408,7 +2416,11 @@ mod mesh_bindings {
         /// is absorbed; an oversize-event rejection propagates at
         /// once.
         #[napi]
-        pub async fn send_blocking(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
+        pub async fn send_blocking(
+            &self,
+            stream: &NetStream,
+            #[napi(ts_arg_type = "Array<Buffer>")] events: Vec<crate::common::JsBytes>,
+        ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let payloads: Vec<bytes::Bytes> = events
@@ -2493,7 +2505,9 @@ mod mesh_bindings {
             &self,
             publisher_node_id: BigInt,
             channel: String,
-            token: Option<Buffer>,
+            #[napi(ts_arg_type = "Buffer | undefined | null")] token: Option<
+                crate::common::JsBytes,
+            >,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
@@ -2550,7 +2564,7 @@ mod mesh_bindings {
         pub async fn publish(
             &self,
             channel: String,
-            payload: Buffer,
+            #[napi(ts_arg_type = "Buffer")] payload: crate::common::JsBytes,
             config: Option<PublishConfigJs>,
         ) -> Result<PublishReportJs> {
             let guard = self.load_node()?;
@@ -3260,7 +3274,7 @@ mod mesh_bindings {
         pub async fn connect_direct(
             &self,
             peer_node_id: BigInt,
-            peer_public_key: Buffer,
+            #[napi(ts_arg_type = "Buffer")] peer_public_key: crate::common::JsBytes,
             coordinator: BigInt,
         ) -> Result<()> {
             let guard = self.load_node()?;
@@ -3299,7 +3313,7 @@ mod mesh_bindings {
         pub async fn connect_direct_auto(
             &self,
             peer_node_id: BigInt,
-            peer_public_key: Buffer,
+            #[napi(ts_arg_type = "Buffer")] peer_public_key: crate::common::JsBytes,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();

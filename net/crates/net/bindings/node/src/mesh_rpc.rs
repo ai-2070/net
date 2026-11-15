@@ -2213,12 +2213,12 @@ impl MeshRpc {
         &self,
         target_node_id: BigInt,
         service: String,
-        request: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
         let target = crate::common::bigint_u64(target_node_id)?;
         let inner_opts = opts.unwrap_or_default().into_inner()?;
-        let req_bytes = Bytes::copy_from_slice(request.as_ref());
+        let req_bytes = request.into_bytes();
         // cancel_token lives on inner_opts; substrate handles cancel
         // uniformly across shapes. RpcError::Cancelled maps to
         // `nrpc:cancelled:` via the error-kind table.
@@ -2236,11 +2236,11 @@ impl MeshRpc {
     pub async fn call_service(
         &self,
         service: String,
-        request: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
         let inner_opts = opts.unwrap_or_default().into_inner()?;
-        let req_bytes = Bytes::copy_from_slice(request.as_ref());
+        let req_bytes = request.into_bytes();
         self.node()?
             .call_service(&service, req_bytes, inner_opts)
             .await
@@ -2258,19 +2258,14 @@ impl MeshRpc {
         &self,
         target_node_id: BigInt,
         service: String,
-        request: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
         opts: Option<CallOptions>,
     ) -> Result<RpcStream> {
         let target = crate::common::bigint_u64(target_node_id)?;
         let opts = opts.unwrap_or_default().into_inner()?;
         let inner = self
             .node()?
-            .call_streaming(
-                target,
-                &service,
-                Bytes::copy_from_slice(request.as_ref()),
-                opts,
-            )
+            .call_streaming(target, &service, request.into_bytes(), opts)
             .await
             .map_err(nrpc_err_from_inner)?;
         let flow_controlled_cached = inner.flow_controlled();
@@ -2294,13 +2289,13 @@ impl MeshRpc {
     pub async fn call_service_streaming(
         &self,
         service: String,
-        request: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
         opts: Option<CallOptions>,
     ) -> Result<RpcStream> {
         let opts = opts.unwrap_or_default().into_inner()?;
         let inner = self
             .node()?
-            .call_service_streaming(&service, Bytes::copy_from_slice(request.as_ref()), opts)
+            .call_service_streaming(&service, request.into_bytes(), opts)
             .await
             .map_err(nrpc_err_from_inner)?;
         let flow_controlled_cached = inner.flow_controlled();

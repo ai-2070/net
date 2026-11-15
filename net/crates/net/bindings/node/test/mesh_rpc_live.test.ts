@@ -579,6 +579,30 @@ describe('handlerTimeoutMs: 0 disables the cap without overflowing', () => {
 // A chunk must fit one packet (8104 bytes with its envelope); a larger
 // one ends the call with an explicit `server_error`, not a silent drop.
 // 7 KB is the largest round size under that.
+// NCALL-01 residual: an `async fn` binding runs its whole body on a
+// tokio worker after the Promise is returned, so a request Buffer it
+// copied there could already have been rewritten by the caller. The
+// copy now happens as napi converts the argument, on the JS thread.
+// Rewriting the Buffer the moment `call()` returns must not change what
+// the server receives. The old race depended on worker wake-up timing,
+// so this repeats the call; with the fix no iteration can differ.
+describe('a request Buffer is snapshotted when the call is made', () => {
+  it('rewriting it after call() returns does not change the request', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.snapshot', async (req: Buffer) => req)
+    const buf = Buffer.alloc(4096)
+    for (let i = 0; i < 50; i += 1) {
+      buf.fill(i)
+      const sent = Buffer.from(buf)
+      const pending = clientRpc.call(server.nodeId(), 'live.snapshot', buf)
+      buf.fill(0xff)
+      const echoed: Buffer = await pending
+      expect(echoed.equals(sent), `iteration ${i}`).toBe(true)
+    }
+    handle.close()
+  }, 60_000)
+})
+
 describe('streamed-call backpressure', () => {
   for (const kb of [1, 7]) {
     it(`sendWait delivers every ${kb} KB chunk in order`, async () => {
