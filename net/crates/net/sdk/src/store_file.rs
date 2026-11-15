@@ -13,7 +13,8 @@
 //! [`create_staging`] keeps the **full destination filename** and makes every
 //! staging file unique per save — `<filename>.tmp.<pid>.<seq>`, created with
 //! `create_new` — so a collision is an error to retry, never a silent
-//! truncation of somebody else's temp.
+//! truncation of somebody else's temp. [`durability_barrier`] commits the
+//! rename itself to stable storage once it has happened.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +69,30 @@ pub(crate) fn create_staging(path: &Path) -> std::io::Result<(PathBuf, std::fs::
             None => "no unused staging name beside the store".to_string(),
         },
     ))
+}
+
+/// Commit a just-completed rename onto `path` to stable storage.
+///
+/// On POSIX `rename()` updates the directory entry only in memory; until the
+/// parent directory is fsynced a crash can revert to the previous file. On
+/// other platforms (no directory handles to sync) the renamed file itself is
+/// reopened and flushed — the same barrier the A2A admission journal uses.
+pub(crate) fn durability_barrier(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(parent).and_then(|dir| dir.sync_all())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.sync_all())
+    }
 }
 
 #[cfg(test)]

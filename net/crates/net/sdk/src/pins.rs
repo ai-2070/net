@@ -95,6 +95,19 @@ pub enum PinStoreError {
         /// Why it failed to parse.
         reason: String,
     },
+    /// The new snapshot was renamed into place — it is **visible** to every
+    /// reader — but the durability barrier that commits the rename to disk
+    /// failed, so a crash or power loss may still revert to the previous
+    /// store (on POSIX, the parent directory's fsync failed). The change is
+    /// **not acknowledged**: a caller must not report it as committed, and
+    /// retrying the same mutation is safe (pin operations are idempotent).
+    #[error("pin store at {path} was updated but not durably committed: {reason}")]
+    NotDurable {
+        /// The file path involved.
+        path: String,
+        /// The stringified durability-barrier failure.
+        reason: String,
+    },
 }
 
 /// Holds the cross-process advisory lock on the pin store's `.lock` sidecar
@@ -188,8 +201,9 @@ async fn spawn_commit(
         })?
 }
 
-/// Test-only pause point inside a commit, between the fsynced staging write
-/// and the rename that publishes it — the window CONSENT-01 is about.
+/// Test-only seams inside a commit: a pause between the fsynced staging write
+/// and the rename that publishes it (the window CONSENT-01 is about), and an
+/// injected durability-barrier failure (CONSENT-02).
 #[cfg(test)]
 mod commit_hooks {
     use std::collections::HashMap;
@@ -214,6 +228,24 @@ mod commit_hooks {
             .lock()
             .get_or_insert_with(HashMap::new)
             .insert(path.to_path_buf(), pause);
+    }
+
+    static BARRIER_FAILURES: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Make the next durability barrier for `path` fail (one-shot).
+    pub(super) fn fail_next_barrier(path: &Path) {
+        BARRIER_FAILURES.lock().push(path.to_path_buf());
+    }
+
+    pub(super) fn take_barrier_failure(path: &Path) -> bool {
+        let mut failures = BARRIER_FAILURES.lock();
+        match failures.iter().position(|p| p == path) {
+            Some(i) => {
+                failures.swap_remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     pub(super) fn before_publish(path: &Path) {
@@ -347,7 +379,25 @@ impl PinStore {
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
-        result.map_err(io_err)
+        result.map_err(io_err)?;
+
+        // Published. `rename` only updates the directory entry in memory: on
+        // POSIX, without an fsync of the parent directory a power loss can
+        // bring back the previous store — e.g. resurrect an approval the
+        // operator was just told was rejected (CONSENT-02). The barrier is
+        // part of the commit, so its failure fails the save with
+        // `NotDurable` rather than being acknowledged as success.
+        #[cfg(test)]
+        if commit_hooks::take_barrier_failure(&self.path) {
+            return Err(PinStoreError::NotDurable {
+                path: self.path.display().to_string(),
+                reason: "injected durability-barrier failure (test seam)".to_string(),
+            });
+        }
+        crate::store_file::durability_barrier(&self.path).map_err(|e| PinStoreError::NotDurable {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        })
     }
 
     /// Atomically apply a mutation under a **cross-process exclusive lock**, so
@@ -972,6 +1022,47 @@ mod tests {
             Some(PinState::Pending),
             "A's started commit still completed",
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_is_not_acknowledged_without_its_durability_barrier() {
+        // CONSENT-02: a rejection published by rename but whose directory
+        // entry never reached disk can be undone by a power loss, restoring
+        // the approval. The barrier is part of the commit: when it fails the
+        // mutation reports `NotDurable`, never success.
+        let (_dir, path) = store_path();
+        PinStore::mutate(path.clone(), |s| s.approve(&cap("b/x")))
+            .await
+            .unwrap();
+
+        commit_hooks::fail_next_barrier(&path);
+        let err = PinStore::mutate(path.clone(), |s| s.remove(&cap("b/x")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PinStoreError::NotDurable { .. }),
+            "a failed barrier must not acknowledge the rejection: {err:?}",
+        );
+        // The rename itself already happened (visible, just unconfirmed), and
+        // a retry is idempotent and succeeds once the barrier does.
+        assert!(!PinStore::load(&path)
+            .await
+            .unwrap()
+            .is_approved(&cap("b/x")));
+        assert!(!PinStore::mutate(path.clone(), |s| s.remove(&cap("b/x")))
+            .await
+            .unwrap());
+        assert_no_staging_left(&path);
+    }
+
+    #[test]
+    fn the_durability_barrier_succeeds_on_a_published_store() {
+        // The real barrier (parent-directory fsync on POSIX; reopen + flush
+        // elsewhere) on a freshly published store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        std::fs::write(&path, b"{}").unwrap();
+        crate::store_file::durability_barrier(&path).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
