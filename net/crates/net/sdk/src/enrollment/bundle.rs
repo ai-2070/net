@@ -872,13 +872,11 @@ impl BundleIssuer for MembershipIssuer {
         if let Some(offer) = invite.channel() {
             // Minted only under a root grant covering exactly this offer;
             // without one the invite cannot be honoured.
-            let chain = self
-                .channels
-                .iter()
-                .find(|issuer| issuer.covers(offer))
-                .ok_or(Refusal::Unavailable)?
-                .issue(intent.subject(), offer.rights)
-                .map_err(|_| Refusal::Unavailable)?;
+            // CISS-01: the first covering grant that can issue NOW — an
+            // expired grant listed first must not shadow a live replacement.
+            let chain =
+                crate::channel_issuer::issue_covering(&self.channels, offer, intent.subject())
+                    .ok_or(Refusal::Unavailable)?;
             bundle = bundle.with_channel_chain(&chain);
         }
         Ok(bundle.to_bytes())

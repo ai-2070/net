@@ -364,12 +364,9 @@ pub fn answer_standalone_redeem(
     // certificate the operator approved for exactly this claim.
     let deliver = |at: u64| -> Result<SubnetRedeemReply, Refusal> {
         if let Some(offer) = invite.channel() {
-            let chain = channels
-                .iter()
-                .find(|issuer| issuer.covers(offer))
-                .ok_or(Refusal::Unavailable)?
-                .issue(&request.subject, offer.rights)
-                .map_err(|_| Refusal::Unavailable)?;
+            // CISS-01: skip covering grants that cannot issue now.
+            let chain = crate::channel_issuer::issue_covering(channels, offer, &request.subject)
+                .ok_or(Refusal::Unavailable)?;
             return Ok(SubnetRedeemReply::ChannelIssued(chain.to_bytes()));
         }
         if let Some(offer) = invite.subnet() {
