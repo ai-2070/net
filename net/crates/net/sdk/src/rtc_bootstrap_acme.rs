@@ -39,7 +39,8 @@ use crate::rtc_bootstrap::{read_pem_pair, AcmeConfig, AcmeState, BootstrapError}
 /// The cache used to be one flat pair in `cache_dir`, so asking for
 /// `different.example` returned the `localhost` certificate that
 /// happened to be there. The directory is now
-/// `<cache_dir>/<domain>/`, and even then the pair is only reused
+/// `<cache_dir>/directory-<id>/<domain>/` — per issuing directory
+/// (TLS-02) and per domain — and even then the pair is only reused
 /// after it is qualified: it must actually cover the domain and
 /// still be inside its validity window.
 const CERT_FILE: &str = "bootstrap-cert.pem";
@@ -92,7 +93,40 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// The cache directory for THIS domain (R4b).
+/// A short, stable identity for [`AcmeConfig::directory_url`]: the
+/// first eight bytes of its BLAKE3 digest, hex.
+///
+/// It names both halves of what a directory owns in the cache — the
+/// account file and the certificate namespace (TLS-02) — so a
+/// staging account and a staging certificate are equally invisible
+/// to production.
+fn directory_id(config: &AcmeConfig) -> String {
+    let digest = blake3::hash(config.directory_url.as_bytes());
+    digest.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The certificate namespace of THIS ACME directory inside
+/// `cache_dir` (TLS-02): `<cache_dir>/directory-<id>/`.
+///
+/// Certificates used to be keyed by domain alone, so an anchor
+/// switched from Let's Encrypt staging to production with the same
+/// cache found the staging certificate, qualified it (right name,
+/// right key, inside its window — everything but the issuer) and
+/// served a chain no browser trusts, for the two months until the
+/// renewal horizon came round. A certificate belongs to the
+/// directory that issued it, as the account already did.
+fn directory_cache_dir(config: &AcmeConfig) -> PathBuf {
+    config
+        .cache_dir
+        .join(format!("directory-{}", directory_id(config)))
+}
+
+/// The cache directory for THIS domain (R4b), inside the issuing
+/// directory's namespace (TLS-02):
+/// `<cache_dir>/directory-<id>/<domain>/`.
 pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
     // A domain is a DNS name: letters, digits, `-`, `.`. Anything
     // else is replaced rather than trusted as a path component.
@@ -107,7 +141,7 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
             }
         })
         .collect();
-    config.cache_dir.join(safe)
+    directory_cache_dir(config).join(safe)
 }
 
 fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
@@ -116,14 +150,10 @@ fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
 
 /// Where the account for [`AcmeConfig::directory_url`] is saved.
 fn account_path(config: &AcmeConfig) -> PathBuf {
-    let digest = blake3::hash(config.directory_url.as_bytes());
-    let id: String = digest.as_bytes()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    config
-        .cache_dir
-        .join(format!("{ACCOUNT_FILE_PREFIX}{id}.json"))
+    config.cache_dir.join(format!(
+        "{ACCOUNT_FILE_PREFIX}{}.json",
+        directory_id(config)
+    ))
 }
 
 /// The saved account for this directory, if there is one that parses.
@@ -676,7 +706,55 @@ mod tests {
             "o@example.invalid",
             base.path().into(),
         );
-        assert_eq!(domain_cache_dir(&evil), base.path().join(".._.._etc"));
+        assert_eq!(
+            domain_cache_dir(&evil),
+            directory_cache_dir(&evil).join(".._.._etc")
+        );
+        assert!(domain_cache_dir(&evil).starts_with(base.path()));
+    }
+
+    /// TLS-02: a certificate cached for one ACME directory is never
+    /// served for another. The scenario: an anchor is brought up
+    /// against Let's Encrypt STAGING, then pointed at production with
+    /// the same domain and the same `--acme-cache`. The staging
+    /// certificate is a perfectly good pair — right name, matching
+    /// key, inside its window — and browsers refuse its issuer.
+    ///
+    /// Inverse: key the certificate cache on the domain alone (the
+    /// previous shape) and production finds the staging pair.
+    #[test]
+    fn a_certificate_from_another_acme_directory_is_not_reused() {
+        let base = tempfile::tempdir().unwrap();
+        let staging = AcmeConfig::new(
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+            "localhost",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        let production = AcmeConfig::new(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            "localhost",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
+        write_cache(&domain_cache_dir(&staging), &cert_pem, &key_pem).unwrap();
+
+        let now = now_unix();
+        assert!(
+            read_cache(&domain_cache_dir(&staging), "localhost", now).is_some(),
+            "the premise: staging's own cache hit is served"
+        );
+        assert_ne!(domain_cache_dir(&staging), domain_cache_dir(&production));
+        assert!(
+            read_cache(&domain_cache_dir(&production), "localhost", now).is_none(),
+            "production must not serve the staging certificate"
+        );
+        assert!(
+            renew_at(&production, DEFAULT_RENEWAL_HORIZON).is_none(),
+            "production has nothing cached, so it orders now instead of              sleeping out the staging certificate's renewal horizon"
+        );
+        assert!(renew_at(&staging, DEFAULT_RENEWAL_HORIZON).is_some());
     }
 
     /// R4c: the renewal owner wakes at `not_after - horizon`.

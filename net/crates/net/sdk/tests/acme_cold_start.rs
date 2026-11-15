@@ -113,6 +113,7 @@ async fn a_cold_cache_orders_a_certificate_and_then_serves_tls() {
     // `client error (Connect)` with pebble logging `unknown
     // certificate authority`.
     .with_directory_roots(directory_roots());
+    let acme_cache_dir = acme.certificate_cache_dir();
     let mut cfg = BootstrapConfig::new(
         "0.0.0.0:0".parse().expect("addr"),
         Psk::new(PSK),
@@ -151,7 +152,8 @@ async fn a_cold_cache_orders_a_certificate_and_then_serves_tls() {
     // `read_cache`/`qualify_leaf` enforce all three, and this asserts
     // the issued material really satisfies them rather than trusting
     // that the startup path happened to.
-    let domain_dir = cache.path().join(domain());
+    // …inside the issuing directory's namespace (TLS-02).
+    let domain_dir = acme_cache_dir.clone();
     let cert_path = domain_dir.join("bootstrap-cert.pem");
     assert!(
         cert_path.exists(),

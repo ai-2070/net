@@ -895,7 +895,7 @@ pub struct ServeArgs {
     pub acme_email: Option<String>,
 
     /// Where issued certificates are cached. One subdirectory per
-    /// domain (R4b).
+    /// ACME directory (TLS-02), and inside it one per domain (R4b).
     #[arg(long = "acme-cache", value_name = "DIR")]
     pub acme_cache: Option<PathBuf>,
 

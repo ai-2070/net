@@ -3236,6 +3236,7 @@ jobs:
             rtc_bootstrap_acme::tests::a_matching_common_name_cannot_override_a_wrong_san
             rtc_bootstrap_acme::tests::a_failed_publication_leaves_the_previous_pair_intact
             rtc_bootstrap_acme::tests::a_cached_pair_is_reused_only_when_it_qualifies
+            rtc_bootstrap_acme::tests::a_certificate_from_another_acme_directory_is_not_reused
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features rtc-bootstrap --lib 2>&1) \
