@@ -249,6 +249,26 @@ pub struct DirManifest {
 }
 
 impl DirManifest {
+    /// Decode a manifest blob and refuse a schema version this build
+    /// does not support.
+    ///
+    /// Every reader goes through here. The FFI inspection path
+    /// (`net_dir_manifest_read`) used to postcard-decode on its own and
+    /// skip the version check, so two bytes `{0, 0}` inspected as a
+    /// valid, empty, version-0 manifest that [`fetch_dir`] then refused
+    /// (GBLOB-02).
+    pub fn decode(bytes: &[u8]) -> Result<Self, DirError> {
+        let manifest: DirManifest =
+            postcard::from_bytes(bytes).map_err(|e| DirError::Manifest(format!("decode: {e}")))?;
+        if manifest.version != DIR_MANIFEST_VERSION {
+            return Err(DirError::Manifest(format!(
+                "unsupported manifest version {}",
+                manifest.version
+            )));
+        }
+        Ok(manifest)
+    }
+
     /// Count of file entries.
     pub fn file_count(&self) -> usize {
         self.entries
@@ -634,14 +654,7 @@ pub async fn fetch_dir_with(
     options: FetchDirOptions,
 ) -> Result<DirStats, DirError> {
     let manifest_bytes = transfer_fetch_blob(node, source, manifest_ref).await?;
-    let manifest: DirManifest = postcard::from_bytes(&manifest_bytes)
-        .map_err(|e| DirError::Manifest(format!("decode: {e}")))?;
-    if manifest.version != DIR_MANIFEST_VERSION {
-        return Err(DirError::Manifest(format!(
-            "unsupported manifest version {}",
-            manifest.version
-        )));
-    }
+    let manifest = DirManifest::decode(&manifest_bytes)?;
     check_unique_entry_paths(&manifest.entries)?;
 
     let dest = dest.to_path_buf();
@@ -1827,6 +1840,34 @@ mod tests {
         assert_eq!(decoded, manifest);
         assert_eq!(decoded.file_count(), 1);
         check_unique_entry_paths(&manifest.entries).expect("distinct paths are accepted");
+    }
+
+    #[test]
+    fn decode_refuses_an_unsupported_manifest_version() {
+        // GBLOB-02: `{0, 0}` is a structurally valid postcard manifest
+        // (version 0, no entries). It must not decode as a manifest.
+        let err = DirManifest::decode(&[0, 0]).expect_err("version 0 is not supported");
+        assert!(
+            matches!(&err, DirError::Manifest(m) if m.contains("unsupported manifest version 0")),
+            "{err:?}"
+        );
+        let future = DirManifest {
+            version: DIR_MANIFEST_VERSION + 1,
+            entries: vec![],
+        };
+        let bytes = postcard::to_allocvec(&future).unwrap();
+        assert!(DirManifest::decode(&bytes).is_err());
+
+        let current = DirManifest {
+            version: DIR_MANIFEST_VERSION,
+            entries: vec![],
+        };
+        let bytes = postcard::to_allocvec(&current).unwrap();
+        assert_eq!(DirManifest::decode(&bytes).unwrap(), current);
+        assert!(matches!(
+            DirManifest::decode(b"not a manifest"),
+            Err(DirError::Manifest(_))
+        ));
     }
 
     fn file_entry(path: &str) -> DirEntry {
