@@ -7755,7 +7755,11 @@ impl MeshNode {
     /// one-snapshot query makes that tear unrepresentable.
     ///
     /// Unowned public candidates are not returned — they are ordinary
-    /// public services, not exported-plane candidates. A candidate node
+    /// public services, not exported-plane candidates. Neither is a
+    /// candidate whose owner certificate has expired since ingest
+    /// (DISC-05): the projection carries the cert's deadline and the
+    /// query judges it against the current time, so verified ownership
+    /// lapses with the cert rather than with the announcement. A candidate node
     /// without a live AEAD entity pin is dropped: without the pin it has
     /// no entity-layer identity to authorize against, and org-protected
     /// RPC is direct-session-only regardless (OA2-E0.3). Results are in

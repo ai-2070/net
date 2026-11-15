@@ -436,11 +436,25 @@ pub(crate) fn verify_announced_owner_cert(
     // `cert.member == ann.entity_id` was checked above, so this records
     // the announcing entity itself — the identity a discovery consumer
     // must pin against, not the node id that merely derives from it.
+    //
+    // DISC-05: the certificate's expiry travels with the projection.
+    // The deadline is the one `is_valid_with_skew` just enforced
+    // (`not_after + skew`, saturating like `check_time_bounds_at`), so
+    // queries stop reporting ownership exactly when this check would
+    // start refusing the cert — the announcement's own TTL (which can
+    // outlast the cert's remaining life) must not extend it.
     Some(VerifiedOwner::new(
         &cert.member,
         cert.org_id,
         cert.generation,
+        cert.not_after.saturating_add(skew_secs),
     ))
+}
+
+/// The wall clock the ownership queries judge projection expiry
+/// against — the same clock `OrgMembershipCert` validity reads.
+fn ownership_now() -> u64 {
+    crate::adapter::net::behavior::org::current_timestamp()
 }
 
 /// Post-apply floor recheck (review-9): a floor can rise BETWEEN
@@ -481,14 +495,30 @@ pub(crate) fn recheck_projected_owner_floor(
 /// the publisher's fold entries via the `by_node` reverse index and
 /// returns the first `Some` (mirrors `reflex_addr_for`'s
 /// one-publisher-one-value shape).
+///
+/// A projection whose certificate has expired since ingest
+/// ([`VerifiedOwner::valid_until`]) is not reported (DISC-05): the
+/// announcement may still be live, but the ownership it proved is not.
 pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<OrgId> {
+    owner_org_for_at(fold, node_id, ownership_now())
+}
+
+/// [`owner_org_for`] judged at an explicit `now_secs` (unix seconds).
+pub(crate) fn owner_org_for_at(
+    fold: &Fold<CapabilityFold>,
+    node_id: NodeId,
+    now_secs: u64,
+) -> Option<OrgId> {
     fold.with_state(|state| {
         let keys = state.keys_for(node_id)?;
         keys.iter().find_map(|key| {
-            state
-                .entries
-                .get(key)
-                .and_then(|entry| entry.payload.owner.map(|owner| owner.org()))
+            state.entries.get(key).and_then(|entry| {
+                entry
+                    .payload
+                    .owner
+                    .filter(|owner| owner.is_current_at(now_secs))
+                    .map(|owner| owner.org())
+            })
         })
     })
 }
@@ -553,7 +583,24 @@ pub struct OwnedPublisher {
 /// Results are deduplicated per publisher and returned in ascending
 /// node-id order. Authority-relevant ordering (by provider `EntityId`)
 /// belongs to the caller.
+///
+/// **Expired ownership is no ownership** (DISC-05). A projection whose
+/// certificate has passed [`VerifiedOwner::valid_until`] is treated as
+/// absent — exactly like an unowned entry — even while its announcement
+/// is still live. The public capability itself stays discoverable
+/// through [`find_nodes_matching`]; only the verified-ownership claim
+/// (and with it exported-plane eligibility) lapses with the cert.
 pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<OwnedPublisher> {
+    public_owned_providers_at(fold, tag, ownership_now())
+}
+
+/// [`public_owned_providers`] judged at an explicit `now_secs` (unix
+/// seconds).
+pub(crate) fn public_owned_providers_at(
+    fold: &Fold<CapabilityFold>,
+    tag: &str,
+    now_secs: u64,
+) -> Vec<OwnedPublisher> {
     let legacy = LegacyFilter::default().require_tag(tag.to_string());
     let fold_filter = translate_filter(&legacy);
     fold.with_state_and_index(|state, index| {
@@ -581,11 +628,17 @@ pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<Own
                 let Some(entry) = state.entries.get(key) else {
                     continue;
                 };
-                let Some(owner) = entry.payload.owner else {
+                let Some(owner) = entry
+                    .payload
+                    .owner
+                    .filter(|owner| owner.is_current_at(now_secs))
+                else {
                     // An unowned entry is not a conflict: ownership is a
                     // per-announcement projection, and a publisher may
                     // legitimately hold unowned classes alongside owned
                     // ones. Only two DISAGREEING projections are ambiguous.
+                    // A projection whose cert has since expired proves
+                    // nothing any more and counts as unowned (DISC-05).
                     continue;
                 };
                 match agreed {
@@ -2120,7 +2173,12 @@ mod tests {
     /// The shape production ingest produces: the projection names the
     /// announcing entity, and the node id derives from it.
     fn owned(kp: &EntityKeypair, org: OrgId, generation: u32) -> Option<VerifiedOwner> {
-        Some(VerifiedOwner::new(kp.entity_id(), org, generation))
+        Some(VerifiedOwner::new(
+            kp.entity_id(),
+            org,
+            generation,
+            u64::MAX,
+        ))
     }
 
     fn one(node_id: NodeId, kp: &EntityKeypair, owner_org: OrgId) -> Vec<OwnedPublisher> {
@@ -4623,6 +4681,7 @@ mod tests {
             .expect("issue");
         let at = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 5, 3600)
             .expect("issue");
+        let (below_not_after, at_not_after) = (below.not_after, at.not_after);
 
         let ann_below = signed_announcement_with_cert(&kp, Some(below));
         let ann_at = signed_announcement_with_cert(&kp, Some(at));
@@ -4634,15 +4693,103 @@ mod tests {
         );
         assert_eq!(
             verify_announced_owner_cert(&ann_at, true, Some(&floors), 0),
-            Some(VerifiedOwner::new(kp.entity_id(), org_root().org_id(), 5)),
+            Some(VerifiedOwner::new(
+                kp.entity_id(),
+                org_root().org_id(),
+                5,
+                at_not_after
+            )),
             "generation at floor must project"
         );
         // No floors tracked (un-adopted node) ⇒ implicit floor 0.
         assert_eq!(
             verify_announced_owner_cert(&ann_below, true, None, 0),
-            Some(VerifiedOwner::new(kp.entity_id(), org_root().org_id(), 4)),
+            Some(VerifiedOwner::new(
+                kp.entity_id(),
+                org_root().org_id(),
+                4,
+                below_not_after
+            )),
             "no floor state ⇒ every generation admissible"
         );
+    }
+
+    /// DISC-05: the projection carries the certificate's expiry, so the
+    /// public ownership queries stop reporting verified ownership once
+    /// the owner cert expires — even though the announcement (normal
+    /// 300 s TTL, longer than the cert's remaining life here) and its
+    /// public capability are still live. Pre-fix the projection kept
+    /// member/org/generation but no deadline, and both queries kept
+    /// answering "owned by org" until the announcement itself expired.
+    #[test]
+    fn owner_cert_expiry_ends_verified_ownership_but_keeps_the_capability() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let now = crate::adapter::net::behavior::org::current_timestamp();
+        let not_after = now + 60;
+        let cert = OrgMembershipCert::issue_at(
+            &org_root(),
+            kp.entity_id().clone(),
+            1,
+            now.saturating_sub(10),
+            not_after,
+            7,
+        );
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
+        apply_legacy_announcement(&fold, ann, None, 0).expect("apply");
+
+        // While the cert is valid: owned, and an exported candidate.
+        assert_eq!(
+            owner_org_for_at(&fold, node_id, now),
+            Some(org_root().org_id())
+        );
+        assert_eq!(
+            public_owned_providers_at(&fold, "nrpc:echo", now),
+            one(node_id, &kp, org_root().org_id()),
+        );
+        assert_eq!(
+            owner_org_for_at(&fold, node_id, not_after - 1),
+            Some(org_root().org_id()),
+            "the last valid second is still owned"
+        );
+
+        // From `not_after` on (the cert's own boundary): no verified
+        // ownership is reported by either query.
+        for t in [not_after, not_after + 1, not_after + 3600] {
+            assert_eq!(
+                owner_org_for_at(&fold, node_id, t),
+                None,
+                "expired cert must not keep reporting ownership at {t}"
+            );
+            assert!(
+                public_owned_providers_at(&fold, "nrpc:echo", t).is_empty(),
+                "expired cert must not keep an exported candidate at {t}"
+            );
+        }
+
+        // The public capability itself is untouched.
+        let legacy = LegacyFilter::default().require_tag("nrpc:echo".to_string());
+        assert_eq!(find_nodes_matching(&fold, &legacy), vec![node_id]);
+    }
+
+    /// DISC-05: the projected deadline is the one ingest's window check
+    /// enforced — `not_after` plus the verification skew — so a query
+    /// lapses ownership exactly when re-verifying the cert would fail.
+    #[test]
+    fn projected_owner_deadline_includes_the_ingest_skew() {
+        let kp = EntityKeypair::generate();
+        let cert = OrgMembershipCert::try_issue(&org_root(), kp.entity_id().clone(), 1, 3600)
+            .expect("issue");
+        let not_after = cert.not_after;
+        let ann = signed_announcement_with_cert(&kp, Some(cert));
+
+        let strict = verify_announced_owner_cert(&ann, true, None, 0).expect("verifies");
+        assert_eq!(strict.valid_until(), not_after);
+        let skewed = verify_announced_owner_cert(&ann, true, None, 30).expect("verifies");
+        assert_eq!(skewed.valid_until(), not_after + 30);
+        assert!(skewed.is_current_at(not_after + 29));
+        assert!(!skewed.is_current_at(not_after + 30));
     }
 
     /// Review-8 §1 witness: a valid replayed membership cert on an
