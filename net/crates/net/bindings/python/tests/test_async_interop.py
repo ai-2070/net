@@ -341,6 +341,57 @@ def test_streaming_mid_iter_cancel_terminates_stream(mesh_pair) -> None:
     assert asyncio.run(_run())
 
 
+def test_cancelling_a_ready_pull_terminates_the_stream(mesh_pair) -> None:
+    """PYBR-02: cancel a pull whose chunk is already buffered.
+
+    The bridge polls the Rust pull before its cancellation receiver, so
+    the pull resolves with the buffered chunk, and the cancelled Python
+    future then discards it. Before the fix nothing cancelled the
+    substrate call: the chunk was silently lost and the stream carried
+    on to a clean EOF. A cancelled pull must terminate the WHOLE stream
+    with a cancellation error instead.
+    """
+    from net import RpcCancelledError
+
+    a, b = mesh_pair
+    srv = MeshRpc(b)
+
+    def _producer(_req: bytes, sink) -> None:
+        for i in range(3):
+            sink.send(str(i).encode())
+        # Keep the stream open so the buffered chunks are not followed
+        # by an EOF terminal while the client cancels.
+        import time as _time
+
+        _time.sleep(3.0)
+
+    h = srv.serve_streaming("pull-cancel", _producer, 60_000)
+
+    async def _run() -> list:
+        acli = AsyncMeshRpc(a)
+        await asyncio.sleep(0.5)
+        stream = await acli.call_streaming(b.node_id, "pull-cancel", b"go")
+        assert await asyncio.wait_for(stream.__anext__(), timeout=2.0) == b"0"
+        # Let chunks 1 and 2 land in the client-side buffer.
+        await asyncio.sleep(0.5)
+        pull = stream.__anext__()
+        pull.cancel()
+        await asyncio.sleep(0.3)
+        rest = []
+        with pytest.raises(RpcCancelledError):
+            while True:
+                rest.append(await asyncio.wait_for(stream.__anext__(), timeout=5.0))
+        return rest
+
+    try:
+        rest = asyncio.run(_run())
+        # Whatever drained before the terminal, it is never the chunk the
+        # cancelled pull consumed.
+        assert b"1" not in rest
+    finally:
+        h.close()
+
+
 def test_async_netmesh_shares_handshake_with_sync_netmesh(mesh_pair) -> None:
     """`AsyncNetMesh(mesh)` doesn't re-handshake — the same peer
     connection set up by the sync `NetMesh.connect/.accept` is

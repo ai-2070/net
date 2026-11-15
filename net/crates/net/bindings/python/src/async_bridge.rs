@@ -330,7 +330,7 @@ where
     let token = mesh.reserve_cancel_token();
     let mesh_for_guard = Arc::clone(mesh);
     let fut = build_fut(token);
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    let py_fut = pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let mut guard = CancelGuard {
             mesh: mesh_for_guard,
             token,
@@ -342,7 +342,9 @@ where
         // just suppresses the redundant cancel call from Drop.
         guard.armed = false;
         result.map_err(Into::into)
-    })
+    })?;
+    cancel_when_python_cancels(&py_fut, mesh, token)?;
+    Ok(py_fut)
 }
 
 /// Variant of [`await_with_cancel`] that reuses an existing
@@ -367,7 +369,7 @@ where
     E: Into<PyErr> + Send + 'static,
 {
     let mesh_for_guard = Arc::clone(mesh);
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    let py_fut = pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let mut guard = CancelGuard {
             mesh: mesh_for_guard,
             token,
@@ -376,7 +378,65 @@ where
         let result = fut.await;
         guard.armed = false;
         result.map_err(Into::into)
-    })
+    })?;
+    cancel_when_python_cancels(&py_fut, mesh, token)?;
+    Ok(py_fut)
+}
+
+/// Make a cancelled Python awaitable cancel its substrate call, however
+/// the cancellation lines up with the Rust side (PYBR-02).
+///
+/// [`CancelGuard`] alone fires only when the Rust future is dropped
+/// while still pending. `pyo3_async_runtimes` polls the wrapped future
+/// BEFORE its cancellation receiver, and then discards the result if
+/// the Python future was cancelled in the meantime (both when it hands
+/// the result over and again on the event loop). So a pull whose data
+/// was already buffered resolved in Rust, disarmed the guard, and had
+/// its chunk thrown away: no `mesh.cancel` fired, a chunk was lost, and
+/// the stream stayed usable — instead of the whole-stream termination a
+/// cancelled pull promises.
+///
+/// A done-callback on the Python future itself sees the final
+/// disposition. A future that ends cancelled never delivered its
+/// result, so the substrate call is cancelled; one that completed
+/// cannot be cancelled afterwards. `MeshNode::cancel` is idempotent,
+/// so the overlap with the guard's own cancel is harmless.
+#[cfg(feature = "net")]
+fn cancel_when_python_cancels(
+    py_fut: &Bound<'_, PyAny>,
+    mesh: &Arc<MeshNode>,
+    token: u64,
+) -> PyResult<()> {
+    py_fut.call_method1(
+        pyo3::intern!(py_fut.py(), "add_done_callback"),
+        (CancelOnPythonCancel {
+            mesh: Arc::clone(mesh),
+            token,
+        },),
+    )?;
+    Ok(())
+}
+
+/// The done-callback [`cancel_when_python_cancels`] installs.
+#[cfg(feature = "net")]
+#[pyclass(frozen)]
+struct CancelOnPythonCancel {
+    mesh: Arc<MeshNode>,
+    token: u64,
+}
+
+#[cfg(feature = "net")]
+#[pymethods]
+impl CancelOnPythonCancel {
+    fn __call__(&self, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+        if fut
+            .call_method0(pyo3::intern!(fut.py(), "cancelled"))?
+            .is_truthy()?
+        {
+            self.mesh.cancel(self.token);
+        }
+        Ok(())
+    }
 }
 
 /// RAII guard whose Drop fires `mesh.cancel(token)` iff still
