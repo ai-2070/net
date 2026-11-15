@@ -246,10 +246,14 @@ impl ForwardedHeaderValue {
     /// (CR/LF/NUL and friends — the header-injection defense; HTAB is allowed)
     /// and anything over [`MAX_HEADER_VALUE_LEN`]. An empty value is allowed:
     /// some legitimate headers are empty, and emptiness carries no secret.
+    ///
+    /// The bytes are taken into the zeroizing wrapper *before* they are
+    /// validated, so a rejected value is scrubbed when it drops too — not
+    /// released in the clear on the error path.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, HeaderError> {
-        let bytes = bytes.into();
-        Self::validate(&bytes)?;
-        Ok(ForwardedHeaderValue(bytes))
+        let value = ForwardedHeaderValue(bytes.into());
+        Self::validate(&value.0)?;
+        Ok(value)
     }
 
     /// The value-acceptance rules ([`Self::new`]'s checks) applied to a borrowed
@@ -311,7 +315,16 @@ impl fmt::Display for ForwardedHeaderValue {
 impl Drop for ForwardedHeaderValue {
     fn drop(&mut self) {
         zeroize_vec(&mut self.0);
+        #[cfg(test)]
+        SCRUBBED_ON_DROP.with(|n| n.set(n.get() + 1));
     }
+}
+
+// How many `ForwardedHeaderValue` buffers this thread has scrubbed on drop —
+// lets a test prove a path took zeroizing ownership of its bytes.
+#[cfg(test)]
+thread_local! {
+    static SCRUBBED_ON_DROP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Best-effort scrub of a `Vec<u8>`'s **entire allocation**. Two things a naive
@@ -465,6 +478,30 @@ mod tests {
             ForwardedHeaderValue::new(too_long).unwrap_err(),
             HeaderError::ValueTooLong { .. },
         ));
+    }
+
+    #[test]
+    fn a_rejected_owned_value_is_scrubbed_not_dropped_in_the_clear() {
+        // MCP-08: `new` used to validate the owned bytes first and drop them
+        // raw on rejection. They must enter the zeroizing wrapper before any
+        // fallible check, so the error path scrubs them too.
+        let scrubbed = || SCRUBBED_ON_DROP.with(std::cell::Cell::get);
+        for bad in [
+            b"Bearer ghp_SECRET\r\nInjected: x".to_vec(),
+            vec![b'x'; MAX_HEADER_VALUE_LEN + 1],
+        ] {
+            let before = scrubbed();
+            assert!(ForwardedHeaderValue::new(bad).is_err());
+            assert_eq!(
+                scrubbed(),
+                before + 1,
+                "a rejected value's buffer must be scrubbed on the error path",
+            );
+        }
+        // And an accepted one is scrubbed exactly once, when it drops.
+        let before = scrubbed();
+        drop(ForwardedHeaderValue::new(b"Bearer ok".to_vec()).unwrap());
+        assert_eq!(scrubbed(), before + 1);
     }
 
     #[test]
