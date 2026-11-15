@@ -392,6 +392,40 @@ def test_cancelling_a_ready_pull_terminates_the_stream(mesh_pair) -> None:
         h.close()
 
 
+def test_a_registration_after_shutdown_is_not_retained(next_port) -> None:
+    """PYBR-01: shutdown is terminal for node-owned registrations.
+
+    An AsyncMeshRpc owns its own reference to the node, so it can still
+    register after ``NetMesh.shutdown()`` has swept the node's services.
+    That registration used to be held in a fresh keepalive bucket that
+    no later shutdown would sweep (a repeated shutdown returns early),
+    keeping the service and node alive for the life of the process. It
+    is now refused: the handle comes back already closed.
+    """
+    mesh = NetMesh(
+        bind_addr=next_port(),
+        psk="42" * 32,
+        heartbeat_interval_ms=200,
+        permissive_channels=True,
+    )
+    mesh.start()
+    retained = AsyncMeshRpc(mesh)
+    before = retained.serve("before-shutdown", _sync_echo)
+    assert not before.is_closed()
+
+    mesh.shutdown()
+    assert before.is_closed(), "shutdown releases the services it swept"
+
+    try:
+        after = retained.serve("after-shutdown", _sync_echo)
+    except RuntimeError:
+        return  # refusing outright also leaves nothing retained
+    assert after.is_closed(), (
+        "a registration after a completed shutdown must not be retained"
+    )
+    after.close()
+
+
 def test_async_netmesh_shares_handshake_with_sync_netmesh(mesh_pair) -> None:
     """`AsyncNetMesh(mesh)` doesn't re-handshake — the same peer
     connection set up by the sync `NetMesh.connect/.accept` is
