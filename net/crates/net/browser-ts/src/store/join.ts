@@ -182,6 +182,16 @@ function randomHex(bytes: number): string {
 }
 
 /**
+ * Whether two interest sets are the same keys in the same order. Compared
+ * element by element, never by joining: keys are arbitrary non-empty
+ * strings and may contain any separator, so `['a\u0000b']` and
+ * `['a', 'b']` joined on NUL would compare equal.
+ */
+function sameKeys(a: readonly string[] | null, b: readonly string[]): boolean {
+  return a !== null && a.length === b.length && a.every((key, i) => key === b[i]);
+}
+
+/**
  * Join a store hosted by `host`.
  *
  * Returns as soon as the join is sent; `ready()` is what waits for a
@@ -788,7 +798,8 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
         // Not installed yet. The join in flight may carry the OLD set,
         // so once ready, the new one is sent — unless it was superseded.
         await handle.ready();
-        if (replica.interest === null || replica.interest.join('\u0000') !== next.join('\u0000')) return;
+        // Superseded unless the stated set is still exactly this one.
+        if (!sameKeys(replica.interest, next)) return;
         return handle.setInterest(next);
       }
       const q = (options.newQ ?? (() => randomHex(8) as Hex))();

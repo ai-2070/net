@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { createLocalMesh, type LocalNode } from '../../src/local.js';
 import { defineStore } from '../../src/store/definition.js';
-import { hostStore } from '../../src/store/host.js';
+import { hostStore, type TransportStream } from '../../src/store/host.js';
 import { cellKey, cellsAround, sameCells, stickyCells } from '../../src/store/interest.js';
 import { joinStore } from '../../src/store/join.js';
 import { hostPlayer } from '../../src/store/player.js';
@@ -111,6 +111,24 @@ function frames(node: LocalNode): string[] {
     if (event.payload !== undefined) seen.push(new TextDecoder().decode(event.payload));
   });
   return seen;
+}
+
+/** `node`, recording every frame it sends into `sent`. */
+function recordingSends(node: LocalNode, sent: string[]): LocalNode {
+  return {
+    ...node,
+    openStream: options => {
+      const wrap = (stream: TransportStream): TransportStream => ({
+        ...stream,
+        send: payload => {
+          sent.push(new TextDecoder().decode(payload));
+          return stream.send(payload);
+        },
+      });
+      const stream = node.openStream(options);
+      return stream instanceof Promise ? stream.then(wrap) : wrap(stream);
+    },
+  };
 }
 
 async function settle(): Promise<void> {
@@ -255,6 +273,21 @@ describe('interest', () => {
     // Asked under the join's own key, like every other read.
     expect(keys.length).toBeGreaterThanOrEqual(2);
     expect(keys.every(key => key === 'player')).toBe(true);
+  });
+
+  it('a superseded pre-ready setInterest sends nothing, even when the sets join to the same string', async () => {
+    // Keys may contain NUL, so `['a', 'b']` and `['a\u0000b']` were equal
+    // to the old NUL-joined comparison: the superseded call thought it
+    // was current and sent its stale set too.
+    const { mesh } = serve();
+    const sent: string[] = [];
+    const replica = join(recordingSends(mesh.node(NEAR), sent));
+    const first = replica.setInterest(['a', 'b']);
+    const second = replica.setInterest(['a\u0000b']);
+    await Promise.all([first, second]);
+    await settle();
+    const ints = sent.map(frame => JSON.parse(frame)).filter(message => message.k === 'int');
+    expect(ints.map(message => message.int)).toEqual([['a\u0000b']]);
   });
 
   it("filters the host's own player too", async () => {
