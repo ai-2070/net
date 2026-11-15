@@ -252,28 +252,27 @@ impl PinStore {
             reason: format!("serialize pin store: {e}"),
         })?;
 
-        // A per-process-unique temp name so two writers don't clobber each
-        // other's temp file mid-write (the final rename is still last-wins).
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-
-        // Create the temp owner-only (0600) *from the start*, then write into
-        // it — the store records security-sensitive consent decisions, so it
-        // must never be even briefly world-/group-readable. Creating first and
-        // chmod'ing after left a window under a permissive umask where the
-        // freshly-written file was readable (and a crash before the chmod left a
-        // umask-perms `.tmp` behind). Truncate so a stale same-pid temp from a
-        // prior crash cannot leave trailing bytes. The 0600 mode travels with
-        // the inode through the atomic rename below. (The `mode` is Unix-only;
-        // on Windows the per-user data dir already scopes access via inherited
-        // ACLs, and the create/write/rename path is otherwise identical.)
+        // An exclusively-created, per-save-unique staging file named after the
+        // **full** store filename (`<file>.tmp.<pid>.<seq>`), owner-only (0600)
+        // from the start — the store records security-sensitive consent
+        // decisions, so it must never be even briefly world-/group-readable.
+        // Never `with_extension`: that replaced the extension, so
+        // `profile.json` and `profile.pins` staged through one shared
+        // `profile.tmp.<pid>` and could publish each other's bytes, while their
+        // full-filename `.lock` sidecars never serialized them (PSTORE-03).
+        // `create_new` means a stale or concurrent temp is skipped, never
+        // truncated. See `crate::store_file`.
         use tokio::io::AsyncWriteExt;
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts.open(&tmp).await.map_err(io_err)?;
+        let stage_path = self.path.clone();
+        let (tmp, f) =
+            tokio::task::spawn_blocking(move || crate::store_file::create_staging(&stage_path))
+                .await
+                .map_err(|e| PinStoreError::Io {
+                    path: self.path.display().to_string(),
+                    reason: format!("pin-store staging task panicked: {e}"),
+                })?
+                .map_err(io_err)?;
+        let mut f = tokio::fs::File::from_std(f);
         // Write, fsync, then atomically rename. `sync_all` before the rename so
         // a crash right after the rename can never surface an empty/truncated
         // store — the bytes are durable before they become the live file.
@@ -291,7 +290,7 @@ impl PinStore {
             Err(e) => Err(e),
         };
         // On any failure, remove the temp so a failed save never leaks a
-        // `.tmp.<pid>` sibling in the store directory.
+        // `.tmp.<pid>.<seq>` sibling in the store directory.
         if result.is_err() {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
@@ -783,11 +782,59 @@ mod tests {
             "the pin store records consent decisions and must be owner-only",
         );
         // A successful save must leave no umask-perms temp sibling behind.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        assert_no_staging_left(&path);
+    }
+
+    /// No `<file>.tmp.*` staging sibling survives in the store's directory.
+    fn assert_no_staging_left(path: &Path) {
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
         assert!(
-            !tmp.exists(),
-            "no leftover temp file after a successful save"
+            leftovers.is_empty(),
+            "leftover staging files: {leftovers:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stores_sharing_a_stem_never_publish_each_others_bytes() {
+        // PSTORE-03: `profile.json` and `profile.pins` are independent stores
+        // with independent `.lock` sidecars, so their saves run concurrently.
+        // With `with_extension("tmp.<pid>")` both staged through one
+        // `profile.tmp.<pid>`: one save truncated the other's temp and renamed
+        // the wrong snapshot over its own target (or failed when the shared
+        // temp had already been renamed away). Each store must only ever hold
+        // its own pins.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("profile.json");
+        let b = dir.path().join("profile.pins");
+        for i in 0..40 {
+            let (ra, rb) = tokio::join!(
+                tokio::spawn(PinStore::mutate(a.clone(), move |s| {
+                    s.approve(&cap(&format!("a/cap{i}")))
+                })),
+                tokio::spawn(PinStore::mutate(b.clone(), move |s| {
+                    s.approve(&cap(&format!("b/cap{i}")))
+                })),
+            );
+            ra.unwrap().unwrap();
+            rb.unwrap().unwrap();
+        }
+        for (path, own, other) in [(&a, "a/", "b/"), (&b, "b/", "a/")] {
+            let store = PinStore::load(path).await.unwrap();
+            let approved: Vec<String> = store.approved().iter().map(|c| c.display()).collect();
+            assert_eq!(approved.len(), 40, "{}: {approved:?}", path.display());
+            assert!(
+                approved
+                    .iter()
+                    .all(|c| c.starts_with(own) && !c.starts_with(other)),
+                "{} holds another store's pins: {approved:?}",
+                path.display(),
+            );
+        }
+        assert_no_staging_left(&a);
     }
 
     #[tokio::test]

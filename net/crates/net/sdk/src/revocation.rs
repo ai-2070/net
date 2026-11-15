@@ -279,20 +279,21 @@ impl RevocationStore {
             reason: format!("serialize revocation store: {e}"),
         })?;
 
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
+        // Exclusive, per-save-unique staging named after the FULL filename
+        // (owner-only on Unix), never `with_extension`: that collapsed e.g.
+        // `x.json` and `x.pins` onto one `x.tmp.<pid>` shared across
+        // independently-locked stores (PSTORE-03). See `crate::store_file`.
+        let (tmp, mut f) = crate::store_file::create_staging(path).map_err(io)?;
+        let written = {
             use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(io)?;
-            f.write_all(&bytes).map_err(io)?;
-            f.flush().map_err(io)?;
-            f.sync_all().map_err(io)?;
+            f.write_all(&bytes)
+                .and_then(|()| f.flush())
+                .and_then(|()| f.sync_all())
+        };
+        drop(f);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
         }
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
