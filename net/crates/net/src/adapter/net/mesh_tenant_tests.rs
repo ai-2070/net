@@ -50,6 +50,7 @@ fn install(ctx: &DispatchCtx, peer: u64, addr: SocketAddr, tenant: Option<Tenant
                 promoted_at: std::time::Instant::now(),
                 session_id: peer,
                 tenant,
+                device: None,
             },
         },
     );
@@ -371,4 +372,113 @@ async fn holding_an_announcement_records_its_origins_tenant() {
         .map(|e| e.value().tenant)
         .expect("a signed direct announcement is held for replay");
     assert_eq!(held, Some(GAME_A));
+}
+
+/// A one-link enrollment grant `root → subject`, serialized as the
+/// enrollment service answers it.
+fn grant_for(subject: &EntityId) -> Vec<u8> {
+    TokenChain::single(PermissionToken::issue(
+        &EntityKeypair::generate(),
+        subject.clone(),
+        TokenScope::SUBSCRIBE,
+        0x1234,
+        3600,
+        0,
+    ))
+    .to_bytes()
+}
+
+/// ANCHOR-03: with subject binding on, an Admitted grant binds only
+/// the session whose participant it names — the grant's leaf subject
+/// must derive the session's node id. A grant for another device, or
+/// one that does not parse, binds nothing (promote nothing); with
+/// binding off the legacy behaviour is unchanged.
+///
+/// Inverse: drop the `subject.node_id() != node_id` comparison and the
+/// stranger's grant binds.
+#[tokio::test]
+async fn an_enrollment_grant_binds_only_the_participant_it_names() {
+    let node = node().await;
+    let device = EntityKeypair::generate();
+    let stranger = EntityKeypair::generate();
+    let session_of_device = device.entity_id().node_id();
+    let session_of_stranger = stranger.entity_id().node_id();
+    let grant = grant_for(device.entity_id());
+
+    assert_eq!(
+        node.enrollment_grant_device(session_of_stranger, Some(&grant)),
+        Ok(None),
+        "binding off: unchanged, nothing recorded"
+    );
+    node.set_enrollment_subject_binding(true);
+    assert_eq!(
+        node.enrollment_grant_device(session_of_device, Some(&grant)),
+        Ok(Some(device.entity_id().clone())),
+        "the device's own session is bound to it"
+    );
+    assert_eq!(
+        node.enrollment_grant_device(session_of_stranger, Some(&grant)),
+        Err(()),
+        "device D's grant must not promote a session that is not D"
+    );
+    assert_eq!(
+        node.enrollment_grant_device(session_of_device, Some(b"not a chain")),
+        Err(()),
+        "an unreadable grant binds nothing"
+    );
+    assert_eq!(
+        node.enrollment_grant_device(session_of_device, None),
+        Err(())
+    );
+}
+
+/// ANCHOR-03: a session admitted on a grant announces as the granted
+/// device and as nobody else. The direct-announcement path already ties
+/// `entity.node_id()` to the session's node id; this holds the admitted
+/// session to the exact device its grant named.
+///
+/// Inverse: drop the granted-device check from
+/// `handle_capability_announcement` and the other entity is held.
+#[tokio::test]
+async fn an_admitted_session_announces_only_as_its_granted_device() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    let speaker = EntityKeypair::generate();
+    let origin = speaker.entity_id().node_id();
+    let announce = |ctx: &DispatchCtx| {
+        let mut ann = CapabilityAnnouncement::new(
+            origin,
+            speaker.entity_id().clone(),
+            1,
+            crate::adapter::net::behavior::capability::CapabilitySet::new(),
+        );
+        ann.sign(&speaker);
+        MeshNode::handle_capability_announcement(&ann.to_bytes(), origin, ctx);
+    };
+    let admit_as = |ctx: &DispatchCtx, device: [u8; 32]| {
+        if let Some(mut entry) = ctx.peers.get_mut(&origin) {
+            entry.admission = PeerAdmission::Admitted {
+                promoted_at: std::time::Instant::now(),
+                session_id: origin,
+                tenant: None,
+                device: Some(device),
+            };
+        }
+    };
+
+    install(&ctx, origin, "127.0.0.1:9".parse().unwrap(), None);
+    admit_as(&ctx, *EntityKeypair::generate().entity_id().as_bytes());
+    announce(&ctx);
+    assert!(
+        !ctx.relay_announcements.contains_key(&origin),
+        "an entity other than the granted device is not ingested"
+    );
+    assert!(node.peer_entity_id(origin).is_none(), "nor pinned");
+
+    admit_as(&ctx, *speaker.entity_id().as_bytes());
+    announce(&ctx);
+    assert!(
+        ctx.relay_announcements.contains_key(&origin),
+        "the positive control: the granted device's own announcement is held"
+    );
 }

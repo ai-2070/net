@@ -3148,6 +3148,10 @@ jobs:
       #     exact incarnation.
       #   - a_rejected_sdk_enrollment_leaves_the_session_provisional — the
       #     negative half; a refusal admits nothing.
+      #   - one_devices_join_body_promotes_only_that_devices_session —
+      #     ANCHOR-03: a game grant promotes only the session whose
+      #     participant it names; a replayed body on another session
+      #     is answered but promotes nothing.
       - name: SDK WebRTC enrollment
         if: ${{ !cancelled() }}
         run: |
@@ -3156,6 +3160,7 @@ jobs:
           REQUIRED="
             a_real_sdk_enrollment_promotes_the_exact_session
             a_rejected_sdk_enrollment_leaves_the_session_provisional
+            one_devices_join_body_promotes_only_that_devices_session
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features "$FEATURES" --test enrollment_over_rtc 2>&1) \
@@ -3167,7 +3172,7 @@ jobs:
                        -E "test(=$required)" 2>&1) \
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
           done
-          echo "SDK RTC enrollment: both witnesses green"
+          echo "SDK RTC enrollment: all witnesses green"
 
       # === the bootstrap listener's witnesses ===================
       #

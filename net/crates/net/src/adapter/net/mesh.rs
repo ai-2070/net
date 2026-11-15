@@ -12383,6 +12383,10 @@ pub struct MeshNode {
     /// ([`Self::set_enrollment_tenant_resolver`]). `None`: no tenants.
     #[cfg(feature = "webrtc")]
     enrollment_tenant_resolver: parking_lot::RwLock<Option<EnrollmentTenantResolver>>,
+    /// ANCHOR-03: bind an Admitted enrollment grant to the session it
+    /// promotes ([`Self::set_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    enrollment_subject_binding: AtomicBool,
     /// §12 step 4: the session incarnation an in-flight enrollment
     /// call was decoded against, keyed by `(node_id, call_id)`.
     /// Promotion consumes it and re-verifies the binding — a
@@ -15179,6 +15183,8 @@ impl MeshNode {
             provisional_endpoints,
             #[cfg(feature = "webrtc")]
             enrollment_tenant_resolver: parking_lot::RwLock::new(None),
+            #[cfg(feature = "webrtc")]
+            enrollment_subject_binding: AtomicBool::new(false),
             #[cfg(feature = "webrtc")]
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
@@ -41368,6 +41374,27 @@ impl MeshNode {
         expected_endpoint: PeerAddr,
         tenant: Option<super::rtc::TenantId>,
     ) -> bool {
+        self.promote_admission_with_grant(
+            node_id,
+            expected_session_id,
+            expected_endpoint,
+            tenant,
+            None,
+        )
+    }
+
+    /// [`Self::promote_admission_with_tenant`], also recording the
+    /// device the grant was issued to (ANCHOR-03), which the caller has
+    /// already checked against `node_id`.
+    #[cfg(feature = "webrtc")]
+    fn promote_admission_with_grant(
+        &self,
+        node_id: u64,
+        expected_session_id: u64,
+        expected_endpoint: PeerAddr,
+        tenant: Option<super::rtc::TenantId>,
+        device: Option<EntityId>,
+    ) -> bool {
         let Some(mut entry) = self.peers.get_mut(&node_id) else {
             return false;
         };
@@ -41382,6 +41409,7 @@ impl MeshNode {
             promoted_at: std::time::Instant::now(),
             session_id: expected_session_id,
             tenant,
+            device: device.map(|d| d.0),
         };
         drop(entry);
         self.provisional_endpoints.remove(&expected_endpoint);
@@ -41529,6 +41557,7 @@ impl MeshNode {
             call_id,
             session,
             None,
+            None,
         )
     }
 
@@ -41631,6 +41660,7 @@ impl MeshNode {
         call_id: u64,
         receiving_session_id: u64,
         tenant: Option<super::rtc::TenantId>,
+        device: Option<EntityId>,
     ) -> bool {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
             return false;
@@ -41654,7 +41684,7 @@ impl MeshNode {
             return false;
         };
         self.release_enrollment_slot_of(node_id, session_id);
-        self.promote_admission_with_tenant(node_id, session_id, endpoint, tenant)
+        self.promote_admission_with_grant(node_id, session_id, endpoint, tenant, device)
     }
 
     /// Install how this node maps an Admitted enrollment grant (the
@@ -41670,6 +41700,61 @@ impl MeshNode {
         *self.enrollment_tenant_resolver.write() = resolver;
     }
 
+    /// **Bind every enrollment grant to the session it promotes**
+    /// (ANCHOR-03).
+    ///
+    /// With this on, an Admitted enrollment outcome promotes the
+    /// provisional session only when the grant it carries — a
+    /// serialized [`TokenChain`](super::identity::TokenChain) — names,
+    /// as its leaf subject, the participant that session IS: the
+    /// subject's [`EntityId::node_id`] must equal the session's node
+    /// id, which every direct announcement from the session must also
+    /// carry. The device is then recorded on the admitted session, and
+    /// a later direct announcement from it under any other entity is
+    /// refused. An outcome whose grant does not parse, or names
+    /// another participant, promotes nothing and is counted as a
+    /// rejection.
+    ///
+    /// Without it, one device's valid, reusable join body sent over
+    /// several provisional sessions (each its own participant) was
+    /// admitted on every one of them: the handler verified the device
+    /// and its invite, and promotion bound the call, the session and
+    /// the tenant — never the device to the session.
+    ///
+    /// The SDK's enrollment services (`serve_game_enrollment`,
+    /// `serve_enrollment`, `serve_enrollment_auto`) turn it on. A
+    /// custom enrollment handler registered directly on the core must
+    /// answer real grants and turn it on itself.
+    #[cfg(feature = "webrtc")]
+    pub fn set_enrollment_subject_binding(&self, enabled: bool) {
+        self.enrollment_subject_binding
+            .store(enabled, Ordering::Release);
+    }
+
+    /// ANCHOR-03: which device an Admitted grant binds to `node_id`'s
+    /// session. `Ok(None)` when this node does not bind grants;
+    /// `Ok(Some(device))` when it does and the grant's leaf subject is
+    /// that session's participant; `Err(())` when it does and the grant
+    /// is unreadable or names someone else — promote nothing.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn enrollment_grant_device(
+        &self,
+        node_id: u64,
+        chain: Option<&[u8]>,
+    ) -> Result<Option<EntityId>, ()> {
+        if !self.enrollment_subject_binding.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let subject = chain
+            .and_then(|bytes| super::identity::TokenChain::from_bytes(bytes).ok())
+            .and_then(|chain| chain.tokens.last().map(|token| token.subject.clone()))
+            .ok_or(())?;
+        if subject.node_id() != node_id {
+            return Err(());
+        }
+        Ok(Some(subject))
+    }
+
     /// The tenant `chain` (an Admitted grant) belongs to, per the
     /// installed resolver.
     #[cfg(feature = "webrtc")]
@@ -41682,6 +41767,14 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     pub fn peer_tenant(&self, node_id: u64) -> Option<super::rtc::TenantId> {
         self.peers.get(&node_id)?.admission.tenant()
+    }
+
+    /// The device (entity id bytes) `node_id`'s current session was
+    /// enrolled as, when this node binds grants to sessions
+    /// ([`Self::set_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    pub fn peer_granted_device(&self, node_id: u64) -> Option<[u8; 32]> {
+        self.peers.get(&node_id)?.admission.granted_device()
     }
 
     /// How many current sessions were enrolled for `tenant`. A scan of
@@ -42687,6 +42780,24 @@ impl MeshNode {
                 "capability: node_id mismatch (peer can only announce for itself)"
             );
             return;
+        }
+
+        // ANCHOR-03: a session admitted on an enrollment grant speaks
+        // as the device that grant named, and as nobody else.
+        #[cfg(feature = "webrtc")]
+        if ann.hop_count == 0 {
+            let granted = ctx
+                .peers
+                .get(&from_node)
+                .and_then(|peer| peer.value().admission.granted_device());
+            if granted.is_some_and(|device| device != ann.entity_id.0) {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    "capability: announcement entity is not the device this session \
+                     was enrolled as"
+                );
+                return;
+            }
         }
 
         // Origin self-check — if we're the origin, drop. A mesh

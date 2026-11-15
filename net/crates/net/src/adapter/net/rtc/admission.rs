@@ -140,6 +140,16 @@ pub enum PeerAdmission {
         /// tenant resolver and it recognised the grant. Bound to this
         /// incarnation like everything else here.
         tenant: Option<TenantId>,
+        /// The device (entity id bytes) the enrollment grant was issued
+        /// to, when the node binds grants to sessions
+        /// ([`MeshNode::set_enrollment_subject_binding`]). Promotion
+        /// already required `device.node_id()` to be this session's
+        /// node id; a later direct announcement from this session must
+        /// carry exactly this entity (ANCHOR-03). `None` for native
+        /// sessions and for nodes that do not bind.
+        ///
+        /// [`MeshNode::set_enrollment_subject_binding`]: crate::adapter::net::MeshNode::set_enrollment_subject_binding
+        device: Option<[u8; 32]>,
     },
 }
 
@@ -153,6 +163,7 @@ impl Default for PeerAdmission {
             promoted_at: Instant::now(),
             session_id: 0,
             tenant: None,
+            device: None,
         }
     }
 }
@@ -229,6 +240,16 @@ impl PeerAdmission {
         match self {
             Self::Admitted { session_id, .. } => Some(*session_id),
             Self::Provisional { .. } => None,
+        }
+    }
+
+    /// The device an enrollment grant bound this admitted session to
+    /// (ANCHOR-03); `None` while provisional, for native sessions, and
+    /// on nodes that do not bind grants to sessions.
+    pub fn granted_device(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Provisional { .. } => None,
+            Self::Admitted { device, .. } => *device,
         }
     }
 
@@ -757,6 +778,7 @@ mod tests {
             promoted_at: start,
             session_id: 7,
             tenant: None,
+            device: None,
         };
         assert!(!admitted.is_provisional());
         assert!(!admitted.is_expired(start + PROVISIONAL_TTL * 10));

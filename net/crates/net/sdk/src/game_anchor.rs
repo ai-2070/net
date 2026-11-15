@@ -1140,8 +1140,15 @@ pub fn serve_game_enrollment(
 ) -> Result<crate::mesh_rpc::ServeHandle, crate::mesh_rpc::ServeError> {
     // Each admitted session is promoted FOR ITS GAME: the core asks this
     // registry which game a grant belongs to, and keeps games apart.
+    //
+    // ANCHOR-03: and FOR ITS DEVICE. A join body is reusable by the
+    // device that signed it, so without this one device's body sent
+    // over several provisional sessions promoted every one of them;
+    // the core now promotes only the session whose participant is the
+    // grant's subject, and holds it to that identity afterwards.
     #[cfg(feature = "webrtc")]
     {
+        mesh.node().set_enrollment_subject_binding(true);
         let registry = registry.clone();
         mesh.node()
             .set_enrollment_tenant_resolver(Some(std::sync::Arc::new(move |chain: &[u8]| {

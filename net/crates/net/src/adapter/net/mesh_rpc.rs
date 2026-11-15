@@ -4314,19 +4314,41 @@ fn prepare_response_to_caller(
             Some(true) => {
                 // P0 slice 2: the grant says which tenant this session
                 // was enrolled for, when the application resolves it.
-                let tenant = admitted_chain(&payload)
-                    .and_then(|chain| mesh.resolve_enrollment_tenant(&chain));
-                if mesh.promote_on_enrollment_response(
-                    node_id,
-                    reply_channel.as_str(),
-                    call_id,
-                    receiving_session_id,
-                    tenant,
-                ) {
-                    tracing::debug!(
-                        node_id = format!("{node_id:#x}"),
-                        "§12: enrollment admitted; session promoted"
-                    );
+                let chain = admitted_chain(&payload);
+                let tenant = chain
+                    .as_deref()
+                    .and_then(|chain| mesh.resolve_enrollment_tenant(chain));
+                // ANCHOR-03: and which device — which must be the
+                // participant this session is, or nothing promotes.
+                match mesh.enrollment_grant_device(node_id, chain.as_deref()) {
+                    Ok(device) => {
+                        if mesh.promote_on_enrollment_response(
+                            node_id,
+                            reply_channel.as_str(),
+                            call_id,
+                            receiving_session_id,
+                            tenant,
+                            device,
+                        ) {
+                            tracing::debug!(
+                                node_id = format!("{node_id:#x}"),
+                                "§12: enrollment admitted; session promoted"
+                            );
+                        }
+                    }
+                    Err(()) => {
+                        mesh.note_enrollment_rejected(
+                            node_id,
+                            reply_channel.as_str(),
+                            call_id,
+                            receiving_session_id,
+                        );
+                        tracing::debug!(
+                            node_id = format!("{node_id:#x}"),
+                            "§12: enrollment grant names another participant; \
+                             session stays provisional"
+                        );
+                    }
                 }
             }
             Some(false) => {
