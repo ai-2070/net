@@ -494,3 +494,71 @@ fn a_standalone_channel_link_issues_one_chain_and_recovers_it_exactly() {
     let reopened = ChannelMembership::open(&dir).unwrap();
     assert!(reopened.chain().is_none() && reopened.left_at().is_some());
 }
+
+/// ENR-03, standalone path: the caller samples `now` when the request
+/// arrives, then the handler may wait for the ledger lock. A claim and first
+/// issuance must be judged at the ledger time, not that stale sample — here
+/// the sample still lies inside the invitation's window while the wall clock
+/// is already past its expiry. Pre-fix the stale time claimed and issued a
+/// chain; now the link is refused as expired and nothing is claimed.
+#[test]
+fn a_standalone_claim_is_judged_at_the_ledger_time_not_a_stale_caller_sample() {
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::standalone::{answer_standalone_redeem, SubnetRedeemRequest};
+    use net_sdk::enrollment::store::{EnrollmentLedger, LedgerLimits, OfferState};
+
+    const NODE: u64 = 0x0C4A_0002;
+    let operator = Identity::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = std::sync::Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    // Created 10 s ago with a 5 s window: expired by the wall clock now.
+    let created = now() - 10;
+    let link = MembershipInvite::sign(
+        &operator,
+        InviteSpec {
+            policy: InvitationPolicy::with_options(
+                created,
+                Duration::from_secs(5),
+                ApprovalMode::Preauthorized,
+            )
+            .unwrap(),
+            ..spec(
+                vec![Relation::Channel],
+                Some(offer(CHANNEL, TokenScope::SUBSCRIBE)),
+            )
+        },
+    )
+    .unwrap();
+    ledger.lock().offer(link.offer_spec(), created + 1).unwrap();
+    let issuers = vec![leaf_issuer(&operator, CHANNEL, TokenScope::SUBSCRIBE)];
+    let device = Identity::generate();
+
+    // The stale caller sample: inside the window.
+    let stale = created + 4;
+    let reply = answer_standalone_redeem(
+        &SubnetRedeemRequest::sign(&device, &link, NODE, stale)
+            .unwrap()
+            .to_bytes(),
+        Some(device.entity_id()),
+        NODE,
+        &ledger,
+        None,
+        None,
+        &issuers,
+        stale,
+    );
+    assert_eq!(reply, Err(Refusal::Expired));
+    let statuses = ledger.lock().statuses().unwrap();
+    assert!(
+        matches!(statuses[0].state, OfferState::Offered),
+        "nothing claimed: {:?}",
+        statuses[0].state
+    );
+}

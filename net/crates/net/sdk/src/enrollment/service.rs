@@ -347,8 +347,17 @@ fn decide(ctx: &Ctx, hh: &[u8; 32], plain: &[u8]) -> Result<RedeemOutcome, Refus
             if bundle.is_empty() || bundle.len() > MAX_BUNDLE_BYTES {
                 return Err(Refusal::Unavailable);
             }
+            // ENR-03: the final authorization is judged NOW, not at the time
+            // sampled before the durable claim and the bundle preparation
+            // (which can take long enough, within the session deadline, to
+            // cross the invitation's expiry). The issuer signs its receipt
+            // during that preparation, so the receipt time never exceeds this
+            // one: a bundle whose receipt postdates expiry is never committed.
+            // Never earlier than the claim time, even if the clock stepped
+            // back. Recovery of an already committed issuance is unaffected.
+            let issue_now = now.max(super::now_unix());
             let receipt_id = ledger
-                .issue(&id, &claimant, &bundle, now)
+                .issue(&id, &claimant, &bundle, issue_now)
                 .map_err(refusal)?;
             Ok(RedeemOutcome::Issued {
                 receipt_id,
