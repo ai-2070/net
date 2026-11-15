@@ -964,8 +964,16 @@ export class TypedMeshRpc {
     // Normalize the napi POD's flat `statusKind` / `statusMessage`
     // into the TS-idiomatic tagged `RpcCallStatus` discriminator
     // before reaching user code.
+    //
+    // Isolated (NCALL-03): the observer is telemetry, dispatched from a
+    // native threadsafe function. A synchronous throw escaping into it
+    // becomes `napi_fatal_exception` — an `uncaughtException` that ends
+    // the process by default — and an `async` observer's rejected
+    // Promise became an unhandled rejection, which ends it too under
+    // `--unhandled-rejections=throw`. Both now go to a non-throwing
+    // process warning instead.
     this._raw.setObserver((raw: RawRpcCallEvent) => {
-      handler(rawEventToTyped(raw))
+      callObserverIsolated(() => handler(rawEventToTyped(raw)))
     })
   }
 
@@ -2275,5 +2283,72 @@ export function rawEventToTyped(raw: RawRpcCallEvent): RpcCallEvent {
     responseBytes: raw.responseBytes,
     direction: raw.direction,
     tsUnixMs: raw.tsUnixMs,
+  }
+}
+
+/**
+ * Default sink for a failing `TypedMeshRpc.setObserver` handler: a
+ * process warning, never an exception escaping into the native
+ * observer dispatch (NCALL-03). Mirrors the SDK's stream-handler sink.
+ *
+ * @internal
+ */
+export function reportObserverError(error: unknown): void {
+  let message: string
+  try {
+    message =
+      error instanceof Error ? (error.stack ?? error.message) : String(error)
+  } catch {
+    // `String(error)` runs user code (`toString`, `Symbol.toPrimitive`)
+    // and can itself throw — or be a symbol-less object with none.
+    message = '<unprintable observer error>'
+  }
+  try {
+    process.emitWarning(`rpc observer threw: ${message}`, 'NetRpcObserverError')
+  } catch {
+    // A sink that cannot report must still not throw.
+  }
+}
+
+/**
+ * Run an observer so that neither a synchronous throw nor a rejected
+ * Promise escapes: both go to {@link reportObserverError}. Same shape
+ * as the SDK's `callIsolated` (`sdk-ts/src/_internal.ts`) — this
+ * package cannot import the SDK, which depends on it.
+ *
+ * @internal
+ */
+export function callObserverIsolated(
+  run: () => unknown,
+  onError: (error: unknown) => void = reportObserverError,
+): void {
+  const report = (error: unknown): void => {
+    try {
+      onError(error)
+    } catch {
+      // An onError that itself throws must not escape either.
+    }
+  }
+  let result: unknown
+  try {
+    result = run()
+  } catch (error) {
+    report(error)
+    return
+  }
+  if (
+    result !== null &&
+    (typeof result === 'object' || typeof result === 'function')
+  ) {
+    try {
+      // The `then` read is inside the try: a thenable whose `then`
+      // getter throws must be reported, not escape.
+      const then = (result as { then?: unknown }).then
+      if (typeof then === 'function') {
+        then.call(result, undefined, report)
+      }
+    } catch (error) {
+      report(error)
+    }
   }
 }

@@ -253,6 +253,57 @@ describe('live nRPC registration through the Node binding', () => {
     expect(() => serverRpc.setObserver(null)).not.toThrow()
   }, 30_000)
 
+  // NCALL-03: the RAW native observer dispatch contains a failing
+  // observer. Pre-fix a plain TSFN `call` left the throw pending and
+  // napi-rs escalated it through `napi_fatal_exception` — an
+  // `uncaughtException` (which vitest reports as an unhandled error and
+  // which ends a default Node process) — and an `async` observer's
+  // rejection became an unhandled rejection.
+  it('a throwing or rejecting raw observer cannot escape the native dispatch', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.observed', async (req: Buffer) => req)
+
+    const escaped: unknown[] = []
+    const onEscape = (e: unknown) => escaped.push(e)
+    process.on('uncaughtException', onEscape)
+    process.on('unhandledRejection', onEscape)
+    try {
+      let syncCalls = 0
+      clientRpc.setObserver(() => {
+        syncCalls += 1
+        throw new Error('raw observer boom')
+      })
+      await clientRpc.call(server.nodeId(), 'live.observed', Buffer.from('a'))
+      for (let i = 0; i < 50 && syncCalls === 0; i++) await sleep(20)
+      expect(syncCalls).toBeGreaterThan(0)
+
+      let asyncCalls = 0
+      clientRpc.setObserver(async () => {
+        asyncCalls += 1
+        throw new Error('raw async observer boom')
+      })
+      await clientRpc.call(server.nodeId(), 'live.observed', Buffer.from('b'))
+      for (let i = 0; i < 50 && asyncCalls === 0; i++) await sleep(20)
+      expect(asyncCalls).toBeGreaterThan(0)
+      // Let unhandled-rejection detection run.
+      await sleep(50)
+
+      expect(escaped).toEqual([])
+      // And the RPC surface still works after both.
+      const resp = await clientRpc.call(
+        server.nodeId(),
+        'live.observed',
+        Buffer.from('after'),
+      )
+      expect(resp.toString()).toBe('after')
+    } finally {
+      clientRpc.setObserver(null)
+      process.off('uncaughtException', onEscape)
+      process.off('unhandledRejection', onEscape)
+      handle.close()
+    }
+  }, 30_000)
+
   it('close releases the node so the mesh can shut down', async () => {
     const { server, client, serverRpc, clientRpc } = await pair()
 

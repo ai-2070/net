@@ -38,7 +38,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::StreamExt;
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::{
+    ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
+};
 use napi_derive::napi;
 
 use ::net::adapter::net::cortex::{
@@ -710,9 +712,16 @@ impl RpcMetricsSnapshotJs {
 /// memory without bound (SDK audit 2026-10-11).
 const OBSERVER_QUEUE: usize = 1024;
 
+/// What an observer may return: anything. A native Promise is taken as
+/// a napi [`Promise`] so its rejection is consumed (its conversion
+/// chains a `catch`); every other value is ignored. Neither arm can fail
+/// conversion, so an `Err` reaching the observer's return callback is a
+/// JS throw (NCALL-03).
+type ObserverReturn = Either<Promise<UnknownReturnValue>, UnknownReturnValue>;
+
 type RpcObserverTsfn = ThreadsafeFunction<
     RpcCallEventJs,
-    (),
+    ObserverReturn,
     RpcCallEventJs,
     napi::Status,
     false,
@@ -2537,8 +2546,17 @@ impl MeshRpc {
     ///
     /// v1 emits only `direction === "outbound"` events; the
     /// substrate's server-side hook is a planned follow-up.
-    #[napi]
-    pub fn set_observer(&self, observer: Option<Function<'_, RpcCallEventJs, ()>>) -> Result<()> {
+    ///
+    /// A throwing observer, or an `async` one whose Promise rejects, is
+    /// contained here (reported on stderr) rather than escalated to an
+    /// `uncaughtException` / unhandled rejection (NCALL-03). The typed
+    /// `TypedMeshRpc.setObserver` wrapper isolates it before this layer
+    /// and reports through `process.emitWarning`.
+    #[napi(ts_args_type = "observer?: ((arg: RpcCallEventJs) => void) | undefined | null")]
+    pub fn set_observer(
+        &self,
+        observer: Option<Function<'_, RpcCallEventJs, ObserverReturn>>,
+    ) -> Result<()> {
         match observer {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f
@@ -2553,7 +2571,32 @@ impl MeshRpc {
                 let channel =
                     ::net::adapter::net::cortex::ObserverChannel::install(handle, move |evt| {
                         let js_evt = RpcCallEventJs::from(evt.as_ref());
-                        let status = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                        // NCALL-03: `call_with_return_value`, not `call`.
+                        // A plain `call` leaves a JS throw pending, and
+                        // napi-rs then routes it to `napi_fatal_exception`
+                        // — an `uncaughtException` that ends the process
+                        // by default, for a telemetry callback. The
+                        // return-value variant takes the exception out of
+                        // the env and hands it to this closure, which
+                        // reports it and returns `Ok`. A returned Promise
+                        // is converted to a napi `Promise`, which chains
+                        // its own `catch` — so an `async` observer's
+                        // rejection is consumed instead of surfacing as
+                        // an unhandled rejection.
+                        let status = tsfn.call_with_return_value(
+                            js_evt,
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                            |ret: napi::Result<ObserverReturn>, _env| {
+                                // Same trail as the compute bridge's
+                                // contained JS throws (`compute.rs`).
+                                if let Err(e) = ret {
+                                    eprintln!("nRPC observer callback threw (contained): {e}");
+                                }
+                                // Dropping a converted Promise is fine: its
+                                // `catch` is already attached.
+                                Ok(())
+                            },
+                        );
                         // The bounded TSFN is a second drop point after the
                         // substrate channel; count it in the same counter so
                         // `observerDroppedTotal` reports every lost event
