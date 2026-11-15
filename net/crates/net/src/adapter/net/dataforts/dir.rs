@@ -161,6 +161,11 @@ pub enum DirError {
     /// A manifest entry's path escaped the destination root (absolute,
     /// `..`, or a drive/root prefix). Never reconstructed — a malicious
     /// or buggy sender must not write outside `dest`.
+    ///
+    /// Also returned by [`store_dir`] for a file name or symlink target
+    /// that is not valid Unicode: the manifest stores names as strings,
+    /// so such a name cannot be represented faithfully and is refused
+    /// rather than rewritten (the payload is its lossy rendering).
     UnsafePath(String),
     /// The manifest blob failed to decode.
     Manifest(String),
@@ -293,6 +298,16 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     .await
     .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
     raw.sort_by(|a, b| a.0.cmp(&b.0));
+    // BLOB-09 defense in depth: with names converted faithfully (or
+    // refused) two walked entries can never render to the same path,
+    // but a manifest that did carry one would make two fetch workers
+    // write the same pathname. Never emit one.
+    if let Some(dup) = raw.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(DirError::Manifest(format!(
+            "duplicate entry path {:?}",
+            dup[0].0
+        )));
+    }
 
     // PERF_AUDIT §6.9 — parallelize file processing with the same
     // shape `fetch_dir` uses (bounded `Semaphore` over file count +
@@ -335,11 +350,14 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
             let file_type = meta.file_type();
             if file_type.is_symlink() {
                 let target = std::fs::read_link(&abs)?;
+                // BLOB-09: the manifest carries a `String`; a target
+                // that is not valid Unicode cannot be stored faithfully
+                // (a lossy rendering would reconstruct the WRONG link),
+                // so it is refused rather than rewritten.
+                let target = utf8_name(target.as_os_str())?;
                 return Ok::<Option<DirEntry>, DirError>(Some(DirEntry {
                     path: rel,
-                    kind: EntryKind::Symlink {
-                        target: target.to_string_lossy().into_owned(),
-                    },
+                    kind: EntryKind::Symlink { target },
                 }));
             }
             if file_type.is_dir() {
@@ -455,7 +473,7 @@ fn walk(
         let entry = entry?;
         let abs = entry.path();
         let meta = std::fs::symlink_metadata(&abs)?;
-        let rel = rel_path(root, &abs);
+        let rel = rel_path(root, &abs)?;
         let is_dir_descend = meta.file_type().is_dir() && !meta.file_type().is_symlink();
         out.push((rel, meta, abs.clone()));
         if is_dir_descend {
@@ -466,17 +484,61 @@ fn walk(
 }
 
 /// Render an absolute path relative to `root` as a `/`-separated
-/// string. Falls back to the raw lossy rendering if `strip_prefix`
-/// fails (shouldn't happen for a path produced by walking `root`).
-fn rel_path(root: &Path, abs: &Path) -> String {
+/// string. Falls back to the raw path if `strip_prefix` fails
+/// (shouldn't happen for a path produced by walking `root`).
+///
+/// BLOB-09: every component must be valid Unicode. The manifest stores
+/// names as `String`s, and the lossy rendering this used to take maps
+/// every invalid sequence to U+FFFD — so distinct non-UTF-8 names (Unix
+/// byte names, unpaired UTF-16 surrogates on Windows) collapsed to one
+/// manifest path and one file's content silently replaced the other's.
+/// Such a name is refused with [`DirError::UnsafePath`] instead.
+fn rel_path(root: &Path, abs: &Path) -> Result<String, DirError> {
     let rel = abs.strip_prefix(root).unwrap_or(abs);
     let mut parts: Vec<String> = Vec::new();
     for comp in rel.components() {
         if let Component::Normal(c) = comp {
-            parts.push(c.to_string_lossy().into_owned());
+            parts.push(utf8_name(c)?);
         }
     }
-    parts.join("/")
+    Ok(parts.join("/"))
+}
+
+/// A filesystem name (path component or symlink target) as an exact
+/// `String`, or [`DirError::UnsafePath`] carrying its lossy rendering
+/// (for the operator) when it is not valid Unicode and so cannot be
+/// represented faithfully in a [`DirManifest`].
+fn utf8_name(name: &std::ffi::OsStr) -> Result<String, DirError> {
+    name.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| DirError::UnsafePath(name.to_string_lossy().into_owned()))
+}
+
+/// Reject a manifest that names the same path twice (BLOB-09).
+///
+/// Duplicate entries would be reconstructed by independent fetch
+/// workers that each create-and-truncate the same pathname, so the
+/// result depends on scheduling and a file's content (or a whole
+/// entry) is silently lost. Paths are compared by their component
+/// sequence, so `a//b` and `a/b` are the same entry. Comparison is
+/// exact (case-sensitive): distinct-case names are legitimate on a
+/// case-sensitive filesystem.
+fn check_unique_entry_paths(entries: &[DirEntry]) -> Result<(), DirError> {
+    let mut seen: std::collections::HashSet<Vec<&std::ffi::OsStr>> =
+        std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let key: Vec<&std::ffi::OsStr> = Path::new(&entry.path)
+            .components()
+            .map(|c| c.as_os_str())
+            .collect();
+        if !seen.insert(key) {
+            return Err(DirError::Manifest(format!(
+                "duplicate entry path {:?}",
+                entry.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -580,6 +642,7 @@ pub async fn fetch_dir_with(
             manifest.version
         )));
     }
+    check_unique_entry_paths(&manifest.entries)?;
 
     let dest = dest.to_path_buf();
     // Reconstruct into a sibling temp dir, then install it atomically.
@@ -1763,5 +1826,153 @@ mod tests {
         let decoded: DirManifest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, manifest);
         assert_eq!(decoded.file_count(), 1);
+        check_unique_entry_paths(&manifest.entries).expect("distinct paths are accepted");
+    }
+
+    fn file_entry(path: &str) -> DirEntry {
+        DirEntry {
+            path: path.into(),
+            kind: EntryKind::File {
+                mode: 0o644,
+                blob: BlobRef::small("mesh://x", [7u8; 32], 3).encode(),
+            },
+        }
+    }
+
+    /// BLOB-09: a manifest naming one path twice would have two fetch
+    /// workers create-and-truncate the same file. Rejected, whatever
+    /// the entry kinds and however the separators are spelled.
+    #[test]
+    fn manifest_with_duplicate_paths_is_rejected() {
+        let dup_files = vec![file_entry("dir/f"), file_entry("dir/f")];
+        assert!(matches!(
+            check_unique_entry_paths(&dup_files),
+            Err(DirError::Manifest(_))
+        ));
+
+        let dup_spelling = vec![file_entry("dir/f"), file_entry("dir//f")];
+        assert!(matches!(
+            check_unique_entry_paths(&dup_spelling),
+            Err(DirError::Manifest(_))
+        ));
+
+        let dup_kinds = vec![
+            file_entry("x"),
+            DirEntry {
+                path: "x".into(),
+                kind: EntryKind::Symlink {
+                    target: "elsewhere".into(),
+                },
+            },
+        ];
+        assert!(matches!(
+            check_unique_entry_paths(&dup_kinds),
+            Err(DirError::Manifest(_))
+        ));
+
+        // Distinct-case names are legitimate on a case-sensitive FS.
+        let distinct = vec![
+            file_entry("README"),
+            file_entry("readme"),
+            file_entry("dir/f"),
+        ];
+        check_unique_entry_paths(&distinct).expect("distinct paths are accepted");
+    }
+
+    fn store_test_adapter() -> MeshBlobAdapter {
+        MeshBlobAdapter::new(
+            "dir-test",
+            Arc::new(crate::adapter::net::redex::Redex::new()),
+        )
+    }
+
+    fn store_test_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "net-blob09-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    /// BLOB-09: two distinct non-UTF-8 Unix names used to render to
+    /// the same lossy `a\u{FFFD}` manifest path, so one file's content
+    /// silently replaced the other's. `store_dir` now refuses the tree.
+    ///
+    /// Unix-only: only Unix filesystems carry arbitrary byte names. A
+    /// filesystem that refuses non-UTF-8 names itself (macOS APFS) has
+    /// nothing to collide, so the test returns early there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_dir_rejects_non_utf8_names_instead_of_colliding_them() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = store_test_root("name");
+        let a = root.join(OsStr::from_bytes(b"a\xff"));
+        let b = root.join(OsStr::from_bytes(b"a\xfe"));
+        if std::fs::write(&a, b"first").is_err() || std::fs::write(&b, b"second").is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let err = store_dir(&store_test_adapter(), &root)
+            .await
+            .expect_err("a non-UTF-8 name must not be stored lossily");
+        assert!(matches!(err, DirError::UnsafePath(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// BLOB-09: a non-UTF-8 symlink target used to be rewritten to its
+    /// lossy rendering, reconstructing a link to the WRONG target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_dir_rejects_non_utf8_symlink_targets() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = store_test_root("target");
+        let link = root.join("link");
+        if std::os::unix::fs::symlink(OsStr::from_bytes(b"t\xff"), &link).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let err = store_dir(&store_test_adapter(), &root)
+            .await
+            .expect_err("a non-UTF-8 symlink target must not be stored lossily");
+        assert!(matches!(err, DirError::UnsafePath(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// BLOB-09, Windows shape: NTFS names are UTF-16 and may hold an
+    /// unpaired surrogate, which also has no exact `String` form (two
+    /// such names used to collapse to one lossy path).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn store_dir_rejects_names_with_unpaired_surrogates() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = store_test_root("surrogate");
+        let name = std::ffi::OsString::from_wide(&[u16::from(b'a'), 0xD800]);
+        if std::fs::write(root.join(&name), b"first").is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let err = store_dir(&store_test_adapter(), &root)
+            .await
+            .expect_err("an unpaired-surrogate name must not be stored lossily");
+        assert!(matches!(err, DirError::UnsafePath(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The UTF-8 gate does not touch ordinary trees.
+    #[tokio::test]
+    async fn store_dir_accepts_unicode_names() {
+        let root = store_test_root("ok");
+        std::fs::write(root.join("caf\u{e9}.txt"), b"ok").expect("write");
+        store_dir(&store_test_adapter(), &root)
+            .await
+            .expect("valid Unicode names store");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

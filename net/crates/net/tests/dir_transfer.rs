@@ -23,8 +23,8 @@ use net::adapter::net::dataforts::blob::{
     chunk_payload, BlobAdapter, BlobRef, Encoding, MeshBlobAdapter,
 };
 use net::adapter::net::dataforts::dir::{
-    fetch_dir, fetch_dir_with, store_dir, DirEntry, DirManifest, EntryKind, FetchDirOptions,
-    DIR_MANIFEST_VERSION,
+    fetch_dir, fetch_dir_with, store_dir, DirEntry, DirError, DirManifest, EntryKind,
+    FetchDirOptions, DIR_MANIFEST_VERSION,
 };
 use net::adapter::net::redex::Redex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
@@ -694,6 +694,61 @@ async fn fetch_dir_failure_does_not_create_dest() {
     assert!(
         temp_orphans(parent.path(), "never").is_empty(),
         "no temp orphan after a failed fetch into a fresh dest"
+    );
+}
+
+/// BLOB-09: a manifest naming one path twice (two File entries with
+/// different content) used to be reconstructed by two fetch workers
+/// that each truncated the same pathname — the fetch "succeeded" with
+/// one file's content silently lost. It is now rejected before any
+/// reconstruction, leaving no dest and no temp orphan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_dir_rejects_a_manifest_with_duplicate_paths() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    // Two real, fetchable file blobs so the pre-fix fetch would succeed.
+    let mut entries = Vec::new();
+    for content in [&b"first content"[..], &b"second, longer content"[..]] {
+        let hash: [u8; 32] = blake3::hash(content).into();
+        let blob = chunk_payload(content)
+            .unwrap()
+            .into_blob_ref(format!("mesh://{}", hex32(&hash)), Encoding::Replicated)
+            .unwrap();
+        adapter_a.store(&blob, content).await.unwrap();
+        entries.push(DirEntry {
+            path: "same.txt".into(),
+            kind: EntryKind::File {
+                mode: 0o644,
+                blob: blob.encode(),
+            },
+        });
+    }
+    let dup = DirManifest {
+        version: DIR_MANIFEST_VERSION,
+        entries,
+    };
+    let m_dup = store_manifest(&adapter_a, &dup).await;
+
+    let parent = TempDir::new("parent");
+    let dest = parent.path().join("dup");
+    let err = fetch_dir(&node_b, a_id, &m_dup, &dest, 0)
+        .await
+        .expect_err("a duplicate-path manifest must fail the fetch");
+    assert!(
+        matches!(err, DirError::Manifest(_)),
+        "expected a typed manifest error, got {err:?}"
+    );
+    assert!(!dest.exists(), "dest must not exist after the rejection");
+    assert!(
+        temp_orphans(parent.path(), "dup").is_empty(),
+        "no temp orphan after the rejection"
     );
 }
 
