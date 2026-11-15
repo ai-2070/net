@@ -82,7 +82,8 @@ here; CI syncs release-tagged builds one-way, re-pinning `net-mesh-sdk` in
   (`AsyncPinStore.snapshot_and_watch` — an OS file watcher, not polling), so a
   cross-process `net mcp pin approve` promotes within ~1s. Remaining refinements:
   SDK-side canonical name allocation (names are deterministic client-side for
-  now) and `dynamic_schema_overrides` wired to the live descriptor (schema is
+  now — `provider/snake_case` ids keep a readable name, any id that form would
+  alias gets a digest suffix; see `naming.py`) and `dynamic_schema_overrides` wired to the live descriptor (schema is
   captured at promote time).
 - **Delegated identity (Phase 3) — Slice A done.** `delegation.py` derives the
   `root -> machine -> gateway` chain at node init from `NET_MESH_IDENTITY_SEED`

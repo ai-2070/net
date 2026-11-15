@@ -22,30 +22,30 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from . import node
+from . import naming, node
 
 logger = logging.getLogger(__name__)
 
 #: The toolset promoted pins live in (distinct from the meta-tools' "net").
 PINNED_TOOLSET = "net-pinned"
 
-_NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_]+")
-
-
 def pinned_tool_name(cap_id: str) -> str:
-    """A stable, Hermes-safe tool name for a pinned capability.
+    """A stable, Hermes-safe, collision-resistant tool name for a pinned
+    capability.
 
     Deterministic — the same ``provider/capability`` id always maps to the same
     name — so a promoted tool keeps its identity across sessions (the plan's
-    "pinned tool names are stable"). Interim scheme until the SDK allocates the
-    canonical name; collisions are avoided by including both id halves.
+    "pinned tool names are stable"). A ``provider/snake_case`` id keeps its
+    readable ``net_pinned__<provider>_<tool>`` name; any id that form would
+    fold onto another (``-``, ``.``, extra ``/``, case, length) gets a digest
+    of the original id appended — see :mod:`naming`. Interim scheme until the
+    SDK allocates the canonical name.
     """
-    safe = _NAME_UNSAFE.sub("_", cap_id).strip("_").lower()
-    return f"net_pinned__{safe}"[:110]
+    readable = cap_id.replace("/", "_") if naming.PINNED_READABLE.fullmatch(cap_id) else None
+    return naming.tool_name("net_pinned__", cap_id, readable)
 
 
 def _risk_note(credential_status: str) -> str:
@@ -114,6 +114,7 @@ class PinPromoter:
         self._check_fn = check_fn
         self._path = pin_store_path
         self._registered: Dict[str, str] = {}  # cap_id -> tool name
+        self._owners: Dict[str, str] = {}  # tool name -> the cap_id that owns it
 
     async def _promote(self, cap_id: str) -> None:
         if cap_id in self._registered:
@@ -132,6 +133,19 @@ class PinPromoter:
                 return
             schema = build_pinned_schema(cap_id, detail)
             name = schema["name"]
+            owner = self._owners.get(name)
+            if owner is not None and owner != cap_id:
+                # The host replaces a same-name registration, so promoting
+                # would hand `owner`'s tool to this capability (and a later
+                # retire of either would remove both). Refuse; it is retried
+                # on its next promotion once the name is free.
+                logger.warning(
+                    "net plugin: not promoting %s: tool name %s is already owned by %s",
+                    cap_id,
+                    name,
+                    owner,
+                )
+                return
             self._registrar.register_pinned(
                 name=name,
                 schema=schema,
@@ -143,17 +157,24 @@ class PinPromoter:
             logger.warning("net plugin: could not promote %s: %s", cap_id, e)
             return
         self._registered[cap_id] = name
+        self._owners[name] = cap_id
         logger.info("net plugin: promoted pinned capability %s -> tool %s", cap_id, name)
 
     def _retire(self, cap_id: str) -> None:
         name = self._registered.pop(cap_id, None)
         if name is None:
             return
+        # Only the owning capability removes a registration.
+        if self._owners.get(name) != cap_id:
+            return
         try:
             self._registrar.deregister_pinned(name)
         except Exception as e:  # noqa: BLE001 — a failed retire must not sink the loop
+            # The host still holds the entry: keep the name owned so no other
+            # capability is promoted over it.
             logger.warning("net plugin: could not retire %s (tool %s): %s", cap_id, name, e)
             return
+        del self._owners[name]
         logger.info("net plugin: retired pinned capability %s (tool %s)", cap_id, name)
 
     async def run(self) -> None:

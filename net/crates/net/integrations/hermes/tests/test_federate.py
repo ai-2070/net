@@ -79,7 +79,10 @@ def _promoter(plugin, reg, *, describe=None, invoke=None):
 
 def test_federated_tool_name_is_namespaced_and_stable(plugin):
     f = plugin.federate.federated_tool_name
-    assert f("pc/terminal.run") == "net_mesh__pc__terminal_run"
+    assert f("pc/terminal_run") == "net_mesh__pc__terminal_run"
+    # `.` would fold onto `_`, so that id is digested rather than aliased
+    # (HERMES-04; see test_promoted_names.py).
+    assert f("pc/terminal.run") != f("pc/terminal_run")
     assert f("42/echo") == f("42/echo")  # stable
     assert f("42/echo") != f("99/echo")  # per-provider namespacing
 
