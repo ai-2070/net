@@ -11123,6 +11123,12 @@ pub(crate) struct HeldAnnouncement {
 pub type EnrollmentTenantResolver =
     Arc<dyn Fn(&[u8]) -> Option<super::rtc::TenantId> + Send + Sync>;
 
+/// The most sessions a tenant may hold admitted at once, or `None` for
+/// no cap. Installed by the application
+/// ([`MeshNode::set_enrollment_tenant_cap`]).
+#[cfg(feature = "webrtc")]
+pub type EnrollmentTenantCap = Arc<dyn Fn(super::rtc::TenantId) -> Option<usize> + Send + Sync>;
+
 /// When a hub replays held announcements to a newly attached peer (after
 /// the peer has had time to install the session, then once more).
 const REPLAY_SETTLE: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(2)];
@@ -12387,6 +12393,14 @@ pub struct MeshNode {
     /// promotes ([`Self::set_enrollment_subject_binding`]).
     #[cfg(feature = "webrtc")]
     enrollment_subject_binding: AtomicBool,
+    /// ANCHOR-04: the per-tenant admitted-session cap
+    /// ([`Self::set_enrollment_tenant_cap`]).
+    #[cfg(feature = "webrtc")]
+    enrollment_tenant_cap: parking_lot::RwLock<Option<EnrollmentTenantCap>>,
+    /// ANCHOR-04: serializes the count-and-promote of a capped tenant,
+    /// so two promotions cannot both observe the last free slot.
+    #[cfg(feature = "webrtc")]
+    tenant_admission: parking_lot::Mutex<()>,
     /// §12 step 4: the session incarnation an in-flight enrollment
     /// call was decoded against, keyed by `(node_id, call_id)`.
     /// Promotion consumes it and re-verifies the binding — a
@@ -15185,6 +15199,10 @@ impl MeshNode {
             enrollment_tenant_resolver: parking_lot::RwLock::new(None),
             #[cfg(feature = "webrtc")]
             enrollment_subject_binding: AtomicBool::new(false),
+            #[cfg(feature = "webrtc")]
+            enrollment_tenant_cap: parking_lot::RwLock::new(None),
+            #[cfg(feature = "webrtc")]
+            tenant_admission: parking_lot::Mutex::new(()),
             #[cfg(feature = "webrtc")]
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
@@ -41395,6 +41413,32 @@ impl MeshNode {
         tenant: Option<super::rtc::TenantId>,
         device: Option<EntityId>,
     ) -> bool {
+        // ANCHOR-04: a capped tenant's slot is taken HERE, at the
+        // commit, under one lock — the count of admitted sessions and
+        // this promotion are one step. The enrollment handler's own
+        // occupancy check runs earlier and per call, so two visitors
+        // answered concurrently both saw the last free slot and both
+        // promoted. Nothing is reserved before this point, so a call
+        // that is cancelled, fails or is replaced, and a session that
+        // disconnects, holds no slot: the count is of sessions that are
+        // admitted now.
+        let cap = tenant.and_then(|tenant| {
+            let cap = self.enrollment_tenant_cap.read().clone()?;
+            cap(tenant).map(|max| (tenant, max))
+        });
+        let _slot = cap.map(|_| self.tenant_admission.lock());
+        if let Some((tenant, max)) = cap {
+            if self.tenant_peer_count(tenant) >= max {
+                if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                    stats.note_admission_rejected_outcome();
+                }
+                tracing::debug!(
+                    node_id = format!("{node_id:#x}"),
+                    "§12: tenant is at its player cap; session stays provisional"
+                );
+                return false;
+            }
+        }
         let Some(mut entry) = self.peers.get_mut(&node_id) else {
             return false;
         };
@@ -41698,6 +41742,21 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     pub fn set_enrollment_tenant_resolver(&self, resolver: Option<EnrollmentTenantResolver>) {
         *self.enrollment_tenant_resolver.write() = resolver;
+    }
+
+    /// Cap how many sessions each tenant may hold **admitted** at once
+    /// (ANCHOR-04). `cap(tenant)` answers the ceiling, or `None` for an
+    /// uncapped tenant; `None` removes the cap entirely.
+    ///
+    /// The ceiling is enforced at promotion, atomically with it: a
+    /// promotion that would take the tenant past its ceiling promotes
+    /// nothing (the session stays provisional, counted as a rejected
+    /// outcome). An application's own occupancy check before it
+    /// answers is still useful — it gives the visitor a readable
+    /// refusal — but it is a preflight, not the admission transaction.
+    #[cfg(feature = "webrtc")]
+    pub fn set_enrollment_tenant_cap(&self, cap: Option<EnrollmentTenantCap>) {
+        *self.enrollment_tenant_cap.write() = cap;
     }
 
     /// **Bind every enrollment grant to the session it promotes**

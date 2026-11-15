@@ -736,6 +736,20 @@ impl GameRegistry {
         self.game_by_root(&chain.root()).map(|g| g.tenant)
     }
 
+    /// The most sessions `tenant` may hold admitted here (ANCHOR-04):
+    /// [`OpenGames::max_players_per_game`] when `tenant` is an open game
+    /// this registry holds and open games are capped; `None` otherwise
+    /// (registered games are not capped).
+    #[cfg(feature = "webrtc")]
+    pub fn player_cap_of_tenant(&self, tenant: net::adapter::net::rtc::TenantId) -> Option<usize> {
+        let cap = self.open_max_players_per_game()?;
+        self.games
+            .read()
+            .values()
+            .any(|g| g.origin.is_some() && g.tenant == tenant)
+            .then_some(cap)
+    }
+
     /// The registered game ids, sorted. Open games are not listed.
     pub fn games(&self) -> Vec<String> {
         let mut ids: Vec<String> = self
@@ -1149,6 +1163,18 @@ pub fn serve_game_enrollment(
     #[cfg(feature = "webrtc")]
     {
         mesh.node().set_enrollment_subject_binding(true);
+        // ANCHOR-04: the open-game player cap is enforced where the
+        // slot is actually taken — at promotion, atomically with it.
+        // The handler's occupancy check below stays as a preflight so
+        // a visitor to a full game reads a refusal, but two visitors
+        // answered concurrently both pass it.
+        {
+            let registry = registry.clone();
+            mesh.node()
+                .set_enrollment_tenant_cap(Some(std::sync::Arc::new(move |tenant| {
+                    registry.player_cap_of_tenant(tenant)
+                })));
+        }
         let registry = registry.clone();
         mesh.node()
             .set_enrollment_tenant_resolver(Some(std::sync::Arc::new(move |chain: &[u8]| {
@@ -1735,6 +1761,43 @@ mod tests {
             .unwrap();
         assert_eq!(lines().len(), base + 3);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ANCHOR-04: the cap the core enforces at promotion is the open
+    /// game's player cap, for exactly the open games this registry
+    /// holds — never a registered game, and nothing when uncapped.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn the_promotion_cap_is_the_open_games_player_cap() {
+        let mut capped = OpenGames::new(None);
+        capped.max_players_per_game = Some(2);
+        let games = open_registry(capped);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(SITE_A, "chess", &issuer, &params(), NOW)
+            .unwrap();
+        assert_eq!(
+            games.player_cap_of_tenant(GameRegistry::open_tenant_id(SITE_A, "chess")),
+            Some(2)
+        );
+        assert_eq!(
+            games.player_cap_of_tenant(GameRegistry::tenant_id("alpha")),
+            None,
+            "a registered game is not capped"
+        );
+        assert_eq!(
+            games.player_cap_of_tenant(GameRegistry::open_tenant_id(SITE_B, "chess")),
+            None,
+            "a game this registry does not hold has no cap to apply"
+        );
+        let uncapped = open_registry(OpenGames::new(None));
+        uncapped
+            .issue_open_credential_at(SITE_A, "chess", &issuer, &params(), NOW)
+            .unwrap();
+        assert_eq!(
+            uncapped.player_cap_of_tenant(GameRegistry::open_tenant_id(SITE_A, "chess")),
+            None
+        );
     }
 
     /// The player cap refuses an open game's visitor once its invite

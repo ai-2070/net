@@ -482,3 +482,62 @@ async fn an_admitted_session_announces_only_as_its_granted_device() {
         "the positive control: the granted device's own announcement is held"
     );
 }
+
+/// ANCHOR-04: a tenant's player cap is enforced AT promotion,
+/// atomically with it. The enrollment handler's occupancy check is a
+/// per-call preflight: with a cap of 1 and nobody admitted, two
+/// visitors answered concurrently both saw room, both responses
+/// promoted, and the game held two. Here two provisional sessions are
+/// promoted for the same capped tenant — exactly what those two
+/// responses do — and only the first is admitted; another tenant is
+/// unaffected; and the slot comes back when the admitted session goes.
+///
+/// The race itself (both handlers observing zero) is not reproduced:
+/// the invariant tested is that the count and the promotion are one
+/// step, so whichever promotion runs second sees the first.
+///
+/// Inverse: drop the cap check from `promote_admission_with_grant`
+/// and the second promotion succeeds.
+#[tokio::test]
+async fn a_capped_tenant_is_full_at_promotion_not_only_at_the_handler() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    node.set_enrollment_tenant_cap(Some(Arc::new(|tenant| (tenant == GAME_A).then_some(1))));
+    let addrs: [SocketAddr; 4] = [
+        "127.0.0.1:11".parse().unwrap(),
+        "127.0.0.1:12".parse().unwrap(),
+        "127.0.0.1:13".parse().unwrap(),
+        "127.0.0.1:14".parse().unwrap(),
+    ];
+    for (peer, addr) in [0xD1u64, 0xD2, 0xD3, 0xD4].into_iter().zip(addrs) {
+        install(&ctx, peer, addr, None);
+        make_provisional(&ctx, peer);
+    }
+    let promote = |peer: u64, addr: SocketAddr, tenant| {
+        let session = node.peer_session_id(peer).expect("session");
+        node.promote_admission_with_tenant(peer, session, PeerAddr::Udp(addr), Some(tenant))
+    };
+
+    assert!(
+        promote(0xD1, addrs[0], GAME_A),
+        "the first player takes the slot"
+    );
+    assert!(
+        !promote(0xD2, addrs[1], GAME_A),
+        "a second concurrent admission must not exceed the cap"
+    );
+    assert!(node.peer_is_provisional(0xD2), "it stays provisional");
+    assert_eq!(node.tenant_peer_count(GAME_A), 1);
+    assert!(
+        promote(0xD3, addrs[2], GAME_B),
+        "an uncapped tenant is not affected"
+    );
+
+    // The admitted player leaves: its slot is free again.
+    ctx.peers.remove(&0xD1);
+    assert!(
+        promote(0xD4, addrs[3], GAME_A),
+        "a released slot is reusable"
+    );
+    assert_eq!(node.tenant_peer_count(GAME_A), 1);
+}
