@@ -70,7 +70,7 @@ pub(crate) async fn obtain_certificate(
     config: &AcmeConfig,
     challenges: &AcmeState,
 ) -> Result<Chain, BootstrapError> {
-    let dir = domain_cache_dir(config);
+    let dir = prepare_cache(config)?;
     if let Some(cached) = read_cache(&dir, &config.domain, now_unix()) {
         return Ok(cached);
     }
@@ -144,6 +144,143 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
     directory_cache_dir(config).join(safe)
 }
 
+/// Is `path` safe to trust as part of the cache (TLS-06)?
+///
+/// `Ok(false)` when it does not exist, `Ok(true)` when it does and
+/// passes, an error when it exists and must not be trusted:
+///
+/// - **a symlink** — anywhere in the cache, a link is a name someone
+///   else may point at their own material;
+/// - on Unix, **owned by another user** — a pair another local user
+///   planted (the default used to be the shared, predictable
+///   `/tmp/net-mesh-acme`) would be served as this anchor's
+///   certificate;
+/// - on Unix, **group- or world-writable** — another user could
+///   replace it after this check.
+///
+/// The key's own 0600 mode (R5b) does not authenticate a
+/// pre-existing cache: it is the mode of what THIS process writes,
+/// not evidence of who wrote what is already there.
+///
+/// On Windows there is no ownership/mode view in `std`; only the
+/// symlink refusal applies, and the default cache lives under the
+/// per-user profile, whose ACL is the user's.
+fn check_cache_entry(path: &Path) -> Result<bool, BootstrapError> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(BootstrapError::Acme(format!(
+                "inspecting the ACME cache entry {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(BootstrapError::Acme(format!(
+            "the ACME cache entry {} is a symbolic link — refusing to trust a cache              another user may control; point --acme-cache at a private directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: `geteuid` takes no arguments, touches no memory and
+        // cannot fail; it is unsafe only because it is `extern`.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(BootstrapError::Acme(format!(
+                "the ACME cache entry {} is owned by uid {}, not this user (uid {euid}) —                  refusing to serve or extend a cache another user controls",
+                path.display(),
+                meta.uid()
+            )));
+        }
+        let mode = meta.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(BootstrapError::Acme(format!(
+                "the ACME cache entry {} has mode {mode:o}, writable by group or other —                  refusing a cache another user could replace",
+                path.display()
+            )));
+        }
+    }
+    Ok(true)
+}
+
+/// Every level of the cache this config reads or writes, each
+/// required to pass [`check_cache_entry`] if it exists (TLS-06):
+/// `cache_dir`, the directory namespace, the domain directory, the
+/// certificate pair and the account file.
+fn check_cache(config: &AcmeConfig) -> Result<(), BootstrapError> {
+    let dir = domain_cache_dir(config);
+    let (cert, key) = cache_paths(&dir);
+    for path in [
+        config.cache_dir.clone(),
+        directory_cache_dir(config),
+        dir,
+        cert,
+        key,
+        account_path(config),
+    ] {
+        check_cache_entry(&path)?;
+    }
+    Ok(())
+}
+
+/// Create the cache's directories private (0700 on Unix) where they
+/// do not exist yet, then check every level (TLS-06). Returns the
+/// domain directory.
+///
+/// The check runs AFTER creation, so a directory someone else
+/// created first — between this process deciding it was absent and
+/// creating it — is still refused.
+fn prepare_cache(config: &AcmeConfig) -> Result<PathBuf, BootstrapError> {
+    let dir = domain_cache_dir(config);
+    create_private_dir_all(&dir)?;
+    check_cache(config)?;
+    Ok(dir)
+}
+
+/// `create_dir_all`, every created level 0700 on Unix (TLS-06).
+///
+/// An explicit mode rather than the umask's: under a `002` umask
+/// (the user-private-group default on many distributions) plain
+/// `create_dir_all` makes group-writable directories, which
+/// [`check_cache_entry`] would then refuse on the next start.
+fn create_private_dir_all(dir: &Path) -> Result<(), BootstrapError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .map_err(|e| BootstrapError::Acme(format!("creating {}: {e}", dir.display())))
+}
+
+/// Write the (public) certificate chain with an explicit 0644 on
+/// Unix, never a umask-derived group-writable mode that
+/// [`check_cache_entry`] would refuse (TLS-06).
+fn write_public_file(path: &Path, contents: &str) -> Result<(), BootstrapError> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o644);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| BootstrapError::Acme(format!("creating {}: {e}", path.display())))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", path.display())))?;
+    file.sync_all()
+        .map_err(|e| BootstrapError::Acme(format!("syncing {}: {e}", path.display())))
+}
+
 fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join(CERT_FILE), dir.join(KEY_FILE))
 }
@@ -169,9 +306,7 @@ fn save_account(
     config: &AcmeConfig,
     credentials: &instant_acme::AccountCredentials,
 ) -> Result<(), BootstrapError> {
-    std::fs::create_dir_all(&config.cache_dir).map_err(|e| {
-        BootstrapError::Acme(format!("creating {}: {e}", config.cache_dir.display()))
-    })?;
+    create_private_dir_all(&config.cache_dir)?;
     let json = serde_json::to_string(credentials)
         .map_err(|e| BootstrapError::Acme(format!("encoding the ACME account: {e}")))?;
     write_private_key(&account_path(config), &json)
@@ -282,6 +417,10 @@ fn name_matches(name: &str, domain: &str) -> bool {
 /// When the cached certificate for `config` should be renewed (R4c):
 /// `not_after - horizon`, or `None` when there is nothing cached.
 pub(crate) fn renew_at(config: &AcmeConfig, horizon: Duration) -> Option<u64> {
+    // A cache that fails its ownership check has nothing usable in it
+    // (TLS-06): "renew now", and the renewal itself refuses the cache
+    // loudly.
+    check_cache(config).ok()?;
     let (cert, key) = cache_paths(&domain_cache_dir(config));
     let (chain, _private) = read_pair_checked(&cert, &key)?;
     let (_, _, not_after) = qualify_leaf(chain.first()?, &config.domain)?;
@@ -309,14 +448,11 @@ pub(crate) fn renew_at(config: &AcmeConfig, horizon: Duration) -> Option<u64> {
 /// (`cert_tmp`) is kept, being the only file that still matches the
 /// published key.
 fn write_cache(dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(), BootstrapError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| BootstrapError::Acme(format!("creating {}: {e}", dir.display())))?;
+    create_private_dir_all(dir)?;
     let (cert, key) = cache_paths(dir);
     let cert_tmp = cert.with_extension("pem.new");
     let key_tmp = key.with_extension("pem.new");
-    let _ = std::fs::remove_file(&cert_tmp);
-    std::fs::write(&cert_tmp, cert_pem)
-        .map_err(|e| BootstrapError::Acme(format!("writing {}: {e}", cert_tmp.display())))?;
+    write_public_file(&cert_tmp, cert_pem)?;
     write_private_key(&key_tmp, key_pem)?;
     std::fs::rename(&key_tmp, &key).map_err(|e| {
         // Nothing was published: the old pair is intact, and the
@@ -417,7 +553,7 @@ pub(crate) async fn renew_certificate(
     config: &AcmeConfig,
     challenges: &AcmeState,
 ) -> Result<Chain, BootstrapError> {
-    let dir = domain_cache_dir(config);
+    let dir = prepare_cache(config)?;
     let (cert_pem, key_pem) = order_certificate(config, challenges).await?;
     write_cache(&dir, &cert_pem, &key_pem)?;
     read_cache(&dir, &config.domain, now_unix()).ok_or_else(|| {
@@ -768,10 +904,10 @@ mod tests {
             base.path().into(),
         );
         let dir = domain_cache_dir(&config);
-        std::fs::create_dir_all(&dir).unwrap();
         let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
-        std::fs::write(dir.join(CERT_FILE), &cert_pem).unwrap();
-        std::fs::write(dir.join(KEY_FILE), &key_pem).unwrap();
+        // Through the writer, so the cache's modes are the ones the
+        // anchor produces, not the test process's umask (TLS-06).
+        write_cache(&dir, &cert_pem, &key_pem).unwrap();
 
         let horizon = Duration::from_secs(30 * 24 * 3600);
         let at = renew_at(&config, horizon).expect("a cached certificate");
@@ -791,6 +927,105 @@ mod tests {
             base.path().into(),
         );
         assert!(renew_at(&cold, horizon).is_none());
+    }
+
+    /// TLS-06: the cache is created private and a clean one passes
+    /// its own check, so the guard does not refuse what this process
+    /// itself writes.
+    #[test]
+    fn a_fresh_cache_is_created_private_and_passes_its_check() {
+        let base = tempfile::tempdir().unwrap();
+        let config = AcmeConfig::new(
+            "http://d/",
+            "localhost",
+            "o@example.invalid",
+            base.path().join("nested").join("acme"),
+        );
+        let dir = prepare_cache(&config).expect("a fresh cache is prepared");
+        assert_eq!(dir, domain_cache_dir(&config));
+        assert!(dir.is_dir());
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 3600);
+        write_cache(&dir, &cert_pem, &key_pem).unwrap();
+        save_account(&config, &credentials()).unwrap();
+        check_cache(&config).expect("what this process wrote is trusted");
+        assert!(renew_at(&config, DEFAULT_RENEWAL_HORIZON).is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for level in [config.cache_dir.clone(), directory_cache_dir(&config), dir] {
+                let mode = std::fs::metadata(&level).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{} is created private", level.display());
+            }
+        }
+    }
+
+    /// TLS-06: a cache another local user could have planted or can
+    /// still replace is refused, not served.
+    ///
+    /// The scenario: the default cache was the predictable shared
+    /// `/tmp/net-mesh-acme`, and another user pre-created it holding
+    /// a matching key and a self-signed certificate with the right
+    /// SAN. Startup reused it, skipped issuance, and served a chain
+    /// every browser refuses. A different uid cannot be conjured
+    /// without root, so this drives the two conditions an unprivileged
+    /// test can create — a group/world-writable level and a symlinked
+    /// one — through the same check a foreign owner fails.
+    ///
+    /// Inverse: drop `check_cache` from `prepare_cache` / `renew_at`
+    /// and every refusal below becomes a cache hit.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_another_user_could_control_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().unwrap();
+        let config = AcmeConfig::new(
+            "http://d/",
+            "localhost",
+            "o@example.invalid",
+            base.path().join("acme"),
+        );
+        let dir = prepare_cache(&config).unwrap();
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 3600);
+        write_cache(&dir, &cert_pem, &key_pem).unwrap();
+        assert!(
+            prepare_cache(&config).is_ok(),
+            "the premise: a private cache"
+        );
+
+        // A world-writable cache root.
+        std::fs::set_permissions(&config.cache_dir, std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert!(
+            prepare_cache(&config).is_err(),
+            "a world-writable cache directory is refused"
+        );
+        assert!(
+            renew_at(&config, DEFAULT_RENEWAL_HORIZON).is_none(),
+            "…and renewal does not schedule off it"
+        );
+        std::fs::set_permissions(&config.cache_dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+
+        // A group-writable certificate.
+        let (cert, _key) = cache_paths(&dir);
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            prepare_cache(&config).is_err(),
+            "a group-writable cached certificate is refused"
+        );
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(prepare_cache(&config).is_ok());
+
+        // A domain directory that is a symlink to someone else's pair.
+        let elsewhere = base.path().join("planted");
+        std::fs::rename(&dir, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert!(
+            prepare_cache(&config).is_err(),
+            "a symlinked domain directory is refused"
+        );
+        assert!(renew_at(&config, DEFAULT_RENEWAL_HORIZON).is_none());
     }
 
     /// R4 (round two): a leaf whose validity has not STARTED is not

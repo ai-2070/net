@@ -896,6 +896,9 @@ pub struct ServeArgs {
 
     /// Where issued certificates are cached. One subdirectory per
     /// ACME directory (TLS-02), and inside it one per domain (R4b).
+    /// Defaults to `<local data>/net-mesh/acme` (per user). The
+    /// directory must be owned by this user and not writable by group
+    /// or other; a symlink anywhere in it is refused (TLS-06).
     #[arg(long = "acme-cache", value_name = "DIR")]
     pub acme_cache: Option<PathBuf>,
 
@@ -1240,6 +1243,25 @@ fn rtc_config_from_args(args: &ServeArgs) -> Result<net::adapter::net::rtc::RtcC
     Ok(rtc)
 }
 
+/// The default `--acme-cache`: `<local data>/net-mesh/acme`, the
+/// per-user location the CLI keeps its other state in (TLS-06).
+///
+/// It used to be `$TMPDIR/net-mesh-acme` — on Unix the shared,
+/// predictable `/tmp/net-mesh-acme`, which any other local user can
+/// create first and fill with a pair this anchor would then serve.
+/// The SDK refuses a cache another user owns or can write; a private
+/// default means the ordinary deployment never meets that refusal.
+#[cfg(feature = "rtc-bootstrap")]
+fn default_acme_cache_dir() -> Result<PathBuf, CliError> {
+    dirs::data_local_dir()
+        .map(|d| d.join("net-mesh").join("acme"))
+        .ok_or_else(|| {
+            invalid_args(
+                "no per-user data directory is available for the ACME cache; pass                  --acme-cache <DIR> (a private directory this user owns)",
+            )
+        })
+}
+
 #[cfg(feature = "rtc-bootstrap")]
 fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
     use net_sdk::rtc_bootstrap::{AcmeConfig, BootstrapTls};
@@ -1281,10 +1303,12 @@ fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
                 args.acme_email.clone().ok_or_else(|| {
                     invalid_args("--acme-email is required with --acme-directory")
                 })?,
-                // One subdirectory per domain inside this path (R4b).
-                args.acme_cache
-                    .clone()
-                    .unwrap_or_else(|| std::env::temp_dir().join("net-mesh-acme")),
+                // One subdirectory per directory and domain inside
+                // this path (R4b, TLS-02).
+                match &args.acme_cache {
+                    Some(dir) => dir.clone(),
+                    None => default_acme_cache_dir()?,
+                },
             );
             BootstrapTls::Acme(acme)
         }
@@ -2164,6 +2188,44 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         try_serve_args(&argv).expect("serve args parse")
+    }
+
+    /// TLS-06: the default ACME cache is per-user state, never the
+    /// shared temporary directory another local user can pre-create.
+    #[test]
+    fn the_default_acme_cache_is_private_per_user_state() {
+        let args = try_serve_args(&[
+            "--psk-file",
+            "psk.hex",
+            "--url",
+            "https://anchor.example.com",
+            "--credential-issuer",
+            hex_string(
+                net_sdk::identity::Identity::from_seed([0x61; 32])
+                    .entity_id()
+                    .as_bytes(),
+            )
+            .as_str(),
+            "--allow-origin",
+            "https://app.example.com",
+            "--acme-directory",
+            "https://acme.example.com/directory",
+            "--acme-email",
+            "ops@example.com",
+        ])
+        .expect("serve args parse");
+        let resolved = resolve_serve(&args).expect("resolves");
+        let net_sdk::rtc_bootstrap::BootstrapTls::Acme(acme) = &resolved.tls else {
+            panic!("ACME was asked for");
+        };
+        assert!(
+            !acme.cache_dir.starts_with(std::env::temp_dir()),
+            "the default cache must not live in the shared temp dir: {}",
+            acme.cache_dir.display()
+        );
+        if let Some(local) = dirs::data_local_dir() {
+            assert_eq!(acme.cache_dir, local.join("net-mesh").join("acme"));
+        }
     }
 
     #[test]
