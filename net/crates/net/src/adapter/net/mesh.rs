@@ -22357,6 +22357,12 @@ impl MeshNode {
         authority
             .config
             .self_verify(self.identity.entity_id(), &candidate_store.snapshot())?;
+        // ORG-03: the owner audience must belong to the (just verified)
+        // membership's org. The authority's fields are public, so an object
+        // that never went through `NodeAuthority::open` reaches here too; an
+        // org-A audience paired with an org-B membership would seal B's
+        // owner-private catalog under A's discovery key.
+        authority.check_audience_binding()?;
         if let Some(pause) = pause_after_verify {
             pause();
         }

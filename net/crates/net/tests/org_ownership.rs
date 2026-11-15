@@ -25,7 +25,9 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
 use net::adapter::net::behavior::fold::capability_bridge::{may_execute, owner_org_for};
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
-use net::adapter::net::behavior::org_authority::NodeAuthority;
+use net::adapter::net::behavior::org_authority::{
+    NodeAuthority, OrgAuthorityError, OwnerAudienceCredential,
+};
 use net::adapter::net::behavior::org_revocation::{OrgRevocationStore, ProvisioningExpectation};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -237,6 +239,37 @@ async fn install_refuses_foreign_authority() {
     assert_eq!(
         node.node_authority().expect("still owned").owner_org(),
         org().org_id()
+    );
+}
+
+/// ORG-03: the runtime install boundary refuses an authority whose owner
+/// audience names another org. `NodeAuthority`'s fields are public, so an
+/// object assembled outside `NodeAuthority::open` reaches the install path
+/// with whatever audience it carries; pairing org A's audience with this
+/// org's membership would seal the owner-private catalog under A's key.
+#[tokio::test]
+async fn install_refuses_an_audience_of_another_org() {
+    let node = build_node().await;
+    let dir = scratch_dir("install-audience");
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let mut authority = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt");
+    let foreign_org = OrgKeypair::from_bytes([0x99u8; 32]).org_id();
+    authority.audience = OwnerAudienceCredential::generate(foreign_org);
+    let err = node
+        .install_node_authority(Arc::new(authority))
+        .expect_err("a foreign-org audience must not install");
+    assert!(
+        matches!(
+            err,
+            OrgAuthorityError::AudienceForeignOrg { audience_org, owner_org }
+                if audience_org == foreign_org && owner_org == org().org_id()
+        ),
+        "expected AudienceForeignOrg, got {err:?}"
+    );
+    assert!(
+        node.node_authority().is_none(),
+        "the refused authority must not be published"
     );
 }
 
