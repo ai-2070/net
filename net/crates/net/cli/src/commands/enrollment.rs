@@ -1646,9 +1646,16 @@ pub async fn run_invite(
                 let token = crate::secret::ScrubbedString::new(
                     reply["token"].as_str().unwrap_or_default().to_string(),
                 );
-                let tmp = out.with_extension("tmp-netmesh-join");
-                crate::commands::identity::write_identity_atomically(&tmp, out, token.as_bytes())
-                    .await?;
+                if let Err(e) = publish_join_token(out, token.as_bytes()).await {
+                    // The node already minted the offer; say which one, so a
+                    // token that never reached `--out` can be withdrawn.
+                    if let Some(offer) = reply["offer_id"].as_str() {
+                        eprintln!(
+                            "note: invite {offer} was created but its token was not written;                              withdraw it with `net-mesh invite revoke {offer}`."
+                        );
+                    }
+                    return Err(e);
+                }
                 reply["token"] = Value::Null;
                 reply["token_file"] = json!(out.display().to_string());
             }
@@ -2111,6 +2118,20 @@ pub async fn run_join(
     .map_err(|e| generic(format!("write result: {e}")))
 }
 
+/// Publish a join token at `invite create --out` (CLI-03 follow-up).
+///
+/// The token is bearer authorization, so it is staged owner-only in an
+/// exclusively created, uniquely named sibling and published NO-CLOBBER: the
+/// `out.exists()` pre-check above runs before a control round-trip to the
+/// node, and anything that appears at `--out` meanwhile (another invite's
+/// token, a seed file) must make the publish fail closed rather than be
+/// replaced by an unconditional rename. The old fixed staging name
+/// (`<out>.tmp-netmesh-join`) is no longer used, so a file there neither
+/// wedges the verb nor is touched.
+async fn publish_join_token(out: &Path, token: &[u8]) -> Result<(), CliError> {
+    super::org::publish_beside(out, token, true, false, super::org::SeedArtifact::None).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2146,5 +2167,85 @@ mod tests {
         );
         // Wildcard bind and no mapping: no direct address is claimed.
         assert_eq!(pick(None, None, None, bind_any), None);
+    }
+
+    fn dir_names(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// CLI-03 follow-up: `invite create --out` checks `--out` before its
+    /// control round-trip and publishes after it, so a file that appears at
+    /// `--out` in between (here: a seed placed there) must survive untouched
+    /// and the publish must fail closed, with no staging residue.
+    ///
+    /// Red-witness: the old publish (`write_identity_atomically`, an
+    /// unconditional `rename`) replaced the file and returned Ok.
+    #[tokio::test]
+    async fn join_token_publish_never_replaces_a_file_that_appeared_at_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("token.txt");
+        std::fs::write(
+            &out,
+            b"seed_hex = \"winner\"
+",
+        )
+        .expect("plant");
+
+        let err = publish_join_token(&out, b"join-token")
+            .await
+            .expect_err("a join token must never replace an existing --out");
+        assert!(
+            format!("{err}").contains("already exists"),
+            "the refusal must say why; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&out).expect("read"),
+            b"seed_hex = \"winner\"
+",
+            "the existing file was replaced"
+        );
+        assert_eq!(
+            dir_names(dir.path()),
+            vec![std::ffi::OsString::from("token.txt")]
+        );
+    }
+
+    /// CLI-03 follow-up: the old fixed staging name `<out>.tmp-netmesh-join`
+    /// is neither required to be free nor touched — a file squatting there
+    /// (here: seed-shaped content) survives byte-identical and the token
+    /// still publishes. The old `create_new` on that name failed the verb
+    /// after the node had already minted the offer.
+    #[tokio::test]
+    async fn join_token_publish_ignores_the_old_fixed_staging_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("token.txt");
+        let squatter = out.with_extension("tmp-netmesh-join");
+        std::fs::write(
+            &squatter,
+            b"seed_hex = \"squatter\"
+",
+        )
+        .expect("plant");
+
+        publish_join_token(&out, b"join-token")
+            .await
+            .expect("the token publishes beside an unrelated file");
+        assert_eq!(std::fs::read(&out).expect("read"), b"join-token");
+        assert_eq!(
+            std::fs::read(&squatter).expect("read squatter"),
+            b"seed_hex = \"squatter\"
+",
+            "the squatter was modified"
+        );
+        assert_eq!(
+            dir_names(dir.path()).len(),
+            2,
+            "staging residue left behind"
+        );
     }
 }

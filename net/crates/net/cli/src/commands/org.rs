@@ -1212,9 +1212,7 @@ async fn run_audience_keygen(
     );
     drop(keypair);
     let encoded = ScrubbedBytes::new(audience.encode_config().to_vec());
-    let tmp = args.out.with_extension("tmp-netmesh-audience");
-    crate::commands::identity::write_identity_atomically(&tmp, &args.out, encoded.as_slice())
-        .await?;
+    publish_org_audience(&args.out, encoded.as_slice()).await?;
     emit_value(
         OutputFormat::resolve_oneshot(output),
         &serde_json::json!({
@@ -1224,6 +1222,21 @@ async fn run_audience_keygen(
         }),
     )
     .map_err(|e| generic(format!("write result: {e}")))
+}
+
+/// Publish a freshly minted org owner audience at `audience-keygen --out`
+/// (CLI-03 follow-up).
+///
+/// The audience is a shared owner secret, so it is staged owner-only in an
+/// exclusively created, uniquely named sibling and published NO-CLOBBER: the
+/// `exists()` pre-check is only the friendly early error, and an audience (or
+/// any other file — the org key included) that appears at `--out` after it
+/// makes the publish fail closed instead of being replaced by an
+/// unconditional rename. The old fixed staging name
+/// (`<out>.tmp-netmesh-audience`) is no longer used, so a file there neither
+/// wedges the verb nor is touched.
+async fn publish_org_audience(out: &Path, encoded: &[u8]) -> Result<(), CliError> {
+    publish_beside(out, encoded, true, false, SeedArtifact::None).await
 }
 
 /// Read an org owner-audience file (`org audience-keygen`) through the
@@ -2453,4 +2466,70 @@ fn default_org_key_path(org_id_hex: &str) -> Option<PathBuf> {
 
 fn default_org_key_dir() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("net-mesh").join("orgs"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir_names(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// CLI-03 follow-up: two `org audience-keygen` runs to one absent `--out`
+    /// both pass the `exists()` pre-check; the loser's publish must fail
+    /// closed and leave the winner's audience — possibly already handed to
+    /// members — byte-identical, with no staging residue.
+    ///
+    /// Red-witness: the old publish (`write_identity_atomically`, an
+    /// unconditional `rename`) replaced the winner's audience and returned Ok.
+    #[tokio::test]
+    async fn audience_publish_never_replaces_an_audience_that_appeared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("org.audience");
+        std::fs::write(&out, b"winner-audience").expect("winner publishes");
+
+        let err = publish_org_audience(&out, b"loser-audience")
+            .await
+            .expect_err("a second audience must never replace the first");
+        assert!(
+            format!("{err}").contains("already exists"),
+            "the refusal must say why; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&out).expect("read"),
+            b"winner-audience",
+            "the first audience was replaced"
+        );
+        assert_eq!(
+            dir_names(dir.path()),
+            vec![std::ffi::OsString::from("org.audience")]
+        );
+    }
+
+    /// CLI-03 follow-up: a file at the old fixed staging name
+    /// `<out>.tmp-netmesh-audience` neither wedges the verb nor is touched.
+    #[tokio::test]
+    async fn audience_publish_ignores_the_old_fixed_staging_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("org.audience");
+        let squatter = out.with_extension("tmp-netmesh-audience");
+        std::fs::write(&squatter, b"squatter").expect("plant");
+
+        publish_org_audience(&out, b"audience")
+            .await
+            .expect("the audience publishes beside an unrelated file");
+        assert_eq!(std::fs::read(&out).expect("read"), b"audience");
+        assert_eq!(std::fs::read(&squatter).expect("read"), b"squatter");
+        assert_eq!(
+            dir_names(dir.path()).len(),
+            2,
+            "staging residue left behind"
+        );
+    }
 }

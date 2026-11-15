@@ -30,6 +30,14 @@ and output shape.
   included) instead of truncating it. Replacing an older announcement at
   `--out` still works; it is now an atomic staged rename, so a symlinked
   `--out` is replaced rather than written through.
+- `org audience-keygen --out` and `invite create --out` are now no-clobber
+  at publication, like `identity generate`: a file that appears at `--out`
+  after the existence pre-check (a concurrent run's audience or token, a
+  seed) is never replaced; the loser exits 2. Staging is a fresh,
+  exclusively created `.<name>.stage.*` file, so a leftover
+  `<out>.tmp-netmesh-audience` / `<out>.tmp-netmesh-join` no longer fails
+  the verb. When `invite create` cannot write its token, it names the
+  already-created offer so it can be withdrawn with `invite revoke`.
 
 ## Unreleased — managed nodes, join links, relations and leave
 
