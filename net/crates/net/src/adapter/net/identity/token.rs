@@ -1459,6 +1459,47 @@ impl TokenCache {
         None
     }
 
+    /// Every cached token for `(subject, channel_hash)` that passes the
+    /// same filters as [`Self::get_for_action`] — exact-channel slot
+    /// first, then the wildcard slot, each in slot order.
+    ///
+    /// The filters here are cache-local (time, revocation, subject,
+    /// scope); they say nothing about which issuer a given consumer
+    /// trusts. A caller that will verify the result against a trust
+    /// anchor set (the channel publish gate verifies against the
+    /// channel's `token_roots`) must walk these candidates and take the
+    /// first one its own verification accepts: taking only the first
+    /// candidate — as `get_for_action` does — fails closed on a token
+    /// from a since-rotated root even when a token from the current
+    /// root sits right behind it in the same slot (CPOL-02).
+    ///
+    /// Returns owned clones so the caller verifies with no cache shard
+    /// lock held. Bounded by [`MAX_TOKENS_PER_SLOT`] per slot.
+    pub fn candidates_for_action(
+        &self,
+        subject: &EntityId,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+    ) -> Vec<PermissionToken> {
+        let authorizes = |t: &&PermissionToken| {
+            t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+                && !self.revocation.is_revoked(t)
+                && t.subject.as_bytes() == subject.as_bytes()
+                && t.authorizes(action, channel_hash)
+        };
+        let mut out = Vec::new();
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
+            out.extend(slot.value().iter().filter(authorizes).cloned());
+        }
+        // `channel_hash == 0` IS the wildcard slot; don't walk it twice.
+        if channel_hash != 0 && self.wildcard_inserted.load(AtomicOrdering::Relaxed) {
+            if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
+                out.extend(slot.value().iter().filter(authorizes).cloned());
+            }
+        }
+        out
+    }
+
     /// Remove exactly `token` (same subject, channel slot and canonical
     /// bytes) if it is cached. Returns whether it was. Other tokens in the
     /// slot — a successor, or another scope — are untouched.

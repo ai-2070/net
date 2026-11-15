@@ -45276,34 +45276,74 @@ impl MeshNode {
                 // token-gated prefix publish, so the delegated-publish
                 // escape hatch was unreachable for that whole class of
                 // channel (M1).
+                //
+                // Candidate selection goes THROUGH the channel gate
+                // (CPOL-02): the cache's own filters (time,
+                // revocation, subject, scope) know nothing about this
+                // channel's `token_roots`, so the first cache hit can
+                // be a still-valid token from a since-rotated root
+                // while a token from the current root sits behind it
+                // in the same slot. Taking only the first hit failed
+                // the publish closed with a usable grant cached. Walk
+                // the held chain (still preferred when it verifies)
+                // and then every cached PUBLISH candidate, and accept
+                // the first one `can_publish` accepts. Every accepted
+                // chain has passed the full gate, so this only widens
+                // which *authorized* grant is found — never what is
+                // authorized.
                 let publish_hash = publisher.channel().hash();
                 let held = self
                     .published_chains
                     .get(&publish_hash)
                     .map(|c| c.value().clone());
                 let transient_revocation;
-                let (revocation, skew, chain) = match self.token_cache.as_ref() {
+                let (revocation, skew, candidates) = match self.token_cache.as_ref() {
                     Some(cache) => {
-                        let chain = held.or_else(|| {
+                        let mut candidates: Vec<TokenChain> = held.into_iter().collect();
+                        candidates.extend(
                             cache
-                                .get_for_action(&self_entity, TokenScope::PUBLISH, publish_hash)
-                                .map(TokenChain::single)
-                        });
-                        (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
+                                .candidates_for_action(
+                                    &self_entity,
+                                    TokenScope::PUBLISH,
+                                    publish_hash,
+                                )
+                                .into_iter()
+                                .map(TokenChain::single),
+                        );
+                        (
+                            cache.revocation().as_ref(),
+                            cache.clock_skew_secs(),
+                            candidates,
+                        )
                     }
                     None => {
                         transient_revocation = RevocationRegistry::new();
-                        (&transient_revocation, 0u64, held)
+                        (
+                            &transient_revocation,
+                            0u64,
+                            held.into_iter().collect::<Vec<_>>(),
+                        )
                     }
                 };
-                if !cfg.can_publish(
-                    &self_caps,
-                    &self_entity,
-                    publish_hash,
-                    chain.as_ref(),
-                    revocation,
-                    skew,
-                ) {
+                let gate = |chain: Option<&TokenChain>| {
+                    cfg.can_publish(
+                        &self_caps,
+                        &self_entity,
+                        publish_hash,
+                        chain,
+                        revocation,
+                        skew,
+                    )
+                };
+                // No candidate at all still runs the gate once with
+                // `None`: an untokened channel with only `publish_caps`
+                // must keep being decided by the cap filter alone.
+                let permitted = if candidates.is_empty() {
+                    gate(None)
+                } else {
+                    candidates.iter().any(|chain| gate(Some(chain)))
+                };
+                if !permitted {
                     return Err(AdapterError::Connection(
                         "channel: publish denied by channel ACL".into(),
                     ));
