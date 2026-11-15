@@ -986,3 +986,141 @@ async fn tampered_announcement_signature_rejected() {
         "tampered announcement must fail verification"
     );
 }
+
+// ---------------------------------------------------------------------
+// CPOL-01: replacing a channel's policy re-asks existing memberships
+// ---------------------------------------------------------------------
+
+fn fire_and_forget(name: &ChannelName) -> ChannelPublisher {
+    ChannelPublisher::new(
+        name.clone(),
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    )
+}
+
+/// A queue-group policy tightened to `Deny` withdraws the workers that
+/// joined under `Unrestricted`. Pre-fix the AuthGuard entry and the
+/// roster entry outlived the policy that admitted them, and the open
+/// channel's publish branch returned "allowed" without reading the
+/// policy, so the worker kept taking the group's work.
+///
+/// An identical re-registration first: the re-check asks the current
+/// policy's questions, it does not evict on every replacement.
+#[tokio::test]
+async fn cpol01_a_policy_tightened_to_deny_withdraws_existing_workers() {
+    use net::adapter::net::QueueGroupPolicy;
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+    let name = ChannelName::new("work/tightened").unwrap();
+    let open = || ChannelConfig::new(ChannelId::new(name.clone()));
+    a.registry.insert(open());
+    b.mesh
+        .subscribe_channel_in_queue_group(a.mesh.node_id(), name.clone(), "workers".to_string())
+        .await
+        .expect("Unrestricted admits the worker");
+    let publisher = fire_and_forget(&name);
+
+    a.registry.insert(open());
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"same-policy"))
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.delivered, 1,
+        "re-registering the same policy must not withdraw anyone"
+    );
+
+    a.registry
+        .insert(open().with_queue_group_policy(QueueGroupPolicy::Deny));
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"after-deny"))
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.attempted, 0,
+        "a worker the current policy refuses must not receive the group's work"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name.clone())),
+        "and it must leave the roster, or it keeps taking its group's selection"
+    );
+}
+
+/// Tightened from `Unrestricted` to `TokenBound` with the same roots, a
+/// worker admitted on its CHANNEL token has no group grant: the current
+/// policy would refuse it, so the retained channel grant no longer
+/// admits it. Pre-fix the publish re-check kept re-verifying the
+/// channel grant it was admitted on, which still verified.
+#[tokio::test]
+async fn cpol01_a_worker_admitted_on_a_channel_token_needs_a_group_grant_once_token_bound() {
+    use net::adapter::net::QueueGroupPolicy;
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+    let name = ChannelName::new("work/token-bound-later").unwrap();
+    let rooted = || {
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()])
+    };
+    a.registry.insert(rooted());
+
+    let reader_token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(),
+        300,
+        0,
+    );
+    b.mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "batch".to_string(),
+            reader_token,
+        )
+        .await
+        .expect("Unrestricted admits a worker on its channel token");
+    let self_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        name.hash(),
+        300,
+        0,
+    );
+    a.mesh.set_publish_chain(
+        &name,
+        net::adapter::net::identity::TokenChain::single(self_token),
+    );
+    let publisher = fire_and_forget(&name);
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"before"))
+        .await
+        .expect("publish");
+    assert_eq!(report.delivered, 1, "harness: the worker receives first");
+
+    a.registry
+        .insert(rooted().with_queue_group_policy(QueueGroupPolicy::TokenBound));
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"after"))
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.attempted, 0,
+        "a channel token is not a worker grant under TokenBound"
+    );
+    assert!(!a
+        .mesh
+        .roster()
+        .is_subscribed(b.mesh.node_id(), &ChannelId::new(name)));
+}

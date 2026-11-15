@@ -80,7 +80,7 @@ use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBER
 use super::channel::{
     queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry,
     ChannelHash, ChannelId, ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport,
-    QueueGroupPolicy, SubscriberRoster,
+    QueueGroupPolicy, SubscriberRoster, SubscriptionMode,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -5287,19 +5287,26 @@ struct MembershipRejection {
 /// behavior you want anyway — rather than growing without bound.
 const MEMBERSHIP_DEDUPE_MAX: usize = 4096;
 
-/// Evict subscribers whose tokens have expired. Walks the roster by
-/// peer and, for every `require_token` channel they hold, runs the
-/// full token-cache check. Expired entries are revoked in the
-/// [`AuthGuard`] and removed from the [`SubscriberRoster`].
+/// Evict subscribers the channel's **current** policy no longer
+/// admits. Walks the roster by peer and, for every channel they hold:
 ///
-/// Skip conditions (short-circuits to no-op):
+/// - re-asks the structural admission questions of the config the
+///   channel resolves to now ([`ChannelConfig::retains_subscription`]:
+///   origin binding, queue-group policy, and which hash a retained
+///   grant must answer), so a replaced policy cannot leave a
+///   subscription admitted under the old one standing (CPOL-01);
+/// - for every token-gated channel, runs the full chain re-check.
 ///
-/// - No `token_cache`: `require_token` channels reject every
-///   subscribe anyway, so the roster contains no token-gated
-///   entries.
-/// - No `channel_configs`: nothing to check `require_token`
-///   against, so every roster entry is treated as open and left
-///   alone.
+/// Failures are revoked in the [`AuthGuard`] and removed from the
+/// [`SubscriberRoster`].
+///
+/// Skip conditions:
+///
+/// - No `channel_configs`: nothing to check against, so every roster
+///   entry is treated as open and left alone.
+/// - No `token_cache`: the chain re-check is skipped (`require_token`
+///   channels reject every subscribe without one, so the roster holds
+///   no token-gated entries); the structural re-check still runs.
 ///
 /// Pulled into a free fn (not a method) so the sweep loop can
 /// call it without capturing `&self` through the async closure.
@@ -5311,11 +5318,9 @@ fn sweep_expired_subscribers(
     channel_configs: Option<&Arc<ChannelConfigRegistry>>,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
 ) {
-    let (Some(cache), Some(configs)) = (token_cache, channel_configs) else {
+    let Some(configs) = channel_configs else {
         return;
     };
-    let revocation = cache.revocation().as_ref();
-    let skew = cache.clock_skew_secs();
     // Snapshot (node_id, entity_id) pairs so we don't hold the
     // DashMap read guard across the chain checks below.
     let peers: Vec<(u64, EntityId)> = peer_entity_ids
@@ -5325,12 +5330,49 @@ fn sweep_expired_subscribers(
     for (node_id, entity_id) in peers {
         for channel_id in roster.channels_for(node_id) {
             let name = channel_id.name();
-            let Some(cfg) = configs.get_by_name(name.as_str()) else {
+            let Some(resolved) = configs.resolve_by_name(name.as_str()) else {
                 continue;
             };
+            let cfg = &resolved.config;
+            let evict = || {
+                guard.revoke_channel(subscriber_principal(node_id), name);
+                roster.remove(&channel_id, node_id);
+                subscriber_chains.remove(&(node_id, name.hash()));
+            };
+            // The structural re-check first (CPOL-01): cheap, and it is
+            // the only check an open channel gets. Only pinned peers are
+            // walked here, so the origin is the pinned one.
+            let group = match roster.subscriber_mode(node_id, &channel_id) {
+                Some(SubscriptionMode::QueueGroup(group)) => Some(group),
+                _ => None,
+            };
+            let admitted_grant = subscriber_chains
+                .get(&(node_id, name.hash()))
+                .map(|r| r.grant_hash);
+            if !cfg.retains_subscription(
+                name.as_str(),
+                name.hash(),
+                resolved.matched_prefix.as_deref(),
+                Some(entity_id.origin_hash()),
+                group.as_ref().map(|g| g.as_str()),
+                admitted_grant,
+            ) {
+                evict();
+                tracing::debug!(
+                    node_id = format!("{:#x}", node_id),
+                    channel = name.as_str(),
+                    "auth: evicted subscriber its channel's current admission policy no longer admits",
+                );
+                continue;
+            }
             if !cfg.token_required() {
                 continue;
             }
+            let Some(cache) = token_cache else {
+                continue;
+            };
+            let revocation = cache.revocation().as_ref();
+            let skew = cache.clock_skew_secs();
             // Re-verify the chain the subscriber presented at subscribe
             // time against the *current* clock + revocation floors.
             // Anything that fails — expiry, a revoked root or link, a
@@ -5353,9 +5395,7 @@ fn sweep_expired_subscribers(
                     cfg.reverify_subscribe(&r.chain, &entity_id, r.grant_hash, revocation, skew)
                 });
             if !authorized {
-                guard.revoke_channel(subscriber_principal(node_id), name);
-                roster.remove(&channel_id, node_id);
-                subscriber_chains.remove(&(node_id, name.hash()));
+                evict();
                 tracing::debug!(
                     node_id = format!("{:#x}", node_id),
                     channel = name.as_str(),
@@ -5363,6 +5403,60 @@ fn sweep_expired_subscribers(
                 );
             }
         }
+    }
+}
+
+/// CPOL-01: the sweep re-asks the current policy even on a channel with
+/// no token gate and a node with no token cache — the configuration it
+/// used to return early on.
+#[cfg(test)]
+mod cpol01_sweep_tests {
+    use super::*;
+    use crate::adapter::net::channel::{ChannelConfig, OriginBinding};
+    use crate::adapter::net::identity::EntityKeypair;
+
+    #[test]
+    fn the_sweep_withdraws_a_subscription_a_replaced_binding_refuses() {
+        let owner = EntityKeypair::generate().entity_id().clone();
+        let other = EntityKeypair::generate().entity_id().clone();
+        let name = ChannelName::new(&format!("svc.replies.{:016x}", owner.origin_hash())).unwrap();
+        let channel = ChannelId::new(name.clone());
+        let (owner_node, other_node) = (1u64, 2u64);
+
+        let roster = SubscriberRoster::new();
+        let guard = AuthGuard::new();
+        let peers = DashMap::new();
+        peers.insert(owner_node, owner);
+        peers.insert(other_node, other);
+        // Both admitted while the family was open.
+        for node in [owner_node, other_node] {
+            roster.add(channel.clone(), node);
+            guard.allow_channel(subscriber_principal(node), &name);
+        }
+        let configs = Arc::new(ChannelConfigRegistry::new());
+        let sentinel = ChannelId::new(ChannelName::new("svc.replies.prefix").unwrap());
+        configs.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(sentinel)
+                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16),
+        );
+
+        sweep_expired_subscribers(
+            &roster,
+            &guard,
+            None,
+            &peers,
+            Some(&configs),
+            &DashMap::new(),
+        );
+
+        assert!(!roster.is_subscribed(other_node, &channel));
+        assert!(!guard.is_authorized_full(subscriber_principal(other_node), &name));
+        assert!(
+            roster.is_subscribed(owner_node, &channel),
+            "the binding admits the owner — it stays"
+        );
+        assert!(guard.is_authorized_full(subscriber_principal(owner_node), &name));
     }
 }
 
@@ -42200,9 +42294,21 @@ impl MeshNode {
         from_node: u64,
         ctx: &DispatchCtx,
     ) -> Option<u64> {
+        Self::bootstrap_reply_origin_in(&ctx.peers, channel, from_node)
+    }
+
+    /// [`Self::bootstrap_reply_origin`] over the peer table directly —
+    /// for the publish path, which holds the node rather than a
+    /// dispatch context.
+    #[cfg(feature = "webrtc")]
+    fn bootstrap_reply_origin_in(
+        peers: &DashMap<u64, PeerInfo>,
+        channel: &ChannelName,
+        from_node: u64,
+    ) -> Option<u64> {
         let claimed =
             super::rtc::PeerAdmission::origin_from_enroll_reply_channel(channel.as_str())?;
-        let entry = ctx.peers.get(&from_node)?;
+        let entry = peers.get(&from_node)?;
         let admission = entry.value().admission;
         if !admission.is_provisional() {
             return None;
@@ -44927,6 +45033,28 @@ impl MeshNode {
 
     // ── Channel fan-out (ChannelPublisher) ─────────────────────────────
 
+    /// The origin an origin-bound channel's subscribe gate binds
+    /// `peer_id` to: its pinned entity's origin, or — only for a
+    /// provisional session on its own enrollment reply channel — the
+    /// bootstrap origin the gate accepts in its place (R6). `None` when
+    /// neither applies, which fails an origin binding closed.
+    ///
+    /// The fan-out's re-check (CPOL-01) must ask exactly what
+    /// `authorize_subscribe` asked, or it would evict the one
+    /// subscription the bootstrap exception exists for.
+    fn subscription_origin(&self, peer_id: u64, channel: &ChannelName) -> Option<u64> {
+        let pinned = self
+            .peer_entity_ids
+            .get(&peer_id)
+            .map(|e| e.value().origin_hash());
+        #[cfg(feature = "webrtc")]
+        let pinned =
+            pinned.or_else(|| Self::bootstrap_reply_origin_in(&self.peers, channel, peer_id));
+        #[cfg(not(feature = "webrtc"))]
+        let _ = channel;
+        pinned
+    }
+
     /// Build a [`ChannelPublisher`] recipe. Does NOT talk to the wire —
     /// combine with [`publish`](Self::publish) or
     /// [`publish_many`](Self::publish_many) to actually fan out.
@@ -44966,10 +45094,18 @@ impl MeshNode {
         // silently publishing to a channel whose own ACL it doesn't
         // match. Channels absent from the registry are treated as
         // open (permissive default).
-        let cfg_snapshot = self.channel_configs.as_ref().and_then(|cr| {
-            cr.get_by_name(publisher.channel().name().as_str())
-                .map(|c| c.clone())
-        });
+        //
+        // Resolved (not just looked up) so the fan-out's admission
+        // re-check knows which prefix matched — an origin binding needs
+        // it to find the dynamic suffix (CPOL-01).
+        let (cfg_snapshot, cfg_matched_prefix) = match self
+            .channel_configs
+            .as_ref()
+            .and_then(|cr| cr.resolve_by_name(publisher.channel().name().as_str()))
+        {
+            Some(resolved) => (Some(resolved.config), resolved.matched_prefix),
+            None => (None, None),
+        };
         if let Some(cfg) = cfg_snapshot.as_ref() {
             if cfg.publish_caps.is_some() || cfg.token_required() {
                 let self_caps = self
@@ -45169,6 +45305,29 @@ impl MeshNode {
         // type-level one, and two in-crate tests write `peer_subnets`
         // directly with no policy installed.
         let subnet_verdict_is_constant = matches!(visibility, Visibility::Global);
+        // CPOL-01: which structural admission questions this channel's
+        // CURRENT config asks, hoisted so an open channel pays nothing.
+        // A subscription admitted under a policy that has since been
+        // replaced is re-asked them here — the AuthGuard entry only
+        // records that SOME policy once admitted the peer.
+        let origin_bound = cfg_snapshot
+            .as_ref()
+            .is_some_and(|c| c.subscriber_origin_binding.is_some());
+        let group_restricted = cfg_snapshot
+            .as_ref()
+            .is_some_and(|c| c.queue_group_policy != QueueGroupPolicy::Unrestricted);
+        let policy_recheck = origin_bound || group_restricted || require_token;
+        // A subscriber the current policy no longer admits leaves the
+        // roster as well as the guard: queue-group selection runs before
+        // this filter with no alternate-member retry, so a denied peer
+        // left rostered would keep taking its group's copy (see the
+        // chain-failure arm below).
+        let evict = |peer_id: u64| {
+            auth_guard.revoke_channel(subscriber_principal(peer_id), &channel_name);
+            self.roster
+                .remove(&ChannelId::new(channel_name.clone()), peer_id);
+            self.subscriber_chains.remove(&(peer_id, channel_hash));
+        };
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
@@ -45206,6 +45365,44 @@ impl MeshNode {
             };
             if !admitted {
                 return false;
+            }
+            // (2b) The current admission policy (CPOL-01). An origin
+            // binding, a restricted queue-group policy, or the hash a
+            // retained grant must answer may all have changed since this
+            // peer was admitted; re-registering a name or prefix replaces
+            // its config without touching existing memberships.
+            if let (true, Some(cfg)) = (policy_recheck, cfg_snapshot.as_ref()) {
+                let origin = if origin_bound {
+                    self.subscription_origin(*peer_id, &channel_name)
+                } else {
+                    None
+                };
+                let group = if group_restricted {
+                    match self.roster.subscriber_mode(*peer_id, publisher.channel()) {
+                        Some(SubscriptionMode::QueueGroup(group)) => Some(group),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let admitted_grant = if require_token {
+                    self.subscriber_chains
+                        .get(&(*peer_id, channel_hash))
+                        .map(|r| r.grant_hash)
+                } else {
+                    None
+                };
+                if !cfg.retains_subscription(
+                    channel_name.as_str(),
+                    channel_hash,
+                    cfg_matched_prefix.as_deref(),
+                    origin,
+                    group.as_ref().map(|g| g.as_str()),
+                    admitted_grant,
+                ) {
+                    evict(*peer_id);
+                    return false;
+                }
             }
             if !require_token {
                 return true;
@@ -45274,7 +45471,6 @@ impl MeshNode {
                 _ => false,
             };
             if !chain_ok {
-                auth_guard.revoke_channel(origin, &channel_name);
                 // Evict from the roster too, not just the AuthGuard.
                 //
                 // Revoking only the guard left the peer rostered, and
@@ -45289,9 +45485,7 @@ impl MeshNode {
                 // disables it outright. Dropping the roster entry here
                 // makes the denial self-clearing on the path that
                 // observed it.
-                self.roster
-                    .remove(&ChannelId::new(channel_name.clone()), *peer_id);
-                self.subscriber_chains.remove(&(*peer_id, channel_hash));
+                evict(*peer_id);
                 return false;
             }
             true
