@@ -477,6 +477,11 @@ export interface RawDuplexStream {
  * - `sendWait` waits for queue room instead of dropping; it resolves
  *   `false` only once the call is gone. Use it when every chunk must
  *   arrive.
+ *
+ * Both copy `body` at the call, so the Buffer may be reused as soon as
+ * `send` returns (or `sendWait` is called): a queued chunk is a snapshot,
+ * not a view of the caller's memory. The upload `send`s of the
+ * client-stream and duplex calls copy the same way.
  */
 export interface RawResponseSink {
   send(body: Buffer): boolean

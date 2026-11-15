@@ -331,17 +331,32 @@ const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 /// the Python binding's `RpcAppError(code, body)` mechanism.
 const JS_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
 
-/// Parse a JS-thrown `nrpc:app_error:0x<code>:<body>` message
-/// Convert an owned napi `Buffer` into `bytes::Bytes` without
-/// an extra copy. napi-rs 3.x backs `Buffer` with an `Arc<Vec<u8>>`
-/// internally; `Bytes::from_owner` takes ownership of the Buffer
-/// (preserving the Arc clone) so the resulting `Bytes` borrows the
-/// same allocation. Replaces the previous `Bytes::copy_from_slice`
-/// pattern that paid a per-chunk memcpy at the JS↔Rust boundary.
-fn napi_buffer_to_bytes(buf: Buffer) -> Bytes {
-    Bytes::from_owner(buf)
+/// Snapshot a JS `Buffer`'s bytes into an independent `Bytes`
+/// (NCALL-01).
+///
+/// The copy is load-bearing. A napi `Buffer` taken from JS is NOT an
+/// immutable `Arc<Vec<u8>>`: it is a reference to the JS object plus a
+/// raw pointer into its live backing store, which JS may rewrite at any
+/// time without synchronization (napi's own `Send`/`Sync` impls for it
+/// say as much). Every caller hands the result to a queue that outlives
+/// the JS call — the response sink's per-call chunk queue (`send` /
+/// `sendWait` return once the chunk is ADMITTED, and the chunk may wait
+/// for stream credit long after), and the upload paths' credit wait —
+/// so aliasing the Buffer (`Bytes::from_owner`, as this once did) put
+/// whatever the caller later wrote into the reused Buffer on the wire,
+/// and let a native read race a JS write. Compute outputs copy for the
+/// same reason (`compute.rs`).
+///
+/// Callers MUST run this on the JS thread, before the call returns to
+/// JS: a copy taken inside a spawned future would itself race a
+/// mutation made after the Promise was handed back. That is why the
+/// async `send` / `sendWait` methods below are synchronous napi
+/// functions that copy first and only then `spawn_future`.
+fn copy_js_bytes(buf: &[u8]) -> Bytes {
+    Bytes::copy_from_slice(buf)
 }
 
+/// Parse a JS-thrown `nrpc:app_error:0x<code>:<body>` message
 /// into the (code, body) pair the SDK expects for
 /// `RpcHandlerError::Application`. Returns `None` if the prefix
 /// is absent or the format is malformed (caller falls through to
@@ -942,41 +957,48 @@ impl ClientStreamCall {
     /// Concurrent `close()` interrupts the await: `send`
     /// `select!`s on the close-notify, so the upload doesn't
     /// queue behind credit that never arrives.
+    ///
+    /// Synchronous with a `PromiseRaw` so `body` is copied on the JS
+    /// thread before JS can reuse it (`copy_js_bytes`, NCALL-01).
     #[napi]
-    pub async fn send(&self, body: Buffer) -> Result<()> {
-        let body = napi_buffer_to_bytes(body);
-        // Take the inner out under a brief lock so the long-lived
-        // tokio mutex isn't held across the credit await; a
-        // racing `close()` can then acquire the lock cleanly to
-        // signal cancellation.
-        let mut call = {
-            let mut guard = self.inner.lock().await;
-            guard
-                .take()
-                .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?
-        };
+    pub fn send<'env>(&self, env: &'env Env, body: Buffer) -> Result<PromiseRaw<'env, ()>> {
+        let body = copy_js_bytes(&body);
+        let inner = self.inner.clone();
         let notify = self.close_notify.clone();
-        let result = tokio::select! {
-            r = call.send(body) => r,
-            _ = notify.notified() => {
-                // close() fired. Drop the call (which drops its
-                // credit semaphore + fires CANCEL via the SDK's
-                // Drop impl) and report stream_closed to JS.
-                drop(call);
-                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+        let org_errors = self.org_errors;
+        env.spawn_future(async move {
+            // Take the inner out under a brief lock so the long-lived
+            // tokio mutex isn't held across the credit await; a
+            // racing `close()` can then acquire the lock cleanly to
+            // signal cancellation.
+            let mut call = {
+                let mut guard = inner.lock().await;
+                guard
+                    .take()
+                    .ok_or_else(|| nrpc_err("stream_closed", "client-stream call already closed"))?
+            };
+            let result = tokio::select! {
+                r = call.send(body) => r,
+                _ = notify.notified() => {
+                    // close() fired. Drop the call (which drops its
+                    // credit semaphore + fires CANCEL via the SDK's
+                    // Drop impl) and report stream_closed to JS.
+                    drop(call);
+                    return Err(nrpc_err("stream_closed", "send aborted by close()"));
+                }
+            };
+            let mut guard = inner.lock().await;
+            match result {
+                Ok(()) => {
+                    *guard = Some(call);
+                    Ok(())
+                }
+                Err(e) => {
+                    drop(call);
+                    Err(call_err(org_errors, e))
+                }
             }
-        };
-        let mut guard = self.inner.lock().await;
-        match result {
-            Ok(()) => {
-                *guard = Some(call);
-                Ok(())
-            }
-            Err(e) => {
-                drop(call);
-                Err(call_err(self.org_errors, e))
-            }
-        }
+        })
     }
 
     /// Close the upload direction (emit REQUEST_END) and await
@@ -1057,34 +1079,40 @@ impl DuplexCall {
     /// Concurrent `close()` interrupts the await via the
     /// close-notify (same shape as `ClientStreamCall::send`),
     /// so a stuck flow-control await doesn't pin the call.
+    ///
+    /// Synchronous with a `PromiseRaw` so `body` is copied on the JS
+    /// thread before JS can reuse it (`copy_js_bytes`, NCALL-01).
     #[napi]
-    pub async fn send(&self, body: Buffer) -> Result<()> {
-        let body = napi_buffer_to_bytes(body);
-        let mut call = {
-            let mut guard = self.inner.lock().await;
-            guard
-                .take()
-                .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?
-        };
+    pub fn send<'env>(&self, env: &'env Env, body: Buffer) -> Result<PromiseRaw<'env, ()>> {
+        let body = copy_js_bytes(&body);
+        let inner = self.inner.clone();
         let notify = self.close_notify.clone();
-        let result = tokio::select! {
-            r = call.send(body) => r,
-            _ = notify.notified() => {
-                drop(call);
-                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+        env.spawn_future(async move {
+            let mut call = {
+                let mut guard = inner.lock().await;
+                guard
+                    .take()
+                    .ok_or_else(|| nrpc_err("stream_closed", "duplex call already closed"))?
+            };
+            let result = tokio::select! {
+                r = call.send(body) => r,
+                _ = notify.notified() => {
+                    drop(call);
+                    return Err(nrpc_err("stream_closed", "send aborted by close()"));
+                }
+            };
+            let mut guard = inner.lock().await;
+            match result {
+                Ok(()) => {
+                    *guard = Some(call);
+                    Ok(())
+                }
+                Err(e) => {
+                    drop(call);
+                    Err(nrpc_err_from_inner(e))
+                }
             }
-        };
-        let mut guard = self.inner.lock().await;
-        match result {
-            Ok(()) => {
-                *guard = Some(call);
-                Ok(())
-            }
-            Err(e) => {
-                drop(call);
-                Err(nrpc_err_from_inner(e))
-            }
-        }
+        })
     }
 
     /// Close the upload direction (emit REQUEST_END). Does NOT
@@ -1199,34 +1227,41 @@ impl DuplexSink {
     ///
     /// Concurrent `close()` interrupts the await via the
     /// close-notify (same shape as `DuplexCall::send`).
+    ///
+    /// Synchronous with a `PromiseRaw` so `body` is copied on the JS
+    /// thread before JS can reuse it (`copy_js_bytes`, NCALL-01).
     #[napi]
-    pub async fn send(&self, body: Buffer) -> Result<()> {
-        let body = napi_buffer_to_bytes(body);
-        let mut sink = {
-            let mut guard = self.inner.lock().await;
-            guard
-                .take()
-                .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?
-        };
+    pub fn send<'env>(&self, env: &'env Env, body: Buffer) -> Result<PromiseRaw<'env, ()>> {
+        let body = copy_js_bytes(&body);
+        let inner = self.inner.clone();
         let notify = self.close_notify.clone();
-        let result = tokio::select! {
-            r = sink.send(body) => r,
-            _ = notify.notified() => {
-                drop(sink);
-                return Err(nrpc_err("stream_closed", "send aborted by close()"));
+        let org_errors = self.org_errors;
+        env.spawn_future(async move {
+            let mut sink = {
+                let mut guard = inner.lock().await;
+                guard
+                    .take()
+                    .ok_or_else(|| nrpc_err("stream_closed", "duplex sink already closed"))?
+            };
+            let result = tokio::select! {
+                r = sink.send(body) => r,
+                _ = notify.notified() => {
+                    drop(sink);
+                    return Err(nrpc_err("stream_closed", "send aborted by close()"));
+                }
+            };
+            let mut guard = inner.lock().await;
+            match result {
+                Ok(()) => {
+                    *guard = Some(sink);
+                    Ok(())
+                }
+                Err(e) => {
+                    drop(sink);
+                    Err(call_err(org_errors, e))
+                }
             }
-        };
-        let mut guard = self.inner.lock().await;
-        match result {
-            Ok(()) => {
-                *guard = Some(sink);
-                Ok(())
-            }
-            Err(e) => {
-                drop(sink);
-                Err(call_err(self.org_errors, e))
-            }
-        }
+        })
     }
 
     /// Close the upload direction (emit REQUEST_END). Consumes
@@ -1479,7 +1514,7 @@ impl JsResponseSink {
     pub fn send(&self, body: Buffer) -> bool {
         let guard = self.inner.lock();
         match guard.as_ref() {
-            Some(sink) => sink.try_send(napi_buffer_to_bytes(body)),
+            Some(sink) => sink.try_send(copy_js_bytes(&body)),
             None => false,
         }
     }
@@ -1489,15 +1524,22 @@ impl JsResponseSink {
     /// `await sink.sendWait(chunk)` in a loop paces it to the caller.
     /// Resolves `true` once queued, `false` if the call is gone (stop
     /// producing).
+    ///
+    /// Synchronous with a `PromiseRaw` so `body` is copied on the JS
+    /// thread before JS can reuse it: a resolved `true` means the
+    /// SNAPSHOT was queued, and the chunk may still wait for stream
+    /// credit afterwards (`copy_js_bytes`, NCALL-01).
     #[napi]
-    pub async fn send_wait(&self, body: Buffer) -> Result<bool> {
-        let body = napi_buffer_to_bytes(body);
+    pub fn send_wait<'env>(&self, env: &'env Env, body: Buffer) -> Result<PromiseRaw<'env, bool>> {
+        let body = copy_js_bytes(&body);
         // Clone the sink out: the slot lock is synchronous and must not
         // be held across the wait.
         let sink = self.inner.lock().clone();
-        Ok(match sink {
-            Some(sink) => sink.send_wait(body).await.is_ok(),
-            None => false,
+        env.spawn_future(async move {
+            Ok(match sink {
+                Some(sink) => sink.send_wait(body).await.is_ok(),
+                None => false,
+            })
         })
     }
 }
@@ -2948,5 +2990,28 @@ mod tests {
             "cancel retirement renders the typed cancelled kind — got {}",
             cancelled.to_wire()
         );
+    }
+
+    /// NCALL-01: a chunk handed to a retained queue (the response sink's
+    /// per-call queue, an upload's credit wait) must be an independent
+    /// snapshot of the JS `Buffer`, not an alias of its backing store —
+    /// `send` / `sendWait` report admission while the chunk can still wait
+    /// for stream credit, and JS is free to reuse the Buffer from then on.
+    ///
+    /// Red-witness: the old `Bytes::from_owner(buf)` kept the Buffer's own
+    /// pointer, so the queued chunk shared the allocation and a later JS
+    /// write reached the wire.
+    #[test]
+    fn js_bytes_are_snapshotted_not_aliased() {
+        let mut buf = Buffer::from(vec![1u8, 2, 3, 4]);
+        let queued = copy_js_bytes(&buf);
+        assert_ne!(
+            queued.as_ptr(),
+            buf.as_ptr(),
+            "the queued chunk aliases the JS Buffer's storage"
+        );
+        // JS reuses its Buffer after `send` returned / `sendWait` resolved.
+        buf.as_mut()[0] = 0xFF;
+        assert_eq!(&queued[..], &[1u8, 2, 3, 4], "the queued chunk changed");
     }
 }

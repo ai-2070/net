@@ -530,4 +530,47 @@ describe('streamed-call backpressure', () => {
     stream.close()
     handle.close()
   }, 60_000)
+
+  // NCALL-01: `send` returns true / `sendWait` resolves true once a chunk
+  // is ADMITTED to the per-call queue, and with a one-chunk window it then
+  // waits for credit. A handler that reuses one Buffer after admission must
+  // still deliver what it submitted: the binding snapshots the bytes at the
+  // call, it does not alias the Buffer (which put the LAST write on the wire
+  // for every chunk still queued).
+  for (const mode of ['send', 'sendWait'] as const) {
+    it(`${mode} delivers the submitted bytes of a reused Buffer`, async () => {
+      const { server, serverRpc, clientRpc } = await pair()
+      const n = 32
+      const handle = serverRpc.serveStreaming(
+        `live.reuse.${mode.toLowerCase()}`,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        async ([, sink]: [Buffer, any]) => {
+          const reused = Buffer.alloc(64)
+          for (let i = 0; i < n; i += 1) {
+            reused.fill(i)
+            const admitted = mode === 'send' ? sink.send(reused) : await sink.sendWait(reused)
+            expect(admitted).toBe(true)
+          }
+          // Overwrite once more after the last admission.
+          reused.fill(0xff)
+          return Buffer.alloc(0)
+        },
+      )
+      const stream = await clientRpc.callStreaming(
+        server.nodeId(),
+        `live.reuse.${mode.toLowerCase()}`,
+        Buffer.from('go'),
+        { streamWindowInitial: 1 },
+      )
+      const got: number[] = []
+      for (let c = await stream.next(); c !== null; c = await stream.next()) {
+        expect(c.length).toBe(64)
+        expect(c.every((b: number) => b === c[0])).toBe(true)
+        got.push(c[0])
+      }
+      expect(got).toEqual(Array.from({ length: n }, (_, i) => i))
+      stream.close()
+      handle.close()
+    }, 60_000)
+  }
 })
