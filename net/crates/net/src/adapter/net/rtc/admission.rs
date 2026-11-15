@@ -150,6 +150,14 @@ pub enum PeerAdmission {
         ///
         /// [`MeshNode::set_enrollment_subject_binding`]: crate::adapter::net::MeshNode::set_enrollment_subject_binding
         device: Option<[u8; 32]>,
+        /// The origin this session had bound while provisional — the
+        /// one its enrollment reply subscription was admitted under.
+        /// `None` for native sessions and for a session promoted before
+        /// it claimed one. Read only by the fan-out's policy re-check
+        /// (CPOL-01), so the reply that promotes a session is not
+        /// refused for the promotion itself; it widens no subscribe
+        /// gate (see [`Self::enrolled_reply_origin`]).
+        enrolled_origin: Option<u64>,
     },
 }
 
@@ -164,6 +172,7 @@ impl Default for PeerAdmission {
             session_id: 0,
             tenant: None,
             device: None,
+            enrolled_origin: None,
         }
     }
 }
@@ -204,6 +213,27 @@ impl PeerAdmission {
             Self::Provisional { origin, .. } => *origin,
             Self::Admitted { .. } => None,
         }
+    }
+
+    /// The origin an **admitted** session had bound while provisional,
+    /// when `channel` is exactly that origin's enrollment reply channel.
+    ///
+    /// For the fan-out's policy re-check only: the reply subscription
+    /// was admitted under that origin by the bootstrap exception, and
+    /// promotion happens just before the Admitted reply is published on
+    /// it, so re-asking with no origin there evicted the subscription
+    /// and dropped the very reply that enrolled the session. The
+    /// subscribe gate never consults this; an admitted session still
+    /// needs a pinned identity to subscribe to any bound channel.
+    pub fn enrolled_reply_origin(&self, channel: &str) -> Option<u64> {
+        let Self::Admitted {
+            enrolled_origin: Some(origin),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        (Self::origin_from_enroll_reply_channel(channel) == Some(*origin)).then_some(*origin)
     }
 
     /// Parse the origin out of an enrollment reply-channel name,
@@ -779,10 +809,47 @@ mod tests {
             session_id: 7,
             tenant: None,
             device: None,
+            enrolled_origin: None,
         };
         assert!(!admitted.is_provisional());
         assert!(!admitted.is_expired(start + PROVISIONAL_TTL * 10));
         assert_eq!(admitted.admitted_session(), Some(7));
+    }
+
+    #[test]
+    fn the_enrolled_reply_origin_names_only_its_own_reply_channel() {
+        let origin = 0x1234_5678_9abc_def0u64;
+        let admitted = PeerAdmission::Admitted {
+            promoted_at: Instant::now(),
+            session_id: 7,
+            tenant: None,
+            device: None,
+            enrolled_origin: Some(origin),
+        };
+        let own = enroll_reply_channel(origin);
+        assert_eq!(admitted.enrolled_reply_origin(&own), Some(origin));
+        assert_eq!(
+            admitted.enrolled_reply_origin(&enroll_reply_channel(origin ^ 1)),
+            None,
+            "another origin's reply channel"
+        );
+        assert_eq!(
+            admitted.enrolled_reply_origin(&format!("svc.replies.{origin:016x}")),
+            None,
+            "another service's reply family"
+        );
+        assert_eq!(
+            PeerAdmission::default().enrolled_reply_origin(&own),
+            None,
+            "a native session bound nothing"
+        );
+        let mut prov = PeerAdmission::provisional(Instant::now());
+        assert!(prov.bind_origin(origin));
+        assert_eq!(
+            prov.enrolled_reply_origin(&own),
+            None,
+            "provisional sessions keep the subscribe gate's own exception"
+        );
     }
 
     #[test]

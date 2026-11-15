@@ -51,6 +51,7 @@ fn install(ctx: &DispatchCtx, peer: u64, addr: SocketAddr, tenant: Option<Tenant
                 session_id: peer,
                 tenant,
                 device: None,
+                enrolled_origin: None,
             },
         },
     );
@@ -462,6 +463,7 @@ async fn an_admitted_session_announces_only_as_its_granted_device() {
                 session_id: origin,
                 tenant: None,
                 device: Some(device),
+                enrolled_origin: None,
             };
         }
     };
@@ -540,4 +542,62 @@ async fn a_capped_tenant_is_full_at_promotion_not_only_at_the_handler() {
         "a released slot is reusable"
     );
     assert_eq!(node.tenant_peer_count(GAME_A), 1);
+}
+
+/// **The promotion an Admitted enrollment reply follows does not cost
+/// the reply its subscription** (CPOL-01 × §12).
+///
+/// A provisional session subscribes to its own enrollment reply channel
+/// under the bootstrap exception: it has no pinned identity, so the
+/// origin binding is judged by the origin the session bound. The
+/// response path promotes the session and only then publishes the
+/// Admitted reply on that channel. The fan-out's policy re-check asked
+/// for the subscriber's origin again — the session was no longer
+/// provisional and still unpinned, so it got none, the origin binding
+/// refused, and the subscription was evicted with the reply that had
+/// just enrolled the session: every real enrollment timed out (the SDK
+/// `enrollment_over_rtc` witnesses, the browser acceptance run).
+///
+/// Inverse: drop the `enrolled_reply_origin` fallback from
+/// `MeshNode::subscription_origin` (or stop recording the origin at
+/// promotion) and the post-promotion assertion fails.
+#[tokio::test]
+async fn a_promoted_session_keeps_its_enrollment_reply_origin_for_the_fan_out() {
+    use crate::adapter::net::rtc::enroll_reply_channel;
+
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let origin = 0x0123_4567_89ab_cdefu64;
+    install(&ctx, 0xC2, addr, None);
+    make_provisional(&ctx, 0xC2);
+    if let Some(mut entry) = ctx.peers.get_mut(&0xC2) {
+        assert!(entry.admission.bind_origin(origin), "first claim binds");
+    }
+    let reply = ChannelName::new(&enroll_reply_channel(origin)).unwrap();
+    let foreign = ChannelName::new(&enroll_reply_channel(origin ^ 1)).unwrap();
+    assert_eq!(
+        node.subscription_origin(0xC2, &reply),
+        Some(origin),
+        "provisional: the bootstrap exception the subscribe gate admitted it under"
+    );
+
+    let session = node.peer_session_id(0xC2).expect("session");
+    assert!(node.promote_admission_with_tenant(0xC2, session, PeerAddr::Udp(addr), None));
+    assert!(!node.peer_is_provisional(0xC2));
+    assert!(
+        node.peer_entity_ids.get(&0xC2).is_none(),
+        "the premise: promoted, not yet announced, so not pinned"
+    );
+    assert_eq!(
+        node.subscription_origin(0xC2, &reply),
+        Some(origin),
+        "admitted and unpinned: its reply subscription is judged by the origin it \
+         was admitted under, so the Admitted reply is delivered"
+    );
+    assert_eq!(
+        node.subscription_origin(0xC2, &foreign),
+        None,
+        "and only on its own reply channel — no other origin is vouched for"
+    );
 }

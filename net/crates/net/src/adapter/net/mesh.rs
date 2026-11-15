@@ -5406,60 +5406,6 @@ fn sweep_expired_subscribers(
     }
 }
 
-/// CPOL-01: the sweep re-asks the current policy even on a channel with
-/// no token gate and a node with no token cache — the configuration it
-/// used to return early on.
-#[cfg(test)]
-mod cpol01_sweep_tests {
-    use super::*;
-    use crate::adapter::net::channel::{ChannelConfig, OriginBinding};
-    use crate::adapter::net::identity::EntityKeypair;
-
-    #[test]
-    fn the_sweep_withdraws_a_subscription_a_replaced_binding_refuses() {
-        let owner = EntityKeypair::generate().entity_id().clone();
-        let other = EntityKeypair::generate().entity_id().clone();
-        let name = ChannelName::new(&format!("svc.replies.{:016x}", owner.origin_hash())).unwrap();
-        let channel = ChannelId::new(name.clone());
-        let (owner_node, other_node) = (1u64, 2u64);
-
-        let roster = SubscriberRoster::new();
-        let guard = AuthGuard::new();
-        let peers = DashMap::new();
-        peers.insert(owner_node, owner);
-        peers.insert(other_node, other);
-        // Both admitted while the family was open.
-        for node in [owner_node, other_node] {
-            roster.add(channel.clone(), node);
-            guard.allow_channel(subscriber_principal(node), &name);
-        }
-        let configs = Arc::new(ChannelConfigRegistry::new());
-        let sentinel = ChannelId::new(ChannelName::new("svc.replies.prefix").unwrap());
-        configs.insert_prefix(
-            "svc.replies.",
-            ChannelConfig::new(sentinel)
-                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16),
-        );
-
-        sweep_expired_subscribers(
-            &roster,
-            &guard,
-            None,
-            &peers,
-            Some(&configs),
-            &DashMap::new(),
-        );
-
-        assert!(!roster.is_subscribed(other_node, &channel));
-        assert!(!guard.is_authorized_full(subscriber_principal(other_node), &name));
-        assert!(
-            roster.is_subscribed(owner_node, &channel),
-            "the binding admits the owner — it stays"
-        );
-        assert!(guard.is_authorized_full(subscriber_principal(owner_node), &name));
-    }
-}
-
 /// Default TTL for the routing header we stamp on routed handshake
 /// packets. Far above any realistic relay chain; the routing layer
 /// drops at zero.
@@ -41449,11 +41395,15 @@ impl MeshNode {
         if !info.admission.is_provisional() {
             return false;
         }
+        // The origin the reply subscription was admitted under; the
+        // Admitted reply this promotion precedes still rides it.
+        let enrolled_origin = info.admission.bound_origin();
         info.admission = super::rtc::PeerAdmission::Admitted {
             promoted_at: std::time::Instant::now(),
             session_id: expected_session_id,
             tenant,
             device: device.map(|d| d.0),
+            enrolled_origin,
         };
         drop(entry);
         self.provisional_endpoints.remove(&expected_endpoint);
@@ -45211,15 +45161,29 @@ impl MeshNode {
     ///
     /// The fan-out's re-check (CPOL-01) must ask exactly what
     /// `authorize_subscribe` asked, or it would evict the one
-    /// subscription the bootstrap exception exists for.
+    /// subscription the bootstrap exception exists for. That includes
+    /// the moment just after promotion: the session is no longer
+    /// provisional and has not announced yet, and the Admitted reply
+    /// that promoted it is published on that subscription next — so an
+    /// admitted session that is still unpinned is judged by the origin
+    /// it bound while provisional, on its own reply channel only
+    /// (`PeerAdmission::enrolled_reply_origin`).
     fn subscription_origin(&self, peer_id: u64, channel: &ChannelName) -> Option<u64> {
         let pinned = self
             .peer_entity_ids
             .get(&peer_id)
             .map(|e| e.value().origin_hash());
         #[cfg(feature = "webrtc")]
-        let pinned =
-            pinned.or_else(|| Self::bootstrap_reply_origin_in(&self.peers, channel, peer_id));
+        let pinned = pinned
+            .or_else(|| Self::bootstrap_reply_origin_in(&self.peers, channel, peer_id))
+            .or_else(|| {
+                self.peers.get(&peer_id).and_then(|entry| {
+                    entry
+                        .value()
+                        .admission
+                        .enrolled_reply_origin(channel.as_str())
+                })
+            });
         #[cfg(not(feature = "webrtc"))]
         let _ = channel;
         pinned
@@ -68173,5 +68137,59 @@ impl Drop for BootstrapOfferTakeGuard<'_> {
             self.node
                 .release_bootstrap_offer_take(admitted, self.budget_key, self.dialog);
         }
+    }
+}
+
+/// CPOL-01: the sweep re-asks the current policy even on a channel with
+/// no token gate and a node with no token cache — the configuration it
+/// used to return early on.
+#[cfg(test)]
+mod cpol01_sweep_tests {
+    use super::*;
+    use crate::adapter::net::channel::{ChannelConfig, OriginBinding};
+    use crate::adapter::net::identity::EntityKeypair;
+
+    #[test]
+    fn the_sweep_withdraws_a_subscription_a_replaced_binding_refuses() {
+        let owner = EntityKeypair::generate().entity_id().clone();
+        let other = EntityKeypair::generate().entity_id().clone();
+        let name = ChannelName::new(&format!("svc.replies.{:016x}", owner.origin_hash())).unwrap();
+        let channel = ChannelId::new(name.clone());
+        let (owner_node, other_node) = (1u64, 2u64);
+
+        let roster = SubscriberRoster::new();
+        let guard = AuthGuard::new();
+        let peers = DashMap::new();
+        peers.insert(owner_node, owner);
+        peers.insert(other_node, other);
+        // Both admitted while the family was open.
+        for node in [owner_node, other_node] {
+            roster.add(channel.clone(), node);
+            guard.allow_channel(subscriber_principal(node), &name);
+        }
+        let configs = Arc::new(ChannelConfigRegistry::new());
+        let sentinel = ChannelId::new(ChannelName::new("svc.replies.prefix").unwrap());
+        configs.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(sentinel)
+                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16),
+        );
+
+        sweep_expired_subscribers(
+            &roster,
+            &guard,
+            None,
+            &peers,
+            Some(&configs),
+            &DashMap::new(),
+        );
+
+        assert!(!roster.is_subscribed(other_node, &channel));
+        assert!(!guard.is_authorized_full(subscriber_principal(other_node), &name));
+        assert!(
+            roster.is_subscribed(owner_node, &channel),
+            "the binding admits the owner — it stays"
+        );
+        assert!(guard.is_authorized_full(subscriber_principal(owner_node), &name));
     }
 }
