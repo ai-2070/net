@@ -69,35 +69,115 @@ def _machine_id_path() -> Optional["pathlib.Path"]:
     return None
 
 
+#: How long a starter that lost the race to publish the machine id waits for a
+#: file it found EMPTY to gain its value. A current writer never publishes an
+#: empty file (see :func:`_publish_machine_id`), so this only covers a writer
+#: on a filesystem without hard links, or an older plugin version mid-write.
+_MACHINE_ID_WAIT_SECONDS = 2.0
+
+
+def _read_machine_id(idfile) -> str:
+    try:
+        return idfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _publish_machine_id(idfile, value: str) -> bool:
+    """Publish ``value`` as the machine id **with its contents already in
+    place**: ``True`` if this call published it, ``False`` if another starter
+    already had.
+
+    The value is written + fsynced to a private temp file first, then linked
+    to the final name — ``os.link`` fails if the name exists, so creation stays
+    exclusive, and the name never exists without its complete value. (An
+    exclusive ``open(.., "x")`` + write, the previous scheme, made the NAME
+    exclusive but published an empty file first: a concurrent starter read it
+    empty and returned its own never-persisted id — HERMES-08.)
+    """
+    import secrets
+
+    tmp = idfile.with_name(f".{idfile.name}.{secrets.token_hex(8)}.tmp")
+    with open(tmp, "x", encoding="utf-8") as f:
+        f.write(value)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        try:
+            os.link(tmp, idfile)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            # The filesystem has no hard links (FAT, some network/FUSE mounts).
+            if os.name == "nt":
+                # Windows rename never replaces an existing target, so it is
+                # the same atomic create-with-contents.
+                try:
+                    os.rename(tmp, idfile)
+                    return True
+                except FileExistsError:
+                    return False
+            # POSIX without hard links has no no-replace rename in the stdlib:
+            # fall back to exclusive create + immediate write. The name can be
+            # briefly empty here; losers wait for the value instead of
+            # inventing their own (`_persistent_machine_id`).
+            try:
+                fd = os.open(idfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                return False
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(value)
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _persistent_machine_id() -> str:
     """A unique, persistent per-machine id — generated once and stored so it
     survives restarts. Returns ``""`` if it can't be read or written (the caller
-    then warns and falls back to the hostname)."""
+    then warns and falls back to the hostname).
+
+    Concurrent first starts agree on ONE id: whoever publishes first wins and
+    every other starter returns the published value — never a value of its own
+    that is not on disk (that would give one namespace two live machine
+    identities, while every later start uses only the persisted one)."""
     import secrets
+    import time
 
     idfile = _machine_id_path()
     if idfile is None:
         return ""
-    try:
-        existing = idfile.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing
-    except OSError:
-        pass
+    existing = _read_machine_id(idfile)
+    if existing:
+        return existing
     try:
         idfile.parent.mkdir(parents=True, exist_ok=True)
         value = secrets.token_hex(16)
-        # Exclusive create so two racing starts on one machine agree on ONE id
-        # (whoever creates first wins; the loser reads it) rather than deriving
-        # two different machine identities.
-        try:
-            with open(idfile, "x", encoding="utf-8") as f:
-                f.write(value)
+        if _publish_machine_id(idfile, value):
             return value
-        except FileExistsError:
-            return (idfile.read_text(encoding="utf-8").strip()) or value
     except OSError:
         return ""
+    # Lost the race: adopt the winner's value. It is normally already complete;
+    # wait briefly only for a writer that cannot publish atomically.
+    deadline = time.monotonic() + _MACHINE_ID_WAIT_SECONDS
+    while True:
+        committed = _read_machine_id(idfile)
+        if committed or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if not committed:
+        logger.warning(
+            "net plugin: machine id file %s exists but is empty; not inventing an "
+            "id that would not be persisted. Delete the file to regenerate it.",
+            idfile,
+        )
+    return committed
 
 
 def _machine_label() -> str:
