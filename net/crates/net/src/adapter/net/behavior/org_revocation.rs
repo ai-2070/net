@@ -110,7 +110,25 @@ pub struct OrgRevocationState {
     /// (plus the skew ceiling), when the grant could no longer verify
     /// anyway.
     revoked_grants: BTreeMap<RevokedGrantKey, u64>,
+    /// ORG-05: for a grant revocation already past its expiry, the wall
+    /// time at which this node FIRST observed that (see
+    /// [`Self::prune_expired_grants`]). An entry is dropped only once the
+    /// clock has run [`GRANT_REVOCATION_CLOCK_GRACE_SECS`] past its mark.
+    expired_seen: BTreeMap<RevokedGrantKey, u64>,
 }
+
+/// ORG-05: how long a grant revocation is kept after this node first saw
+/// it expire. A forward wall-clock step that crosses an entry's expiry only
+/// marks it; the entry still revokes, and survives a correction back into
+/// the grant's window, as long as the clock is corrected within this grace.
+/// It also bounds the extra retention an ordinary expiry costs: an entry
+/// outlives its grant by at most this long (plus the skew ceiling).
+pub const GRANT_REVOCATION_CLOCK_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Format version written once any grant revocation carries an ORG-05
+/// expiry mark. Older builds refuse it as unsupported (fail-closed), exactly
+/// as they refuse version 2.
+pub const ORG_REVOCATION_STATE_VERSION_WITH_EXPIRY_MARKS: u32 = 3;
 
 impl OrgRevocationState {
     /// The empty state (fresh adopt).
@@ -126,6 +144,7 @@ impl OrgRevocationState {
         Self {
             floors,
             revoked_grants: BTreeMap::new(),
+            expired_seen: BTreeMap::new(),
         }
     }
 
@@ -263,6 +282,9 @@ impl OrgRevocationState {
                 Some(not_after) if *not_after >= entry_not_after => {}
                 Some(not_after) => {
                     *not_after = entry_not_after;
+                    // A later horizon restarts the entry's life: an expiry
+                    // observed for the old horizon says nothing about the new.
+                    self.expired_seen.remove(&key);
                     changed += 1;
                 }
                 None => {
@@ -274,13 +296,49 @@ impl OrgRevocationState {
         changed + self.prune_expired_grants(now_secs)
     }
 
-    /// Drop grant revocations whose grants can no longer verify.
-    /// Returns how many were dropped.
+    /// Retire grant revocations whose grants can no longer verify, in two
+    /// steps (ORG-05). Returns how many entries changed (marked or dropped),
+    /// so a caller knows whether the state changed.
+    ///
+    /// The first prune that finds an entry expired only MARKS it with that
+    /// wall time; the entry keeps revoking and is dropped by a later prune at
+    /// least [`GRANT_REVOCATION_CLOCK_GRACE_SECS`] after the mark. A one-step
+    /// drop let a forward wall-clock step cross an entry's expiry, prune it,
+    /// persist the removal, and, once the clock was corrected back into the
+    /// grant's validity window, leave the signed grant valid again with no
+    /// revocation. The mark records WHEN this node first saw the entry
+    /// expire, so a clock corrected back below it cannot have dropped the
+    /// entry, and the grace bounds how long a stepped clock may run before
+    /// it is corrected. A stepped clock left uncorrected for longer than the
+    /// grace is the documented residual.
     pub fn prune_expired_grants(&mut self, now_secs: u64) -> usize {
-        let before = self.revoked_grants.len();
-        self.revoked_grants
-            .retain(|_, not_after| !revocation_entry_expired(*not_after, now_secs));
-        before - self.revoked_grants.len()
+        let mut changed = 0;
+        let mut dropped = Vec::new();
+        for (key, not_after) in &self.revoked_grants {
+            if !revocation_entry_expired(*not_after, now_secs) {
+                continue;
+            }
+            match self.expired_seen.get(key) {
+                None => {
+                    self.expired_seen.insert(*key, now_secs);
+                    changed += 1;
+                }
+                Some(seen) if now_secs > seen.saturating_add(GRANT_REVOCATION_CLOCK_GRACE_SECS) => {
+                    dropped.push(*key);
+                }
+                Some(_) => {}
+            }
+        }
+        for key in &dropped {
+            self.revoked_grants.remove(key);
+            self.expired_seen.remove(key);
+            changed += 1;
+        }
+        // A mark is meaningful only beside its entry.
+        let revoked_grants = &self.revoked_grants;
+        self.expired_seen
+            .retain(|key, _| revoked_grants.contains_key(key));
+        changed
     }
 
     /// The current floor for `(org, member)`. Absent keys floor at
@@ -354,20 +412,27 @@ impl OrgRevocationState {
         let revoked_grants: Vec<PersistedRevokedGrant> = self
             .revoked_grants
             .iter()
-            .map(|((org, kind, grant_id), not_after)| PersistedRevokedGrant {
-                org: *org,
-                kind: kind.as_str().to_string(),
-                grant_id: hex::encode(grant_id),
-                not_after: *not_after,
+            .map(|(key, not_after)| {
+                let (org, kind, grant_id) = key;
+                PersistedRevokedGrant {
+                    org: *org,
+                    kind: kind.as_str().to_string(),
+                    grant_id: hex::encode(grant_id),
+                    not_after: *not_after,
+                    expired_seen: self.expired_seen.get(key).copied(),
+                }
             })
             .collect();
         let file = PersistedStateFile {
             // Version 1 stays byte-identical for a state with no grant
-            // revocations (the field is skipped when empty).
+            // revocations (the field is skipped when empty), and version 2
+            // for one with no expiry marks.
             version: if revoked_grants.is_empty() {
                 ORG_REVOCATION_STATE_VERSION
-            } else {
+            } else if self.expired_seen.is_empty() {
                 ORG_REVOCATION_STATE_VERSION_WITH_GRANTS
+            } else {
+                ORG_REVOCATION_STATE_VERSION_WITH_EXPIRY_MARKS
             },
             floors: self
                 .floors
@@ -414,6 +479,7 @@ impl OrgRevocationState {
             })?;
         if file.version != ORG_REVOCATION_STATE_VERSION
             && file.version != ORG_REVOCATION_STATE_VERSION_WITH_GRANTS
+            && file.version != ORG_REVOCATION_STATE_VERSION_WITH_EXPIRY_MARKS
         {
             return Err(OrgRevocationError::UnsupportedVersion {
                 path: path.display().to_string(),
@@ -430,9 +496,16 @@ impl OrgRevocationState {
             path: path.display().to_string(),
             detail,
         };
-        let now_secs = current_timestamp();
         let mut revoked_grants = BTreeMap::new();
+        let mut expired_seen = BTreeMap::new();
         for entry in file.revoked_grants {
+            if entry.expired_seen.is_some()
+                && file.version != ORG_REVOCATION_STATE_VERSION_WITH_EXPIRY_MARKS
+            {
+                return Err(corrupt(
+                    "a grant expiry mark in a state file older than version 3".to_string(),
+                ));
+            }
             let kind = match entry.kind.as_str() {
                 "capability" => RevokedGrantKind::Capability,
                 "dispatcher" => RevokedGrantKind::Dispatcher,
@@ -442,17 +515,21 @@ impl OrgRevocationState {
                 .ok()
                 .and_then(|b| b.try_into().ok())
                 .ok_or_else(|| corrupt("revoked grant id is not 32 hex bytes".to_string()))?;
-            if revoked_grants
-                .insert((entry.org, kind, grant_id), entry.not_after)
-                .is_some()
-            {
+            let key = (entry.org, kind, grant_id);
+            if revoked_grants.insert(key, entry.not_after).is_some() {
                 return Err(corrupt("duplicate revoked grant entry".to_string()));
             }
+            if let Some(seen) = entry.expired_seen {
+                expired_seen.insert(key, seen);
+            }
         }
-        // An expired entry says nothing (its grant cannot verify), so it
-        // is dropped here exactly like a zero floor below; the next write
-        // persists the pruned set.
-        revoked_grants.retain(|_, not_after| !revocation_entry_expired(*not_after, now_secs));
+        // ORG-05: an expired entry is NOT dropped at load. It used to be,
+        // which let a forward clock step prune it here and the next write
+        // persist the removal. Entries are retired only by the two-step
+        // `prune_expired_grants` (marked on first sight, dropped once the
+        // clock has run the grace past the mark), which every apply runs
+        // under the state lock and persists. Until then a loaded expired
+        // entry names a grant that cannot verify, so keeping it is inert.
         let mut floors = BTreeMap::new();
         for entry in file.floors {
             // §20 — the §14 zero-floor rule is enforced HERE too, not just in
@@ -513,6 +590,7 @@ impl OrgRevocationState {
         Ok(Self {
             floors,
             revoked_grants,
+            expired_seen,
         })
     }
 }
@@ -550,6 +628,10 @@ struct PersistedRevokedGrant {
     grant_id: String,
     /// The revoked grant's `not_after` (unix seconds).
     not_after: u64,
+    /// ORG-05 (version 3 only): when this node first saw the entry
+    /// expired. Skipped when absent, so version 2 is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expired_seen: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2661,7 +2743,12 @@ impl OrgRevocationStore {
 
             // 4. Monotone merge against the reread disk state.
             let mut merged = disk.clone();
-            let changed_on_disk = merge(&mut merged);
+            // ORG-05: retire expired grant revocations in two steps (mark,
+            // then drop after the grace) on EVERY apply, and count either
+            // step as a change so the mark that protects against a clock
+            // rollback is durable before anything relies on it.
+            let pruned = merged.prune_expired_grants(current_timestamp()) > 0;
+            let changed_on_disk = merge(&mut merged) | pruned;
 
             // 5. Persist iff the disk state changed; the write must
             //    complete before anything is published.
@@ -4969,7 +5056,8 @@ mod tests {
     }
 
     /// An entry whose grant has expired is never stored, and one that
-    /// expires while stored is dropped at load: it can no longer matter.
+    /// expires while stored is retired at load: marked first, then dropped
+    /// once the ORG-05 grace has passed.
     #[test]
     fn expired_grant_revocations_are_not_kept() {
         let skew = crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
@@ -4984,9 +5072,86 @@ mod tests {
         state.merge_grant_revocations(&grant_revocation(1_000), 0);
         assert_eq!(state.revoked_grant_count(), 1);
         let bytes = state.to_file_bytes().expect("serialize");
-        let loaded =
-            OrgRevocationState::from_file_bytes(&bytes, Path::new("x")).expect("load drops it");
+        // ORG-05: load never drops; the first prune MARKS the expired entry,
+        // which keeps revoking until the clock has run the grace past it.
+        let mut loaded =
+            OrgRevocationState::from_file_bytes(&bytes, Path::new("x")).expect("load keeps it");
+        assert_eq!(loaded.revoked_grant_count(), 1);
+        let now = current_timestamp();
+        assert_eq!(loaded.prune_expired_grants(now), 1, "marked");
+        assert_eq!(loaded.revoked_grant_count(), 1);
+        assert_eq!(
+            loaded.prune_expired_grants(now + GRANT_REVOCATION_CLOCK_GRACE_SECS + 60),
+            1,
+            "dropped once the grace has passed"
+        );
         assert_eq!(loaded.revoked_grant_count(), 0);
+    }
+
+    /// ORG-05: a forward wall-clock step that crosses a revoked grant's
+    /// expiry must not resurrect the grant once the clock is corrected. The
+    /// step only marks the entry; the mark (and the entry) persist, so after
+    /// the correction back into the grant's window the grant is still
+    /// revoked. Retention stays bounded: a clock that keeps running past the
+    /// mark plus the grace drops it.
+    ///
+    /// Red: the previous one-step prune dropped the entry at the stepped
+    /// time, and the corrected clock saw the signed grant valid with no
+    /// revocation.
+    #[test]
+    fn a_forward_clock_step_does_not_resurrect_a_revoked_grant() {
+        let key = (org().org_id(), RevokedGrantKind::Capability, [0x3cu8; 32]);
+        let now = current_timestamp();
+        let mut state = OrgRevocationState::empty();
+        assert_eq!(
+            state.merge_grant_revocations(&grant_revocation(now + 3_600), now),
+            1
+        );
+
+        // The clock jumps a year ahead, past expiry + skew, and an apply runs.
+        let stepped = now + 365 * 24 * 60 * 60;
+        assert_eq!(
+            state.prune_expired_grants(stepped),
+            1,
+            "marked, so persisted"
+        );
+        assert!(
+            state.is_grant_revoked(&key.0, key.1, &key.2),
+            "the step marks the entry but must not drop it"
+        );
+
+        // The stepped state is what gets written; a restart under the
+        // CORRECTED clock (real time, inside the grant's window) reloads it.
+        let bytes = state.to_file_bytes().expect("serialize");
+        let on_disk: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            on_disk["version"],
+            ORG_REVOCATION_STATE_VERSION_WITH_EXPIRY_MARKS
+        );
+        let mut reloaded = OrgRevocationState::from_file_bytes(&bytes, Path::new("x"))
+            .expect("reload under the corrected clock");
+        assert!(
+            reloaded.is_grant_revoked(&key.0, key.1, &key.2),
+            "the corrected clock must still see the revocation"
+        );
+        assert_eq!(reloaded.prune_expired_grants(now + 60), 0);
+        assert!(reloaded.is_grant_revoked(&key.0, key.1, &key.2));
+
+        // Bounded: once the clock has truly run the grace past the mark, the
+        // entry goes (its grant expired long ago).
+        assert_eq!(
+            reloaded.prune_expired_grants(stepped + GRANT_REVOCATION_CLOCK_GRACE_SECS + 1),
+            1
+        );
+        assert_eq!(reloaded.revoked_grant_count(), 0);
+        assert_eq!(
+            reloaded.to_file_bytes().expect("serialize").as_slice(),
+            OrgRevocationState::empty()
+                .to_file_bytes()
+                .expect("serialize")
+                .as_slice(),
+            "no orphan mark survives its entry"
+        );
     }
 
     /// A version-1 file cannot carry grant revocations, and an unknown kind
