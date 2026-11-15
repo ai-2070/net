@@ -115,8 +115,9 @@ which is the projection property the store exists for.
 Everything below brings up the anchor half. It is correct as far as it
 goes, and by itself it is not enough — see (1).
 
-`--bind` (the node's own mesh address) defaults to `0.0.0.0:0` and is
-left out above; `--listen` defaults to `0.0.0.0:8443`. Everything
+`--bind` (the node's own native mesh address) defaults to `127.0.0.1:0`
+— loopback, because every browser credential carries the mesh PSK and
+a native session on it skips enrollment — and is left out above; `--listen` defaults to `0.0.0.0:8443`. Everything
 else on `serve` in that block is required: without `--psk-file`,
 `--url`, `--credential-issuer` or at least one `--allow-origin` the
 command refuses to start. On Windows `openssl` is usually not on

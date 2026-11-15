@@ -800,7 +800,20 @@ pub struct ServeArgs {
     /// Resolve listeners/TLS paths without reading PSK/TLS files or starting services.
     #[arg(long)]
     pub inspect_target: bool,
-    /// Mesh bind address for the node itself (default: 0.0.0.0:0).
+    /// Mesh bind address for the node itself — the NATIVE UDP socket
+    /// (default: 127.0.0.1:0, loopback only).
+    ///
+    /// Every browser credential this anchor issues carries the mesh
+    /// PSK, so the PSK is public to anyone a credential reaches. A
+    /// native UDP session authenticated by that PSK is admitted
+    /// without enrollment and without a game ("meets everyone"), so a
+    /// reachable native socket lets any credential holder skip the
+    /// browser admission path entirely (ANCHOR-01). The default
+    /// therefore keeps it on loopback: browsers never use it (they
+    /// arrive on the RTC socket, which keeps its public default), and
+    /// a co-located native host still can. Pass a reachable address
+    /// only for native peers you trust with the PSK, behind a firewall
+    /// that admits only them.
     #[arg(long, value_name = "ADDR")]
     pub bind: Option<String>,
 
@@ -1262,13 +1275,18 @@ fn default_acme_cache_dir() -> Result<PathBuf, CliError> {
         })
 }
 
+/// The default native mesh bind of `anchor serve` (ANCHOR-01): loopback.
+#[cfg(feature = "rtc-bootstrap")]
+const DEFAULT_NATIVE_BIND: &str = "127.0.0.1:0";
+
 #[cfg(feature = "rtc-bootstrap")]
 fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
     use net_sdk::rtc_bootstrap::{AcmeConfig, BootstrapTls};
+    // ANCHOR-01: the native socket defaults to loopback — see `--bind`.
     let bind: std::net::SocketAddr = args
         .bind
         .as_deref()
-        .unwrap_or("0.0.0.0:0")
+        .unwrap_or(DEFAULT_NATIVE_BIND)
         .parse()
         .map_err(|e| invalid_args(format!("--bind: {e}")))?;
     let listen = addrs_or_default("--listen", &args.listen, "0.0.0.0:8443")?;
@@ -1324,8 +1342,17 @@ fn resolve_serve(args: &ServeArgs) -> Result<ResolvedServe, CliError> {
     let mut rtc = rtc_config_from_args(args)?;
     // Resolve the documented RTC default once, rather than having inspection
     // invent an address separately from the config consumed by the builder.
+    // An explicit `--bind` keeps its IP for the RTC socket, as before; the
+    // loopback native default (ANCHOR-01) must not drag the browser-facing
+    // socket onto loopback with it, so that case keeps the public wildcard
+    // the RTC socket always had.
+    let rtc_ip = if args.bind.is_some() {
+        bind.ip()
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
     rtc.bind_addr
-        .get_or_insert_with(|| std::net::SocketAddr::new(bind.ip(), 0));
+        .get_or_insert_with(|| std::net::SocketAddr::new(rtc_ip, 0));
     if rtc.stun_public_addr.is_some() && rtc.stun_addr.is_none() {
         return Err(invalid_args(
             "--rtc-stun-public-addr requires --rtc-stun-bind",
@@ -1522,6 +1549,18 @@ async fn run_serve(
         }
     };
     let games = parse_games(&args.game)?;
+
+    // ANCHOR-01: a reachable native socket accepts the PSK every
+    // credential carries. Say so when the operator chose one.
+    if !resolved.bind.ip().is_loopback() {
+        eprintln!(
+            "warning: --bind {} exposes the native mesh socket. Every browser \
+             credential this anchor issues carries the mesh PSK, and a native \
+             session authenticated by it is admitted without enrollment and meets \
+             every game. Firewall it to native peers you trust with the PSK.",
+            resolved.bind
+        );
+    }
 
     let mesh = Mesh::builder(&resolved.bind.to_string(), &psk)
         .map_err(|e| generic(format!("mesh builder: {e}")))?
@@ -2226,6 +2265,32 @@ mod tests {
         if let Some(local) = dirs::data_local_dir() {
             assert_eq!(acme.cache_dir, local.join("net-mesh").join("acme"));
         }
+    }
+
+    /// ANCHOR-01: the native mesh socket — which the public browser
+    /// PSK authenticates without enrollment — defaults to loopback,
+    /// while the browser-facing RTC socket keeps its public default.
+    /// An explicit `--bind` is honoured, and still seeds the RTC IP.
+    #[test]
+    fn the_native_socket_defaults_to_loopback_and_rtc_stays_public() {
+        let defaulted = resolve_serve(&resolvable_serve_args(&[])).expect("resolves");
+        assert!(
+            defaulted.bind.ip().is_loopback(),
+            "the native socket must not be reachable by default: {}",
+            defaulted.bind
+        );
+        assert_eq!(
+            defaulted.rtc.bind_addr,
+            Some("0.0.0.0:0".parse().unwrap()),
+            "browsers still reach the RTC socket"
+        );
+        let explicit =
+            resolve_serve(&resolvable_serve_args(&["--bind", "0.0.0.0:7000"])).expect("resolves");
+        assert_eq!(explicit.bind, "0.0.0.0:7000".parse().unwrap());
+        assert_eq!(explicit.rtc.bind_addr, Some("0.0.0.0:0".parse().unwrap()));
+        let pinned =
+            resolve_serve(&resolvable_serve_args(&["--bind", "10.0.0.5:7000"])).expect("resolves");
+        assert_eq!(pinned.rtc.bind_addr, Some("10.0.0.5:0".parse().unwrap()));
     }
 
     #[test]
