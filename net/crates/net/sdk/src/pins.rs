@@ -17,7 +17,10 @@
 //!   half-written file, and every read-modify-write goes through
 //!   [`PinStore::mutate`] under a cross-process advisory lock, so a stale
 //!   snapshot can never clobber a concurrent change and resurrect a removed
-//!   consent decision. The file is owner-only (0600 on Unix).
+//!   consent decision. A raw [`PinStore::save`] is a compare-and-swap under
+//!   the same lock: it refuses ([`PinStoreError::Stale`]) once the file has
+//!   changed since its snapshot was read. The file is owner-only (0600 on
+//!   Unix).
 //!
 //! **The lock protocol is the contract** (bridge-SDK doctrine #1): this is the
 //! only implementation, ever — adapters and language bindings consume it from
@@ -107,6 +110,16 @@ pub enum PinStoreError {
         path: String,
         /// The stringified durability-barrier failure.
         reason: String,
+    },
+    /// [`PinStore::save`] refused to publish: the store file changed after
+    /// this snapshot was loaded (or last saved), so publishing it would
+    /// silently undo that change — e.g. resurrect an approval another
+    /// process just removed. Nothing was written. Reload and reapply, or
+    /// use [`PinStore::mutate`], which does both under the store lock.
+    #[error("pin store at {path} changed since this snapshot was loaded; reload it or use mutate")]
+    Stale {
+        /// The file path involved.
+        path: String,
     },
 }
 
@@ -263,6 +276,10 @@ pub struct PinStore {
     path: PathBuf,
     /// Keyed by `CapabilityId` display form for stable, provider-bound records.
     pins: BTreeMap<String, PinState>,
+    /// The exact file bytes this snapshot was loaded from (or last saved
+    /// as); `None` when the file did not exist. [`save`](Self::save)
+    /// publishes only while the file still holds exactly these bytes.
+    baseline: Option<Vec<u8>>,
 }
 
 // On-disk shape. A struct wrapper (not a bare map) leaves room for a future
@@ -293,11 +310,16 @@ impl PinStore {
                         reason: e.to_string(),
                     })?;
                 let pins = file.pins.into_iter().map(|p| (p.cap_id, p.state)).collect();
-                Ok(Self { path, pins })
+                Ok(Self {
+                    path,
+                    pins,
+                    baseline: Some(bytes),
+                })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 path,
                 pins: BTreeMap::new(),
+                baseline: None,
             }),
             Err(e) => Err(PinStoreError::Io {
                 path: path.display().to_string(),
@@ -310,13 +332,78 @@ impl PinStore {
     /// over the target (an atomic replace on both Unix and Windows), so a
     /// concurrent reader sees either the old or the new file, never a partial.
     ///
-    /// This publishes the whole snapshot as-is and takes **no** lock: it does
-    /// not merge with changes another process made since this snapshot was
-    /// loaded. Every read-modify-write must go through
-    /// [`mutate`](Self::mutate) instead.
-    pub async fn save(&self) -> Result<(), PinStoreError> {
+    /// This publishes the whole snapshot; it does not merge. It is therefore a
+    /// **compare-and-swap**: under the store's cross-process lock it re-reads
+    /// the file and publishes only if the file still holds exactly the bytes
+    /// this snapshot was loaded from (or last saved as). If anything changed
+    /// it — another process's [`mutate`](Self::mutate), the pin CLI — the save
+    /// is refused with [`PinStoreError::Stale`] and nothing is written, so a
+    /// stale snapshot can never undo a newer decision (resurrect a removed
+    /// approval). Prefer [`mutate`](Self::mutate) for read-modify-write: it
+    /// cannot go stale.
+    ///
+    /// After a successful save (or a [`NotDurable`](PinStoreError::NotDurable)
+    /// one, whose snapshot is already visible) this handle's baseline is the
+    /// snapshot just published, so saving the same handle again works. A save
+    /// whose future is dropped mid-commit still completes under the lock, but
+    /// the handle keeps its old baseline and its next save is refused as
+    /// stale — reload it.
+    pub async fn save(&mut self) -> Result<(), PinStoreError> {
+        let published = self.encode()?;
+        let guard = LockGuard::acquire(&self.path).await?;
         let store = self.clone();
-        spawn_commit(&self.path, move || store.save_blocking()).await
+        let result = spawn_commit(&self.path, move || {
+            let _guard = guard;
+            store.check_unchanged_blocking()?;
+            store.save_blocking()
+        })
+        .await;
+        if matches!(result, Ok(()) | Err(PinStoreError::NotDurable { .. })) {
+            self.baseline = Some(published);
+        }
+        result
+    }
+
+    /// Refuse with [`PinStoreError::Stale`] unless the store file still holds
+    /// exactly this snapshot's `baseline` bytes. Run with
+    /// the store lock held, so the answer stays true until the publish.
+    fn check_unchanged_blocking(&self) -> Result<(), PinStoreError> {
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(PinStoreError::Io {
+                    path: self.path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
+        };
+        if current == self.baseline {
+            Ok(())
+        } else {
+            Err(PinStoreError::Stale {
+                path: self.path.display().to_string(),
+            })
+        }
+    }
+
+    /// The on-disk encoding of this snapshot (deterministic: the pins are a
+    /// `BTreeMap`, so equal snapshots encode to equal bytes).
+    fn encode(&self) -> Result<Vec<u8>, PinStoreError> {
+        let file = PinFile {
+            pins: self
+                .pins
+                .iter()
+                .map(|(cap_id, state)| StoredPin {
+                    cap_id: cap_id.clone(),
+                    state: *state,
+                })
+                .collect(),
+        };
+        serde_json::to_vec_pretty(&file).map_err(|e| PinStoreError::Io {
+            path: self.path.display().to_string(),
+            reason: format!("serialize pin store: {e}"),
+        })
     }
 
     /// The synchronous body of [`save`](Self::save): staging write, fsync,
@@ -335,20 +422,7 @@ impl PinStore {
             }
         }
 
-        let file = PinFile {
-            pins: self
-                .pins
-                .iter()
-                .map(|(cap_id, state)| StoredPin {
-                    cap_id: cap_id.clone(),
-                    state: *state,
-                })
-                .collect(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| PinStoreError::Io {
-            path: self.path.display().to_string(),
-            reason: format!("serialize pin store: {e}"),
-        })?;
+        let bytes = self.encode()?;
 
         // An exclusively-created, per-save-unique staging file named after the
         // **full** store filename (`<file>.tmp.<pid>.<seq>`), owner-only (0600)
@@ -688,7 +762,7 @@ impl PinStore {
     }
 
     /// Begin watching for approved-set changes, discarding the initial
-    /// snapshot. Convenience over [`snapshot_and_watch`] when the caller has
+    /// snapshot. Convenience over [`snapshot_and_watch`](Self::snapshot_and_watch) when the caller has
     /// already read the current set.
     pub async fn watch(path: impl Into<PathBuf>) -> Result<PinWatcher, PinStoreError> {
         Ok(Self::snapshot_and_watch(path).await?.1)
@@ -877,6 +951,79 @@ mod tests {
                 (cap("b/a"), PinState::Approved),
                 (cap("b/z"), PinState::Pending),
             ],
+        );
+    }
+
+    /// The audit's seam: a raw `save` of a snapshot loaded before another
+    /// process removed an approval must not republish that approval. The
+    /// save is refused as stale and the removal stands.
+    ///
+    /// Red-witness: the previous `save` published the old snapshot
+    /// unconditionally, so `b/x` came back approved.
+    #[tokio::test]
+    async fn a_stale_snapshot_save_cannot_resurrect_a_removed_approval() {
+        let (_dir, path) = store_path();
+        let x = cap("b/x");
+        let y = cap("b/y");
+        PinStore::mutate(&path, |s| s.approve(&x)).await.unwrap();
+
+        let mut stale = PinStore::load(&path).await.unwrap();
+        assert!(stale.is_approved(&x));
+        // Another process removes the approval.
+        PinStore::mutate(&path, |s| s.remove(&x)).await.unwrap();
+        // The stale holder adds an unrelated pin and saves its whole snapshot.
+        stale.request(&y);
+        let err = stale.save().await.unwrap_err();
+        assert!(
+            matches!(err, PinStoreError::Stale { .. }),
+            "expected Stale, got {err:?}"
+        );
+
+        let now = PinStore::load(&path).await.unwrap();
+        assert!(!now.is_approved(&x), "the removed approval was resurrected");
+        assert_eq!(now.state(&y), None, "a refused save wrote nothing");
+    }
+
+    /// A snapshot loaded while the store did not exist goes stale once
+    /// anyone creates it.
+    #[tokio::test]
+    async fn a_save_from_an_absent_store_is_stale_once_the_store_exists() {
+        let (_dir, path) = store_path();
+        let mut early = PinStore::load(&path).await.unwrap();
+        PinStore::mutate(&path, |s| s.approve(&cap("b/x")))
+            .await
+            .unwrap();
+        early.approve(&cap("b/y"));
+        assert!(matches!(
+            early.save().await,
+            Err(PinStoreError::Stale { .. })
+        ));
+        let now = PinStore::load(&path).await.unwrap();
+        assert_eq!(now.approved(), vec![cap("b/x")]);
+    }
+
+    /// The compare-and-swap does not get in the way of a sole writer: a
+    /// handle saves repeatedly (its baseline follows its own publishes),
+    /// and a store left unchanged by others saves fine.
+    #[tokio::test]
+    async fn an_unchanged_store_saves_and_the_handle_can_save_again() {
+        let (_dir, path) = store_path();
+        let mut store = PinStore::load(&path).await.unwrap();
+        store.approve(&cap("b/a"));
+        store.save().await.unwrap();
+        store.approve(&cap("b/b"));
+        store
+            .save()
+            .await
+            .expect("the handle's own publish is its baseline");
+
+        // A reader-only load does not disturb anyone's baseline.
+        let _reader = PinStore::load(&path).await.unwrap();
+        store.remove(&cap("b/a"));
+        store.save().await.unwrap();
+        assert_eq!(
+            PinStore::load(&path).await.unwrap().approved(),
+            vec![cap("b/b")]
         );
     }
 
