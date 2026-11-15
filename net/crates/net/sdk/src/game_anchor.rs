@@ -231,6 +231,14 @@ struct Game {
     /// for longer than [`OpenGames::idle_after`] has no invite left
     /// that could enroll, and may be reclaimed.
     last_issued: AtomicU64,
+    /// The issuance gate, and whether this incarnation has been reclaimed
+    /// (ANCHOR-06). An open-game issuance holds it from its check through
+    /// advancing `last_issued`; reclamation takes it to re-judge idleness
+    /// and mark the game reclaimed before removing it. So either the
+    /// issuance lands first and reclamation sees the fresh `last_issued`
+    /// and keeps the game, or reclamation lands first and the issuance sees
+    /// `true` and does not issue from the removed incarnation.
+    reclaimed: Mutex<bool>,
 }
 
 impl Game {
@@ -277,6 +285,10 @@ impl Game {
 
 /// Bindings past which expired entries are swept on the next insert.
 const PRUNE_AT: usize = 4096;
+
+/// Lookups an open-game issuance makes before giving up when every game it
+/// found had been reclaimed before it could issue (ANCHOR-06).
+const OPEN_ISSUE_ATTEMPTS: usize = 4;
 
 /// **Open games**: admit any game, from any page, without registering
 /// it first ([`GameRegistry::with_open_games`]).
@@ -599,33 +611,65 @@ impl GameRegistry {
     /// Drop the open games idle past [`OpenGames::idle_after`]. Only a
     /// game with no invite left that could enroll goes.
     fn reclaim_idle(&self, now: u64) {
+        let gone = self.idle_candidates(now);
+        if !gone.is_empty() && self.reclaim(&gone, now) {
+            self.write_state();
+        }
+    }
+
+    /// The keys of the open games idle at `now`, sampled under the read
+    /// lock. Candidates only: any of them may issue before
+    /// [`Self::reclaim`] takes the write lock.
+    fn idle_candidates(&self, now: u64) -> Vec<String> {
         let Some(open) = self.open.as_ref() else {
-            return;
+            return Vec::new();
         };
         let idle = open.config.idle_after.as_secs();
-        let gone: Vec<String> = self
-            .games
+        self.games
             .read()
             .iter()
-            .filter(|(_, g)| {
-                g.origin.is_some()
-                    && g.last_issued.load(Ordering::Relaxed).saturating_add(idle) < now
-            })
+            .filter(|(_, g)| g.origin.is_some() && g.is_idle(idle, now))
             .map(|(key, _)| key.clone())
-            .collect();
-        if gone.is_empty() {
-            return;
-        }
-        {
-            let mut games = self.games.write();
-            let mut by_root = self.by_root.write();
-            for key in &gone {
-                if let Some(game) = games.remove(key) {
-                    by_root.remove(game.root.entity_id().as_bytes());
-                }
+            .collect()
+    }
+
+    /// Remove those of `candidates` that are STILL idle at `now`; whether
+    /// any went.
+    ///
+    /// ANCHOR-06: the candidates were sampled without the write lock, so a
+    /// candidate may have issued a credential since (advancing its
+    /// `last_issued`), or been reclaimed and re-created as a new
+    /// incarnation. Each is re-judged here, under the write lock and its
+    /// own issuance gate, and marked reclaimed before it is removed — so a
+    /// game that just issued a credential is kept, and a request already
+    /// holding the removed incarnation cannot issue from it afterwards.
+    fn reclaim(&self, candidates: &[String], now: u64) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return false;
+        };
+        let idle = open.config.idle_after.as_secs();
+        let mut games = self.games.write();
+        let mut by_root = self.by_root.write();
+        let mut any = false;
+        for key in candidates {
+            let Some(game) = games.get(key).cloned() else {
+                continue;
+            };
+            if game.origin.is_none() {
+                continue;
             }
+            {
+                let mut reclaimed = game.reclaimed.lock();
+                if *reclaimed || !game.is_idle(idle, now) {
+                    continue;
+                }
+                *reclaimed = true;
+            }
+            games.remove(key);
+            by_root.remove(game.root.entity_id().as_bytes());
+            any = true;
         }
-        self.write_state();
+        any
     }
 
     /// Append one open game to the state file.
@@ -876,7 +920,34 @@ impl GameRegistry {
         anchor: &AnchorCredentialParams,
         now: u64,
     ) -> Result<BrowserBootstrapCredential, GameAnchorError> {
-        let entry = self.open_game(origin, game, now)?;
+        // ANCHOR-06: the game looked up may be reclaimed before it issues.
+        // Issuance from a reclaimed incarnation is refused under its gate,
+        // and the next lookup re-creates the game (same derived root). The
+        // bound only matters if reclamation keeps winning, which needs an
+        // `idle_after` shorter than the time between lookup and issuance.
+        for _ in 0..OPEN_ISSUE_ATTEMPTS {
+            let entry = self.open_game(origin, game, now)?;
+            if let Some(credential) = self.issue_open_from(&entry, game, issuer, anchor, now)? {
+                return Ok(credential);
+            }
+        }
+        Err(GameAnchorError::OpenGamesFull)
+    }
+
+    /// Issue from the open game `entry` under its issuance gate, or `None`
+    /// when that incarnation has already been reclaimed (ANCHOR-06).
+    fn issue_open_from(
+        &self,
+        entry: &Game,
+        game: &str,
+        issuer: &Identity,
+        anchor: &AnchorCredentialParams,
+        now: u64,
+    ) -> Result<Option<BrowserBootstrapCredential>, GameAnchorError> {
+        let reclaimed = entry.reclaimed.lock();
+        if *reclaimed {
+            return Ok(None);
+        }
         if let Some(open) = self.open.as_ref() {
             let minute = now / 60;
             let mut window = open.window.lock();
@@ -893,7 +964,11 @@ impl GameRegistry {
             entry.admit_issuance(now)?;
             window.1 += 1;
         }
-        Ok(self.issue_for(&entry, issuer, anchor, now))
+        // Still under the gate: `last_issued` advances before any
+        // reclamation can re-judge this game.
+        let credential = self.issue_for(entry, issuer, anchor, now);
+        drop(reclaimed);
+        Ok(Some(credential))
     }
 
     fn issue_for(
@@ -1112,7 +1187,16 @@ impl Game {
             window: Mutex::new((0, 0)),
             bound: Mutex::new(HashMap::new()),
             last_issued: AtomicU64::new(now),
+            reclaimed: Mutex::new(false),
         }
+    }
+
+    /// Idle past `idle` seconds since its last issuance, at `now`.
+    fn is_idle(&self, idle: u64, now: u64) -> bool {
+        self.last_issued
+            .load(Ordering::Relaxed)
+            .saturating_add(idle)
+            < now
     }
 }
 
@@ -1655,6 +1739,75 @@ mod tests {
             NOW + 5402
         )));
         assert_eq!(games.open_stats().unwrap().games, 1);
+    }
+
+    /// ANCHOR-06, first schedule: a full-registry request samples a game
+    /// idle, then — before it takes the write lock — another request issues
+    /// a credential from that game. Reclamation must re-judge the game under
+    /// the write lock and keep it; pre-fix it removed every sampled key, and
+    /// the fresh, unexpired credential was refused as UNKNOWN_INVITE. The
+    /// interleaving is driven step by step through the two halves of
+    /// `reclaim_idle` rather than raced.
+    #[test]
+    fn reclamation_keeps_a_game_that_issued_after_it_was_sampled_idle() {
+        let mut open = OpenGames::new(None);
+        open.idle_after = Duration::from_secs(3600);
+        let games = open_registry(open);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW)
+            .unwrap();
+        let later = NOW + 3601;
+        let candidates = games.idle_candidates(later);
+        assert_eq!(candidates, vec![open_key(SITE_A, "one")], "sampled idle");
+        let fresh = games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), later)
+            .unwrap();
+        assert!(
+            !games.reclaim(&candidates, later),
+            "re-judged under the write lock: no longer idle"
+        );
+        assert!(games.open_root_of(SITE_A, "one").is_some());
+        assert!(admitted(&games.handle_join_request_at(
+            &join(&fresh.invite),
+            DEFAULT_GRANT_TTL,
+            later + 1
+        )));
+    }
+
+    /// ANCHOR-06, second schedule: a request already holds a game's `Arc`
+    /// when reclamation removes it. Issuance from that removed incarnation
+    /// is refused under its gate (pre-fix it minted a credential no lookup
+    /// could resolve), and the public path re-creates the game and issues a
+    /// credential that enrolls.
+    #[test]
+    fn a_reclaimed_incarnation_issues_nothing_and_the_next_lookup_recreates_it() {
+        let mut open = OpenGames::new(None);
+        open.idle_after = Duration::from_secs(3600);
+        let games = open_registry(open);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW)
+            .unwrap();
+        let later = NOW + 3601;
+        let held = games.open_game(SITE_A, "one", later).unwrap();
+        assert!(games.reclaim(&games.idle_candidates(later), later));
+        assert_eq!(games.open_root_of(SITE_A, "one"), None, "reclaimed");
+        assert!(
+            games
+                .issue_open_from(&held, "one", &issuer, &params(), later)
+                .unwrap()
+                .is_none(),
+            "the removed incarnation issues nothing"
+        );
+        let credential = games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), later)
+            .unwrap();
+        assert!(admitted(&games.handle_join_request_at(
+            &join(&credential.invite),
+            DEFAULT_GRANT_TTL,
+            later + 1
+        )));
     }
 
     /// Inventing names does not multiply the budget: every open game
