@@ -52,7 +52,8 @@ Then join your mesh via environment (see `node.py` for the full list):
 |---|---|
 | `NET_MESH_PSK` | 64-hex pre-shared key of your mesh (required to join a real mesh; unset ⇒ isolated dev node — tools still load, search is empty). |
 | `NET_MESH_PEERS` | JSON `[{"addr","pubkey","node_id"}]` of the machines running `net wrap`. |
-| `NET_MESH_IDENTITY_SEED` | 32-byte hex seed for a stable node identity. |
+| `NET_MESH_IDENTITY_SEED` | 32-byte hex seed of your user **root**. It signs this machine's delegation chain; the node itself runs as a stable per-machine identity derived from it, so every machine under one root is a distinct mesh node. |
+| `NET_MESH_NODE_SEED` | Optional 32-byte hex seed the node runs as instead of the derived one. Must be unique per machine. |
 | `NET_MESH_PIN_STORE` | Pin-store path; defaults to the machine-shared file `net mcp pin` uses. |
 
 A capability is invocable only once its pin is **approved** — from anywhere on

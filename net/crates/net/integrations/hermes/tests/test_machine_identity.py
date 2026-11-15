@@ -102,3 +102,126 @@ def test_concurrent_first_starts_agree_on_one_machine_id(plugin, monkeypatch, tm
             t.join()
         committed = (d / "machine-id").read_text(encoding="utf-8")
         assert out == [committed] * n, (round_, set(out), committed)
+
+
+# ---------------------------------------------------------------------------
+# HERMES-02 — the operator root seed is authority, not a transport identity:
+# machines under one root must run as distinct, stable mesh nodes.
+# ---------------------------------------------------------------------------
+
+_ROOT_SEED = bytes(range(32))
+
+
+class _FakeMesh:
+    built: list = []
+
+    def __init__(self, bind_addr, psk, **kwargs):
+        self.kwargs = kwargs
+        _FakeMesh.built.append(self)
+
+    def connect(self, *_a):
+        pass
+
+    def start(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+class _FakeGateway:
+    def __init__(self, mesh, **kwargs):
+        self.mesh = mesh
+        self.kwargs = kwargs
+
+
+@pytest.fixture()
+def stub_native(plugin, monkeypatch, tmp_path):
+    """Stand-in ``net`` / ``net_sdk`` modules for ``node._build``. The stub
+    ``net`` has no delegation surface, so the node takes its documented
+    un-delegated path unless a test substitutes ``GatewayDelegation``."""
+    import sys
+    import types
+
+    net = types.ModuleType("net")
+    net.NetMesh = _FakeMesh
+    sdk = types.ModuleType("net_sdk")
+    sdk.AsyncCapabilityGateway = _FakeGateway
+    sdk.default_pin_store_path = lambda: str(tmp_path / "pins.json")
+    monkeypatch.setitem(sys.modules, "net", net)
+    monkeypatch.setitem(sys.modules, "net_sdk", sdk)
+    for k in ("NET_MESH_PSK", "NET_MESH_PEERS", "NET_MESH_DEVICE_ENROLLMENT", "NET_MESH_NODE_SEED"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("NET_MESH_PIN_STORE", str(tmp_path / "pins.json"))
+    monkeypatch.setenv("NET_MESH_IDENTITY_SEED", _ROOT_SEED.hex())
+    _FakeMesh.built = []
+    return _FakeMesh
+
+
+def _transport_seed_for(plugin, monkeypatch, machine_id):
+    monkeypatch.setenv("NET_MESH_MACHINE_ID", machine_id)
+    mesh = plugin.node._build()[0]
+    return mesh.kwargs.get("identity_seed")
+
+
+def test_machines_under_one_root_get_distinct_transport_identities(
+    plugin, stub_native, monkeypatch
+):
+    a = _transport_seed_for(plugin, monkeypatch, "machine-a")
+    b = _transport_seed_for(plugin, monkeypatch, "machine-b")
+    assert a is not None and b is not None, "a rooted node keeps a stable seeded identity"
+    assert a != b, "two machines under one root must not share a node identity"
+    # The root (signing authority for delegation / enrollment) is never the
+    # node's transport key.
+    assert _ROOT_SEED not in (a, b)
+    assert len(a) == len(b) == 32
+
+
+def test_transport_identity_is_stable_per_machine(plugin, stub_native, monkeypatch):
+    first = _transport_seed_for(plugin, monkeypatch, "machine-a")
+    again = _transport_seed_for(plugin, monkeypatch, "machine-a")
+    assert first == again, "a restart must keep the node's identity"
+
+
+def test_transport_identity_and_delegation_share_one_machine_label(
+    plugin, stub_native, monkeypatch
+):
+    # The node identity and the gateway delegation must describe the SAME
+    # machine — one label read, not two that could disagree.
+    labels = []
+
+    class _FakeDelegation:
+        def __init__(self, seed, *, machine_label=None, **_kw):
+            labels.append(machine_label)
+            self._machine_label = machine_label
+            self.gateway_identity = object()
+            self.gateway_id = b"\x01" * 32
+
+        def chain_bytes(self):
+            return b"chain"
+
+    monkeypatch.setattr(plugin.delegation, "GatewayDelegation", _FakeDelegation)
+    seed = _transport_seed_for(plugin, monkeypatch, "machine-a")
+    assert labels == ["machine-a"]
+    assert seed == plugin.delegation.transport_identity_seed(_ROOT_SEED, "machine-a")
+
+
+def test_explicit_node_seed_overrides_the_derived_identity(plugin, stub_native, monkeypatch):
+    explicit = bytes([7]) * 32
+    monkeypatch.setenv("NET_MESH_NODE_SEED", explicit.hex())
+    assert _transport_seed_for(plugin, monkeypatch, "machine-a") == explicit
+
+
+def test_wrong_length_root_seed_is_a_clear_error(plugin, stub_native, monkeypatch):
+    # The transport seed is derived (always 32 bytes), so the root seed's own
+    # length must be checked explicitly — NetMesh no longer sees it.
+    monkeypatch.setenv("NET_MESH_IDENTITY_SEED", "ab" * 31)
+    with pytest.raises(RuntimeError, match="NET_MESH_IDENTITY_SEED"):
+        plugin.node._build()
+    assert stub_native.built == []
+
+
+def test_unseeded_node_stays_ephemeral(plugin, stub_native, monkeypatch):
+    monkeypatch.delenv("NET_MESH_IDENTITY_SEED", raising=False)
+    mesh = plugin.node._build()[0]
+    assert mesh.kwargs.get("identity_seed") is None

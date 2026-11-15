@@ -209,6 +209,41 @@ def _machine_label() -> str:
     return host
 
 
+#: Domain separation for :func:`transport_identity_seed` — keyed BLAKE2b, a
+#: different function and context than the SDK's blake3 child-seed KDF, so a
+#: node's transport key never coincides with its machine / gateway delegation
+#: keys derived from the same root.
+_TRANSPORT_SEED_PERSON = b"net-hermes-node"
+_TRANSPORT_SEED_CONTEXT = b"net-mesh hermes transport identity v1\x00"
+
+
+def transport_identity_seed(root_seed: bytes, machine_label: str) -> bytes:
+    """The 32-byte seed this machine's embedded mesh node runs as, derived from
+    the operator ``root_seed`` and the per-machine ``machine_label``.
+
+    The root is signing *authority* (delegation, device enrollment), not a
+    transport identity: a node built from the root seed itself has the root's
+    entity id and therefore its node id, so every machine under one root would
+    be the SAME mesh node — discovery and routing key providers by node id and
+    could not tell them apart (HERMES-02). Deriving per machine keeps each
+    node distinct, and stable across restarts as long as its label is (the
+    persistent machine id, or ``NET_MESH_MACHINE_ID``).
+
+    Keyed BLAKE2b is a PRF, so the result reveals nothing about the root. The
+    derived seed is held in Python only as long as the root seed already is
+    (both are passed to ``NetMesh`` as bytes), and it carries strictly less
+    authority: it can run this one node, not sign delegations.
+    """
+    import hashlib
+
+    if len(root_seed) != 32:
+        raise ValueError(f"root seed must be 32 bytes, got {len(root_seed)}")
+    h = hashlib.blake2b(key=root_seed, digest_size=32, person=_TRANSPORT_SEED_PERSON)
+    h.update(_TRANSPORT_SEED_CONTEXT)
+    h.update(machine_label.encode("utf-8"))
+    return h.digest()
+
+
 def _revocation_store_path() -> Optional[str]:
     """The machine-shared delegation-revocation store path — the same file a
     ``net wrap --owner-root`` provider honors and ``net identity revoke`` writes.
