@@ -204,6 +204,30 @@ impl OrgRevocationState {
             .count()
     }
 
+    /// ORG-01: `true` iff `candidate` retains every grant revocation this
+    /// state still enforces at `now_secs`, each for at least as long (its
+    /// retained `not_after` is no earlier than ours).
+    ///
+    /// The replacement-dominance companion of the per-`(org, member)` floor
+    /// comparison: a candidate store with equal or higher floors but without
+    /// an unexpired grant revocation would re-enable the withdrawn grant the
+    /// moment it was installed, and one holding it with an earlier horizon
+    /// would re-enable it sooner. Entries already expired at `now_secs` name
+    /// grants that can no longer verify and are not required.
+    pub fn grant_revocations_retained_by(
+        &self,
+        candidate: &OrgRevocationState,
+        now_secs: u64,
+    ) -> bool {
+        self.revoked_grants.iter().all(|(key, not_after)| {
+            revocation_entry_expired(*not_after, now_secs)
+                || candidate
+                    .revoked_grants
+                    .get(key)
+                    .is_some_and(|retained| *retained >= *not_after)
+        })
+    }
+
     /// Iterate grant revocations in canonical order, each with the
     /// revoked grant's `not_after`.
     pub fn iter_revoked_grants(&self) -> impl Iterator<Item = (&RevokedGrantKey, &u64)> {
@@ -608,6 +632,16 @@ pub enum OrgRevocationError {
         /// The candidate store's state-file path.
         path: String,
     },
+    /// ORG-01: a running node refused to swap its installed revocation
+    /// store for one that lacks (or retains for a shorter time) a grant
+    /// revocation the installed store still enforces. Installing it would
+    /// re-enable a capability or dispatcher grant its issuer withdrew.
+    /// Apply the missing grant-revocation bundle to the candidate through
+    /// [`OrgRevocationStore::apply_grant_revocations`] first.
+    GrantRevocationsNotRetained {
+        /// The candidate store's state-file path.
+        path: String,
+    },
     /// R2-4: this backing path is already bound, for the lifetime of a
     /// live core, to a DIFFERENT `.lock` sidecar identity than the one
     /// just opened — the sidecar was recreated or replaced underneath a
@@ -659,6 +693,13 @@ impl std::fmt::Display for OrgRevocationError {
                 "refusing to replace the installed revocation store with {path}: its \
                  live view is lower on at least one (org, member) floor — an installed \
                  floor never lowers; apply a bundle instead"
+            ),
+            Self::GrantRevocationsNotRetained { path } => write!(
+                f,
+                "refusing to replace the installed revocation store with {path}: it \
+                 does not retain every unexpired grant revocation the installed store \
+                 enforces — installing it would re-enable a withdrawn grant; apply the \
+                 grant-revocation bundle to it first"
             ),
             Self::BackingIdentityConflict { path } => write!(
                 f,

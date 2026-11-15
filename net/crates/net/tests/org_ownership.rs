@@ -324,6 +324,99 @@ async fn store_replacement_never_lowers_the_live_view() {
     );
 }
 
+/// ORG-01: replacement dominance covers GRANT revocations, not only floors.
+/// A candidate store with equal floors (here: none at all — an older backup)
+/// that lacks an unexpired capability-grant revocation must not replace the
+/// installed one, or the withdrawn grant becomes usable again with no new
+/// root signature. A candidate holding the revocation for a shorter horizon
+/// is refused too; one that holds it at least as long is accepted.
+#[tokio::test]
+async fn store_replacement_never_drops_a_grant_revocation() {
+    use net::adapter::net::behavior::org_grant_revocation::{
+        OrgGrantRevocationBundle, RevokedGrant, RevokedGrantKind,
+    };
+    use net::adapter::net::behavior::org_revocation::OrgRevocationError;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let revoked = |not_after: u64| RevokedGrant {
+        kind: RevokedGrantKind::Capability,
+        grant_id: [0x5Cu8; 32],
+        not_after,
+    };
+    let bundle = |not_after: u64| {
+        OrgGrantRevocationBundle::try_issue(&org(), [revoked(not_after)]).expect("issue bundle")
+    };
+    let open = |tag: &str| {
+        Arc::new(
+            OrgRevocationStore::init(
+                scratch_dir(tag).join("revocation-state.json"),
+                ProvisioningExpectation::MayBeFresh,
+            )
+            .expect("init store"),
+        )
+    };
+
+    let node = build_node().await;
+    let installed = open("grant-rev-installed");
+    installed
+        .apply_grant_revocations(&bundle(now + 3_600))
+        .expect("revoke the grant");
+    node.install_org_revocation_store(installed.clone())
+        .expect("install");
+
+    // An older backup: no floors to compare, and no grant revocation.
+    let backup = open("grant-rev-backup");
+    let err = node
+        .install_org_revocation_store(backup)
+        .expect_err("a store lacking the grant revocation must not replace the installed one");
+    assert!(
+        matches!(err, OrgRevocationError::GrantRevocationsNotRetained { .. }),
+        "expected GrantRevocationsNotRetained, got {err:?}"
+    );
+
+    // The same revocation retained for a SHORTER time would re-enable the
+    // grant sooner — refused as well.
+    let shorter = open("grant-rev-shorter");
+    shorter
+        .apply_grant_revocations(&bundle(now + 60))
+        .expect("revoke with an earlier horizon");
+    assert!(
+        matches!(
+            node.install_org_revocation_store(shorter),
+            Err(OrgRevocationError::GrantRevocationsNotRetained { .. })
+        ),
+        "a shorter retention horizon must be refused"
+    );
+
+    assert!(
+        Arc::ptr_eq(
+            &node.org_revocation_store().expect("still installed"),
+            &installed
+        ),
+        "every refused candidate leaves the installed store live"
+    );
+    assert!(node
+        .org_revocation_store()
+        .expect("installed")
+        .snapshot()
+        .is_grant_revoked(&org().org_id(), RevokedGrantKind::Capability, &[0x5Cu8; 32]));
+
+    // Positive control: a candidate that retains the revocation is accepted.
+    let dominating = open("grant-rev-dominating");
+    dominating
+        .apply_grant_revocations(&bundle(now + 3_600))
+        .expect("revoke on the candidate");
+    node.install_org_revocation_store(dominating.clone())
+        .expect("a dominating candidate installs");
+    assert!(Arc::ptr_eq(
+        &node.org_revocation_store().expect("installed"),
+        &dominating
+    ));
+}
+
 /// Review-9 red 1: installing a store whose floors ALREADY rose
 /// must reconcile existing projections — no floor-change event
 /// fires after installation, so the install itself performs the

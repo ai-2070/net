@@ -22031,6 +22031,23 @@ impl MeshNode {
                     },
                 );
             }
+            // ORG-01: floors are only one dimension of the installed view.
+            // A candidate with equal or higher floors that lacks an
+            // unexpired capability/dispatcher grant revocation — an older
+            // backup, another node's store — would re-enable the withdrawn
+            // grant the instant it publishes, with no new root signature.
+            // Both views are frozen by the pin above, so this comparison and
+            // the swap below see the same entries.
+            if !current_view.grant_revocations_retained_by(
+                &candidate_view,
+                super::behavior::org::current_timestamp(),
+            ) {
+                return Err(
+                    super::behavior::org_revocation::OrgRevocationError::GrantRevocationsNotRetained {
+                        path: store.path().display().to_string(),
+                    },
+                );
+            }
         }
         if let Some(pause) = pause_before_swap {
             pause();
