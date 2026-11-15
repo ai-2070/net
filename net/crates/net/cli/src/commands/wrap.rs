@@ -225,6 +225,32 @@ pub async fn run(
         return view.emit(output);
     }
 
+    // A delegation gate must start from its revocation floors. Load the
+    // configured store once, up front — before any mesh or child exists — and
+    // refuse to start when it is unreadable or corrupt: a fresh gate's empty
+    // registry would otherwise admit a chain the store revokes (CONSENT-03).
+    // An absent store is an empty one (the first-run contract of
+    // `RevocationStore::load`) and starts normally. Later reload failures
+    // keep last-known floors inside the gate, which also refuses delegated
+    // invokes until its own first load succeeds.
+    let revocation_store = match &args.owner_root {
+        Some(_) => args
+            .revocation_store
+            .clone()
+            .or_else(net_sdk::revocation::default_revocation_store_path),
+        None => None,
+    };
+    if let Some(p) = &revocation_store {
+        net_sdk::revocation::RevocationStore::load(p).map_err(|e| {
+            generic(format!(
+                "net-mesh wrap: refusing to start the delegation gate: its revocation \
+                 store could not be loaded ({e}). Without it, already-revoked delegation \
+                 chains would be admitted. Repair the store, or point --revocation-store \
+                 at the intended one."
+            ))
+        })?;
+    }
+
     // Operator identity — owner-only keys on this node's origin. An enrolled
     // device (`--joined`) runs as its enrolled identity instead.
     let identity = match &args.joined {
@@ -333,10 +359,7 @@ pub async fn run(
         // Honor a machine-shared revocation store so an operator can revoke a
         // gateway's access without restarting this provider. Falls back to the
         // per-user default path when the flag is omitted.
-        let rev_path = args
-            .revocation_store
-            .clone()
-            .or_else(net_sdk::revocation::default_revocation_store_path);
+        let rev_path = revocation_store.clone();
         if let Some(p) = &rev_path {
             gate = gate.with_revocation_store(p.clone());
         }

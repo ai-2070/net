@@ -158,3 +158,63 @@ fn listener_requires_valid_psk_and_refuses_ambiguous_targets_before_execution() 
         assert!(!error.contains(&psk));
     }
 }
+
+/// CONSENT-03: a delegation gate never starts against a revocation store it
+/// cannot load. A fresh gate's registry is empty, so starting anyway would
+/// admit chains the (unreadable / corrupt) store revokes. An ABSENT store is
+/// an empty one and does not trip the check (the run then stops later, at
+/// the missing operator identity — still before the child starts).
+#[test]
+fn delegation_gate_refuses_to_start_on_an_unloadable_revocation_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let psk = "42".repeat(32);
+    config(&path, &format!("[default]\npsk_hex = '{psk}'\n"));
+    let child = marker_child(dir.path());
+    let marker = dir.path().join("child-started.marker");
+    let owner_root = "11".repeat(32);
+
+    let corrupt = dir.path().join("revocations.json");
+    std::fs::write(&corrupt, b"{ not json").unwrap();
+    let corrupt_arg = corrupt.to_string_lossy().into_owned();
+    let result = run(
+        &path,
+        &[
+            "--owner-root",
+            &owner_root,
+            "--revocation-store",
+            &corrupt_arg,
+        ],
+        &child,
+        &marker,
+    );
+    assert!(!result.status.success());
+    assert!(!marker.exists(), "the wrapped child started");
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("refusing to start the delegation gate"),
+        "{error}"
+    );
+
+    let absent = dir.path().join("never-written.json");
+    let absent_arg = absent.to_string_lossy().into_owned();
+    let result = run(
+        &path,
+        &[
+            "--owner-root",
+            &owner_root,
+            "--revocation-store",
+            &absent_arg,
+        ],
+        &child,
+        &marker,
+    );
+    assert!(!result.status.success());
+    assert!(!marker.exists(), "the wrapped child started");
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !error.contains("refusing to start the delegation gate"),
+        "an absent store is an empty store, not a load failure: {error}"
+    );
+    assert!(error.contains("operator identity"), "{error}");
+}
