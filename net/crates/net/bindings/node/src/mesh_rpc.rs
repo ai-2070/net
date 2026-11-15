@@ -391,6 +391,25 @@ fn js_app_error(error: &napi::Error) -> Option<(u16, String)> {
     parse_js_app_error(&error.reason)
 }
 
+/// Map a handler that threw before returning its Promise.
+///
+/// A handler that validates its input before doing any async work
+/// throws synchronously, and that is the most likely place for a typed
+/// refusal (`appError(code, body)`) to come from. The Promise-rejection
+/// paths always classified the marker; the synchronous paths of the
+/// three streaming bridges did not, so the same `appError` thrown one
+/// line earlier reached the caller as `Internal` (NCALL-02). Every
+/// bridge's synchronous branch now goes through here.
+fn synchronous_throw(handler: &str, error: &napi::Error) -> RpcHandlerError {
+    match js_app_error(error) {
+        Some((code, body)) => RpcHandlerError::Application {
+            code,
+            message: body,
+        },
+        None => RpcHandlerError::Internal(format!("{handler} threw synchronously: {error}")),
+    }
+}
+
 type RpcHandlerTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, napi::Status, false>;
 
 struct NodeRpcHandler {
@@ -441,24 +460,7 @@ impl RpcHandler for NodeRpcHandler {
         let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
-            Ok(Ok(Err(e))) => {
-                // A handler that validates its input before doing any
-                // async work throws synchronously, and that is the
-                // most likely place for a typed refusal to come from.
-                // This arm never parsed the marker, so the one shape
-                // the contract most expects — reject early, with a
-                // status — was the one shape guaranteed to arrive as
-                // `Internal`.
-                if let Some((code, body)) = js_app_error(&e) {
-                    return Err(RpcHandlerError::Application {
-                        code,
-                        message: body,
-                    });
-                }
-                return Err(RpcHandlerError::Internal(format!(
-                    "JS handler threw synchronously: {e}"
-                )));
-            }
+            Ok(Ok(Err(e))) => return Err(synchronous_throw("JS handler", &e)),
             Ok(Err(_)) => {
                 return Err(RpcHandlerError::Internal(
                     "JS callback channel disconnected before handler responded".into(),
@@ -1798,11 +1800,7 @@ impl RpcStreamingHandler for NodeStreamingRpcHandler {
         let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
-            Ok(Ok(Err(e))) => {
-                return Err(RpcHandlerError::Internal(format!(
-                    "JS streaming handler threw synchronously: {e}"
-                )))
-            }
+            Ok(Ok(Err(e))) => return Err(synchronous_throw("JS streaming handler", &e)),
             Ok(Err(_)) => {
                 return Err(RpcHandlerError::Internal(
                     "JS streaming callback channel disconnected".into(),
@@ -1896,11 +1894,7 @@ impl RpcClientStreamingHandler for NodeClientStreamingRpcHandler {
         let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
-            Ok(Ok(Err(e))) => {
-                return Err(RpcHandlerError::Internal(format!(
-                    "JS client-streaming handler threw synchronously: {e}"
-                )))
-            }
+            Ok(Ok(Err(e))) => return Err(synchronous_throw("JS client-streaming handler", &e)),
             Ok(Err(_)) => {
                 return Err(RpcHandlerError::Internal(
                     "JS client-streaming callback channel disconnected".into(),
@@ -2008,11 +2002,7 @@ impl RpcDuplexHandler for NodeDuplexRpcHandler {
         let deadline = crate::common::deadline_after(self.timeout);
         let promise = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(p))) => p,
-            Ok(Ok(Err(e))) => {
-                return Err(RpcHandlerError::Internal(format!(
-                    "JS duplex handler threw synchronously: {e}"
-                )))
-            }
+            Ok(Ok(Err(e))) => return Err(synchronous_throw("JS duplex handler", &e)),
             Ok(Err(_)) => {
                 return Err(RpcHandlerError::Internal(
                     "JS duplex callback channel disconnected".into(),

@@ -23,6 +23,8 @@
 
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { appError } from '../mesh_rpc'
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
 const { NetMesh, MeshRpc } = binding
@@ -477,6 +479,64 @@ describe('forced drop releases handler handles on every public serve bridge', ()
 // SDK audit 2026-10-11: `handlerTimeoutMs` bounded only the TSFN dispatch,
 // and an `async` handler returns its Promise at once — so a handler whose
 // promise never settled held its task and in-flight slot forever.
+// NCALL-02: a raw handler that throws `appError` BEFORE returning its
+// Promise (synchronous validation) must surface the same Application
+// status as one that rejects. Only unary classified the synchronous
+// throw; the three streaming bridges sent it to the caller as Internal
+// (0x0006), discarding the status the raw API documents.
+describe('a synchronous appError throw keeps its status on every serve shape', () => {
+  const rejected = /status=0x8002/
+
+  // Deliberately NOT `async`: an async function never throws
+  // synchronously, it rejects, and that path was already classified.
+  const refuse = (): never => {
+    throw appError(0x8002, 'rejected')
+  }
+
+  it('unary', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.sync.unary', refuse)
+    await expect(
+      clientRpc.call(server.nodeId(), 'live.sync.unary', Buffer.from('x')),
+    ).rejects.toThrow(rejected)
+    handle.close()
+  }, 30_000)
+
+  it('server streaming', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serveStreaming('live.sync.streaming', refuse)
+    const stream = await clientRpc.callStreaming(
+      server.nodeId(),
+      'live.sync.streaming',
+      Buffer.from('x'),
+    )
+    await expect(stream.next()).rejects.toThrow(rejected)
+    stream.close()
+    handle.close()
+  }, 30_000)
+
+  it('client streaming', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serveClientStream('live.sync.clientstream', refuse)
+    const call = await clientRpc.callClientStream(
+      server.nodeId(),
+      'live.sync.clientstream',
+    )
+    await expect(call.finish()).rejects.toThrow(rejected)
+    handle.close()
+  }, 30_000)
+
+  it('duplex', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serveDuplex('live.sync.duplex', refuse)
+    const call = await clientRpc.callDuplex(server.nodeId(), 'live.sync.duplex')
+    await call.finishSending()
+    await expect(call.next()).rejects.toThrow(rejected)
+    await call.close()
+    handle.close()
+  }, 30_000)
+})
+
 describe('unary handler timeout bounds the promise, not just the dispatch', () => {
   it('cuts off a never-settling async handler at handlerTimeoutMs', async () => {
     const { server, serverRpc, clientRpc } = await pair()
