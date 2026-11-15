@@ -3713,6 +3713,23 @@ impl BlobAdapter for MeshBlobAdapter {
                     // the partial-Small range returns without a
                     // memcpy. Pre-fix this allocated `bytes[..].to_vec()`
                     // for every range read.
+                    //
+                    // BLOB-10: the check above binds the range to the
+                    // ADVERTISED `size`, which a decoded Small ref does
+                    // not bind to the content (fetch verifies the hash
+                    // only). An inflated `size` over a short chunk would
+                    // otherwise reach an out-of-bounds `Bytes::slice`
+                    // and panic. Check the ACTUAL length and surface the
+                    // same typed `ShortChunk` the Manifest arm uses.
+                    Ok(bytes) if range.end > bytes.len() as u64 => (
+                        Err(BlobError::ShortChunk {
+                            hash: *hash,
+                            requested_start: range.start,
+                            requested_end: range.end,
+                            actual_len: bytes.len() as u64,
+                        }),
+                        Vec::new(),
+                    ),
                     Ok(bytes) => (
                         Ok(bytes.slice(range.start as usize..range.end as usize)),
                         vec![*hash],
@@ -4903,6 +4920,45 @@ mod tests {
 
         let fetched = adapter.fetch_range(&blob, 6..11).await.unwrap();
         assert_eq!(fetched.as_ref(), b"world");
+    }
+
+    /// BLOB-10: a Small ref whose advertised `size` is inflated past
+    /// the real content (the hash still names an existing short
+    /// chunk) must answer a range inside the advertised size but past
+    /// the actual bytes with a typed `ShortChunk`, not panic in
+    /// `Bytes::slice`.
+    #[tokio::test]
+    async fn fetch_range_small_with_inflated_size_returns_short_chunk() {
+        let adapter = make_adapter();
+        let payload = b"hello world, mesh blob adapter".to_vec();
+        let honest = small_ref_for(&payload);
+        adapter.store(&honest, &payload).await.unwrap();
+
+        let hash = *honest.small_hash().unwrap();
+        let inflated = BlobRef::small("mesh://inflated", hash, 4096);
+        let actual = payload.len() as u64;
+        let err = adapter
+            .fetch_range(&inflated, 10..actual + 10)
+            .await
+            .expect_err("range past the actual chunk length must be rejected");
+        match err {
+            BlobError::ShortChunk {
+                hash: h,
+                requested_start,
+                requested_end,
+                actual_len,
+            } => {
+                assert_eq!(h, hash);
+                assert_eq!(requested_start, 10);
+                assert_eq!(requested_end, actual + 10);
+                assert_eq!(actual_len, actual);
+            }
+            other => panic!("expected ShortChunk, got {other:?}"),
+        }
+
+        // A range that fits inside the real bytes still succeeds.
+        let ok = adapter.fetch_range(&inflated, 6..11).await.unwrap();
+        assert_eq!(ok.as_ref(), b"world");
     }
 
     /// Pin dataforts perf #184: `fetch_range` on a `BlobRef::Small`
