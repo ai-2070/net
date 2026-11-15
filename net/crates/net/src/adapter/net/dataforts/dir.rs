@@ -843,14 +843,25 @@ async fn reconstruct_tree(
             links.push((target.clone(), safe));
         }
     }
-    stats.symlinks = tokio::task::spawn_blocking(move || {
-        links
-            .into_iter()
-            .filter(|(target, safe)| make_symlink(target, safe).is_ok())
-            .count()
+    // BLOB-09: a link whose path is already taken aliases another entry
+    // on this filesystem (case or Unicode form; exact duplicates were
+    // refused up front). That is a refused manifest, not a tolerated
+    // platform limitation — silently dropping it loses an entry.
+    stats.symlinks = tokio::task::spawn_blocking(move || -> Result<usize, DirError> {
+        let mut n = 0;
+        for (target, safe) in links {
+            match make_symlink(&target, &safe) {
+                Ok(()) => n += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(aliased_entry_error(&safe, e));
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(n)
     })
     .await
-    .map_err(|e| DirError::Io(std::io::Error::other(e)))?;
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
 
     Ok(stats)
 }
@@ -1289,9 +1300,22 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DirError> {
 /// Since umask can only clear bits, requesting the final mode here means
 /// the file is never *broader* than it is meant to end up, at any point
 /// in its life.
+///
+/// BLOB-09 (case-insensitive filesystems): the file is created
+/// **exclusively** (`create_new`). Reconstruction writes into a fresh,
+/// private, empty temp tree and creates each manifest entry exactly
+/// once, so a file already present at the path can only be another
+/// entry whose name aliases this one on the destination filesystem —
+/// `A` and `a` on a case-insensitive volume (Windows, macOS), or two
+/// Unicode forms on a normalization-insensitive one. Truncating it, as
+/// this used to, silently dropped that entry's content; the fetch now
+/// fails with [`DirError::Manifest`] instead. Exact-name duplicates are
+/// rejected earlier by `check_unique_entry_paths`, and a case-sensitive
+/// filesystem never trips this, so legitimate `README`/`readme` trees
+/// still fetch there.
 fn create_file_with_final_mode(path: &Path, mode: u32) -> Result<std::fs::File, DirError> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1307,7 +1331,21 @@ fn create_file_with_final_mode(path: &Path, mode: u32) -> Result<std::fs::File, 
     }
     #[cfg(not(unix))]
     ignore_mode_on_this_platform(mode);
-    Ok(opts.open(path)?)
+    opts.open(path).map_err(|e| aliased_entry_error(path, e))
+}
+
+/// Map an `AlreadyExists` from creating a reconstructed entry to the
+/// BLOB-09 collision error (see [`create_file_with_final_mode`]); any
+/// other I/O error passes through unchanged.
+fn aliased_entry_error(path: &Path, e: std::io::Error) -> DirError {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        DirError::Manifest(format!(
+            "entry {:?} collides with another entry on this filesystem (names that differ only in case or Unicode form)",
+            path.file_name().unwrap_or(path.as_os_str())
+        ))
+    } else {
+        DirError::Io(e)
+    }
 }
 
 /// Create a directory that no other local user can traverse.
@@ -1627,14 +1665,14 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path).expect("read"), b"hello");
 
-        // Truncating re-create: a retried fetch must not append to a
-        // partial file from the previous attempt.
-        {
-            use std::io::Write as _;
-            let mut f = create_file_with_final_mode(&path, 0o600).expect("recreate");
-            f.write_all(b"hi").expect("write");
-        }
-        assert_eq!(std::fs::read(&path).expect("read"), b"hi");
+        // BLOB-09: creation is exclusive. Each entry is created once in
+        // a fresh temp tree, so an existing file can only be an aliasing
+        // entry — refused, and the first file is left intact.
+        assert!(matches!(
+            create_file_with_final_mode(&path, 0o600),
+            Err(DirError::Manifest(_))
+        ));
+        assert_eq!(std::fs::read(&path).expect("read"), b"hello");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

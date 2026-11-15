@@ -752,6 +752,83 @@ async fn fetch_dir_rejects_a_manifest_with_duplicate_paths() {
     );
 }
 
+/// Whether `dir`'s filesystem treats names that differ only in case as
+/// one name (Windows / macOS defaults), probed rather than assumed.
+fn case_insensitive(dir: &std::path::Path) -> bool {
+    let probe = dir.join("CaseProbe");
+    std::fs::write(&probe, b"x").unwrap();
+    let folded = dir.join("caseprobe").exists();
+    std::fs::remove_file(&probe).unwrap();
+    folded
+}
+
+/// BLOB-09 residual: `Readme.txt` and `README.txt` are distinct exact
+/// paths, so the duplicate-path check passes them — but on a
+/// case-insensitive filesystem they are one file, and the second fetch
+/// worker used to truncate the first's content away while the fetch
+/// "succeeded". Creation is now exclusive: on such a filesystem the
+/// fetch fails with a typed manifest error (no dest, no temp orphan);
+/// on a case-sensitive one the same tree is legitimate and both files
+/// land with their own content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_dir_refuses_names_that_alias_on_the_destination_filesystem() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    let files: [(&str, &[u8]); 2] = [
+        ("Readme.txt", b"first content"),
+        ("README.txt", b"second, longer content"),
+    ];
+    let mut entries = Vec::new();
+    for (path, content) in files {
+        let hash: [u8; 32] = blake3::hash(content).into();
+        let blob = chunk_payload(content)
+            .unwrap()
+            .into_blob_ref(format!("mesh://{}", hex32(&hash)), Encoding::Replicated)
+            .unwrap();
+        adapter_a.store(&blob, content).await.unwrap();
+        entries.push(DirEntry {
+            path: path.into(),
+            kind: EntryKind::File {
+                mode: 0o644,
+                blob: blob.encode(),
+            },
+        });
+    }
+    let manifest = DirManifest {
+        version: DIR_MANIFEST_VERSION,
+        entries,
+    };
+    let m = store_manifest(&adapter_a, &manifest).await;
+
+    let parent = TempDir::new("parent");
+    let dest = parent.path().join("cased");
+    let result = fetch_dir(&node_b, a_id, &m, &dest, 0).await;
+    if case_insensitive(parent.path()) {
+        let err = result.expect_err("aliasing names must fail the fetch, not drop a file");
+        assert!(
+            matches!(err, DirError::Manifest(_)),
+            "expected a typed manifest error, got {err:?}"
+        );
+        assert!(!dest.exists(), "dest must not exist after the rejection");
+        assert!(
+            temp_orphans(parent.path(), "cased").is_empty(),
+            "no temp orphan after the rejection"
+        );
+    } else {
+        result.expect("distinct-case names are a legitimate tree here");
+        for (path, content) in files {
+            assert_eq!(std::fs::read(dest.join(path)).unwrap(), content);
+        }
+    }
+}
+
 /// Two concurrent fetches into sibling destinations don't collide on
 /// their temp paths and each reconstructs its own tree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
