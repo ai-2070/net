@@ -2252,17 +2252,19 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     node.install_org_revocation_store(store.clone())
         .expect("install");
     // Rewritten 2026-09-22 (named, plan §2.3), extended 2026-10-17 for
-    // grant revocation: installation registers exactly THREE subscribers —
-    // the node's own raise callback, the protected-call registry's second
-    // `subscribe_floors_raised` feed, and the registry's
-    // `subscribe_grants_revoked` feed. The teardown property below is
-    // unchanged and guards strictly more: ALL of them must be gone after
-    // the drop.
+    // grant revocation, and again for ORG-02: installation registers
+    // exactly FOUR subscribers — the node's own raise callback, the node's
+    // own grant-revocation callback (scoped-discovery retraction), the
+    // protected-call registry's second `subscribe_floors_raised` feed, and
+    // the registry's `subscribe_grants_revoked` feed. The teardown property
+    // below is unchanged and guards strictly more: ALL of them must be gone
+    // after the drop.
     assert_eq!(
         store.subscriber_count(),
-        3,
-        "installation registers exactly three subscribers: the node's own \
-         raise callback and the protected-call registry's floor and grant feeds"
+        4,
+        "installation registers exactly four subscribers: the node's own \
+         raise and grant callbacks and the protected-call registry's floor \
+         and grant feeds"
     );
 
     // Drop the node (the test holds the only strong Arc, and an
@@ -2354,9 +2356,9 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
     // over every snapshotted callback, not just one.
     assert_eq!(
         store.subscriber_count(),
-        3,
-        "§2.3: the node's callback plus the protected-call registry's floor \
-         and grant feeds"
+        4,
+        "§2.3 + ORG-02: the node's raise and grant callbacks plus the \
+         protected-call registry's floor and grant feeds"
     );
 
     // Project ownership under the installed store (cert generation 4).

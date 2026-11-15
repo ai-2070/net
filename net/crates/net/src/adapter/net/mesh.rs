@@ -5848,6 +5848,18 @@ impl LocalServiceRegistry {
     }
 }
 
+/// The capability grant a granted-audience envelope was sealed under (ORG-02):
+/// its issuer (this provider's owner org) and its grant id — the key the
+/// grant-revocation denylist is looked up by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Only `granted_envelopes` (cortex) builds one; without cortex the send-path
+// filter still compiles against the always-empty `scoped_grants`.
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+struct ScopedEnvelopeGrant {
+    issuer_org: super::behavior::org::OrgId,
+    grant_id: [u8; 32],
+}
+
 /// One coherent publication of this node's local capability emission (Kyra OA3
 /// torn-snapshot invariant): the plaintext `public` announcement and the
 /// encrypted owner-scoped announcement bytes in `scoped` are stored and read as a
@@ -5890,6 +5902,14 @@ struct LocalCapabilityEmission {
     /// allocation.
     provider_grant_snapshot:
         Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+    /// ORG-02: parallel to `scoped` — for each envelope, the capability grant
+    /// that sealed it (`None` for the owner envelope). A capability-grant
+    /// revocation swaps no registry pointer, so `provider_grant_snapshot`
+    /// cannot see it; the send path consults the live revocation view and
+    /// drops the envelope of every grant revoked since this emission was
+    /// built, so a former grantee stops receiving new private-discovery
+    /// updates the moment the provider applies the revocation.
+    scoped_grants: Vec<Option<ScopedEnvelopeGrant>>,
     /// The local-service-registry PRIVATIZATION generation this emission's
     /// public/scoped projection was derived from. The send path rejects the
     /// emission if it has advanced — a concurrent visibility change made a
@@ -13095,6 +13115,10 @@ pub struct MeshNode {
     /// every node subscribed (the registry replaced the old
     /// single-slot callback).
     org_raise_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
+    /// ORG-02: the node's slot in the INSTALLED store's grant-revocation
+    /// subscriber registry, replaced with `org_raise_subscription` on every
+    /// store installation and dropped with it on teardown.
+    org_grant_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
     /// Review-11 P1: bumped ONLY by
     /// [`Self::set_owner_cert_emission`]. Store/authority
     /// (re)installations and floor raises are captured DIRECTLY by
@@ -15285,6 +15309,7 @@ impl MeshNode {
             org_install_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
+            org_grant_subscription: Arc::new(parking_lot::Mutex::new(None)),
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
@@ -22146,6 +22171,41 @@ impl MeshNode {
                 );
             }
         });
+        // ORG-02: a capability-grant revocation retracts the grant's scoped-
+        // discovery records at query time, exactly as a floor raise retracts a
+        // revoked member's — so it must dirty those capabilities and wake
+        // consumers too, through the same node-global gated commit, behind the
+        // same store-identity gate.
+        let grant_subscription = {
+            let slot = self.org_revocation.clone();
+            let me = Arc::downgrade(&store);
+            let scoped_discovery = self.scoped_discovery.clone();
+            let scoped_publication = self.scoped_publication.clone();
+            let routing_authority = self.routing_authority.clone();
+            let routing_registry = self.routing_registry.clone();
+            store.subscribe_grants_revoked(move |revoked| {
+                let installed = slot.load_full();
+                let still_installed = match (&installed, me.upgrade()) {
+                    (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
+                    _ => false,
+                };
+                if !still_installed {
+                    return;
+                }
+                // The revocation changes what the routing source may serve,
+                // whether or not it retracts a scoped row — same ordering as
+                // the floor callback above.
+                move_routing_authority(&routing_authority, &routing_registry, || {});
+                let retracted = scoped_publication
+                    .gated_commit(&scoped_discovery, |s| s.note_grants_revoked(revoked));
+                if retracted > 0 {
+                    tracing::info!(
+                        retracted,
+                        "grant revocation retracted scoped-discovery record(s)"
+                    );
+                }
+            })
+        };
         // Swap the node's observer slot: drop the guard held on the
         // outgoing store FIRST so a detached store neither keeps nor
         // steals this node's notifications (review-9 addendum). The old
@@ -22155,6 +22215,11 @@ impl MeshNode {
             let mut slot = self.org_raise_subscription.lock();
             slot.take();
             *slot = Some(subscription);
+        }
+        {
+            let mut slot = self.org_grant_subscription.lock();
+            slot.take();
+            *slot = Some(grant_subscription);
         }
         // OLB-2B-E3c: the swap and the routing-authority bump are ONE ordered
         // unit under the authority gate. Publishing the store first and bumping
@@ -22223,6 +22288,21 @@ impl MeshNode {
             tracing::info!(
                 retracted,
                 "store installation retracted scoped-discovery record(s)"
+            );
+        }
+        // ORG-02: the same install-time gap for grant revocations — a store
+        // installed after it learned a revocation fires no grant callback.
+        let revoked: Vec<super::behavior::org_revocation::RevokedGrantKey> = snapshot
+            .iter_revoked_grants()
+            .map(|(key, _)| *key)
+            .collect();
+        let retracted = self
+            .scoped_publication
+            .gated_commit(&self.scoped_discovery, |s| s.note_grants_revoked(&revoked));
+        if retracted > 0 {
+            tracing::info!(
+                retracted,
+                "store installation retracted grant-revoked scoped-discovery record(s)"
             );
         }
         // A visible store publication occurred (None→store or A→B).
@@ -23499,9 +23579,19 @@ impl MeshNode {
         generation: u64,
         now_secs: u64,
         ttl: Duration,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<(Vec<u8>, ScopedEnvelopeGrant)> {
         use super::behavior::org_grant::CapabilityAuthorityId;
+        use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+
+        // ORG-02: the grant-revocation view this emission is decided under. A
+        // revoked grant is inactive for emission; a revocation landing after
+        // this read is caught by the send path, which drops the envelope of
+        // any grant revoked since (see `scoped_unrevoked`).
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
 
         // Precompute each granted service's capability id ONCE (blake3 per tag),
         // then match records against it — O(services + services*records) rather
@@ -23531,6 +23621,7 @@ impl MeshNode {
                 &authority.owner_org(),
                 now_secs,
                 authority.config.verification_skew_secs,
+                floors,
             ) {
                 continue;
             }
@@ -23565,7 +23656,13 @@ impl MeshNode {
                 expires_at,
                 &descriptor,
             ) {
-                Ok(envelope) => envelopes.push(envelope.to_bytes()),
+                Ok(envelope) => envelopes.push((
+                    envelope.to_bytes(),
+                    ScopedEnvelopeGrant {
+                        issuer_org: grant.issuer_org,
+                        grant_id: grant.grant_id,
+                    },
+                )),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -23660,6 +23757,41 @@ impl MeshNode {
     /// floor publish, and no emission toggle occurred.
     fn security_stamp(&self) -> SendStamp {
         self.security_snapshot().stamp
+    }
+
+    /// ORG-02: the cached emission's scoped envelopes minus every granted
+    /// envelope whose capability grant the installed store now revokes.
+    ///
+    /// A grant revocation changes no registry pointer and no public cert, so
+    /// neither the provider-snapshot comparison nor the cert rebuild notices
+    /// it; without this the cached ciphertext sealed for the former grantee
+    /// kept shipping on every send until the grant expired. Owner envelopes
+    /// and grants still in force pass through unchanged — each envelope is
+    /// independently decryptable, so dropping one never tears another.
+    fn scoped_unrevoked(&self, cached: &LocalCapabilityEmission) -> Vec<Vec<u8>> {
+        debug_assert_eq!(cached.scoped.len(), cached.scoped_grants.len());
+        if cached.scoped_grants.iter().all(Option::is_none) {
+            return cached.scoped.clone();
+        }
+        let Some(store) = self.org_revocation.load_full() else {
+            return cached.scoped.clone();
+        };
+        let floors = store.snapshot();
+        cached
+            .scoped
+            .iter()
+            .zip(cached.scoped_grants.iter())
+            .filter(|(_, grant)| {
+                grant.is_none_or(|g| {
+                    !floors.is_grant_revoked(
+                        &g.issuer_org,
+                        super::behavior::org_grant_revocation::RevokedGrantKind::Capability,
+                        &g.grant_id,
+                    )
+                })
+            })
+            .map(|(envelope, _)| envelope.clone())
+            .collect()
     }
 
     /// Capture the [`SendStamp`] AND retain the exact authority/store
@@ -23770,6 +23902,11 @@ impl MeshNode {
             let desired = self.owner_cert_for_emission_at(now_secs);
             if desired == cached.public.owner_cert {
                 let bytes = cached.public.to_bytes();
+                // ORG-02: drop the envelope of every grant revoked since this
+                // emission was built. Read BEFORE the stability recheck below, so
+                // a revocation publishing after this read moves the stamp and the
+                // attempt retries against the new view.
+                let scoped = self.scoped_unrevoked(&cached);
                 if let Some(probe) = probe {
                     probe();
                 }
@@ -23830,7 +23967,7 @@ impl MeshNode {
                     // envelope embedding a stale cert cannot ship.
                     return Some(SendEmission {
                         public: bytes,
-                        scoped: cached.scoped.clone(),
+                        scoped,
                         exposure_generation: cached.exposure_revocation_generation,
                     });
                 }
@@ -24877,6 +25014,7 @@ impl MeshNode {
             .store(Some(Arc::new(LocalCapabilityEmission {
                 public: ann,
                 scoped: Vec::new(),
+                scoped_grants: Vec::new(),
                 // Scoped cleared ⇒ no sealing authority to track (Kyra B2).
                 scoped_authority: None,
                 // Scoped cleared ⇒ no sealing provider snapshot to track either
@@ -46655,11 +46793,17 @@ impl MeshNode {
             // stored in `local_announcement` or sent. When no private service is
             // registered it is identical to the broadcast form.
             #[cfg(feature = "cortex")]
-            let (self_ann, scoped_envelopes, scoped_authority, provider_grant_snapshot) = {
+            let (
+                self_ann,
+                scoped_envelopes,
+                scoped_grants,
+                scoped_authority,
+                provider_grant_snapshot,
+            ) = {
                 let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
                 let granted = self.rpc_local_services.granted_snapshot();
                 if owner_scoped.is_empty() && granted.is_empty() {
-                    (broadcast_ann.clone(), Vec::new(), None, None)
+                    (broadcast_ann.clone(), Vec::new(), Vec::new(), None, None)
                 } else {
                     let mut self_caps = caps;
                     for svc in owner_scoped.iter().chain(granted.iter()) {
@@ -46695,6 +46839,9 @@ impl MeshNode {
                     // sealed under (owner audience / provider grant snapshot) so the
                     // send path refuses if that Arc is later replaced.
                     let mut scoped_envelopes: Vec<Vec<u8>> = Vec::new();
+                    // ORG-02: parallel to `scoped_envelopes` — the grant that
+                    // sealed each one (`None` for the owner envelope).
+                    let mut scoped_grants: Vec<Option<ScopedEnvelopeGrant>> = Vec::new();
                     let mut scoped_authority = None;
                     let mut provider_grant_snapshot = None;
                     if let (Some(authority), Some(cert)) =
@@ -46713,6 +46860,7 @@ impl MeshNode {
                                 ttl,
                             );
                             if !owner_env.is_empty() {
+                                scoped_grants.extend(owner_env.iter().map(|_| None));
                                 scoped_envelopes.extend(owner_env);
                                 scoped_authority = Some(Arc::clone(authority));
                             }
@@ -46727,7 +46875,10 @@ impl MeshNode {
                                 authority, cert, &snapshot, &granted, version, now_secs, ttl,
                             );
                             if !granted_env.is_empty() {
-                                scoped_envelopes.extend(granted_env);
+                                for (envelope, grant) in granted_env {
+                                    scoped_envelopes.push(envelope);
+                                    scoped_grants.push(Some(grant));
+                                }
                                 provider_grant_snapshot = Some(snapshot);
                             }
                         }
@@ -46735,6 +46886,7 @@ impl MeshNode {
                     (
                         a,
                         scoped_envelopes,
+                        scoped_grants,
                         scoped_authority,
                         provider_grant_snapshot,
                     )
@@ -46743,11 +46895,13 @@ impl MeshNode {
             #[cfg(not(feature = "cortex"))]
             let self_ann = broadcast_ann.clone();
             #[cfg(not(feature = "cortex"))]
-            let (scoped_envelopes, scoped_authority, provider_grant_snapshot): (
+            #[allow(clippy::type_complexity)]
+            let (scoped_envelopes, scoped_grants, scoped_authority, provider_grant_snapshot): (
                 Vec<Vec<u8>>,
+                Vec<Option<ScopedEnvelopeGrant>>,
                 Option<Arc<super::behavior::org_authority::NodeAuthority>>,
                 Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
-            ) = (Vec::new(), None, None);
+            ) = (Vec::new(), Vec::new(), None, None);
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
@@ -46828,6 +46982,7 @@ impl MeshNode {
                 .store(Some(Arc::new(LocalCapabilityEmission {
                     public: broadcast_ann,
                     scoped: scoped_envelopes,
+                    scoped_grants,
                     scoped_authority,
                     provider_grant_snapshot,
                     exposure_revocation_generation,
@@ -53683,6 +53838,7 @@ impl Drop for MeshNode {
         // `Weak<StoreCore>`. So a late callback neither starts nor is left
         // mid-retraction against a fold the node no longer owns.
         drop(self.org_raise_subscription.lock().take());
+        drop(self.org_grant_subscription.lock().take());
     }
 }
 
@@ -60073,6 +60229,72 @@ mod oa34b2_query_currentness_tests {
         assert!(
             c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
             "the revoked provider stops resolving",
+        );
+        assert!(
+            c.private_discovery_generation() > before,
+            "the retraction advanced the private-discovery generation",
+        );
+        assert!(
+            changes.has_changed().expect("watch alive"),
+            "and published the change wake",
+        );
+    }
+
+    /// ORG-02 end-to-end (consumer side): a capability-grant revocation by the
+    /// grant's ISSUER, applied through the installed store, retracts the stored
+    /// granted record at query time AND dirties its capability — exactly as a
+    /// floor raise does. Without the currentness check the former grantee kept
+    /// resolving the provider until the grant expired; without the
+    /// subscription the retraction moved the visible set with no wake.
+    #[tokio::test]
+    async fn a_grant_revocation_retracts_scoped_discovery_and_wakes_consumers() {
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+        let p = EntityKeypair::from_bytes([0xB2u8; 32]);
+        let p_entity = p.entity_id().clone();
+        let n = current_timestamp();
+        let exp = n + 600;
+
+        let (g, s) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-a"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            3600,
+        )
+        .expect("issue grant");
+        let s = s.expect("secret");
+        let grant_id = g.grant_id;
+
+        let (c, _dir) = adopted_consumer(&org_a, "grantrevwake").await;
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&s))
+            .expect("install grant");
+        c.ingest_scoped_announcement_for_test(&granted_envelope(&p, &org_b, &g, &s, "svc-a", exp));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity.clone()],
+            "the record resolves before the grant is revoked",
+        );
+
+        let mut changes = c.subscribe_private_discovery_changes();
+        changes.borrow_and_update();
+        let before = c.private_discovery_generation();
+
+        // Org B withdraws the grant it issued.
+        let bundle = OrgGrantRevocationBundle::try_issue(&org_b, [RevokedGrant::capability(&g)])
+            .expect("issue grant revocation");
+        c.org_revocation_store()
+            .expect("installed")
+            .apply_grant_revocations(&bundle)
+            .expect("apply grant revocation");
+
+        assert!(
+            c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
+            "a revoked grant no longer discovers its provider",
         );
         assert!(
             c.private_discovery_generation() > before,

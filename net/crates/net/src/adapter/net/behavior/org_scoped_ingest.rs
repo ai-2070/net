@@ -31,6 +31,7 @@ use super::capability::CapabilitySet;
 use super::org::OrgId;
 use super::org_authority::OwnerAudienceCredential;
 use super::org_grant::{CapabilityAuthorityId, OrgAudienceSecret, OrgCapabilityGrant};
+use super::org_grant_revocation::RevokedGrantKind;
 use super::org_revocation::OrgRevocationState;
 use super::org_scoped_ann::ScopedCapabilityAnnouncement;
 use crate::adapter::net::identity::EntityId;
@@ -311,6 +312,10 @@ pub enum ScopedIngestError {
     Expired,
     /// The grant's signature or validity window failed (granted ingest).
     GrantInvalid,
+    /// The grant's issuer has REVOKED it (ORG-02): this node holds the
+    /// issuer's capability-grant revocation, so the grant no longer carries
+    /// DISCOVER authority even inside its validity window.
+    GrantRevoked,
     /// The grant does not name this node's org as grantee.
     GrantWrongGrantee,
     /// The grant does not carry DISCOVER rights.
@@ -351,6 +356,7 @@ impl std::fmt::Display for ScopedIngestError {
             }
             ScopedIngestError::Expired => "scoped announcement expired",
             ScopedIngestError::GrantInvalid => "capability grant invalid",
+            ScopedIngestError::GrantRevoked => "capability grant revoked by its issuer",
             ScopedIngestError::GrantWrongGrantee => "grant does not name this org",
             ScopedIngestError::GrantMissingDiscover => "grant lacks DISCOVER rights",
             ScopedIngestError::GrantIdMismatch => "envelope grant id does not match the grant",
@@ -491,6 +497,16 @@ fn verify_granted_ingest(
     grant
         .is_valid_at_with_skew(ctx.now_secs, ctx.skew_secs)
         .map_err(|_| ScopedIngestError::GrantInvalid)?;
+    // ORG-02: a grant its issuer has withdrawn early carries no DISCOVER
+    // authority, exactly as it carries no INVOKE authority at admission. Looked
+    // up under the grant's OWN issuer, so only that org's bundles can revoke it.
+    if ctx.floors.is_grant_revoked(
+        &grant.issuer_org,
+        RevokedGrantKind::Capability,
+        &grant.grant_id,
+    ) {
+        return Err(ScopedIngestError::GrantRevoked);
+    }
     // The grant must name THIS node's org as grantee, and carry DISCOVER.
     if grant.grantee_org != ctx.local_owner_org {
         return Err(ScopedIngestError::GrantWrongGrantee);
@@ -1441,6 +1457,49 @@ mod tests {
         assert_eq!(
             verify_scoped_ingest(&f.envelope, &authority, &ctx).unwrap_err(),
             ScopedIngestError::MembershipRevoked
+        );
+    }
+
+    /// ORG-02: a capability grant its ISSUER revoked carries no DISCOVER
+    /// authority — the envelope is refused even though the grant is inside its
+    /// window, the secret matches and the provider's membership is current. A
+    /// revocation of the same grant id by another org is not the issuer's and
+    /// changes nothing.
+    #[test]
+    fn granted_ingest_rejects_a_revoked_grant() {
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        let p = provider_kp();
+        let f = granted_fixture(exact_target(&p));
+        let authority = AudienceAuthority::granted(&f.grant, &f.secret);
+
+        let mut foreign = OrgRevocationState::empty();
+        let by_other_org = OrgGrantRevocationBundle::issue_at(
+            &OrgKeypair::from_bytes([0x33u8; 32]),
+            [RevokedGrant::capability(&f.grant)],
+            f.now,
+        )
+        .expect("foreign bundle");
+        foreign.merge_grant_revocations(&by_other_org, f.now);
+        let ctx = granted_ctx(f.a_org, f.now + 5, &foreign);
+        assert!(
+            verify_scoped_ingest(&f.envelope, &authority, &ctx).is_ok(),
+            "another org cannot revoke the issuer's grant"
+        );
+
+        let mut revoked = OrgRevocationState::empty();
+        let by_issuer = OrgGrantRevocationBundle::issue_at(
+            &f.issuer,
+            [RevokedGrant::capability(&f.grant)],
+            f.now,
+        )
+        .expect("issuer bundle");
+        revoked.merge_grant_revocations(&by_issuer, f.now);
+        let ctx = granted_ctx(f.a_org, f.now + 5, &revoked);
+        assert_eq!(
+            verify_scoped_ingest(&f.envelope, &authority, &ctx).unwrap_err(),
+            ScopedIngestError::GrantRevoked
         );
     }
 
