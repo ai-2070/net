@@ -112,6 +112,17 @@ pub enum WrapError {
          supply one source of truth (or identical maps)"
     )]
     PricingSourceConflict,
+    /// The payment-admission gate refused a priced tool's terms as quote
+    /// authority (they do not decode, or name another provider). Rejected
+    /// before anything announces — a price the provider cannot quote on its
+    /// own terms must never reach discovery.
+    #[error("payment gate refused the pricing terms of tool {tool:?}: {reason}")]
+    PricingRefused {
+        /// The tool whose terms were refused.
+        tool: String,
+        /// The gate's reason.
+        reason: String,
+    },
     /// A publish/refresh step failed AND the rollback re-announce that would
     /// restore a consistent mesh state also failed — the node may be left
     /// advertising tools with no live handler. Both errors are surfaced so the
@@ -126,6 +137,29 @@ pub enum WrapError {
         /// The failure of the rollback re-announce.
         rollback: String,
     },
+}
+
+/// Hand every priced tool's announced terms to the payment gate as quote
+/// authority, before anything announces. Idempotent (a gate replaces a
+/// tool's offers on re-publication), so the refresh paths call it too.
+fn publish_offers(
+    lowered: &[LoweredTool],
+    admission: Option<&Arc<dyn crate::serve::payment::PaymentAdmission>>,
+) -> Result<(), WrapError> {
+    let Some(admission) = admission else {
+        return Ok(());
+    };
+    for lt in lowered {
+        if let Some(terms) = lt.descriptor.pricing_terms.as_deref() {
+            admission
+                .publish_offer(&lt.descriptor.tool_id, terms)
+                .map_err(|reason| WrapError::PricingRefused {
+                    tool: lt.descriptor.tool_id.clone(),
+                    reason,
+                })?;
+        }
+    }
+    Ok(())
 }
 
 /// Fold a rollback re-announce result into the error to return: if the
@@ -540,6 +574,7 @@ impl ServerPublisher {
                 return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
             }
         }
+        publish_offers(&lowered, config.payment_admission.as_ref())?;
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -692,6 +727,7 @@ impl ServerPublisher {
                 return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
             }
         }
+        publish_offers(&lowered, config.payment_admission.as_ref())?;
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -877,6 +913,7 @@ impl PublicationHandle {
     /// tools too.
     pub async fn refresh(&mut self) -> Result<RefreshDelta, WrapError> {
         let (lowered, skipped) = discover_and_lower(&self.client, &self.ctx).await?;
+        publish_offers(&lowered, self.payment_admission.as_ref())?;
         let desired: HashSet<String> = lowered
             .iter()
             .map(|lt| lt.descriptor.tool_id.clone())
@@ -1059,6 +1096,7 @@ impl LocalPublicationHandle {
     /// tool-id collision restores the prior contribution and re-announces it.
     pub async fn refresh(&mut self, tools: &[Tool]) -> Result<RefreshDelta, WrapError> {
         let (lowered, skipped) = lower_local_tools(tools, &self.ctx);
+        publish_offers(&lowered, self.payment_admission.as_ref())?;
         let desired: HashSet<String> = lowered
             .iter()
             .map(|lt| lt.descriptor.tool_id.clone())

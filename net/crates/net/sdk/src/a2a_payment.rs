@@ -107,6 +107,16 @@ pub struct TaskPaymentEvidence {
 pub trait TaskAdmissionGate: Send + Sync {
     /// Redeem `claim`, or refuse it.
     async fn redeem(&self, claim: TaskPaymentClaim<'_>) -> Result<TaskPaymentEvidence, GateDenial>;
+
+    /// A configured serve is about to announce `pricing_terms` for the
+    /// paid task tool `tool_id` (`net.a2a.task/{service_id}`): make them
+    /// the provider's quote authority — the twin of
+    /// [`ToolPaymentGate::publish_offer`](crate::tool_payment::ToolPaymentGate::publish_offer).
+    /// `Err(reason)` refuses the serve. The default does nothing.
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        let _ = (tool_id, pricing_terms);
+        Ok(())
+    }
 }
 
 /// The caller's transport evidence for a paid task: what to present at

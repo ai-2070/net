@@ -118,4 +118,16 @@ pub trait PaymentAdmission: Send + Sync {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), net_sdk::tool_payment::GateDenial>;
+
+    /// The publication is about to announce `pricing_terms` (canonical
+    /// `net.pricing.terms@1` JSON, carried opaquely) for the served
+    /// `tool_id`: make them the provider's quote authority, so it signs
+    /// quotes only on the price and recipient it announced — never on a
+    /// requester's template. `Err(reason)` refuses the publication. The
+    /// default does nothing (gates with no quote issuance of their own).
+    /// Same contract as `net_sdk::tool_payment::ToolPaymentGate::publish_offer`.
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        let _ = (tool_id, pricing_terms);
+        Ok(())
+    }
 }

@@ -431,8 +431,18 @@ impl Mesh {
         Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
     {
         let tool_id = descriptor.tool_id.clone();
-        if descriptor.pricing_terms.is_none() {
+        let Some(terms) = descriptor.pricing_terms.as_deref() else {
             return Err(ServeError::MissingPricingTerms(tool_id));
+        };
+        // The announced terms become the gate's quote authority before
+        // anything is announced: a provider signs quotes only on the price
+        // and recipient it publishes, never on a requester's template. A
+        // gate that cannot hold them cannot enforce this price.
+        if let Err(reason) = gate.publish_offer(&tool_id, terms) {
+            return Err(ServeError::CapabilityRefused(format!(
+                "paid tool `{tool_id}`: its payment gate refused the announced pricing \
+                 terms: {reason}"
+            )));
         }
         let registry = self.inner().tool_registry().clone();
 

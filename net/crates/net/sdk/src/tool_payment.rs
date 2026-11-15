@@ -96,6 +96,21 @@ pub trait ToolPaymentGate: Send + Sync {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), GateDenial>;
+
+    /// The serving path is about to announce `pricing_terms` (canonical
+    /// `net.pricing.terms@1` JSON) for `tool_id`: make them the
+    /// provider's quote authority. An engine-backed gate registers them so
+    /// the provider signs quotes only on the terms it announced — a quote
+    /// request's template is the requester's choice, never authority for
+    /// the price or recipient. `Err(reason)` refuses the serve.
+    ///
+    /// The default does nothing, for gates with no quote issuance of their
+    /// own (scripted test gates). `Mesh::serve_tool_paid` calls it before
+    /// the tool is registered.
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        let _ = (tool_id, pricing_terms);
+        Ok(())
+    }
 }
 
 /// Object tag of the failure schematic. SDK wire vocabulary (like

@@ -2535,6 +2535,23 @@ impl Mesh {
                     .to_string(),
             ));
         }
+        // Every announced price becomes the gate's quote authority before
+        // anything serves: the provider signs quotes only on the terms its
+        // catalog publishes, never on a requester's template.
+        if let Some(gate) = &config.payment {
+            for (id, policy) in &config.services {
+                if let (A2aServicePolicy::Paid(offer), Some(terms)) =
+                    (policy, policy.offer().pricing_terms.as_deref())
+                {
+                    if let Err(reason) = gate.publish_offer(&tool_id_of(&offer.service_id), terms) {
+                        return Err(ServeError::A2aPaidMisconfigured(format!(
+                            "service {id:?}: the admission gate refused its pricing terms: \
+                             {reason}"
+                        )));
+                    }
+                }
+            }
+        }
 
         let A2aServiceConfig {
             services,
