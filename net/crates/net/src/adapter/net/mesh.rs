@@ -2674,6 +2674,10 @@ struct DispatchCtx {
     /// without charging the peer's auth-failure budget twice. Accepted
     /// requests are deliberately absent — see [`MembershipRejection`].
     membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
+    /// Per-`(peer, channel hash)` operation-ordering fence, so a
+    /// delayed copy of a superseded Subscribe/Unsubscribe cannot undo
+    /// a later applied one (CHAN-04). See [`MembershipFence`].
+    membership_fence: Arc<DashMap<(u64, ChannelHash), MembershipFence>>,
     /// How long a [`MembershipRejection`] stays replayable. Sized at
     /// `2 ×` the sender's `membership_ack_timeout` — every retransmit
     /// of a request happens inside that one budget, so double it is
@@ -5286,6 +5290,85 @@ struct MembershipRejection {
 /// retransmit charged, which under exactly that kind of spam is the
 /// behavior you want anyway — rather than growing without bound.
 const MEMBERSHIP_DEDUPE_MAX: usize = 4096;
+
+/// Operation-ordering fence for one `(peer, channel)` membership
+/// (CHAN-04).
+///
+/// Membership requests are fire-and-forget datagrams retransmitted
+/// under ONE nonce, so the publisher can see a copy of a request
+/// arrive after a *later* request on the same membership was applied
+/// and acknowledged — the first `Subscribe` datagram delayed past its
+/// own retransmit and the `Unsubscribe` that followed it, say. Applying
+/// that copy re-adds a member the subscriber just removed (or, for a
+/// delayed `Unsubscribe`, removes a newer subscription).
+///
+/// The fence records the nonce of the operation most recently
+/// **applied** to this membership (`latest`) and the nonces it
+/// superseded (`retired`). A copy whose nonce is retired is a request
+/// the membership has already moved past: it is re-acked but not
+/// re-applied. A copy of `latest` is a retransmit of the current
+/// operation and is re-decided in full as before (a `Subscribe` re-runs
+/// `authorize_subscribe`, so current authorization is still rechecked
+/// on accepted retries). Rejected requests change no membership state
+/// and never enter the fence.
+///
+/// Ordering is known only for requests the publisher has *seen*: the
+/// wire carries random correlation nonces, not a per-membership
+/// generation, so a request none of whose copies arrived before a later
+/// one was applied cannot be ordered — and its sender got a timeout,
+/// not an acknowledgement, for it.
+#[derive(Debug, Clone)]
+struct MembershipFence {
+    /// Nonce of the operation currently in effect.
+    latest: u64,
+    /// Superseded nonces with the instant each was superseded, oldest
+    /// first, bounded by [`MEMBERSHIP_FENCE_RETIRED_MAX`].
+    retired: Vec<(u64, std::time::Instant)>,
+}
+
+impl MembershipFence {
+    fn is_retired(&self, nonce: u64, ttl: Duration) -> bool {
+        self.retired
+            .iter()
+            .any(|(n, at)| *n == nonce && at.elapsed() < ttl)
+    }
+
+    /// Whether the entry currently fences any copy. An entry whose
+    /// retired list has fully aged out carries only `latest`: dropping
+    /// it loses nothing for copies of `latest` (re-decided either way),
+    /// only the ability to retire `latest` when the next operation
+    /// lands — which is why such entries are pruned only at the cap.
+    fn is_live(&self, ttl: Duration) -> bool {
+        self.retired.iter().any(|(_, at)| at.elapsed() < ttl)
+    }
+
+    /// Record that `nonce` was just applied.
+    fn advance(&mut self, nonce: u64, ttl: Duration) {
+        if self.latest == nonce {
+            return;
+        }
+        self.retired.retain(|(_, at)| at.elapsed() < ttl);
+        self.retired.push((self.latest, std::time::Instant::now()));
+        if self.retired.len() > MEMBERSHIP_FENCE_RETIRED_MAX {
+            let excess = self.retired.len() - MEMBERSHIP_FENCE_RETIRED_MAX;
+            self.retired.drain(..excess);
+        }
+        self.latest = nonce;
+    }
+}
+
+/// Superseded nonces remembered per `(peer, channel)` membership. Each
+/// is a distinct request the subscriber issued within the fence TTL on
+/// ONE channel, so a handful covers any honest churn.
+const MEMBERSHIP_FENCE_RETIRED_MAX: usize = 8;
+
+/// Hard cap on fenced `(peer, channel)` memberships — the same bound
+/// and the same degradation as [`MEMBERSHIP_DEDUPE_MAX`]: at the cap,
+/// entries with nothing currently retired are pruned (their membership
+/// is fenced again from its next operation on), and if that does not
+/// make room a NEW membership goes unfenced (pre-fence behavior) rather
+/// than growing the map.
+const MEMBERSHIP_FENCE_MAX: usize = 4096;
 
 /// Evict subscribers the channel's **current** policy no longer
 /// admits. Walks the roster by peer and, for every channel they hold:
@@ -13253,6 +13336,9 @@ pub struct MeshNode {
     /// nonce)`. Shared with `DispatchCtx` via `Arc` clone; see the
     /// field of the same name there and [`MembershipRejection`].
     membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
+    /// Membership operation-ordering fence. Shared with `DispatchCtx`
+    /// via `Arc` clone; see [`MembershipFence`].
+    membership_fence: Arc<DashMap<(u64, ChannelHash), MembershipFence>>,
     /// Verifier-side identity-proof challenges. Shared with
     /// `DispatchCtx` via `Arc` clone; see the field of the same name
     /// there.
@@ -15414,6 +15500,7 @@ impl MeshNode {
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
             membership_dedupe: Arc::new(DashMap::new()),
+            membership_fence: Arc::new(DashMap::new()),
             identity_challenges,
             pending_identity_proofs: Arc::new(DashMap::new()),
             pending_subnet_admissions: Arc::new(DashMap::new()),
@@ -28273,6 +28360,7 @@ impl MeshNode {
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
             membership_dedupe: self.membership_dedupe.clone(),
+            membership_fence: self.membership_fence.clone(),
             membership_dedupe_ttl: self.config.membership_ack_timeout * 2,
             identity_challenges: self.identity_challenges.clone(),
             pending_identity_proofs: self.pending_identity_proofs.clone(),
@@ -37194,36 +37282,39 @@ impl MeshNode {
                 // accepted request is deliberately NOT cached and is
                 // re-decided in full — see [`MembershipRejection`].
                 let replayed = Self::recorded_membership_rejection(from_node, nonce, ctx);
-                let (accepted, reason) = match replayed {
-                    Some(hit) => (false, hit.reason),
-                    None => Self::authorize_subscribe(
-                        &channel,
-                        from_node,
-                        token.as_deref(),
-                        queue_group.as_deref(),
-                        ctx,
-                    ),
+                let channel_hash = ChannelId::new(channel.clone()).hash();
+                // CHAN-04: decide AND apply under the membership's
+                // ordering fence. A copy of a Subscribe this membership
+                // has already moved past (an Unsubscribe was applied
+                // after it) is re-acked without re-adding the member.
+                let fenced =
+                    Self::fenced_membership_op(from_node, channel_hash, nonce, ctx, || {
+                        let decision = match replayed {
+                            Some(hit) => (false, hit.reason),
+                            None => Self::authorize_subscribe(
+                                &channel,
+                                from_node,
+                                token.as_deref(),
+                                queue_group.as_deref(),
+                                ctx,
+                            ),
+                        };
+                        if decision.0 {
+                            Self::apply_accepted_subscribe(&channel, from_node, queue_group, ctx);
+                        }
+                        (decision.0, decision)
+                    });
+                let Some((accepted, reason)) = fenced else {
+                    tracing::debug!(
+                        nonce,
+                        from = from_node,
+                        channel = %channel,
+                        "superseded membership Subscribe copy; re-acked, not re-applied"
+                    );
+                    Self::send_membership_ack(from_node, nonce, true, None, ctx);
+                    return;
                 };
                 if accepted {
-                    // Populate the AuthGuard fast path so publish
-                    // fan-out can admit this subscriber in <10 ns
-                    // without re-walking the ACL. Mirrors the
-                    // `roster.add_with_mode` below — both are
-                    // keyed on the channel name so they stay
-                    // consistent. Auth is mode-agnostic: a
-                    // subscriber's queue-group choice doesn't
-                    // change which capability tokens authorize the
-                    // channel.
-                    ctx.auth_guard
-                        .allow_channel(subscriber_principal(from_node), &channel);
-                    let id = ChannelId::new(channel);
-                    let mode = match queue_group {
-                        None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
-                        Some(name) => crate::adapter::net::channel::SubscriptionMode::QueueGroup(
-                            crate::adapter::net::channel::QueueGroupName::new(name),
-                        ),
-                    };
-                    ctx.roster.add_with_mode(id, from_node, mode);
                     Self::clear_auth_failures(from_node, ctx);
                 } else if replayed.is_none() {
                     // First time we've refused THIS request. A
@@ -37247,16 +37338,30 @@ impl MeshNode {
                 Self::send_membership_ack(from_node, nonce, accepted, reason, ctx);
             }
             MembershipMsg::Unsubscribe { channel, nonce } => {
-                // Revoke from the fast path first so any in-flight
-                // publish stops admitting this subscriber even
-                // before the roster update is visible.
-                ctx.auth_guard
-                    .revoke_channel(subscriber_principal(from_node), &channel);
-                let id = ChannelId::new(channel);
-                // Drop the retained subscribe chain so it can't be
-                // re-validated by the sweep and doesn't leak memory.
-                ctx.subscriber_chains.remove(&(from_node, id.hash()));
-                ctx.roster.remove(&id, from_node);
+                let id = ChannelId::new(channel.clone());
+                // CHAN-04: a copy of an Unsubscribe this membership has
+                // already moved past (a Subscribe was applied after it)
+                // must not remove the newer subscription.
+                let fenced = Self::fenced_membership_op(from_node, id.hash(), nonce, ctx, || {
+                    // Revoke from the fast path first so any in-flight
+                    // publish stops admitting this subscriber even
+                    // before the roster update is visible.
+                    ctx.auth_guard
+                        .revoke_channel(subscriber_principal(from_node), &channel);
+                    // Drop the retained subscribe chain so it can't be
+                    // re-validated by the sweep and doesn't leak memory.
+                    ctx.subscriber_chains.remove(&(from_node, id.hash()));
+                    ctx.roster.remove(&id, from_node);
+                    (true, ())
+                });
+                if fenced.is_none() {
+                    tracing::debug!(
+                        nonce,
+                        from = from_node,
+                        channel = %channel,
+                        "superseded membership Unsubscribe copy; re-acked, not re-applied"
+                    );
+                }
                 // Unsubscribe is always accepted — idempotent even if the
                 // peer wasn't actually subscribed.
                 Self::send_membership_ack(from_node, nonce, true, None, ctx);
@@ -45094,6 +45199,87 @@ impl MeshNode {
                 at: std::time::Instant::now(),
             },
         );
+    }
+
+    /// Run one membership operation `(from_node, channel_hash, nonce)`
+    /// behind the [`MembershipFence`]. Returns `None` — without calling
+    /// `apply` — when `nonce` is a request this membership has already
+    /// moved past (a delayed copy of a superseded operation). Otherwise
+    /// runs `apply`, which returns `(applied, out)`: `applied` says the
+    /// operation changed (or re-asserted) membership state and so
+    /// becomes the fence's `latest`; `out` is passed through.
+    ///
+    /// The fence check and `apply` run under the entry's lock, so two
+    /// copies racing on the same membership cannot interleave between
+    /// the check and the state change. `apply` must not touch
+    /// `membership_fence` (it would deadlock on its own shard).
+    fn fenced_membership_op<R>(
+        from_node: u64,
+        channel_hash: ChannelHash,
+        nonce: u64,
+        ctx: &DispatchCtx,
+        apply: impl FnOnce() -> (bool, R),
+    ) -> Option<R> {
+        use dashmap::mapref::entry::Entry;
+        let ttl = ctx.membership_dedupe_ttl;
+        let key = (from_node, channel_hash);
+        // Cap check BEFORE taking the entry: `len`/`retain` lock every
+        // shard, including the one the entry guard would hold.
+        let mut may_insert = true;
+        if ctx.membership_fence.len() >= MEMBERSHIP_FENCE_MAX
+            && !ctx.membership_fence.contains_key(&key)
+        {
+            ctx.membership_fence.retain(|_, f| f.is_live(ttl));
+            may_insert = ctx.membership_fence.len() < MEMBERSHIP_FENCE_MAX;
+        }
+        match ctx.membership_fence.entry(key) {
+            Entry::Occupied(mut slot) => {
+                if slot.get().is_retired(nonce, ttl) {
+                    return None;
+                }
+                let (applied, out) = apply();
+                if applied {
+                    slot.get_mut().advance(nonce, ttl);
+                }
+                Some(out)
+            }
+            Entry::Vacant(slot) => {
+                let (applied, out) = apply();
+                if applied && may_insert {
+                    slot.insert(MembershipFence {
+                        latest: nonce,
+                        retired: Vec::new(),
+                    });
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// Install an accepted Subscribe: the AuthGuard fast path plus the
+    /// roster entry in the requested mode.
+    fn apply_accepted_subscribe(
+        channel: &ChannelName,
+        from_node: u64,
+        queue_group: Option<String>,
+        ctx: &DispatchCtx,
+    ) {
+        // Populate the AuthGuard fast path so publish fan-out can
+        // admit this subscriber in <10 ns without re-walking the ACL.
+        // Mirrors the `roster.add_with_mode` below — both are keyed on
+        // the channel name so they stay consistent. Auth is
+        // mode-agnostic: a subscriber's queue-group choice doesn't
+        // change which capability tokens authorize the channel.
+        ctx.auth_guard
+            .allow_channel(subscriber_principal(from_node), channel);
+        let id = ChannelId::new(channel.clone());
+        let mode = match queue_group {
+            None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
+            Some(name) => crate::adapter::net::channel::SubscriptionMode::QueueGroup(
+                crate::adapter::net::channel::QueueGroupName::new(name),
+            ),
+        };
+        ctx.roster.add_with_mode(id, from_node, mode);
     }
 
     /// Send an `Ack` on the membership subprotocol back to `to_node`.
@@ -66161,6 +66347,138 @@ mod membership_failure_tests {
         assert!(
             ctx.membership_dedupe.is_empty(),
             "accepted requests must not occupy the rejection cache"
+        );
+    }
+
+    fn unsubscribe_bytes(channel: &ChannelName, nonce: u64) -> Vec<u8> {
+        membership::encode(&MembershipMsg::Unsubscribe {
+            channel: channel.clone(),
+            nonce,
+        })
+    }
+
+    /// CHAN-04: a delayed copy of an already-applied membership request
+    /// cannot undo a LATER applied one, in either direction.
+    ///
+    /// The reordering is modeled deterministically by delivering the
+    /// datagrams in the order the network would have: the first
+    /// `Subscribe` copy was delayed past its own retransmit (which was
+    /// applied and acked) and past the `Unsubscribe` that followed it.
+    /// Pre-fix the late copy re-ran the accept path and re-rostered a
+    /// member who had just been acknowledged as removed; the converse —
+    /// a late `Unsubscribe` copy — removed a newer subscription.
+    ///
+    /// Each late copy is still ACKED, so a sender that never saw the
+    /// first ack gets an answer. A retransmit of the CURRENT operation
+    /// is still re-decided in full (the accepted-retry contract above),
+    /// and a fresh request after all of it applies normally.
+    #[tokio::test]
+    async fn a_delayed_superseded_membership_copy_does_not_undo_a_later_operation() {
+        const PEER: u64 = 0xC4A4;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        install_resolvable_peer(&ctx, PEER);
+        let channel = ChannelName::new("open/plain").unwrap();
+        let id = ChannelId::new(channel.clone());
+
+        // Subscribe S1 (its retransmit lands; the first copy is in flight).
+        let s1 = subscribe_bytes(&channel, 0x5151);
+        MeshNode::handle_membership_message(&s1, PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &id), "S1 applies");
+
+        // Unsubscribe U applied and acked.
+        let u = unsubscribe_bytes(&channel, 0x0B0B);
+        MeshNode::handle_membership_message(&u, PEER, &ctx);
+        assert!(!ctx.roster.is_subscribed(PEER, &id), "U applies");
+
+        // The delayed first copy of S1 finally arrives.
+        MeshNode::handle_membership_message(&s1, PEER, &ctx);
+        assert!(
+            !ctx.roster.is_subscribed(PEER, &id),
+            "a delayed copy of a superseded Subscribe must not re-add the member"
+        );
+        assert!(
+            !ctx.auth_guard
+                .is_authorized_full(subscriber_principal(PEER), &channel),
+            "nor re-open the AuthGuard fast path"
+        );
+
+        // Converse: a fresh Subscribe S2 applies, then a delayed copy
+        // of U arrives.
+        let s2 = subscribe_bytes(&channel, 0x5252);
+        MeshNode::handle_membership_message(&s2, PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &id), "S2 applies");
+        MeshNode::handle_membership_message(&u, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "a delayed copy of a superseded Unsubscribe must not remove the newer subscription"
+        );
+
+        // A retransmit of the CURRENT operation is still re-decided:
+        // after an eviction it re-runs the accept path.
+        ctx.roster.remove(&id, PEER);
+        MeshNode::handle_membership_message(&s2, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "a retransmit of the current Subscribe must still re-run the accept path"
+        );
+
+        // And a fresh Unsubscribe still applies.
+        MeshNode::handle_membership_message(&unsubscribe_bytes(&channel, 0x0C0C), PEER, &ctx);
+        assert!(!ctx.roster.is_subscribed(PEER, &id), "a fresh U applies");
+    }
+
+    /// The fence is per membership: a request on one channel never
+    /// fences the same peer's requests on another, and fencing one
+    /// peer never fences another peer's identical nonce.
+    #[tokio::test]
+    async fn the_membership_fence_is_scoped_to_peer_and_channel() {
+        const PEER: u64 = 0xC4A5;
+        const OTHER: u64 = 0xC4A6;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        install_resolvable_peer(&ctx, PEER);
+        install_resolvable_peer(&ctx, OTHER);
+        let a = ChannelName::new("open/a").unwrap();
+        let b = ChannelName::new("open/b").unwrap();
+
+        MeshNode::handle_membership_message(&subscribe_bytes(&a, 1), PEER, &ctx);
+        MeshNode::handle_membership_message(&unsubscribe_bytes(&a, 2), PEER, &ctx);
+        // Nonce 1 is retired for (PEER, a) only.
+        MeshNode::handle_membership_message(&subscribe_bytes(&b, 1), PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &ChannelId::new(b)));
+        MeshNode::handle_membership_message(&subscribe_bytes(&a, 1), OTHER, &ctx);
+        assert!(ctx.roster.is_subscribed(OTHER, &ChannelId::new(a.clone())));
+        assert!(!ctx.roster.is_subscribed(PEER, &ChannelId::new(a)));
+    }
+
+    /// The fence map is bounded like the rejection cache: a peer
+    /// cycling through fresh channels cannot grow it past its cap.
+    #[tokio::test]
+    async fn the_membership_fence_is_bounded() {
+        const PEER: u64 = 0xC4A7;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        for i in 0..(MEMBERSHIP_FENCE_MAX as u64 + 64) {
+            let applied = MeshNode::fenced_membership_op(PEER, i, i, &ctx, || (true, ()));
+            assert!(applied.is_some());
+        }
+        assert!(
+            ctx.membership_fence.len() <= MEMBERSHIP_FENCE_MAX,
+            "fence grew past its cap: {}",
+            ctx.membership_fence.len()
         );
     }
 
