@@ -991,29 +991,12 @@ async fn run_snapshot(
     // tmp+rename layer alone closed the "truncated blob at the
     // documented path" hazard from #3; this commit closes the
     // crash-window hazard from #20.
-    // The staging name keeps the full filename (`snap.json` and
-    // `snap.bin` never share one) and is unique per call (PSTORE-03).
-    let tmp = {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut os = args.out.as_os_str().to_os_string();
-        os.push(format!(".tmp.{}.{seq}", std::process::id()));
-        PathBuf::from(os)
-    };
     let bytes_owned = bytes.clone();
-    let tmp_for_write = tmp.clone();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_for_write)?;
-        f.write_all(&bytes_owned)?;
-        f.sync_all()
-    })
-    .await
-    .map_err(|e| generic(format!("snapshot tmp-write task panicked: {e}")))?
-    .map_err(|e| generic(format!("write snapshot tmp {}: {e}", tmp.display())))?;
+    let out_for_write = args.out.clone();
+    let tmp = tokio::task::spawn_blocking(move || stage_snapshot(&out_for_write, &bytes_owned))
+        .await
+        .map_err(|e| generic(format!("snapshot tmp-write task panicked: {e}")))?
+        .map_err(|(tmp, e)| generic(format!("write snapshot tmp {}: {e}", tmp.display())))?;
     tokio::fs::rename(&tmp, &args.out).await.map_err(|e| {
         // Best-effort cleanup of the temp file if rename failed;
         // ignore secondary errors.
@@ -1121,4 +1104,109 @@ fn default_netdb_path() -> Option<PathBuf> {
 struct SnapshotResult {
     path: String,
     bytes: u64,
+}
+
+/// How many taken staging names a snapshot skips before giving up.
+const STAGE_ATTEMPTS: usize = 64;
+
+/// Write `bytes` to a fresh staging sibling of `out` (`create_new` +
+/// `fsync`) and return its path; the caller renames it onto `out`.
+///
+/// The name is [`staging_sibling`](crate::commands::org::staging_sibling)'s:
+/// it keeps the full filename (`snap.json` and `snap.bin` never share one,
+/// PSTORE-03), falls back to a short name when a long `--out` leaves no room
+/// for the suffix, and is unique per call. A name that is already taken
+/// (a temp a crashed run left behind) is skipped, never truncated, and the
+/// next candidate is tried. On failure the error carries the name tried.
+fn stage_snapshot(
+    out: &std::path::Path,
+    bytes: &[u8],
+) -> Result<PathBuf, (PathBuf, std::io::Error)> {
+    stage_snapshot_with(bytes, || {
+        crate::commands::org::staging_sibling(out, "", "tmp")
+    })
+}
+
+fn stage_snapshot_with(
+    bytes: &[u8],
+    mut candidate: impl FnMut() -> PathBuf,
+) -> Result<PathBuf, (PathBuf, std::io::Error)> {
+    use std::io::Write;
+    let mut attempts = 0;
+    loop {
+        let tmp = candidate();
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp);
+        let mut f = match opened {
+            Ok(f) => f,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && attempts + 1 < STAGE_ATTEMPTS =>
+            {
+                attempts += 1;
+                continue;
+            }
+            Err(e) => return Err((tmp, e)),
+        };
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err((tmp, e));
+        }
+        return Ok(tmp);
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+
+    /// A `--out` near the 255-byte component limit has no room for the
+    /// staging suffix; the snapshot stages under a short name in the same
+    /// directory instead of failing (ENAMETOOLONG / os error 206).
+    #[test]
+    fn a_long_out_name_stages_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("s".repeat(250));
+        let tmp = stage_snapshot(&out, b"snap")
+            .map_err(|(_, e)| e)
+            .expect("staged");
+        assert_eq!(tmp.parent(), Some(dir.path()));
+        assert!(tmp.file_name().unwrap().len() <= 255);
+        assert_eq!(std::fs::read(&tmp).expect("read"), b"snap");
+        std::fs::rename(&tmp, &out).expect("publish");
+        assert_eq!(std::fs::read(&out).expect("read"), b"snap");
+    }
+
+    /// A staging name left behind by a crashed run (PID reuse lands the
+    /// next invocation on the same candidate) is skipped, never reused or
+    /// truncated, and the snapshot stages under the next candidate.
+    #[test]
+    fn a_taken_staging_name_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join("snap.bin.tmp.stale");
+        std::fs::write(&stale, b"left by a crash").expect("seed");
+        let fresh = dir.path().join("snap.bin.tmp.fresh");
+        let mut names = vec![fresh.clone(), stale.clone()];
+        let tmp = stage_snapshot_with(b"snap", || names.pop().unwrap())
+            .map_err(|(_, e)| e)
+            .expect("staged past the taken name");
+        assert_eq!(tmp, fresh);
+        assert_eq!(std::fs::read(&stale).expect("read"), b"left by a crash");
+        assert_eq!(std::fs::read(&fresh).expect("read"), b"snap");
+    }
+
+    /// Two snapshots of one `--out` in one process never share a name.
+    #[test]
+    fn staging_names_are_unique_and_keep_the_filename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("snap.json");
+        let a = stage_snapshot(&out, b"a").map_err(|(_, e)| e).expect("a");
+        let b = stage_snapshot(&out, b"b").map_err(|(_, e)| e).expect("b");
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("snap.json.tmp."), "{name}");
+    }
 }
