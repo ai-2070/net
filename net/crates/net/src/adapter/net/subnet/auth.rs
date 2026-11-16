@@ -2062,13 +2062,14 @@ pub struct VerifiedGatewayContext {
     pub subject: EntityId,
     /// Rights held over `scope`.
     pub rights: SubnetRights,
-    /// Leaf generation at verification time. For an entry merged from
-    /// several credentials at one scope, the LOWEST of their generations,
-    /// so a subject floor is judged against the weakest of them.
+    /// Leaf generation at verification time. For an entry the published
+    /// set merged from several credentials at one scope, the first
+    /// credential's; the set keeps each right's own standing
+    /// (see [`VerifiedGatewayContextSet::subject_floor_covers`]).
     pub generation: u32,
     /// Whether the credential behind this entry is delegated (one hop
     /// below a root issuer). A delegated leaf never meets a subject
-    /// floor. For a merged entry, whether ANY credential behind it is.
+    /// floor. For a merged entry, the first credential's, as `generation`.
     pub delegated: bool,
     /// Authority auth epoch at verification time.
     pub subnet_auth_epoch: u64,
@@ -2169,6 +2170,28 @@ pub struct VerifiedGatewayContextSet {
     earliest_expiry: u64,
     /// Off-path scope index, and the thing that actually authorizes.
     index: GatewayScopeIndex,
+    /// Per entry (same order as `entries`), per right (indexed like
+    /// [`RIGHT_BITS`]): the STRONGEST subject-floor standing among the
+    /// credentials merged into that entry that hold the right — the
+    /// highest generation of a root-direct holder, or `None` when every
+    /// holder is delegated (a delegated leaf never meets a floor). A right
+    /// survives a subject floor while any of its holders does, so this is
+    /// what [`Self::subject_floor_covers`] judges it by.
+    floor_standing: Box<[[Option<u32>; 3]]>,
+}
+
+/// One credential's subject-floor standing for a right it holds: its
+/// generation when root-direct, `None` when delegated. `Option`'s order
+/// (`None` below every `Some`) is the strength order.
+fn floor_standing_of(entry: &VerifiedGatewayContext) -> [Option<u32>; 3] {
+    let standing = (!entry.delegated).then_some(entry.generation);
+    RIGHT_BITS.map(|bit| {
+        if entry.rights.contains(bit) {
+            standing
+        } else {
+            None
+        }
+    })
 }
 
 /// Ceiling on indexed lookups for one protected transition.
@@ -2386,25 +2409,39 @@ impl VerifiedGatewayContextSet {
     /// Whether a subject floor refuses a right some entry holds
     /// (SUBNET-05) — the test a subject floor for the LOCAL entity uses
     /// to withdraw published gateway authority. Judged exactly as
-    /// [`compile_gateway_context`] judges it: each entry at its own leaf
-    /// generation, a delegated entry never meeting a floor. Judging it
+    /// [`compile_gateway_context`] judges it: each credential at its own
+    /// leaf generation, a delegated one never meeting a floor. Judging it
     /// conservatively (as if every leaf were delegated) made ANY subject
     /// floor naming the local entity — an unrelated one, or the retry of
     /// one the installed credentials were already re-issued above —
     /// withdraw a gateway whose credentials satisfy every floor.
+    ///
+    /// An entry merged from several credentials at one scope is judged per
+    /// right, by the strongest credential holding that right: a right is
+    /// refused only when every credential that supplies it is, which is
+    /// exactly when recompiling the credentials would lose it. A floor that
+    /// refuses one credential therefore no longer withdraws a right another
+    /// credential at that scope still supplies, nor a right the refused
+    /// credential never held.
     pub fn subject_floor_covers(&self, floors: &SubnetFloorRegistry) -> bool {
-        self.entries.iter().any(|e| {
-            floors.gateway_refused_rights(
-                &e.authority,
-                e.topology_epoch,
-                &e.subject,
-                e.attachment,
-                e.scope,
-                e.rights,
-                e.generation,
-                e.delegated,
-            ) != 0
-        })
+        self.entries
+            .iter()
+            .zip(self.floor_standing.iter())
+            .any(|(e, standing)| {
+                RIGHT_BITS.iter().zip(standing).any(|(&bit, &standing)| {
+                    e.rights.contains(bit)
+                        && floors.gateway_refused_rights(
+                            &e.authority,
+                            e.topology_epoch,
+                            &e.subject,
+                            e.attachment,
+                            e.scope,
+                            bit,
+                            standing.unwrap_or(0),
+                            standing.is_none(),
+                        ) != 0
+                })
+            })
     }
 }
 
@@ -2812,6 +2849,7 @@ pub fn build_gateway_context_set(
     compiled: Vec<VerifiedGatewayContext>,
 ) -> Result<VerifiedGatewayContextSet, SubnetAuthError> {
     let mut entries: Vec<VerifiedGatewayContext> = Vec::with_capacity(compiled.len());
+    let mut floor_standing: Vec<[Option<u32>; 3]> = Vec::with_capacity(compiled.len());
     for entry in compiled {
         if &entry.authority != authority {
             return Err(SubnetAuthError::WrongAuthority);
@@ -2826,18 +2864,22 @@ pub fn build_gateway_context_set(
                 return Err(SubnetAuthError::MixedGatewayEpochs);
             }
         }
-        match entries.iter_mut().find(|e| e.scope == entry.scope) {
-            Some(existing) => {
+        match entries.iter().position(|e| e.scope == entry.scope) {
+            Some(at) => {
+                let existing = &mut entries[at];
                 existing.rights = existing.rights.union(entry.rights);
                 // Keep the tightest expiry so the merged entry cannot
                 // outlive the shorter-lived credential behind it.
                 existing.expires_at = existing.expires_at.min(entry.expires_at);
-                // And the weakest subject-floor standing, so a floor
-                // that refuses either credential reaches the merged one.
-                existing.generation = existing.generation.min(entry.generation);
-                existing.delegated |= entry.delegated;
+                // Each right keeps the strongest subject-floor standing
+                // among its holders: it survives a floor while any of
+                // them does.
+                for (have, add) in floor_standing[at].iter_mut().zip(floor_standing_of(&entry)) {
+                    *have = (*have).max(add);
+                }
             }
             None => {
+                floor_standing.push(floor_standing_of(&entry));
                 entries.push(entry);
                 // Enforced at each push, not after the loop: the cap
                 // is on DISTINCT scopes (an input merging down to few
@@ -2870,6 +2912,7 @@ pub fn build_gateway_context_set(
         subnet_auth_epoch,
         earliest_expiry,
         index,
+        floor_standing: floor_standing.into_boxed_slice(),
     })
 }
 
@@ -3529,5 +3572,84 @@ mod floor_coherence_tests {
             Ok(()),
             "ATTACH is not floored"
         );
+    }
+
+    /// SUBNET-05: an entry merged from several local gateway credentials at
+    /// one scope is judged per right, by the strongest credential holding
+    /// it. A floor refusing one credential withdraws nothing another
+    /// credential still supplies, nor a right the refused one never held;
+    /// a right every holder fails is still withdrawn.
+    ///
+    /// Inverse: the merged entry carries the weakest standing of all its
+    /// credentials, and a delegated EXPORT credential makes a ROUTE floor
+    /// that the root-direct ROUTE credential satisfies withdraw the gateway.
+    #[test]
+    fn a_merged_gateway_entry_is_floored_per_right_by_its_strongest_holder() {
+        let config = config();
+        let gw = EntityKeypair::from_bytes([0x58; 32]);
+        let entry =
+            |rights: SubnetRights, generation: u32, delegated: bool| VerifiedGatewayContext {
+                authority: root().entity_id().clone(),
+                attachment: TopologySubnetId::new(&[3, 7]),
+                scope: TopologySubnetId::new(&[3]),
+                topology_epoch: 0,
+                subject: gw.entity_id().clone(),
+                rights,
+                generation,
+                delegated,
+                subnet_auth_epoch: 0,
+                expires_at: now() + DAY,
+                credential_set_hash: [0; 32],
+            };
+        let covered = |set: &VerifiedGatewayContextSet, rights, generation| {
+            let registry = SubnetFloorRegistry::new();
+            let floor = subject_floor(&gw, &[3], rights, generation, 1);
+            assert!(registry.apply_subject(&floor, &config).unwrap());
+            set.subject_floor_covers(&registry)
+        };
+        let authority = root().entity_id().clone();
+
+        // A delegated EXPORT credential beside a root-direct ROUTE one.
+        let set = build_gateway_context_set(
+            &authority,
+            vec![
+                entry(SubnetRights::EXPORT, 0, true),
+                entry(SubnetRights::ROUTE, 5, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.entries().len(), 1, "the premise: one merged entry");
+        assert!(
+            !covered(&set, SubnetRights::ROUTE, 2),
+            "ROUTE's only holder is at generation 5, above the floor"
+        );
+        assert!(covered(&set, SubnetRights::ROUTE, 6), "the holder fails it");
+        assert!(
+            covered(&set, SubnetRights::EXPORT, 1),
+            "EXPORT's only holder is delegated"
+        );
+
+        // Both hold ROUTE: it survives while the root-direct holder does.
+        let set = build_gateway_context_set(
+            &authority,
+            vec![
+                entry(SubnetRights::ROUTE, 0, true),
+                entry(SubnetRights::ROUTE, 5, false),
+            ],
+        )
+        .unwrap();
+        assert!(!covered(&set, SubnetRights::ROUTE, 2));
+        assert!(covered(&set, SubnetRights::ROUTE, 6));
+
+        // Order does not matter: the weaker credential first or second.
+        let set = build_gateway_context_set(
+            &authority,
+            vec![
+                entry(SubnetRights::ROUTE, 5, false),
+                entry(SubnetRights::ROUTE, 1, false),
+            ],
+        )
+        .unwrap();
+        assert!(!covered(&set, SubnetRights::ROUTE, 2));
     }
 }
