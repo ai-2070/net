@@ -651,7 +651,13 @@ impl ChannelConfig {
                 !self.token_roots.is_empty()
                     && admitted_grant == Some(super::name::queue_group_hash(channel, group))
             }
-            _ => !self.token_required() || admitted_grant == Some(channel_hash),
+            // A token-gated policy with no roots admits no subscriber (no
+            // chain can anchor), so it retains none either — whatever grant
+            // a subscriber was admitted on under an earlier, rooted policy.
+            _ => {
+                !self.token_required()
+                    || (!self.token_roots.is_empty() && admitted_grant == Some(channel_hash))
+            }
         }
     }
 
@@ -2666,6 +2672,20 @@ mod tests {
         ));
         // An open channel asks for no grant at all.
         assert!(base.retains_subscription(name, hash, None, None, Some("workers"), None));
+
+        // A token-gated policy with no roots admits no fresh subscriber,
+        // so it keeps none on the grant a rooted policy admitted it on.
+        // Red: the previous check accepted the retained channel grant.
+        let rootless_gated = base.clone().with_require_token(true);
+        assert!(!rootless_gated.retains_subscription(name, hash, None, None, None, Some(hash)));
+        assert!(!rootless_gated.retains_subscription(
+            name,
+            hash,
+            None,
+            None,
+            Some("workers"),
+            Some(hash)
+        ));
     }
 
     // ---- H3 (2026-07-31 audit): origin-bound channel families ----

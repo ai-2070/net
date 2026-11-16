@@ -231,19 +231,41 @@ impl OrgRevocationState {
     /// comparison: a candidate store with equal or higher floors but without
     /// an unexpired grant revocation would re-enable the withdrawn grant the
     /// moment it was installed, and one holding it with an earlier horizon
-    /// would re-enable it sooner. Entries already expired at `now_secs` name
-    /// grants that can no longer verify and are not required.
+    /// would re-enable it sooner.
+    ///
+    /// ORG-05 interplay: an entry that has expired at `now_secs` is still
+    /// required while this state would keep it, i.e. until the clock has run
+    /// [`GRANT_REVOCATION_CLOCK_GRACE_SECS`] past its expiry mark. That
+    /// retention is exactly what survives a corrected clock; exempting every
+    /// expired entry let a candidate that dropped it be installed, after
+    /// which a clock stepped back into the grant's window saw the grant valid
+    /// again. The candidate must also not have marked the entry EARLIER than
+    /// this state did (it would drop it sooner); an unmarked candidate entry
+    /// is marked at its next prune, no earlier than now. Only an entry this
+    /// state's own next prune would drop is not required.
     pub fn grant_revocations_retained_by(
         &self,
         candidate: &OrgRevocationState,
         now_secs: u64,
     ) -> bool {
         self.revoked_grants.iter().all(|(key, not_after)| {
-            revocation_entry_expired(*not_after, now_secs)
-                || candidate
-                    .revoked_grants
-                    .get(key)
-                    .is_some_and(|retained| *retained >= *not_after)
+            let seen = self.expired_seen.get(key).copied();
+            let droppable = revocation_entry_expired(*not_after, now_secs)
+                && seen.is_some_and(|seen| {
+                    now_secs > seen.saturating_add(GRANT_REVOCATION_CLOCK_GRACE_SECS)
+                });
+            if droppable {
+                return true;
+            }
+            let retained = candidate
+                .revoked_grants
+                .get(key)
+                .is_some_and(|retained| *retained >= *not_after);
+            let marked_no_earlier = match (seen, candidate.expired_seen.get(key)) {
+                (Some(ours), Some(theirs)) => *theirs >= ours,
+                _ => true,
+            };
+            retained && marked_no_earlier
         })
     }
 
@@ -5086,6 +5108,51 @@ mod tests {
             "dropped once the grace has passed"
         );
         assert_eq!(loaded.revoked_grant_count(), 0);
+    }
+
+    /// ORG-05 x ORG-01: a replacement store must keep an expired-but-marked
+    /// grant revocation for as long as the installed state would. The
+    /// installed state marked the entry during a forward clock step; a
+    /// candidate that dropped it (or marked it earlier) must be refused, or a
+    /// clock corrected back into the grant's window would see the grant
+    /// valid again. Once the installed state's own grace has passed, the
+    /// entry is no longer required.
+    ///
+    /// Red: the previous check exempted every entry expired at `now`, so the
+    /// candidate without it was accepted.
+    #[test]
+    fn a_replacement_must_keep_a_marked_expired_grant_revocation() {
+        let now = current_timestamp();
+        let mut installed = OrgRevocationState::empty();
+        installed.merge_grant_revocations(&grant_revocation(now + 3_600), now);
+        let stepped = now + 365 * 24 * 60 * 60;
+        assert_eq!(installed.prune_expired_grants(stepped), 1, "marked");
+
+        let dropped = OrgRevocationState::empty();
+        assert!(
+            !installed.grant_revocations_retained_by(&dropped, stepped),
+            "a candidate without the marked entry must be refused"
+        );
+
+        let mut marked_earlier = installed.clone();
+        for seen in marked_earlier.expired_seen.values_mut() {
+            *seen -= 1;
+        }
+        assert!(
+            !installed.grant_revocations_retained_by(&marked_earlier, stepped),
+            "a candidate that would drop it sooner must be refused"
+        );
+
+        let mut unmarked = OrgRevocationState::empty();
+        unmarked.merge_grant_revocations(&grant_revocation(now + 3_600), now);
+        assert!(installed.grant_revocations_retained_by(&unmarked, stepped));
+        assert!(installed.grant_revocations_retained_by(&installed.clone(), stepped));
+
+        let past_grace = stepped + GRANT_REVOCATION_CLOCK_GRACE_SECS + 1;
+        assert!(
+            installed.grant_revocations_retained_by(&dropped, past_grace),
+            "past its grace the entry is ours to drop too"
+        );
     }
 
     /// ORG-05: a forward wall-clock step that crosses a revoked grant's

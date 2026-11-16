@@ -500,16 +500,22 @@ pub(crate) fn recheck_projected_owner_floor(
 /// ([`VerifiedOwner::valid_until`]) is not reported (DISC-05): the
 /// announcement may still be live, but the ownership it proved is not.
 pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<OrgId> {
-    owner_org_for_at(fold, node_id, ownership_now())
+    owner_org_for_at(fold, node_id, ownership_now)
 }
 
-/// [`owner_org_for`] judged at an explicit `now_secs` (unix seconds).
+/// [`owner_org_for`] judged by the clock `now` (unix seconds).
+///
+/// `now` is read only once the fold snapshot is held: sampled before the
+/// read lock, a wait on a contended lock would judge expiry at a time
+/// earlier than the snapshot, and a projection that expired during the wait
+/// would still be reported.
 pub(crate) fn owner_org_for_at(
     fold: &Fold<CapabilityFold>,
     node_id: NodeId,
-    now_secs: u64,
+    now: impl FnOnce() -> u64,
 ) -> Option<OrgId> {
     fold.with_state(|state| {
+        let now_secs = now();
         let keys = state.keys_for(node_id)?;
         keys.iter().find_map(|key| {
             state.entries.get(key).and_then(|entry| {
@@ -591,19 +597,20 @@ pub struct OwnedPublisher {
 /// through [`find_nodes_matching`]; only the verified-ownership claim
 /// (and with it exported-plane eligibility) lapses with the cert.
 pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<OwnedPublisher> {
-    public_owned_providers_at(fold, tag, ownership_now())
+    public_owned_providers_at(fold, tag, ownership_now)
 }
 
-/// [`public_owned_providers`] judged at an explicit `now_secs` (unix
-/// seconds).
+/// [`public_owned_providers`] judged by the clock `now` (unix seconds),
+/// read once the fold snapshot is held (see [`owner_org_for_at`]).
 pub(crate) fn public_owned_providers_at(
     fold: &Fold<CapabilityFold>,
     tag: &str,
-    now_secs: u64,
+    now: impl FnOnce() -> u64,
 ) -> Vec<OwnedPublisher> {
     let legacy = LegacyFilter::default().require_tag(tag.to_string());
     let fold_filter = translate_filter(&legacy);
     fold.with_state_and_index(|state, index| {
+        let now_secs = now();
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
 
         // Phase 1 — which publishers advertise `tag` at all. Tag-filtered
@@ -4714,6 +4721,51 @@ mod tests {
         );
     }
 
+    /// The expiry clock is read with the fold snapshot already held, so the
+    /// time a projection is judged at is never earlier than the snapshot.
+    /// Witness: while the clock is being read, a concurrent fold writer must
+    /// be unable to complete — it would, had the clock been sampled before
+    /// the read lock was taken.
+    ///
+    /// Red: both wrappers used to sample `ownership_now()` before calling
+    /// into the fold, so the writer below finished during the clock read.
+    #[test]
+    fn the_ownership_clock_is_read_under_the_fold_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let node_id = kp.entity_id().node_id();
+        let now = crate::adapter::net::behavior::org::current_timestamp();
+        let writer_kp = EntityKeypair::generate();
+        let writer_ann = signed_announcement_with_cert(&writer_kp, None);
+        for query in 0..2 {
+            let writer_done = AtomicBool::new(false);
+            let done_during_clock = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let clock = || {
+                    s.spawn(|| {
+                        let _ = apply_legacy_announcement(&fold, writer_ann.clone(), None, 0);
+                        writer_done.store(true, Ordering::SeqCst);
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    done_during_clock.store(writer_done.load(Ordering::SeqCst), Ordering::SeqCst);
+                    now
+                };
+                if query == 0 {
+                    let _ = owner_org_for_at(&fold, node_id, clock);
+                } else {
+                    let _ = public_owned_providers_at(&fold, "nrpc:echo", clock);
+                }
+            });
+            assert!(
+                !done_during_clock.load(Ordering::SeqCst),
+                "query {query}: a fold writer completed while the clock was read, so the \
+                 clock was sampled outside the snapshot"
+            );
+            assert!(writer_done.load(Ordering::SeqCst));
+        }
+    }
+
     /// DISC-05: the projection carries the certificate's expiry, so the
     /// public ownership queries stop reporting verified ownership once
     /// the owner cert expires — even though the announcement (normal
@@ -4741,15 +4793,15 @@ mod tests {
 
         // While the cert is valid: owned, and an exported candidate.
         assert_eq!(
-            owner_org_for_at(&fold, node_id, now),
+            owner_org_for_at(&fold, node_id, || now),
             Some(org_root().org_id())
         );
         assert_eq!(
-            public_owned_providers_at(&fold, "nrpc:echo", now),
+            public_owned_providers_at(&fold, "nrpc:echo", || now),
             one(node_id, &kp, org_root().org_id()),
         );
         assert_eq!(
-            owner_org_for_at(&fold, node_id, not_after - 1),
+            owner_org_for_at(&fold, node_id, || not_after - 1),
             Some(org_root().org_id()),
             "the last valid second is still owned"
         );
@@ -4758,12 +4810,12 @@ mod tests {
         // ownership is reported by either query.
         for t in [not_after, not_after + 1, not_after + 3600] {
             assert_eq!(
-                owner_org_for_at(&fold, node_id, t),
+                owner_org_for_at(&fold, node_id, || t),
                 None,
                 "expired cert must not keep reporting ownership at {t}"
             );
             assert!(
-                public_owned_providers_at(&fold, "nrpc:echo", t).is_empty(),
+                public_owned_providers_at(&fold, "nrpc:echo", || t).is_empty(),
                 "expired cert must not keep an exported candidate at {t}"
             );
         }
