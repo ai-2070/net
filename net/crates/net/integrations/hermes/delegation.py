@@ -76,11 +76,49 @@ def _machine_id_path() -> Optional["pathlib.Path"]:
 _MACHINE_ID_WAIT_SECONDS = 2.0
 
 
+#: Every machine id this plugin has ever generated is ``secrets.token_hex(16)``.
+#: Anything else in the file — notably a PREFIX of one, left by a fallback
+#: writer that died mid-write — is not a committed id.
+_MACHINE_ID_LEN = 32
+
+
+def _is_machine_id(value: str) -> bool:
+    return len(value) == _MACHINE_ID_LEN and all(c in "0123456789abcdef" for c in value)
+
+
 def _read_machine_id(idfile) -> str:
+    """The committed machine id in ``idfile``, or ``""`` when it is absent,
+    unreadable, empty, or not a complete id (a partial write)."""
     try:
-        return idfile.read_text(encoding="utf-8").strip()
+        value = idfile.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+    return value if _is_machine_id(value) else ""
+
+
+def _sync_dir(path) -> None:
+    """Best-effort durability barrier for a new directory entry: ``fsync`` the
+    directory on POSIX, so a power loss after a successful publish cannot drop
+    the ``machine-id`` name (a restart would then mint a new node identity).
+    There is no portable equivalent elsewhere; NTFS journals the entry."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+#: Windows ``os.rename`` refuses an existing target, so there it is an atomic
+#: create-with-contents; POSIX ``rename`` replaces. (A module constant so the
+#: POSIX fallback can be exercised on any host.)
+_RENAME_NEVER_REPLACES = os.name == "nt"
 
 
 def _publish_machine_id(idfile, value: str) -> bool:
@@ -105,16 +143,18 @@ def _publish_machine_id(idfile, value: str) -> bool:
     try:
         try:
             os.link(tmp, idfile)
+            _sync_dir(idfile.parent)
             return True
         except FileExistsError:
             return False
         except OSError:
             # The filesystem has no hard links (FAT, some network/FUSE mounts).
-            if os.name == "nt":
+            if _RENAME_NEVER_REPLACES:
                 # Windows rename never replaces an existing target, so it is
                 # the same atomic create-with-contents.
                 try:
                     os.rename(tmp, idfile)
+                    _sync_dir(idfile.parent)
                     return True
                 except FileExistsError:
                     return False
@@ -126,10 +166,21 @@ def _publish_machine_id(idfile, value: str) -> bool:
                 fd = os.open(idfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
                 return False
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(value)
-                f.flush()
-                os.fsync(f.fileno())
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(value)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                # This call created the name, so a failed write must not leave
+                # a partial id behind for later starts (they would also refuse
+                # it — `_read_machine_id` accepts only a complete id).
+                try:
+                    os.unlink(idfile)
+                except OSError:
+                    pass
+                raise
+            _sync_dir(idfile.parent)
             return True
     finally:
         try:
@@ -173,32 +224,46 @@ def _persistent_machine_id() -> str:
         time.sleep(0.01)
     if not committed:
         logger.warning(
-            "net plugin: machine id file %s exists but is empty; not inventing an "
-            "id that would not be persisted. Delete the file to regenerate it.",
+            "net plugin: machine id file %s exists but holds no complete id; not "
+            "inventing an id that would not be persisted. Delete the file to "
+            "regenerate it.",
             idfile,
         )
     return committed
 
 
 def _machine_label() -> str:
-    """A **unique, persistent** per-machine label for the delegation namespace.
+    """The delegation label of :func:`_machine_labels`."""
+    return _machine_labels()[0]
 
-    Machine + gateway identities are derived deterministically from this label
+
+def _machine_labels() -> "tuple[str, str]":
+    """``(delegation_label, transport_label)`` for this machine, from ONE read
+    of the machine id.
+
+    The delegation label must be **unique and persistent** per machine: machine
+    + gateway identities are derived deterministically from it
     (`derive_child_seed(root, f"machine:{label}")`), so two machines sharing a
     label produce identical `machine_id` / `gateway_id` from the same root —
     breaking per-machine revocation isolation and conflating audit trails.
-
     Order: explicit ``NET_MESH_MACHINE_ID`` → a persistent random per-machine id
     (host-prefixed for readability) → **hostname with a loud warning** (the only
     unstable path, and only when no id can be persisted).
+
+    The transport label (what the node's transport identity derives from) is
+    hostname-independent: the explicit ``NET_MESH_MACHINE_ID`` or the persistent
+    machine id alone. The delegation label keeps its readable host prefix. So
+    renaming the host does not rotate the node's mesh identity. Only the
+    hostname fallback (no id could be persisted) uses the hostname for both.
     """
     override = (os.environ.get("NET_MESH_MACHINE_ID") or "").strip()
     if override:
-        return override
+        return override, override
     host = _hostname()
     persistent = _persistent_machine_id()
     if persistent:
-        return f"{host}:{persistent}" if host != "unknown-host" else persistent
+        label = f"{host}:{persistent}" if host != "unknown-host" else persistent
+        return label, persistent
     logger.warning(
         "net plugin: could not establish a unique persistent machine id; "
         "delegation identities derive from the hostname (%s) and may COLLIDE "
@@ -206,7 +271,7 @@ def _machine_label() -> str:
         "NET_MESH_MACHINE_ID to a unique, stable value.",
         host,
     )
-    return host
+    return host, host
 
 
 #: Domain separation for :func:`transport_identity_seed` — keyed BLAKE2b, a

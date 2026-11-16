@@ -134,6 +134,79 @@ def test_federation_of_aliasing_ids_keeps_both(plugin):
     assert list(reg.registered) == [plugin.federate.federated_tool_name("42/foo_bar")]
 
 
+class _FlakyPinRegistrar(_PinRegistrar):
+    """Deregistration fails the first ``fail`` times."""
+
+    def __init__(self, fail=1):
+        super().__init__()
+        self.fail = fail
+
+    def deregister_pinned(self, name):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("registry busy")
+        super().deregister_pinned(name)
+
+
+class _FlakyFedRegistrar(_FedRegistrar):
+    def __init__(self, fail=1):
+        super().__init__()
+        self.fail = fail
+
+    def deregister_federated(self, name):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("registry busy")
+        super().deregister_federated(name)
+
+
+def test_a_failed_pin_retire_is_retried(plugin):
+    # The pin is gone (`removed` fired once); no second event will come. The
+    # removal must still happen, and the name must then be free again.
+    reg = _FlakyPinRegistrar()
+    prom = _pin_promoter(plugin, reg)
+    asyncio.run(prom._promote("42/a"))
+    name = plugin.pins.pinned_tool_name("42/a")
+    prom._retire("42/a")
+    assert name in reg.registered, "the first deregistration failed"
+    asyncio.run(prom._retry_pending())
+    assert reg.registered == {}
+    assert prom._owners == {} and prom._retiring == {}
+
+
+def test_a_re_promoted_pin_is_not_removed_by_its_stale_retire(plugin):
+    reg = _FlakyPinRegistrar()
+    prom = _pin_promoter(plugin, reg)
+    asyncio.run(prom._promote("42/a"))
+    prom._retire("42/a")  # fails; queued for retry
+    asyncio.run(prom._promote("42/a"))  # approved again before the retry
+    asyncio.run(prom._retry_pending())
+    assert list(reg.registered) == [plugin.pins.pinned_tool_name("42/a")]
+
+
+def test_a_collision_refused_pin_is_promoted_once_the_name_frees(plugin, monkeypatch):
+    monkeypatch.setattr(plugin.pins, "pinned_tool_name", lambda _c: "net_pinned__same")
+    reg = _PinRegistrar()
+    prom = _pin_promoter(plugin, reg)
+    asyncio.run(prom._promote("42/a"))
+    asyncio.run(prom._promote("42/b"))  # refused: the name is owned
+    prom._retire("42/a")
+    # No new `added` event for 42/b: the retry after the change promotes it.
+    asyncio.run(prom._retry_pending())
+    assert prom._registered == {"42/b": "net_pinned__same"}
+
+
+def test_a_failed_federation_retire_is_retried_on_the_next_reconcile(plugin):
+    reg = _FlakyFedRegistrar()
+    prom = _fed_promoter(plugin, reg)
+    asyncio.run(prom.reconcile([{"cap_id": "42/a"}]))
+    asyncio.run(prom.reconcile([]))  # vanished; deregistration fails
+    assert len(reg.registered) == 1
+    asyncio.run(prom.reconcile([]))  # retried
+    assert reg.registered == {}
+    assert prom._owners == {} and prom._registered == {}
+
+
 @pytest.mark.parametrize("which", ["pins", "federate"])
 def test_name_collision_is_refused_not_replaced(plugin, monkeypatch, which):
     # Defence in depth: even if two ids ever produced one name, the second

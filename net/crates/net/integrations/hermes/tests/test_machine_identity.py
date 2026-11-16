@@ -41,9 +41,60 @@ def test_loser_never_returns_an_unpersisted_machine_id(plugin, idfile):
     assert got == on_disk, (got, on_disk)
 
 
+_COMMITTED = "0123456789abcdef" * 2
+
+
 def test_loser_adopts_the_committed_machine_id(plugin, idfile):
-    idfile.write_text("abc123", encoding="utf-8")
-    assert plugin.delegation._persistent_machine_id() == "abc123"
+    idfile.write_text(_COMMITTED, encoding="utf-8")
+    assert plugin.delegation._persistent_machine_id() == _COMMITTED
+
+
+def test_a_partial_machine_id_is_not_adopted(plugin, idfile):
+    # A fallback writer that died mid-write leaves a PREFIX of an id. It is
+    # not a committed id: adopting it would make every later start a
+    # different machine from the one whose write completes (or none).
+    idfile.write_text(_COMMITTED[:10], encoding="utf-8")
+    assert plugin.delegation._persistent_machine_id() == ""
+
+
+def test_a_failed_fallback_write_leaves_no_partial_id(plugin, idfile, monkeypatch):
+    # POSIX without hard links: exclusive create, then write. A write that
+    # fails after the create must remove the name it created.
+    delegation = plugin.delegation
+    monkeypatch.setattr(delegation, "_RENAME_NEVER_REPLACES", False)
+
+    def _no_links(*_a, **_kw):
+        raise OSError(1, "hard links not supported")
+
+    real_fdopen = delegation.os.fdopen
+
+    def _failing_fdopen(fd, *a, **kw):
+        f = real_fdopen(fd, *a, **kw)
+
+        class _Broken:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                f.close()
+                return False
+
+            def write(self, _data):
+                raise OSError(28, "No space left on device")
+
+        return _Broken()
+
+    monkeypatch.setattr(delegation.os, "link", _no_links)
+    monkeypatch.setattr(delegation.os, "fdopen", _failing_fdopen)
+    assert delegation._persistent_machine_id() == ""
+    assert not idfile.exists(), "a failed write left the id file behind"
+
+
+def test_a_published_machine_id_syncs_its_directory(plugin, idfile, monkeypatch):
+    synced = []
+    monkeypatch.setattr(plugin.delegation, "_sync_dir", lambda p: synced.append(p))
+    got = plugin.delegation._persistent_machine_id()
+    assert got and synced == [idfile.parent]
 
 
 def test_machine_id_is_published_with_its_contents(plugin, idfile, monkeypatch):
@@ -80,9 +131,20 @@ def test_machine_id_publishes_without_hard_link_support(plugin, idfile, monkeypa
     assert delegation._persistent_machine_id() == got
 
 
-def test_concurrent_first_starts_agree_on_one_machine_id(plugin, monkeypatch, tmp_path):
+@pytest.mark.parametrize("hard_links", [True, False])
+def test_concurrent_first_starts_agree_on_one_machine_id(
+    plugin, monkeypatch, tmp_path, hard_links
+):
+    # Also without hard links: the fallback publish is what the loser's
+    # wait-for-the-value path exists for.
     delegation = plugin.delegation
     monkeypatch.delenv("NET_MESH_MACHINE_ID", raising=False)
+    if not hard_links:
+
+        def _no_links(*_a, **_kw):
+            raise OSError(1, "hard links not supported")
+
+        monkeypatch.setattr(delegation.os, "link", _no_links)
     for round_ in range(10):
         d = tmp_path / f"r{round_}"
         d.mkdir()
@@ -204,6 +266,24 @@ def test_transport_identity_and_delegation_share_one_machine_label(
     seed = _transport_seed_for(plugin, monkeypatch, "machine-a")
     assert labels == ["machine-a"]
     assert seed == plugin.delegation.transport_identity_seed(_ROOT_SEED, "machine-a")
+
+
+def test_renaming_the_host_keeps_the_node_identity(plugin, stub_native, monkeypatch):
+    # The persistent machine id, not the hostname, names the node: a host
+    # rename must not rotate the mesh identity peers and allow-lists know.
+    monkeypatch.delenv("NET_MESH_MACHINE_ID", raising=False)
+    monkeypatch.setattr(plugin.delegation, "_hostname", lambda: "host-a")
+    before = plugin.node._build()[0].kwargs.get("identity_seed")
+    monkeypatch.setattr(plugin.delegation, "_hostname", lambda: "host-b")
+    after = plugin.node._build()[0].kwargs.get("identity_seed")
+    assert before is not None and before == after
+
+
+def test_a_node_seed_equal_to_the_root_is_refused(plugin, stub_native, monkeypatch):
+    monkeypatch.setenv("NET_MESH_NODE_SEED", _ROOT_SEED.hex())
+    with pytest.raises(RuntimeError, match="NET_MESH_NODE_SEED must differ"):
+        plugin.node._build()
+    assert stub_native.built == []
 
 
 def test_explicit_node_seed_overrides_the_derived_identity(plugin, stub_native, monkeypatch):

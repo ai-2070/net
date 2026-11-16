@@ -136,19 +136,24 @@ def _build() -> Tuple[object, object, str, object]:
     # machine under one root the same mesh node (HERMES-02). One machine label
     # is resolved here and shared by the node identity and the delegation, so
     # the two always describe the same machine.
+    #
+    # The node's identity derives from the hostname-independent transport
+    # label (the persistent machine id or NET_MESH_MACHINE_ID), so renaming the
+    # host does not rotate it; the delegation keeps its host-prefixed label.
     machine_label = None
     transport_seed = node_seed
     if seed is not None:
-        from .delegation import _machine_label, transport_identity_seed
+        from .delegation import _machine_labels, transport_identity_seed
 
-        machine_label = _machine_label()
+        machine_label, transport_label = _machine_labels()
         if transport_seed is None:
-            transport_seed = transport_identity_seed(seed, machine_label)
+            transport_seed = transport_identity_seed(seed, transport_label)
         elif transport_seed == seed:
-            logger.warning(
-                "net plugin: NET_MESH_NODE_SEED equals the root seed; this node runs "
-                "as the operator root, and any other machine doing the same is the "
-                "SAME mesh node. Use a distinct node seed per machine."
+            # Running the node AS the root makes every machine that does the
+            # same one mesh node (HERMES-02). A warning let it start anyway.
+            raise RuntimeError(
+                "net plugin: NET_MESH_NODE_SEED must differ from "
+                "NET_MESH_IDENTITY_SEED; use a distinct per-machine node seed"
             )
 
     # Phase 3 (Slice A): derive the `root -> machine -> gateway` delegation

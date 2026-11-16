@@ -198,19 +198,23 @@ class FederationPromoter:
         logger.info("net plugin: federated mesh capability %s -> tool %s", cap_id, name)
 
     def _retire(self, cap_id: str) -> None:
-        name = self._registered.pop(cap_id, None)
+        name = self._registered.get(cap_id)
         if name is None:
             return
         # Only the owning capability removes a registration.
         if self._owners.get(name) != cap_id:
+            del self._registered[cap_id]
             return
         try:
             self._registrar.deregister_federated(name)
         except Exception as e:  # noqa: BLE001 — a failed retire must not sink the loop
-            # The host still holds the entry: keep the name owned so no other
-            # capability is federated over it.
+            # The host still holds the entry: keep it registered AND owned, so
+            # no other capability is federated over the name and the next
+            # reconcile (which retires every registered capability it no
+            # longer sees) retries the removal.
             logger.warning("net plugin: could not retire federated %s (%s): %s", cap_id, name, e)
             return
+        del self._registered[cap_id]
         del self._owners[name]
         logger.info("net plugin: retired federated capability %s (tool %s)", cap_id, name)
 
