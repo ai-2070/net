@@ -2062,8 +2062,14 @@ pub struct VerifiedGatewayContext {
     pub subject: EntityId,
     /// Rights held over `scope`.
     pub rights: SubnetRights,
-    /// Leaf generation at verification time.
+    /// Leaf generation at verification time. For an entry merged from
+    /// several credentials at one scope, the LOWEST of their generations,
+    /// so a subject floor is judged against the weakest of them.
     pub generation: u32,
+    /// Whether the credential behind this entry is delegated (one hop
+    /// below a root issuer). A delegated leaf never meets a subject
+    /// floor. For a merged entry, whether ANY credential behind it is.
+    pub delegated: bool,
     /// Authority auth epoch at verification time.
     pub subnet_auth_epoch: u64,
     /// Leaf expiry (unix seconds, exclusive).
@@ -2377,13 +2383,15 @@ impl VerifiedGatewayContextSet {
         self.earliest_expiry
     }
 
-    /// Whether any subject floor for this set's subject covers a right
-    /// some entry holds (SUBNET-05) — the conservative test a subject
-    /// floor for the LOCAL entity uses to withdraw published gateway
-    /// authority, mirroring how remote contexts are dropped
-    /// ([`SubnetFloorRegistry::subject_covers`]): coverage ignores the
-    /// leaf generation and delegation, and re-installation then decides
-    /// exactly through [`compile_gateway_context`].
+    /// Whether a subject floor refuses a right some entry holds
+    /// (SUBNET-05) — the test a subject floor for the LOCAL entity uses
+    /// to withdraw published gateway authority. Judged exactly as
+    /// [`compile_gateway_context`] judges it: each entry at its own leaf
+    /// generation, a delegated entry never meeting a floor. Judging it
+    /// conservatively (as if every leaf were delegated) made ANY subject
+    /// floor naming the local entity — an unrelated one, or the retry of
+    /// one the installed credentials were already re-issued above —
+    /// withdraw a gateway whose credentials satisfy every floor.
     pub fn subject_floor_covers(&self, floors: &SubnetFloorRegistry) -> bool {
         self.entries.iter().any(|e| {
             floors.gateway_refused_rights(
@@ -2393,8 +2401,8 @@ impl VerifiedGatewayContextSet {
                 e.attachment,
                 e.scope,
                 e.rights,
-                0,
-                true,
+                e.generation,
+                e.delegated,
             ) != 0
         })
     }
@@ -2751,6 +2759,7 @@ pub fn compile_gateway_context(
     // session — a delegated leaf never meets one, a root-direct leaf
     // meets it at or above its generation. A credential left with no
     // right is revoked outright, the same verdict a subtree floor gives.
+    let delegated = matches!(set, SubnetCredentialSet::OneHop { .. });
     let refused = floors.gateway_refused_rights(
         &verified.authority,
         verified.topology_epoch,
@@ -2759,7 +2768,7 @@ pub fn compile_gateway_context(
         verified.scope,
         verified.rights,
         verified.generation,
-        matches!(set, SubnetCredentialSet::OneHop { .. }),
+        delegated,
     );
     let rights = SubnetRights(verified.rights.bits() & !refused);
     if rights.bits() == 0 {
@@ -2773,6 +2782,7 @@ pub fn compile_gateway_context(
         subject: verified.subject,
         rights,
         generation: verified.generation,
+        delegated,
         subnet_auth_epoch: verified.subnet_auth_epoch,
         expires_at: verified.expires_at,
         credential_set_hash: verified.credential_set_hash,
@@ -2822,6 +2832,10 @@ pub fn build_gateway_context_set(
                 // Keep the tightest expiry so the merged entry cannot
                 // outlive the shorter-lived credential behind it.
                 existing.expires_at = existing.expires_at.min(entry.expires_at);
+                // And the weakest subject-floor standing, so a floor
+                // that refuses either credential reaches the merged one.
+                existing.generation = existing.generation.min(entry.generation);
+                existing.delegated |= entry.delegated;
             }
             None => {
                 entries.push(entry);

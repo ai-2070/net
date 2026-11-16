@@ -769,10 +769,29 @@ async fn a_subject_floor_on_the_local_entity_withdraws_its_gateway_authority() {
         route_other,
     ])
     .expect("root-direct re-issuance at the floor restores EXPORT");
-    let entries = v
-        .subnet_gateway_contexts()
-        .expect("published")
-        .entries()
-        .len();
-    assert_eq!(entries, 2);
+    let reinstalled = v.subnet_gateway_contexts().expect("published");
+    assert_eq!(reinstalled.entries().len(), 2);
+
+    // A later subject floor naming this node that refuses nothing it now
+    // holds (it removes ATTACH, which no installed credential carries;
+    // EXPORT is already re-issued at the generation the first floor
+    // demands) must leave the re-credentialed gateway alone. Coverage
+    // judged as if every leaf were delegated withdrew it again.
+    assert!(v
+        .apply_subnet_subject_floor(&subject_floor(&gw, SubnetRights::ATTACH, 2, 2))
+        .unwrap());
+    assert!(
+        v.subnet_gateway_contexts()
+            .is_some_and(|now| Arc::ptr_eq(&now, &reinstalled)),
+        "credentials that satisfy every floor keep their published authority"
+    );
+
+    // A floor the re-issued credential does NOT meet still withdraws it.
+    assert!(v
+        .apply_subnet_subject_floor(&subject_floor(&gw, SubnetRights::EXPORT, 3, 3))
+        .unwrap());
+    assert!(
+        v.subnet_gateway_contexts().is_none(),
+        "a floor above the re-issued generation withdraws it again"
+    );
 }
