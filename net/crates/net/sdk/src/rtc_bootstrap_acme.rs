@@ -138,9 +138,11 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
 
 /// The domain as a path component. A domain is a DNS name: letters,
 /// digits, `-`, `.`. Anything else is replaced rather than trusted as
-/// a path component.
+/// a path component. A name that is empty or only dots (`.`, `..`) would
+/// join as the parent directory itself, or above it, so it is replaced
+/// too: the result is always one ordinary component below its parent.
 fn safe_domain(config: &AcmeConfig) -> String {
-    config
+    let safe: String = config
         .domain
         .chars()
         .map(|c| {
@@ -150,7 +152,13 @@ fn safe_domain(config: &AcmeConfig) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if safe.chars().all(|c| c == '.') {
+        // Covers the empty name as well (`all` of nothing is true).
+        "_".repeat(safe.len().max(1))
+    } else {
+        safe
+    }
 }
 
 /// Where this domain's pair lived before TLS-02 namespaced the cache by
@@ -1067,6 +1075,38 @@ mod tests {
              sleeping out the staging certificate's renewal horizon"
         );
         assert!(renew_at(&staging, DEFAULT_RENEWAL_HORIZON).is_some());
+    }
+
+    /// A domain that is empty or only dots never names the cache directory
+    /// itself or anything above it: neither the namespaced nor the
+    /// pre-namespace (legacy) domain directory may leave `cache_dir`, so
+    /// the legacy adoption can never inspect or copy files outside it.
+    ///
+    /// Inverse: `..` resolves the legacy domain directory to the cache's
+    /// parent.
+    #[test]
+    fn a_dot_segment_domain_stays_one_component_below_the_cache() {
+        let base = tempfile::tempdir().unwrap();
+        for domain in ["", ".", "..", "...", "a.b", "x/../y"] {
+            let config = AcmeConfig::new(
+                "https://acme-v02.api.letsencrypt.org/directory",
+                domain,
+                "o@example.invalid",
+                base.path().into(),
+            );
+            for (dir, parent) in [
+                (legacy_domain_cache_dir(&config), config.cache_dir.clone()),
+                (domain_cache_dir(&config), directory_cache_dir(&config)),
+            ] {
+                assert_eq!(dir.parent(), Some(parent.as_path()), "{domain:?}");
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+                let name = name.unwrap_or_default();
+                assert!(
+                    !name.is_empty() && !name.chars().all(|c| c == '.'),
+                    "{domain:?} became the component {name:?}"
+                );
+            }
+        }
     }
 
     /// TLS-02 upgrade: a pair cached under the pre-namespace layout
