@@ -2399,6 +2399,40 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         2,
         "the node's grant callback and the registry's grant feed"
     );
+    // Sentinels for what the grant callbacks actually do: the node's
+    // callback advances its routing-authority epoch (the probe holds the
+    // authority past teardown), and the registry's feed bumps the
+    // protected-call registry's authority epoch. The registry is held only
+    // WEAKLY — a strong handle would keep its subscriptions alive past the
+    // node's teardown and change what this test is about. A grant key that
+    // matches no record or scoped row changes nothing else.
+    let routing_epoch = node.org_routing_epoch_probe_for_test();
+    let registry = Arc::downgrade(
+        &net::adapter::net::cortex::rpc::protected_call_registry_for(
+            node.protected_call_registry_key(),
+        ),
+    );
+    let registry_epoch = || registry.upgrade().map(|r| r.authority_epoch());
+    let revoked_grant = [(
+        org().org_id(),
+        net::adapter::net::behavior::org_grant_revocation::RevokedGrantKind::Capability,
+        [0x5au8; 32],
+    )];
+    // Positive control: invoked while the node is live, the snapshotted
+    // grant callbacks move both sentinels, so an inert result below is
+    // inertness, not a sentinel that never moves.
+    let (routing_live, registry_live) = (routing_epoch(), registry_epoch());
+    for callback in &grant_snapshot {
+        callback(&revoked_grant);
+    }
+    assert!(
+        routing_epoch() > routing_live,
+        "a live grant callback advances the routing authority"
+    );
+    assert!(
+        registry_epoch() > registry_live && registry_live.is_some(),
+        "a live grant feed bumps the protected-call registry"
+    );
 
     // Tear the node down: MeshNode::drop invalidates the owner token
     // BEFORE unsubscribing, so the count returns to baseline…
@@ -2417,19 +2451,25 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         "a callback snapshotted before teardown must not retract the fold afterward",
     );
     // The grant callbacks snapshotted before teardown are inert too (their
-    // guards' leases are dead): invoking them must not reach the torn-down
-    // node's scoped-discovery or routing state. Their inertness itself is
-    // witnessed in `org_revocation`
-    // (`a_snapshotted_grant_callback_is_inert_after_its_guard_drops`); here
-    // they must at least be callable after teardown without effect on the
-    // fold the test still holds.
+    // guards' leases are dead): invoked afterwards, the node's callback does
+    // not move the torn-down node's routing authority, the registry's feed
+    // has no registry left to reach, and the fold the test still holds is
+    // untouched. (The lease mechanism itself is witnessed in
+    // `org_revocation`, `a_snapshotted_grant_callback_is_inert_after_its_guard_drops`.)
+    assert_eq!(
+        registry_epoch(),
+        None,
+        "teardown releases the protected-call registry the feed would reach"
+    );
+    let routing_before = routing_epoch();
     for callback in &grant_snapshot {
-        callback(&[(
-            org().org_id(),
-            net::adapter::net::behavior::org_grant_revocation::RevokedGrantKind::Capability,
-            [0x5au8; 32],
-        )]);
+        callback(&revoked_grant);
     }
+    assert_eq!(
+        routing_epoch(),
+        routing_before,
+        "a grant callback snapshotted before teardown must not move the routing authority"
+    );
     assert_eq!(
         owner_org_for(&fold, publisher_node_id),
         Some(org().org_id())

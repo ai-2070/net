@@ -50519,6 +50519,17 @@ impl MeshNode {
         }
     }
 
+    /// Test-only probe of the node's org routing-authority epoch, which
+    /// every live org revocation callback (floor raise or grant revocation)
+    /// advances. The probe holds the authority itself, so it still reads
+    /// after the node is torn down: a callback snapshotted before teardown
+    /// and invoked afterwards must leave it where it was.
+    #[doc(hidden)]
+    pub fn org_routing_epoch_probe_for_test(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
+        let authority = self.routing_authority.clone();
+        move || authority.epoch()
+    }
+
     /// Test-only helper — translate a legacy
     /// [`CapabilityAnnouncement`] into the fold-shaped envelope
     /// and apply it. Mirrors the inbound dispatch path's
