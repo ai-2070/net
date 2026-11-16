@@ -78,6 +78,10 @@ pub(crate) fn create_staging(path: &Path) -> std::io::Result<(PathBuf, std::fs::
 /// other platforms (no directory handles to sync) the renamed file itself is
 /// reopened and flushed — the same barrier the A2A admission journal uses.
 pub(crate) fn durability_barrier(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DURABILITY_BARRIER.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("injected durability-barrier failure"));
+    }
     #[cfg(unix)]
     {
         let parent = match path.parent() {
@@ -93,6 +97,26 @@ pub(crate) fn durability_barrier(path: &Path) -> std::io::Result<()> {
             .open(path)
             .and_then(|f| f.sync_all())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fault injection: while set on this thread, [`durability_barrier`]
+    /// fails as a full or failing disk would, AFTER the rename published.
+    static FAIL_DURABILITY_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make [`durability_barrier`] fail on this thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn fail_durability_barrier_for_test() -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_DURABILITY_BARRIER.with(|f| f.set(false));
+        }
+    }
+    FAIL_DURABILITY_BARRIER.with(|f| f.set(true));
+    Reset
 }
 
 #[cfg(test)]

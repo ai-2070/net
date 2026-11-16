@@ -43,10 +43,19 @@ pub fn default_revocation_store_path() -> Option<PathBuf> {
 
 /// Errors from the revocation store.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RevocationStoreError {
-    /// An I/O error touching the store or its lock.
+    /// An I/O error touching the store or its lock. Nothing was published:
+    /// the previous contents are still in place.
     #[error("revocation store I/O at {path}: {reason}")]
     Io { path: String, reason: String },
+    /// The update WAS published (renamed into place, visible to every
+    /// reader) but the durability barrier after it failed, so it may not
+    /// survive a crash. Unlike [`Self::Io`] it must not be treated as "nothing
+    /// happened": a caller that rolls back its own side effects on this error
+    /// would contradict what readers already see. Saving again is safe.
+    #[error("revocation store at {path} was saved, but not durably (the update may not survive a crash): {reason}")]
+    NotDurable { path: String, reason: String },
     /// The store file exists but couldn't be parsed — surfaced (not silently
     /// treated as empty) so a typo never quietly drops revocations.
     #[error("revocation store at {path} is corrupt: {reason}")]
@@ -308,9 +317,11 @@ impl RevocationStore {
         // itself is reopened and flushed. A failed barrier is an error: the
         // new contents are in place but may not survive a crash, and saving
         // again is safe.
-        crate::store_file::durability_barrier(path).map_err(|e| RevocationStoreError::Io {
-            path: path.display().to_string(),
-            reason: format!("saved, but not durably (the update may not survive a crash): {e}"),
+        crate::store_file::durability_barrier(path).map_err(|e| {
+            RevocationStoreError::NotDurable {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            }
         })?;
         Ok(())
     }
@@ -355,6 +366,30 @@ fn decode_entity_hex(s: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A revocation whose durability barrier failed was still published:
+    /// the error says so (`NotDurable`, not `Io`), and every reader already
+    /// sees the floor.
+    #[test]
+    fn a_failed_barrier_is_reported_as_published_not_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.json");
+        let device = crate::Identity::generate();
+        {
+            let _fail = crate::store_file::fail_durability_barrier_for_test();
+            assert!(matches!(
+                RevocationStore::revoke_subject(&path, device.entity_id()),
+                Err(RevocationStoreError::NotDurable { .. })
+            ));
+        }
+        assert_eq!(
+            RevocationStore::load(&path)
+                .unwrap()
+                .floor(device.entity_id()),
+            REVOKED_SUBJECT_FLOOR,
+            "the floor is in place"
+        );
+    }
     use crate::Identity;
 
     #[test]

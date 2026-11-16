@@ -46,10 +46,19 @@ pub fn default_device_registry_path() -> Option<PathBuf> {
 
 /// Errors from the device registry.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeviceRegistryError {
-    /// An I/O error touching the registry or its lock.
+    /// An I/O error touching the registry or its lock. Nothing was published:
+    /// the previous contents are still in place.
     #[error("device registry I/O at {path}: {reason}")]
     Io { path: String, reason: String },
+    /// The update WAS published (renamed into place, visible to every
+    /// reader) but the durability barrier after it failed, so it may not
+    /// survive a crash. Unlike [`Self::Io`] it must not be treated as "nothing
+    /// happened": a caller that rolls back its own side effects on this error
+    /// would contradict what readers already see. Saving again is safe.
+    #[error("device registry at {path} was saved, but not durably (the update may not survive a crash): {reason}")]
+    NotDurable { path: String, reason: String },
     /// The registry file exists but couldn't be parsed — surfaced (not silently
     /// treated as empty) so a typo never quietly drops the inventory.
     #[error("device registry at {path} is corrupt: {reason}")]
@@ -259,9 +268,11 @@ impl DeviceRegistry {
         // itself is reopened and flushed. A failed barrier is an error: the
         // new contents are in place but may not survive a crash, and saving
         // again is safe.
-        crate::store_file::durability_barrier(path).map_err(|e| DeviceRegistryError::Io {
-            path: path.display().to_string(),
-            reason: format!("saved, but not durably (the update may not survive a crash): {e}"),
+        crate::store_file::durability_barrier(path).map_err(|e| {
+            DeviceRegistryError::NotDurable {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            }
         })?;
         Ok(())
     }

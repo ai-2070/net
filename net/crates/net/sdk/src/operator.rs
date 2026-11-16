@@ -178,10 +178,7 @@ impl OperatorEnrollment {
             .authority
             .approve(request, &invite, now, grant_ttl, max_depth)?;
         if let Err(e) = self.record_admitted(&enrollment, now) {
-            // The admission didn't commit — un-spend the nonce so the device's
-            // retry (once the store recovers) isn't permanently rejected as a
-            // replay while `pending` still advertises the invite.
-            self.authority.unspend_nonce(&invite.nonce);
+            self.settle_failed_record(&invite.nonce, &e);
             return Err(e);
         }
         // Single-use: retire the invite only after a successful admission.
@@ -235,13 +232,34 @@ impl OperatorEnrollment {
             self.authority
                 .approve(request, &invite, now_unix(), grant_ttl, max_depth)?;
         if let Err(e) = self.record_admitted(&enrollment, now_unix()) {
-            // Mirror `approve_at`: a failed commit un-spends the nonce so the
-            // invite stays redeemable for the device's retry.
-            self.authority.unspend_nonce(&invite.nonce);
+            // Mirror `approve_at`.
+            self.settle_failed_record(&invite.nonce, &e);
             return Err(e);
         }
         self.pending.lock().remove(&request.invite_nonce);
         Ok(enrollment)
+    }
+
+    /// Undo — or not — the invite spend after [`Self::record_admitted`] failed.
+    ///
+    /// If nothing was published, the admission didn't commit: un-spend the
+    /// nonce so the device's retry (once the store recovers) isn't permanently
+    /// rejected as a replay while `pending` still advertises the invite. If
+    /// the record WAS published and only its durability barrier failed
+    /// ([`DeviceRegistryError::NotDurable`]), the device is already in the
+    /// inventory every reader sees: un-spending would let the invite admit a
+    /// second time beside a record that says it was used. The nonce stays
+    /// spent and the invite is retired, as on success; the error still
+    /// reaches the caller, who learns the inventory may not survive a crash.
+    fn settle_failed_record(&self, nonce: &[u8; 16], e: &OperatorError) {
+        if matches!(
+            e,
+            OperatorError::Registry(DeviceRegistryError::NotDurable { .. })
+        ) {
+            self.pending.lock().remove(nonce);
+        } else {
+            self.authority.unspend_nonce(nonce);
+        }
     }
 
     /// The inventory half of an admission: build the record (revocation stamp
@@ -589,6 +607,44 @@ mod tests {
             .expect("retry after the store recovers succeeds");
         assert_eq!(op.devices().unwrap().len(), 1);
         assert!(op.pending_invites(T0).is_empty());
+    }
+
+    /// A record that was published but whose durability barrier failed is
+    /// in the inventory already, so the invite stays spent and retired; only
+    /// a record that was never published rolls the spend back.
+    ///
+    /// Inverse: the nonce is un-spent while the device's record is visible,
+    /// and the same invite admits again.
+    #[test]
+    fn a_published_but_not_durable_record_keeps_the_invite_spent() {
+        let (op, _root, _dir) = operator();
+        let invite = op.invite_at("relay://rv", HOUR, T0);
+        let device = Identity::generate();
+        let req = JoinRequest::create(&device, "pc", vec![], &invite);
+        {
+            let _fail = crate::store_file::fail_durability_barrier_for_test();
+            assert!(matches!(
+                op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH),
+                Err(OperatorError::Registry(
+                    DeviceRegistryError::NotDurable { .. }
+                ))
+            ));
+        }
+        let devices = op.devices().unwrap();
+        assert_eq!(devices.len(), 1, "the record was published");
+        assert_eq!(&devices[0].device, device.entity_id());
+        assert!(op.pending_invites(T0).is_empty(), "the invite is retired");
+        assert!(
+            op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH)
+                .is_err(),
+            "the invite does not admit a second time"
+        );
+        // And the authority's own ledger still holds the nonce spent.
+        op.pending.lock().insert(invite.nonce, invite.clone());
+        assert!(matches!(
+            op.approve_at(&req, T0, HOUR, DEFAULT_DELEGATION_DEPTH),
+            Err(OperatorError::Enrollment(_))
+        ));
     }
 
     #[test]
