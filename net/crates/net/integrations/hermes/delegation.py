@@ -77,23 +77,53 @@ _MACHINE_ID_WAIT_SECONDS = 2.0
 
 
 #: Every machine id this plugin has ever generated is ``secrets.token_hex(16)``.
-#: Anything else in the file — notably a PREFIX of one, left by a fallback
-#: writer that died mid-write — is not a committed id.
 _MACHINE_ID_LEN = 32
 
+#: How long after its last write a file that could still be a write in
+#: progress (see :func:`_may_be_partial`) is taken as final. A writer finishes
+#: in one write + fsync, so a file this old is not being written any more.
+_MACHINE_ID_SETTLE_SECONDS = 60.0
 
-def _is_machine_id(value: str) -> bool:
-    return len(value) == _MACHINE_ID_LEN and all(c in "0123456789abcdef" for c in value)
+
+def _may_be_partial(value: str) -> bool:
+    """Whether ``value`` could be a write in progress: empty, or a strict
+    lowercase-hex PREFIX of a generated id (the POSIX no-hard-link fallback
+    writes the name before its value). Anything else — a complete generated id,
+    an id an operator wrote by hand, uppercase hex, any other shape an older
+    plugin version accepted — is never a partial write of this plugin's, so it
+    is the committed id as it stands."""
+    return len(value) < _MACHINE_ID_LEN and all(c in "0123456789abcdef" for c in value)
+
+
+def _settled(idfile) -> bool:
+    """Whether ``idfile`` was last written long enough ago that no writer is
+    still filling it in."""
+    import time
+
+    try:
+        return time.time() - idfile.stat().st_mtime >= _MACHINE_ID_SETTLE_SECONDS
+    except OSError:
+        return False
 
 
 def _read_machine_id(idfile) -> str:
     """The committed machine id in ``idfile``, or ``""`` when it is absent,
-    unreadable, empty, or not a complete id (a partial write)."""
+    unreadable, empty, or possibly still being written.
+
+    A value that could be a partial write is adopted only once the file has
+    settled: then it is all that was ever persisted (its writer died before
+    completing it, so nobody used the full value), and every later start reads
+    the same. A FRESH prefix may be completed any moment, so it is not adopted.
+    """
     try:
         value = idfile.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
-    return value if _is_machine_id(value) else ""
+    if not _may_be_partial(value):
+        return value
+    if value and _settled(idfile):
+        return value
+    return ""
 
 
 def _sync_dir(path) -> None:
@@ -219,7 +249,8 @@ def _persistent_machine_id() -> str:
     deadline = time.monotonic() + _MACHINE_ID_WAIT_SECONDS
     while True:
         committed = _read_machine_id(idfile)
-        if committed or time.monotonic() >= deadline:
+        # A settled empty file has no writer left to wait for.
+        if committed or time.monotonic() >= deadline or _settled(idfile):
             break
         time.sleep(0.01)
     if not committed:

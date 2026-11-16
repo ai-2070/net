@@ -57,6 +57,50 @@ def test_a_partial_machine_id_is_not_adopted(plugin, idfile):
     assert plugin.delegation._persistent_machine_id() == ""
 
 
+def _age(path, seconds):
+    import os
+    import time
+
+    then = time.time() - seconds
+    os.utime(path, (then, then))
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    ["Build-Box-07", "0123456789ABCDEF0123456789ABCDEF", "lab-node", "abc123-custom"],
+)
+def test_a_legacy_or_hand_set_machine_id_is_kept(plugin, idfile, legacy, monkeypatch):
+    # Upgrading must not change the node's identity: an id an older plugin
+    # accepted (any non-empty value — hand-set, uppercase) is still the id. It
+    # can never be a partial write of a current writer, which only writes
+    # lowercase hex, so it is adopted at once, with no wait.
+    monkeypatch.setattr(plugin.delegation, "_MACHINE_ID_WAIT_SECONDS", 30.0)
+    idfile.write_text(legacy + "\n", encoding="utf-8")
+    assert plugin.delegation._persistent_machine_id() == legacy
+    assert plugin.delegation._machine_labels()[1] == legacy
+
+
+def test_a_settled_prefix_is_the_persisted_id(plugin, idfile):
+    # A fallback writer that died mid-write long ago left a prefix; it is all
+    # that was ever persisted, and every start must agree on it.
+    idfile.write_text(_COMMITTED[:10], encoding="utf-8")
+    _age(idfile, plugin.delegation._MACHINE_ID_SETTLE_SECONDS + 5)
+    assert plugin.delegation._persistent_machine_id() == _COMMITTED[:10]
+
+
+def test_a_settled_empty_file_does_not_stall_every_start(plugin, idfile, monkeypatch):
+    # An empty file abandoned long ago has no writer to wait for: the start
+    # falls back without the wait, every time.
+    import time
+
+    monkeypatch.setattr(plugin.delegation, "_MACHINE_ID_WAIT_SECONDS", 30.0)
+    idfile.write_text("", encoding="utf-8")
+    _age(idfile, plugin.delegation._MACHINE_ID_SETTLE_SECONDS + 5)
+    started = time.monotonic()
+    assert plugin.delegation._persistent_machine_id() == ""
+    assert time.monotonic() - started < 5.0
+
+
 def test_a_failed_fallback_write_leaves_no_partial_id(plugin, idfile, monkeypatch):
     # POSIX without hard links: exclusive create, then write. A write that
     # fails after the create must remove the name it created.
