@@ -90,11 +90,7 @@ impl LockGuard {
     pub async fn acquire(store_path: &Path) -> Result<Self, StoreError> {
         const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
-        // Sidecar path from the raw OS path bytes — not the lossy
-        // `display()` — so non-UTF-8 paths still lock the right file.
-        let mut lock_os = store_path.as_os_str().to_os_string();
-        lock_os.push(".lock");
-        let lock_path = PathBuf::from(lock_os);
+        let lock_path = lock_path_for(store_path);
 
         if let Some(parent) = lock_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -287,6 +283,24 @@ where
     Ok(result)
 }
 
+/// The lock sidecar for `store`: `<store>.lock`, exactly as every earlier
+/// version names it, so processes of different versions still exclude each
+/// other. Only a filename too long to take the `.lock` suffix within the
+/// 255-byte component limit — one no earlier version could lock at all —
+/// uses the bounded per-store name from [`sibling_path`] instead.
+fn lock_path_for(store: &Path) -> PathBuf {
+    // From the raw OS path bytes — not the lossy `display()` — so non-UTF-8
+    // paths still lock the right file.
+    let mut lock_os = store.as_os_str().to_os_string();
+    lock_os.push(".lock");
+    let legacy = PathBuf::from(lock_os);
+    if legacy.file_name().is_some_and(|n| n.len() <= 255) {
+        legacy
+    } else {
+        sibling_path(store, ".lock")
+    }
+}
+
 /// A unique staging name beside `path` that keeps its FULL filename:
 /// `<filename>.tmp.<pid>.<seq>`. `with_extension("tmp.<pid>")` replaced the
 /// extension instead, so two stores sharing a stem in one directory (`x.json`
@@ -396,20 +410,42 @@ mod tests {
         assert_eq!(prefix(&staging_path(&a)), prefix(&staging_path(&a)));
     }
 
-    /// Red-witness: with the suffix appended to a 250-byte store name the
-    /// staging file could not be created, so a valid custom store path could
-    /// never be saved.
+    /// Red-witness: with the suffix appended to a near-limit store name the
+    /// staging file (and, above 250 bytes, the `.lock` sidecar) could not be
+    /// created, so a valid custom store path could never be saved. Up to the
+    /// 255-byte limit itself.
     #[tokio::test]
     async fn a_near_limit_store_path_saves() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s".repeat(250));
-        mutate_json::<Counters, _, _>(&path, |s| {
-            *s.counts.entry("a".into()).or_default() += 1;
-        })
-        .await
-        .expect("a near-limit store name saves");
-        let loaded: Counters = load_json(&path).await.unwrap();
-        assert_eq!(loaded.counts["a"], 1);
+        for len in [250, 251, 255] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s".repeat(len));
+            mutate_json::<Counters, _, _>(&path, |s| {
+                *s.counts.entry("a".into()).or_default() += 1;
+            })
+            .await
+            .unwrap_or_else(|e| panic!("a {len}-byte store name saves: {e}"));
+            let loaded: Counters = load_json(&path).await.unwrap();
+            assert_eq!(loaded.counts["a"], 1, "{len}");
+        }
+    }
+
+    /// The lock sidecar keeps the name every earlier version uses whenever it
+    /// fits, so processes of different versions still exclude each other.
+    #[test]
+    fn the_lock_sidecar_keeps_its_name_when_it_fits() {
+        let dir = std::path::Path::new("some").join("dir");
+        assert_eq!(
+            lock_path_for(&dir.join("state.json")),
+            dir.join("state.json.lock")
+        );
+        assert_eq!(
+            lock_path_for(&dir.join("s".repeat(250))),
+            dir.join(format!("{}.lock", "s".repeat(250)))
+        );
+        let long = lock_path_for(&dir.join("s".repeat(251)));
+        let name = long.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 255 && name.ends_with(".lock"), "{name}");
+        assert_eq!(long.parent(), Some(dir.as_path()));
     }
 
     #[derive(Default, serde::Serialize, serde::Deserialize)]

@@ -146,7 +146,7 @@ struct LockGuard {
 
 impl LockGuard {
     async fn acquire(store_path: &Path) -> Result<Self, StoreError> {
-        let lock_path = PathBuf::from(format!("{}.lock", store_path.display()));
+        let lock_path = lock_path_for(store_path);
         let display = lock_path.clone();
         let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
             if let Some(parent) = lock_path.parent() {
@@ -618,6 +618,20 @@ pub fn validate_ref_name(name: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The lock sidecar for `store`: `<store>.lock`, exactly as every earlier
+/// version names it, so processes of different versions still exclude each
+/// other. Only a filename too long to take the `.lock` suffix within the
+/// 255-byte component limit — one no earlier version could lock at all —
+/// uses the bounded per-store name from [`sibling_path`] instead.
+fn lock_path_for(store: &Path) -> PathBuf {
+    let legacy = PathBuf::from(format!("{}.lock", store.display()));
+    if legacy.file_name().is_some_and(|n| n.len() <= 255) {
+        legacy
+    } else {
+        sibling_path(store, ".lock")
+    }
+}
+
 /// A unique staging name beside `path` that keeps its FULL filename:
 /// `<filename>.tmp.<pid>.<seq>`. `with_extension("tmp.<pid>")` replaced the
 /// extension instead, so two stores sharing a stem in one directory (`x.json`
@@ -716,14 +730,33 @@ mod tests {
     /// never be saved.
     #[tokio::test]
     async fn a_near_limit_store_path_saves() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f".repeat(250));
-        ForwardingStore::mutate(path.clone(), |s| {
-            s.set_secret("t", "Authorization", AllowList::default(), None, false)
-        })
-        .await
-        .expect("a near-limit store name saves");
-        assert!(tokio::fs::metadata(&path).await.is_ok(), "store persisted");
+        // Up to the 255-byte limit: above 250 bytes the `.lock` sidecar did
+        // not fit either.
+        for len in [250, 251, 255] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("f".repeat(len));
+            ForwardingStore::mutate(path.clone(), |s| {
+                s.set_secret("t", "Authorization", AllowList::default(), None, false)
+            })
+            .await
+            .unwrap_or_else(|e| panic!("a {len}-byte store name saves: {e}"));
+            assert!(tokio::fs::metadata(&path).await.is_ok(), "{len}");
+        }
+    }
+
+    /// The lock sidecar keeps the name every earlier version uses whenever it
+    /// fits, so processes of different versions still exclude each other.
+    #[test]
+    fn the_lock_sidecar_keeps_its_name_when_it_fits() {
+        let dir = std::path::Path::new("some").join("dir");
+        assert_eq!(
+            lock_path_for(&dir.join("forwarding.json")),
+            dir.join("forwarding.json.lock")
+        );
+        let long = lock_path_for(&dir.join("f".repeat(251)));
+        let name = long.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 255 && name.ends_with(".lock"), "{name}");
+        assert_eq!(long.parent(), Some(dir.as_path()));
     }
 
     fn allow(providers: ProviderScope, caps: &[&str]) -> AllowList {
