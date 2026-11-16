@@ -5321,30 +5321,46 @@ const MEMBERSHIP_DEDUPE_MAX: usize = 4096;
 struct MembershipFence {
     /// Nonce of the operation currently in effect.
     latest: u64,
+    /// When a copy of `latest` was last applied.
+    latest_at: std::time::Instant,
     /// Superseded nonces with the instant each was superseded, oldest
     /// first, bounded by [`MEMBERSHIP_FENCE_RETIRED_MAX`].
     retired: Vec<(u64, std::time::Instant)>,
 }
 
 impl MembershipFence {
+    fn new(nonce: u64) -> Self {
+        Self {
+            latest: nonce,
+            latest_at: std::time::Instant::now(),
+            retired: Vec::new(),
+        }
+    }
+
     fn is_retired(&self, nonce: u64, ttl: Duration) -> bool {
         self.retired
             .iter()
             .any(|(n, at)| *n == nonce && at.elapsed() < ttl)
     }
 
-    /// Whether the entry currently fences any copy. An entry whose
-    /// retired list has fully aged out carries only `latest`: dropping
-    /// it loses nothing for copies of `latest` (re-decided either way),
-    /// only the ability to retire `latest` when the next operation
-    /// lands — which is why such entries are pruned only at the cap.
+    /// Whether dropping the entry could let a delayed copy through.
+    ///
+    /// A retired nonce inside the TTL fences copies directly. `latest`
+    /// matters too, even with nothing retired: its copies can still be
+    /// in flight for a TTL after the last one was applied, and the entry
+    /// is what lets the NEXT operation retire it. Dropping an entry whose
+    /// `latest` is that recent lets the next operation open a fresh entry
+    /// that never learned `latest`, so a delayed copy of it is re-applied
+    /// over the newer operation. Only an entry quiet on both counts is
+    /// safe to prune.
     fn is_live(&self, ttl: Duration) -> bool {
-        self.retired.iter().any(|(_, at)| at.elapsed() < ttl)
+        self.latest_at.elapsed() < ttl || self.retired.iter().any(|(_, at)| at.elapsed() < ttl)
     }
 
     /// Record that `nonce` was just applied.
     fn advance(&mut self, nonce: u64, ttl: Duration) {
         if self.latest == nonce {
+            self.latest_at = std::time::Instant::now();
             return;
         }
         self.retired.retain(|(_, at)| at.elapsed() < ttl);
@@ -5354,6 +5370,7 @@ impl MembershipFence {
             self.retired.drain(..excess);
         }
         self.latest = nonce;
+        self.latest_at = std::time::Instant::now();
     }
 }
 
@@ -5364,10 +5381,11 @@ const MEMBERSHIP_FENCE_RETIRED_MAX: usize = 8;
 
 /// Hard cap on fenced `(peer, channel)` memberships — the same bound
 /// and the same degradation as [`MEMBERSHIP_DEDUPE_MAX`]: at the cap,
-/// entries with nothing currently retired are pruned (their membership
-/// is fenced again from its next operation on), and if that does not
-/// make room a NEW membership goes unfenced (pre-fence behavior) rather
-/// than growing the map.
+/// entries quiet for a full TTL are pruned (no copy of anything they
+/// remember can still be in flight), and if that does not make room a
+/// NEW membership goes unfenced (pre-fence behavior) rather than growing
+/// the map. Pruning never takes an entry that is still fencing: a
+/// steady-state subscription past the cap keeps its fence.
 const MEMBERSHIP_FENCE_MAX: usize = 4096;
 
 /// Evict subscribers the channel's **current** policy no longer
@@ -45251,10 +45269,13 @@ impl MeshNode {
         let ttl = ctx.membership_dedupe_ttl;
         let key = (from_node, channel_hash);
         // Cap check BEFORE taking the entry: `len`/`retain` lock every
-        // shard, including the one the entry guard would hold.
+        // shard, including the one the entry guard would hold. An
+        // operation on a fenced membership (the common case: retransmits
+        // and every Unsubscribe) touches one shard only; `len` is paid
+        // just for a membership the fence does not hold yet.
         let mut may_insert = true;
-        if ctx.membership_fence.len() >= MEMBERSHIP_FENCE_MAX
-            && !ctx.membership_fence.contains_key(&key)
+        if !ctx.membership_fence.contains_key(&key)
+            && ctx.membership_fence.len() >= MEMBERSHIP_FENCE_MAX
         {
             ctx.membership_fence.retain(|_, f| f.is_live(ttl));
             may_insert = ctx.membership_fence.len() < MEMBERSHIP_FENCE_MAX;
@@ -45273,10 +45294,7 @@ impl MeshNode {
             Entry::Vacant(slot) => {
                 let (applied, out) = apply();
                 if applied && may_insert {
-                    slot.insert(MembershipFence {
-                        latest: nonce,
-                        retired: Vec::new(),
-                    });
+                    slot.insert(MembershipFence::new(nonce));
                 }
                 Some(out)
             }
@@ -66507,6 +66525,41 @@ mod membership_failure_tests {
             "fence grew past its cap: {}",
             ctx.membership_fence.len()
         );
+    }
+
+    /// CHAN-04 past the cap: a steady-state subscription (its `latest`
+    /// applied, nothing retired yet) keeps its fence while newcomers push
+    /// the map over the cap. Pruning it there opened a fresh entry on the
+    /// next Unsubscribe that never learned the Subscribe's nonce, so a
+    /// delayed copy of that Subscribe re-added a member who had left.
+    #[tokio::test]
+    async fn a_steady_membership_keeps_its_fence_past_the_cap() {
+        const PEER: u64 = 0xC4A8;
+        const OTHERS: u64 = 0xC4A9;
+        const CHANNEL: ChannelHash = 0xFFFF_0001;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+
+        // The subscription applies; nothing is retired for it yet.
+        assert!(MeshNode::fenced_membership_op(PEER, CHANNEL, 0x51, &ctx, || (true, ())).is_some());
+        // Newcomers fill the fence past its cap, each triggering a prune.
+        for i in 0..(MEMBERSHIP_FENCE_MAX as ChannelHash + 64) {
+            MeshNode::fenced_membership_op(OTHERS, i, i, &ctx, || (true, ()));
+        }
+        // The Unsubscribe applies on the same membership...
+        assert!(MeshNode::fenced_membership_op(PEER, CHANNEL, 0x0B, &ctx, || (true, ())).is_some());
+        // ...so the delayed Subscribe copy is a superseded request.
+        assert!(
+            MeshNode::fenced_membership_op(PEER, CHANNEL, 0x51, &ctx, || -> (bool, ()) {
+                panic!("a superseded Subscribe copy must not be re-applied")
+            })
+            .is_none(),
+        );
+        assert!(ctx.membership_fence.len() <= MEMBERSHIP_FENCE_MAX);
     }
 
     /// **#8's gate contract, pinned.** A membership message from a
