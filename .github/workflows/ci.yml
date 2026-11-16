@@ -7069,7 +7069,7 @@ jobs:
             --floor rtc_classifier=2 \
             --floor rtc_admission_probes=11 \
             --floor rtc_signalling=14 \
-            --floor rtc_admission=27 \
+            --floor rtc_admission=28 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
             --floor natsim_browser=49 \
@@ -7094,6 +7094,7 @@ jobs:
           rtc_dual_stack:the_ipv6_stun_endpoint_answers_on_its_own_socket
           rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
           rtc_admission:a_claimant_is_not_promoted_by_another_peers_enrollment
+          rtc_admission:an_admitted_outcome_refused_at_the_tenant_cap_reaches_the_client_as_a_refusal
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
           rtc_repairs:rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error
