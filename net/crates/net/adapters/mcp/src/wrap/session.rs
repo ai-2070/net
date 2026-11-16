@@ -139,27 +139,84 @@ pub enum WrapError {
     },
 }
 
-/// Hand every priced tool's announced terms to the payment gate as quote
-/// authority, before anything announces. Idempotent (a gate replaces a
-/// tool's offers on re-publication), so the refresh paths call it too.
-fn publish_offers(
-    lowered: &[LoweredTool],
-    admission: Option<&Arc<dyn crate::serve::payment::PaymentAdmission>>,
-) -> Result<(), WrapError> {
-    let Some(admission) = admission else {
-        return Ok(());
-    };
-    for lt in lowered {
-        if let Some(terms) = lt.descriptor.pricing_terms.as_deref() {
-            admission
-                .publish_offer(&lt.descriptor.tool_id, terms)
-                .map_err(|reason| WrapError::PricingRefused {
-                    tool: lt.descriptor.tool_id.clone(),
-                    reason,
-                })?;
+/// The quote authority one publication holds in its payment gate: the terms
+/// it published, per tool id.
+///
+/// Its lifetime is the publication's. Offers are published only once the
+/// publication SERVES the tool ids (a colliding publish or refresh fails at
+/// `serve_rpc` without ever having replaced a sibling's terms), every
+/// failure restores what was published before, a refresh withdraws the ids
+/// that vanished or became free, and dropping it (the handle is released or
+/// withdrawn) withdraws them all. A publication handle holds it as its FIRST
+/// field, so the offers go before the tool handlers are released — no other
+/// publication can have claimed those ids and published its own terms yet.
+struct PublishedOffers {
+    admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>,
+    terms: std::collections::BTreeMap<String, String>,
+}
+
+impl PublishedOffers {
+    fn new(admission: Option<Arc<dyn crate::serve::payment::PaymentAdmission>>) -> Self {
+        Self {
+            admission,
+            terms: std::collections::BTreeMap::new(),
         }
     }
-    Ok(())
+
+    /// Make this publication's offers exactly `lowered`'s priced tools:
+    /// publish each one's terms, then withdraw those it published before that
+    /// are no longer priced. On a refusal nothing changes: what this call
+    /// published is restored (the earlier terms re-published, or withdrawn if
+    /// there were none) and the error names the refused tool.
+    fn reconcile(&mut self, lowered: &[LoweredTool]) -> Result<(), WrapError> {
+        let Some(admission) = self.admission.clone() else {
+            return Ok(());
+        };
+        let next: std::collections::BTreeMap<String, String> = lowered
+            .iter()
+            .filter_map(|lt| {
+                lt.descriptor
+                    .pricing_terms
+                    .clone()
+                    .map(|terms| (lt.descriptor.tool_id.clone(), terms))
+            })
+            .collect();
+        let mut published: Vec<&str> = Vec::with_capacity(next.len());
+        for (tool_id, terms) in &next {
+            if let Err(reason) = admission.publish_offer(tool_id, terms) {
+                for id in published {
+                    match self.terms.get(id) {
+                        Some(before) => {
+                            let _ = admission.publish_offer(id, before);
+                        }
+                        None => admission.withdraw_offer(id),
+                    }
+                }
+                return Err(WrapError::PricingRefused {
+                    tool: tool_id.clone(),
+                    reason,
+                });
+            }
+            published.push(tool_id);
+        }
+        for id in self.terms.keys() {
+            if !next.contains_key(id) {
+                admission.withdraw_offer(id);
+            }
+        }
+        self.terms = next;
+        Ok(())
+    }
+}
+
+impl Drop for PublishedOffers {
+    fn drop(&mut self) {
+        if let Some(admission) = &self.admission {
+            for id in self.terms.keys() {
+                admission.withdraw_offer(id);
+            }
+        }
+    }
 }
 
 /// Fold a rollback re-announce result into the error to return: if the
@@ -574,8 +631,6 @@ impl ServerPublisher {
                 return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
             }
         }
-        publish_offers(&lowered, config.payment_admission.as_ref())?;
-
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
         // One writer at a time to the announced set / merged catalog.
@@ -644,9 +699,21 @@ impl ServerPublisher {
             }
         }
 
+        // Every tool id is now served by this publication: publish the priced
+        // ones' terms as quote authority. A refusal unwinds the publication
+        // like a serve failure (the offers restore themselves).
+        let mut offers = PublishedOffers::new(config.payment_admission.clone());
+        if let Err(e) = offers.reconcile(&lowered) {
+            drop(handles);
+            self.shared.remove(id);
+            self.shared.drop_describe_if_idle();
+            return Err(rollback_result(e, self.shared.sync_mesh(&self.mesh).await));
+        }
+
         let mut tools: Vec<String> = handles.keys().cloned().collect();
         tools.sort();
         Ok(PublicationHandle {
+            offers,
             client,
             handles,
             ctx,
@@ -727,8 +794,6 @@ impl ServerPublisher {
                 return Err(WrapError::PricingKeyUnmatched { keys: unmatched });
             }
         }
-        publish_offers(&lowered, config.payment_admission.as_ref())?;
-
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
 
         // One writer at a time to the announced set / merged catalog.
@@ -793,9 +858,19 @@ impl ServerPublisher {
             }
         }
 
+        // As `publish_server`: offers only for ids this publication serves.
+        let mut offers = PublishedOffers::new(config.payment_admission.clone());
+        if let Err(e) = offers.reconcile(&lowered) {
+            drop(handles);
+            self.shared.remove(id);
+            self.shared.drop_describe_if_idle();
+            return Err(rollback_result(e, self.shared.sync_mesh(&self.mesh).await));
+        }
+
         let mut served: Vec<String> = handles.keys().cloned().collect();
         served.sort();
         Ok(LocalPublicationHandle {
+            offers,
             invoker,
             handles,
             ctx,
@@ -856,6 +931,9 @@ impl Drop for Registration {
 /// leaves the announcement to the next registry change (Drop cannot
 /// announce).
 pub struct PublicationHandle {
+    /// This publication's quote authority. FIRST, so it is withdrawn before
+    /// the handlers below are released (see [`PublishedOffers`]).
+    offers: PublishedOffers,
     /// The connected client. Held so the wrapped process outlives the
     /// publication; dropping it kills the child.
     client: Arc<StdioMcpClient>,
@@ -913,7 +991,6 @@ impl PublicationHandle {
     /// tools too.
     pub async fn refresh(&mut self) -> Result<RefreshDelta, WrapError> {
         let (lowered, skipped) = discover_and_lower(&self.client, &self.ctx).await?;
-        publish_offers(&lowered, self.payment_admission.as_ref())?;
         let desired: HashSet<String> = lowered
             .iter()
             .map(|lt| lt.descriptor.tool_id.clone())
@@ -990,6 +1067,17 @@ impl PublicationHandle {
                 }
             }
         }
+        // Every desired tool is served: reconcile the quote authority — new
+        // and repriced terms published, vanished or now-free tools'
+        // withdrawn — BEFORE their handlers go. A refusal undoes this
+        // refresh like a serve failure (the offers restore themselves).
+        if let Err(e) = self.offers.reconcile(&lowered) {
+            for served in &added {
+                self.handles.remove(served);
+            }
+            shared.restore(id, prior.clone());
+            return Err(rollback_result(e, shared.sync_mesh(mesh).await));
+        }
         // Withdraw tools that vanished (dropping the handle reverses serve_rpc).
         let removed: Vec<String> = self
             .handles
@@ -1045,6 +1133,9 @@ impl PublicationHandle {
 /// services and leaves the announcement to the next registry change (Drop
 /// cannot announce).
 pub struct LocalPublicationHandle {
+    /// This publication's quote authority. FIRST, so it is withdrawn before
+    /// the handlers below are released (see [`PublishedOffers`]).
+    offers: PublishedOffers,
     /// Backs every served tool. Held so a mesh call can reach the invoker for
     /// this publication's lifetime (each handler also holds its own clone).
     invoker: Arc<dyn ToolInvoker>,
@@ -1096,7 +1187,6 @@ impl LocalPublicationHandle {
     /// tool-id collision restores the prior contribution and re-announces it.
     pub async fn refresh(&mut self, tools: &[Tool]) -> Result<RefreshDelta, WrapError> {
         let (lowered, skipped) = lower_local_tools(tools, &self.ctx);
-        publish_offers(&lowered, self.payment_admission.as_ref())?;
         let desired: HashSet<String> = lowered
             .iter()
             .map(|lt| lt.descriptor.tool_id.clone())
@@ -1162,6 +1252,17 @@ impl LocalPublicationHandle {
                     }
                 }
             }
+        }
+        // Every desired tool is served: reconcile the quote authority — new
+        // and repriced terms published, vanished or now-free tools'
+        // withdrawn — BEFORE their handlers go. A refusal undoes this
+        // refresh like a serve failure (the offers restore themselves).
+        if let Err(e) = self.offers.reconcile(&lowered) {
+            for served in &added {
+                self.handles.remove(served);
+            }
+            shared.restore(id, prior.clone());
+            return Err(rollback_result(e, shared.sync_mesh(mesh).await));
         }
         // Withdraw tools that vanished (dropping the handle reverses serve_rpc).
         let removed: Vec<String> = self

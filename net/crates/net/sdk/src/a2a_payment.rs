@@ -117,6 +117,16 @@ pub trait TaskAdmissionGate: Send + Sync {
         let _ = (tool_id, pricing_terms);
         Ok(())
     }
+
+    /// The serving path stopped (or never started) serving `tool_id` that
+    /// it published terms for: withdraw them as quote authority, so the
+    /// provider stops signing quotes a caller would pay for with no handler
+    /// left to serve them. Quotes already signed are unaffected. Called on
+    /// every rollback of a failed serve and when the serving handle is
+    /// released. The default does nothing, like the default `publish_offer`.
+    fn withdraw_offer(&self, tool_id: &str) {
+        let _ = tool_id;
+    }
 }
 
 /// The caller's transport evidence for a paid task: what to present at

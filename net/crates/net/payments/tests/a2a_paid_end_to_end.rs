@@ -198,6 +198,10 @@ impl TaskAdmissionGate for CountingGate {
     fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
         self.inner.publish_offer(tool_id, pricing_terms)
     }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.inner.withdraw_offer(tool_id)
+    }
 }
 
 /// What the next pay call over the wire does.

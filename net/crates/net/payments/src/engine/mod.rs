@@ -1101,8 +1101,16 @@ impl PaymentEngine {
     ///
     /// **Replaces** whatever was published for the tool before, so a
     /// re-publication at a new price withdraws the old one. Refused when
-    /// the terms do not decode or name a provider other than this engine —
-    /// terms this engine cannot sign quotes for are not its to publish.
+    /// the terms do not decode, name a provider other than this engine, or
+    /// could never produce a quote here — terms this engine cannot sign
+    /// quotes for are not its to publish:
+    ///
+    /// - authored under a different asset-registry revision than the one
+    ///   this engine quotes under (a caller would pay under a registry the
+    ///   provider never announced);
+    /// - an `accepts[]` entry the registry refuses (an unsupported network
+    ///   or asset), which [`Self::issue_quote`] would refuse at every
+    ///   request — a priced tool that can never be bought.
     pub fn publish_offers(&self, tool_id: &str, pricing_terms: &[u8]) -> Result<(), EngineError> {
         let terms = crate::core::terms::PricingTerms::from_json_bytes(pricing_terms)
             .map_err(|e| EngineError::InvalidOffer(e.to_string()))?;
@@ -1112,6 +1120,21 @@ impl PaymentEngine {
                 terms.provider,
                 self.provider.entity_id()
             )));
+        }
+        if terms.asset_registry != self.registry_ref {
+            return Err(EngineError::InvalidOffer(format!(
+                "terms for `{tool_id}` were authored under a different asset registry \
+                 than this engine quotes under"
+            )));
+        }
+        for requirements in &terms.accepts {
+            self.registry
+                .check_requirements(requirements.view())
+                .map_err(|e| {
+                    EngineError::InvalidOffer(format!(
+                        "terms for `{tool_id}` offer requirements this engine cannot quote: {e}"
+                    ))
+                })?;
         }
         let accepts = terms.accepts.iter().map(|t| t.bytes().to_vec()).collect();
         self.offers.write().insert(tool_id.to_string(), accepts);
@@ -1159,8 +1182,12 @@ impl PaymentEngine {
         ttl_ns: u64,
     ) -> Result<PaymentQuote, EngineError> {
         let tool_id = bound_tool_of(capability);
+        // The offer book's read guard is held through signing: released
+        // after the check, a concurrent withdrawal or repricing could leave
+        // the template unpublished by the time the quote is signed. A
+        // publish or withdraw waits for in-flight issuance instead.
+        let offers = self.offers.read();
         {
-            let offers = self.offers.read();
             let Some(published) = offers.get(tool_id) else {
                 return Err(EngineError::UnpublishedOffer(format!(
                     "no pricing terms are published for `{tool_id}` — this provider \
@@ -1178,7 +1205,9 @@ impl PaymentEngine {
                 )));
             }
         }
-        self.issue_quote(caller, capability, requirements, input_hash, now_ns, ttl_ns)
+        let quote = self.issue_quote(caller, capability, requirements, input_hash, now_ns, ttl_ns);
+        drop(offers);
+        quote
     }
 
     /// Accept a payment against a quote: the full settle path, or the
@@ -3260,6 +3289,56 @@ mod offer_book_tests {
             Err(EngineError::InvalidOffer(_))
         ));
         // Nothing was published by either refusal.
+        assert!(matches!(
+            offered(&engine, "prov/tool", published()),
+            Err(EngineError::UnpublishedOffer(_))
+        ));
+    }
+
+    /// Terms that could never produce a quote here are refused at
+    /// publication, not at every request: authored under another asset
+    /// registry revision (a caller would pay under a registry this provider
+    /// never announced), or offering requirements the registry refuses (a
+    /// priced tool nobody can buy).
+    ///
+    /// Red: `publish_offers` accepted both, and only `issue_quote` refused
+    /// the second — after the tool was already announced as purchasable.
+    #[test]
+    fn terms_this_engine_could_never_quote_are_not_publishable() {
+        let (engine, _dir) = engine();
+        let provider = engine.provider.entity_id().clone();
+
+        let mut other_registry = engine.registry_ref.clone();
+        other_registry.hash = "00".repeat(32);
+        let foreign_registry = crate::core::canonical::canonical_bytes(&PricingTerms::new(
+            provider.clone(),
+            format!("prov/{TOOL}"),
+            vec![published()],
+            other_registry,
+        ))
+        .expect("canonicalize");
+        assert!(matches!(
+            engine.publish_offers(TOOL, &foreign_registry),
+            Err(EngineError::InvalidOffer(_))
+        ));
+
+        let unsupported = X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: "eip155:999999999".into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author requirements");
+        let unquotable = terms_for(&engine, provider, vec![published(), unsupported]);
+        assert!(matches!(
+            engine.publish_offers(TOOL, &unquotable),
+            Err(EngineError::InvalidOffer(_))
+        ));
+
+        // Neither refusal published anything.
         assert!(matches!(
             offered(&engine, "prov/tool", published()),
             Err(EngineError::UnpublishedOffer(_))

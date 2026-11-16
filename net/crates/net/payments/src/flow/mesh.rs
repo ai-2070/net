@@ -498,6 +498,10 @@ impl net_sdk::tool_payment::ToolPaymentGate for EngineToolPaymentGate {
             .publish_offers(tool_id, pricing_terms.as_bytes())
             .map_err(|e| e.to_string())
     }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.engine.withdraw_offers(tool_id);
+    }
 }
 
 /// The provider-side gate for **paid A2A tasks**
@@ -538,5 +542,9 @@ impl net_sdk::a2a_payment::TaskAdmissionGate for EngineTaskAdmissionGate {
         self.engine
             .publish_offers(tool_id, pricing_terms.as_bytes())
             .map_err(|e| e.to_string())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.engine.withdraw_offers(tool_id);
     }
 }
