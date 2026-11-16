@@ -706,6 +706,20 @@ async fn a_failed_floor_write_still_revokes_and_a_retry_persists_it() {
     assert_eq!(a.apply, FloorApplyOutcome::Applied);
     assert!(!a.persisted && a.covers(SubnetRights::ATTACH, 2));
 
+    // A stale fact arriving meanwhile changes nothing itself, but its
+    // commit retries the pending write — which fails again. It must not
+    // report success while the earlier floor is still not on disk; the
+    // readback still calls it unchanged, with `persisted: false`.
+    let stale = subject_floor(&b_kp, SubnetRights::ATTACH, 1, 0);
+    assert_eq!(
+        v.apply_subnet_subject_floor(&stale),
+        Err(SubnetAuthError::StateNotPersisted),
+        "a no-op fact must not report durable while another is pending"
+    );
+    let a = readback(&v, Some(&stale));
+    assert_eq!(a.apply, FloorApplyOutcome::Unchanged);
+    assert!(!a.persisted);
+
     disk.set_fail_writes(false);
     assert_eq!(
         v.apply_subnet_subject_floor(&floor),

@@ -21335,14 +21335,25 @@ impl MeshNode {
         let commit = store.commit(&fact_bytes(), accept)?;
         let enforce = commit.acceptance.changed || commit.was_pending_enforceable;
         let involved = commit.acceptance.accepted || commit.was_pending;
-        let persisted = if involved && !commit.durable {
-            tracing::warn!(
-                "subnet: floor accepted and enforced in memory but NOT durably logged; \
-                 re-apply the same fact to retry persistence"
-            );
-            Err(SubnetAuthError::StateNotPersisted)
-        } else {
+        // Not durable is reported whichever fact is still pending: a stale
+        // or no-op fact arriving while an earlier accepted one has not
+        // reached the disk retried that write (the commit flushes the whole
+        // queue) and must not report success when it failed again.
+        let persisted = if commit.durable {
             Ok(())
+        } else {
+            if involved {
+                tracing::warn!(
+                    "subnet: floor accepted and enforced in memory but NOT durably logged; \
+                     re-apply the same fact to retry persistence"
+                );
+            } else {
+                tracing::warn!(
+                    "subnet: an earlier accepted floor is still NOT durably logged; \
+                     re-apply it (or any floor) to retry persistence"
+                );
+            }
+            Err(SubnetAuthError::StateNotPersisted)
         };
         Ok(FloorCommitOutcome { enforce, persisted })
     }
@@ -21435,6 +21446,24 @@ impl MeshNode {
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
         gateway: &LocalGatewayHandles<'_>,
     ) -> Result<bool, SubnetAuthError> {
+        let commit = Self::apply_subject_floor_tracked_with(
+            floor, config, floors, contexts, store, gateway,
+        )?;
+        commit.persisted?;
+        Ok(commit.enforce)
+    }
+
+    /// [`Self::apply_subject_floor_with`], reporting whether this fact
+    /// changed enforceable state separately from whether the store is
+    /// durable — the readback attests the two separately.
+    fn apply_subject_floor_tracked_with(
+        floor: &SubnetSubjectFloor,
+        config: &SubnetAuthorityConfig,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        gateway: &LocalGatewayHandles<'_>,
+    ) -> Result<FloorCommitOutcome, SubnetAuthError> {
         // Durable before anything reports it committed (§6.1a item 2);
         // acceptance and log order are one order (SUBNET-03). On a write
         // failure the stricter in-memory state stays and the caller sees
@@ -21457,8 +21486,7 @@ impl MeshNode {
                 "subnet: subject floor accepted; dropped only the removed subject's contexts"
             );
         }
-        commit.persisted?;
-        Ok(commit.enforce)
+        Ok(commit)
     }
 
     /// Answer one authenticated floor readback request (V3-4 slice 2): it
@@ -21500,13 +21528,25 @@ impl MeshNode {
         }
         let apply = match request.apply_fact()? {
             None => FloorApplyOutcome::NotRequested,
-            Some(floor) => match self.apply_subnet_subject_floor(&floor) {
-                Ok(true) => FloorApplyOutcome::Applied,
-                Ok(false) => FloorApplyOutcome::Unchanged,
-                // Accepted and enforced in memory, but not durable: the
-                // honest answer is "applied" with `persisted: false`
-                // below, not a refusal of a floor that IS enforced.
-                Err(SubnetAuthError::StateNotPersisted) => FloorApplyOutcome::Applied,
+            // Whether this fact changed anything, judged apart from
+            // durability: a floor enforced in memory but not yet durable is
+            // "applied" with `persisted: false` below, never a refusal, and a
+            // stale fact is "unchanged" even while an earlier one is pending.
+            Some(floor) => match self
+                .subnet_authority_config(&floor.scope.authority)
+                .ok_or(SubnetAuthError::UnknownAuthority)
+                .and_then(|config| {
+                    Self::apply_subject_floor_tracked_with(
+                        &floor,
+                        config,
+                        &self.subnet_floors,
+                        &self.subnet_contexts,
+                        self.subnet_floor_store.as_deref(),
+                        &self.local_gateway_handles(),
+                    )
+                }) {
+                Ok(commit) if commit.enforce => FloorApplyOutcome::Applied,
+                Ok(_) => FloorApplyOutcome::Unchanged,
                 Err(e) => FloorApplyOutcome::Refused(e),
             },
         };
