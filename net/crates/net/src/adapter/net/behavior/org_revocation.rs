@@ -1154,18 +1154,22 @@ impl StoreCore {
         if revoked.is_empty() {
             return;
         }
-        let subscribers: Vec<GrantsRevokedCallback> = self
-            .subscribers
+        for callback in self.grant_subscribers() {
+            callback(revoked);
+        }
+    }
+
+    /// Snapshot the grant subscribers' callbacks outside the registry lock
+    /// (the [`Self::notify_grants`] discipline).
+    fn grant_subscribers(&self) -> Vec<GrantsRevokedCallback> {
+        self.subscribers
             .read()
             .iter()
             .filter_map(|(_, s)| match s {
                 Subscriber::Grants(callback) => Some(callback.clone()),
                 Subscriber::Floors(_) => None,
             })
-            .collect();
-        for callback in subscribers {
-            callback(revoked);
-        }
+            .collect()
     }
 
     /// Everything one publication owes its observers: floor raises,
@@ -2363,6 +2367,14 @@ impl OrgRevocationStore {
     #[doc(hidden)]
     pub fn snapshot_subscribers_for_test(&self) -> Vec<FloorsRaisedCallback> {
         self.core.floor_subscribers()
+    }
+
+    /// Test-only: [`Self::snapshot_subscribers_for_test`] for the GRANT
+    /// revocation subscribers, snapshotted exactly as
+    /// `StoreCore::notify_grants` does.
+    #[doc(hidden)]
+    pub fn snapshot_grant_subscribers_for_test(&self) -> Vec<GrantsRevokedCallback> {
+        self.core.grant_subscribers()
     }
 
     /// Register `callback` as ONE subscriber in the core's raise
@@ -5288,6 +5300,36 @@ mod tests {
             .apply_grant_revocations(&grant_revocation(not_after))
             .expect("re-apply");
         assert_eq!(grants.lock().len(), 1, "nothing new, nothing heard");
+    }
+
+    /// A grant-revocation callback snapshotted while its subscription is
+    /// live (as `notify_grants` snapshots outside the registry lock) is
+    /// inert once the subscription guard has dropped: the guard's lease is
+    /// what a node's teardown relies on, exactly as for floor callbacks.
+    #[test]
+    fn a_snapshotted_grant_callback_is_inert_after_its_guard_drops() {
+        let scratch = Scratch::new();
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
+        let heard = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = heard.clone();
+        let guard = store.subscribe_grants_revoked(move |_revoked| {
+            h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let snapshot = store.snapshot_grant_subscribers_for_test();
+        assert_eq!(snapshot.len(), 1);
+        drop(guard);
+        assert_eq!(store.subscriber_count(), 0);
+        let key = (org().org_id(), RevokedGrantKind::Capability, [0x3cu8; 32]);
+        for callback in &snapshot {
+            callback(&[key]);
+        }
+        assert_eq!(
+            heard.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a callback snapshotted before its guard dropped must not run"
+        );
     }
 
     /// A forged grant-revocation bundle is refused before any lock and

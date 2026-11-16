@@ -485,6 +485,57 @@ async fn an_admitted_session_announces_only_as_its_granted_device() {
     );
 }
 
+/// ANCHOR-04, concurrently: the witness below promotes sequentially, so a
+/// check-then-commit promotion (count, then promote, under no common lock)
+/// would pass it too. Here eight promotions for one tenant capped at 1 are
+/// released together on separate threads; exactly one may take the slot.
+///
+/// Inverse: release the admission lock between the count and the promotion
+/// in `promote_admission_with_grant` and more than one promotes.
+#[tokio::test]
+async fn concurrent_promotions_never_exceed_a_tenant_cap() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    node.set_enrollment_tenant_cap(Some(Arc::new(|tenant| (tenant == GAME_A).then_some(1))));
+    let peers: Vec<(u64, SocketAddr)> = (0..8u64)
+        .map(|i| {
+            (
+                0xE0 + i,
+                format!("127.0.0.1:{}", 21 + i).parse().expect("addr"),
+            )
+        })
+        .collect();
+    for &(peer, addr) in &peers {
+        install(&ctx, peer, addr, None);
+        make_provisional(&ctx, peer);
+    }
+    let barrier = std::sync::Barrier::new(peers.len());
+    let admitted = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for &(peer, addr) in &peers {
+            let (node, barrier, admitted) = (&node, &barrier, &admitted);
+            s.spawn(move || {
+                let session = node.peer_session_id(peer).expect("session");
+                barrier.wait();
+                if node.promote_admission_with_tenant(
+                    peer,
+                    session,
+                    PeerAddr::Udp(addr),
+                    Some(GAME_A),
+                ) {
+                    admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert_eq!(
+        admitted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "concurrent promotions must not exceed the cap"
+    );
+    assert_eq!(node.tenant_peer_count(GAME_A), 1);
+}
+
 /// ANCHOR-04: a tenant's player cap is enforced AT promotion,
 /// atomically with it. The enrollment handler's occupancy check is a
 /// per-call preflight: with a cap of 1 and nobody admitted, two

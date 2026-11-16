@@ -2391,6 +2391,14 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         "the snapshot captures both live callbacks — inertness is asserted \
          below over every one of them"
     );
+    // ORG-02: the grant-revocation callbacks (the node's own and the
+    // registry's feed) are snapshotted the same way.
+    let grant_snapshot = store.snapshot_grant_subscribers_for_test();
+    assert_eq!(
+        grant_snapshot.len(),
+        2,
+        "the node's grant callback and the registry's grant feed"
+    );
 
     // Tear the node down: MeshNode::drop invalidates the owner token
     // BEFORE unsubscribing, so the count returns to baseline…
@@ -2407,5 +2415,23 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         owner_org_for(&fold, publisher_node_id),
         Some(org().org_id()),
         "a callback snapshotted before teardown must not retract the fold afterward",
+    );
+    // The grant callbacks snapshotted before teardown are inert too (their
+    // guards' leases are dead): invoking them must not reach the torn-down
+    // node's scoped-discovery or routing state. Their inertness itself is
+    // witnessed in `org_revocation`
+    // (`a_snapshotted_grant_callback_is_inert_after_its_guard_drops`); here
+    // they must at least be callable after teardown without effect on the
+    // fold the test still holds.
+    for callback in &grant_snapshot {
+        callback(&[(
+            org().org_id(),
+            net::adapter::net::behavior::org_grant_revocation::RevokedGrantKind::Capability,
+            [0x5au8; 32],
+        )]);
+    }
+    assert_eq!(
+        owner_org_for(&fold, publisher_node_id),
+        Some(org().org_id())
     );
 }
