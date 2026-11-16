@@ -13,8 +13,9 @@ and output shape.
 - `anchor serve` caches ACME certificates per issuing directory
   (`<acme-cache>/directory-<id>/<domain>/`). A certificate already cached
   under an explicit `--acme-cache` in the old `<acme-cache>/<domain>/`
-  layout is adopted on first start when that directory's ACME account is
-  the only one in the cache; otherwise the anchor orders a fresh one. The
+  layout is adopted on first start when the cached chain verifies for the
+  domain against the platform trust store, so a staging certificate is
+  never adopted; otherwise the anchor orders a fresh one. The
   default cache moved from the shared temp directory to
   `<local data>/net-mesh/acme`, and nothing is adopted from the old shared
   location, which another local user could write: an anchor on the default

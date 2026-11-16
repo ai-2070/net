@@ -161,6 +161,10 @@ hyper-rustls = { version = "0.27", optional = true, default-features = false, fe
     "tls12",
     "logging",
 ] }
+# The platform trust store a pre-namespace cached certificate must
+# verify against before an upgraded anchor adopts it (TLS-02). Already in
+# the graph through instant-acme's default (platform-trust) client.
+rustls-native-certs = { version = "0.8", optional = true }
 # The keypair + CSR the ACME order is finalized with.
 rcgen = { version = "0.14", optional = true, default-features = false, features = [
     "pem",
@@ -252,6 +256,7 @@ rtc-bootstrap = [
     "dep:str0m",
     "dep:instant-acme",
     "dep:x509-parser",
+    "dep:rustls-native-certs",
     "dep:rcgen",
     "dep:socket2",
     "dep:libc",

@@ -167,24 +167,50 @@ fn legacy_domain_cache_dir(config: &AcmeConfig) -> PathBuf {
     config.cache_dir.join(safe_domain(config))
 }
 
-/// Whether THIS directory's account is the only ACME account in the
-/// cache. Ordering a certificate needs an account, and accounts were
-/// always saved per directory, so then every certificate this cache was
-/// ever ordered under came from this directory.
-fn only_account_is_this_directory(config: &AcmeConfig) -> bool {
-    let Ok(entries) = std::fs::read_dir(&config.cache_dir) else {
+/// The roots a public ACME directory's certificates are judged against:
+/// the platform trust store, the same one browsers and the anchor's other
+/// clients use. Empty when it cannot be loaded.
+fn platform_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+    if !loaded.errors.is_empty() {
+        tracing::debug!(errors = ?loaded.errors, "ACME: some platform roots could not be loaded");
+    }
+    roots.add_parsable_certificates(loaded.certs);
+    roots
+}
+
+/// Whether `chain` verifies as a TLS server chain for `domain` against
+/// `roots`, now — the check every client of the anchor will make.
+fn chain_is_trusted(
+    chain: &[rustls::pki_types::CertificateDer<'static>],
+    domain: &str,
+    roots: rustls::RootCertStore,
+) -> bool {
+    use rustls::client::danger::ServerCertVerifier as _;
+
+    let Some((leaf, intermediates)) = chain.split_first() else {
         return false;
     };
-    let ours = account_path(config);
-    let mut accounts = entries.filter_map(Result::ok).filter(|e| {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        name.starts_with(ACCOUNT_FILE_PREFIX) && name.ends_with(".json")
-    });
-    matches!(
-        (accounts.next(), accounts.next()),
-        (Some(only), None) if only.path() == ours
+    let Ok(name) = rustls::pki_types::ServerName::try_from(domain.to_string()) else {
+        return false;
+    };
+    let Ok(verifier) = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
     )
+    .build() else {
+        return false;
+    };
+    verifier
+        .verify_server_cert(
+            leaf,
+            intermediates,
+            &name,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .is_ok()
 }
 
 /// The TLS-02 upgrade: adopt this domain's pre-TLS-02 pair into the
@@ -192,18 +218,36 @@ fn only_account_is_this_directory(config: &AcmeConfig) -> bool {
 /// certificate does not place a new order (and spend rate limit) just
 /// because the layout changed. Returns whether a pair was adopted.
 ///
-/// Adopted only when the pair can be attributed to THIS directory —
-/// its account is the only one in the cache — which is exactly the
-/// staging-then-production case TLS-02 exists for, refused; only through
-/// the same trust checks the cache itself gets (TLS-06: no symlink, this
-/// user's, not writable by others, the key private); and only a pair that
-/// qualifies for the domain now. It is copied, not moved: the legacy
-/// files stay where an older build looks for them. Anything else adopts
-/// nothing and the anchor orders as usual.
+/// The old layout recorded nothing about which directory issued a pair,
+/// and nothing in the cache can prove it after the fact (account files
+/// can be deleted). So provenance is not inferred; the harm TLS-02 exists
+/// for — serving a certificate the anchor's clients will refuse, such as a
+/// staging one — is checked directly instead. For a public directory (no
+/// [`AcmeConfig::directory_roots`]) the legacy chain is adopted only if it
+/// verifies for the domain against the platform trust store, which a
+/// staging certificate never does. A private directory adopts nothing: its
+/// clients' trust is not known here. The pair must also pass the trust
+/// checks the cache itself gets (TLS-06: no symlink, this user's, not
+/// writable by others, the key private) and qualify for the domain now. It
+/// is copied, not moved: the legacy files stay where an older build looks
+/// for them. Anything else adopts nothing and the anchor orders as usual.
 fn adopt_legacy_pair(config: &AcmeConfig, dir: &Path) -> bool {
+    if !config.directory_roots.is_empty() {
+        return false;
+    }
+    adopt_legacy_pair_trusting(config, dir, platform_roots)
+}
+
+/// [`adopt_legacy_pair`] judged against the roots `roots` yields (loaded
+/// only once a legacy pair is actually there).
+fn adopt_legacy_pair_trusting(
+    config: &AcmeConfig,
+    dir: &Path,
+    roots: impl FnOnce() -> rustls::RootCertStore,
+) -> bool {
     let legacy = legacy_domain_cache_dir(config);
     let (cert, key) = cache_paths(&legacy);
-    if !cert.exists() || !key.exists() || !only_account_is_this_directory(config) {
+    if !cert.exists() || !key.exists() {
         return false;
     }
     for (path, private) in [
@@ -216,7 +260,15 @@ fn adopt_legacy_pair(config: &AcmeConfig, dir: &Path) -> bool {
             return false;
         }
     }
-    if read_cache(&legacy, &config.domain, now_unix()).is_none() {
+    let Some((chain, _)) = read_cache(&legacy, &config.domain, now_unix()) else {
+        return false;
+    };
+    if !chain_is_trusted(&chain, &config.domain, roots()) {
+        tracing::info!(
+            from = %legacy.display(),
+            "ACME: not adopting the pre-namespace cached certificate: it does not verify \
+             against the platform trust store (it may be a staging certificate)"
+        );
         return false;
     }
     let (Ok(cert_pem), Ok(key_pem)) = (
@@ -1109,16 +1161,39 @@ mod tests {
         }
     }
 
+    /// A CA and a `localhost` leaf it signed: `(root store, leaf PEM, key PEM)`.
+    fn ca_signed_localhost() -> (rustls::RootCertStore, String, String) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "net-mesh adoption test CA");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        (roots, leaf.pem(), leaf_key.serialize_pem())
+    }
+
     /// TLS-02 upgrade: a pair cached under the pre-namespace layout
-    /// (`<cache>/<domain>/`) is adopted when this directory's account is
-    /// the only one in the cache, so an upgraded anchor does not re-order
-    /// a certificate it already holds. With another directory's account
-    /// beside it the pair cannot be attributed — it may be staging's — and
-    /// nothing is adopted.
+    /// (`<cache>/<domain>/`) is adopted when its chain verifies for the
+    /// domain against the trust the anchor's clients use, so an upgraded
+    /// anchor does not re-order a certificate it already holds. A chain
+    /// that does not verify — a staging certificate, which no client
+    /// trusts — is never adopted, whatever account files the cache holds:
+    /// deleting the staging account (the case an account-based check got
+    /// wrong) changes nothing. A private directory adopts nothing.
     ///
-    /// Inverse: no adoption, and every upgraded anchor places a new order.
+    /// Inverse: adopt by account files alone, and a staging pair whose
+    /// account was deleted is served in production.
     #[test]
-    fn a_pre_namespace_pair_is_adopted_only_when_attributable() {
+    fn a_pre_namespace_pair_is_adopted_only_when_its_chain_is_trusted() {
         let production = |base: &Path| {
             AcmeConfig::new(
                 "https://acme-v02.api.letsencrypt.org/directory",
@@ -1127,19 +1202,16 @@ mod tests {
                 base.into(),
             )
         };
-        let seed_legacy = |config: &AcmeConfig| {
-            let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
-            write_cache(&legacy_domain_cache_dir(config), &cert_pem, &key_pem).unwrap();
-            write_private_key(&account_path(config), "{}").unwrap();
-        };
         let now = now_unix();
 
+        // A trusted chain is adopted, and copied rather than moved.
         let base = tempfile::tempdir().unwrap();
         let config = production(base.path());
-        seed_legacy(&config);
+        let (roots, cert_pem, key_pem) = ca_signed_localhost();
+        write_cache(&legacy_domain_cache_dir(&config), &cert_pem, &key_pem).unwrap();
         let dir = prepare_cache(&config).unwrap();
         assert!(read_cache(&dir, "localhost", now).is_none(), "the premise");
-        assert!(adopt_legacy_pair(&config, &dir), "the only account is ours");
+        assert!(adopt_legacy_pair_trusting(&config, &dir, || roots));
         assert!(read_cache(&dir, "localhost", now).is_some());
         assert!(renew_at(&config, DEFAULT_RENEWAL_HORIZON).is_some());
         assert!(
@@ -1147,32 +1219,45 @@ mod tests {
             "copied, not moved: an older build still finds it"
         );
 
+        // The reviewed case: a staging pair (its CA is trusted by no
+        // client) with the staging account deleted and only production's
+        // account left. Not adopted, against the platform store or against
+        // roots that do not include its CA.
         let base = tempfile::tempdir().unwrap();
         let config = production(base.path());
-        seed_legacy(&config);
-        let staging = AcmeConfig::new(
-            "https://acme-staging-v02.api.letsencrypt.org/directory",
-            "localhost",
-            "o@example.invalid",
-            base.path().into(),
-        );
-        write_private_key(&account_path(&staging), "{}").unwrap();
+        let (_staging_roots, cert_pem, key_pem) = ca_signed_localhost();
+        write_cache(&legacy_domain_cache_dir(&config), &cert_pem, &key_pem).unwrap();
+        write_private_key(&account_path(&config), "{}").unwrap();
         let dir = prepare_cache(&config).unwrap();
+        let (other_roots, _, _) = ca_signed_localhost();
+        assert!(
+            !adopt_legacy_pair_trusting(&config, &dir, || other_roots),
+            "a chain no trusted root signed is not adopted"
+        );
         assert!(
             !adopt_legacy_pair(&config, &dir),
-            "another directory's account is present: the pair may be its"
+            "the platform store does not trust it either"
         );
         assert!(read_cache(&dir, "localhost", now).is_none());
 
+        // A self-signed pair (no chain at all) is not adopted.
         let base = tempfile::tempdir().unwrap();
         let config = production(base.path());
         let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
         write_cache(&legacy_domain_cache_dir(&config), &cert_pem, &key_pem).unwrap();
         let dir = prepare_cache(&config).unwrap();
-        assert!(
-            !adopt_legacy_pair(&config, &dir),
-            "no account at all: nothing attributes the pair"
-        );
+        assert!(!adopt_legacy_pair(&config, &dir));
+
+        // A private directory adopts nothing, even a chain its own roots
+        // would verify: its clients' trust is not known here.
+        let base = tempfile::tempdir().unwrap();
+        let root_file = base.path().join("root.pem");
+        let (_roots, cert_pem, key_pem) = ca_signed_localhost();
+        std::fs::write(&root_file, &cert_pem).unwrap();
+        let config = production(base.path()).with_directory_roots([root_file]);
+        write_cache(&legacy_domain_cache_dir(&config), &cert_pem, &key_pem).unwrap();
+        let dir = prepare_cache(&config).unwrap();
+        assert!(!adopt_legacy_pair(&config, &dir));
     }
 
     /// R4c: the renewal owner wakes at `not_after - horizon`.

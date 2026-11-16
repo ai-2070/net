@@ -3375,6 +3375,7 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "schemars",
  "serde",
