@@ -41845,6 +41845,35 @@ impl MeshNode {
             .store(enabled, Ordering::Release);
     }
 
+    /// [`Self::set_enrollment_subject_binding`], returning the setting it
+    /// replaced — so a caller that fails after installing its enrollment
+    /// policy can put the previous one back.
+    #[cfg(feature = "webrtc")]
+    pub fn replace_enrollment_subject_binding(&self, enabled: bool) -> bool {
+        self.enrollment_subject_binding
+            .swap(enabled, Ordering::AcqRel)
+    }
+
+    /// [`Self::set_enrollment_tenant_resolver`], returning the resolver it
+    /// replaced (see [`Self::replace_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    pub fn replace_enrollment_tenant_resolver(
+        &self,
+        resolver: Option<EnrollmentTenantResolver>,
+    ) -> Option<EnrollmentTenantResolver> {
+        std::mem::replace(&mut *self.enrollment_tenant_resolver.write(), resolver)
+    }
+
+    /// [`Self::set_enrollment_tenant_cap`], returning the cap it replaced
+    /// (see [`Self::replace_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    pub fn replace_enrollment_tenant_cap(
+        &self,
+        cap: Option<EnrollmentTenantCap>,
+    ) -> Option<EnrollmentTenantCap> {
+        std::mem::replace(&mut *self.enrollment_tenant_cap.write(), cap)
+    }
+
     /// ANCHOR-03: which device an Admitted grant binds to `node_id`'s
     /// session. `Ok(None)` when this node does not bind grants;
     /// `Ok(Some(device))` when it does and the grant's leaf subject is

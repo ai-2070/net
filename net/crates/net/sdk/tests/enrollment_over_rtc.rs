@@ -347,3 +347,65 @@ async fn one_devices_join_body_promotes_only_that_devices_session() {
         "and the stranger is still not promoted"
     );
 }
+
+/// A second `serve_game_enrollment` on a node already serving enrollment
+/// fails to register, and must leave the running service's node-wide
+/// admission policy alone. It used to install its own registry's tenant
+/// resolver and player cap before failing, so the running service's
+/// grants were then resolved by a registry that never issued them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_duplicate_game_enrollment_serve_keeps_the_running_policy() {
+    use net_sdk::game_anchor::{serve_game_enrollment, GameConfig, GameRegistry};
+
+    let issuer = Identity::generate();
+    let anchor = Mesh::builder("127.0.0.1:0", &PSK)
+        .expect("builder")
+        .identity(issuer.clone())
+        .rtc(rtc(true))
+        .build()
+        .await
+        .expect("anchor");
+    anchor.start().expect("mesh start");
+    let first = Arc::new(
+        GameRegistry::from_identity(&issuer, vec![GameConfig::new("chess")]).expect("registry"),
+    );
+    let _serve = serve_game_enrollment(&anchor, Arc::clone(&first), Duration::from_secs(3600))
+        .expect("serve game enrollment");
+    let second = Arc::new(
+        GameRegistry::from_identity(&Identity::generate(), vec![GameConfig::new("go")])
+            .expect("registry"),
+    );
+    assert!(
+        serve_game_enrollment(&anchor, second, Duration::from_secs(3600)).is_err(),
+        "enrollment is already served on this node"
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let invite = first
+        .mint_invite_at(
+            "chess",
+            anchor.rendezvous_string(),
+            Duration::from_secs(3600),
+            now,
+        )
+        .expect("invite");
+    let body = JoinRequest::create(&Identity::generate(), "tab", vec![], &invite).to_bytes();
+    let JoinOutcome::Admitted { chain } =
+        JoinOutcome::from_bytes(&first.handle_join_request(&body, Duration::from_secs(3600)))
+            .expect("outcome")
+    else {
+        panic!("the first registry admits its own invite");
+    };
+    let resolver = anchor
+        .node()
+        .replace_enrollment_tenant_resolver(None)
+        .expect("a resolver is installed");
+    assert!(
+        resolver(&chain).is_some(),
+        "the running service's grants must still resolve to their game"
+    );
+    assert_eq!(resolver(&chain), first.tenant_of_chain(&chain));
+}
