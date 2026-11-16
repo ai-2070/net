@@ -4263,6 +4263,20 @@ struct LocalGatewayHandles<'a> {
     publish: &'a parking_lot::Mutex<()>,
 }
 
+/// What one enrollment promotion attempt did (§12 step 4).
+#[cfg(feature = "webrtc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Promotion {
+    /// The session is admitted.
+    Promoted,
+    /// The tenant was at its player cap (ANCHOR-04): the session stays
+    /// provisional, and the Admitted verdict being answered is void.
+    TenantFull,
+    /// Nothing promoted for any other reason — not this call's
+    /// reservation, a replaced incarnation, an already-admitted session.
+    NotPromoted,
+}
+
 /// What committing one floor fact requires of the caller
 /// (`MeshNode::commit_floor_fact`).
 struct FloorCommitOutcome {
@@ -41465,7 +41479,7 @@ impl MeshNode {
             expected_endpoint,
             tenant,
             None,
-        )
+        ) == Promotion::Promoted
     }
 
     /// [`Self::promote_admission_with_tenant`], also recording the
@@ -41479,7 +41493,7 @@ impl MeshNode {
         expected_endpoint: PeerAddr,
         tenant: Option<super::rtc::TenantId>,
         device: Option<EntityId>,
-    ) -> bool {
+    ) -> Promotion {
         // ANCHOR-04: a capped tenant's slot is taken HERE, at the
         // commit, under one lock — the count of admitted sessions and
         // this promotion are one step. The enrollment handler's own
@@ -41503,18 +41517,18 @@ impl MeshNode {
                     node_id = format!("{node_id:#x}"),
                     "§12: tenant is at its player cap; session stays provisional"
                 );
-                return false;
+                return Promotion::TenantFull;
             }
         }
         let Some(mut entry) = self.peers.get_mut(&node_id) else {
-            return false;
+            return Promotion::NotPromoted;
         };
         let info = entry.value_mut();
         if info.session.session_id() != expected_session_id || info.addr() != expected_endpoint {
-            return false;
+            return Promotion::NotPromoted;
         }
         if !info.admission.is_provisional() {
-            return false;
+            return Promotion::NotPromoted;
         }
         // The origin the reply subscription was admitted under; the
         // Admitted reply this promotion precedes still rides it.
@@ -41543,7 +41557,7 @@ impl MeshNode {
         if tokio::runtime::Handle::try_current().is_ok() {
             self.spawn_relay_replay(node_id);
         }
-        true
+        Promotion::Promoted
     }
 
     /// Charge one enrollment REQUEST frame and reserve its
@@ -41673,7 +41687,7 @@ impl MeshNode {
             session,
             None,
             None,
-        )
+        ) == Promotion::Promoted
     }
 
     /// Drive the rejection half by call id (R2 witness seam).
@@ -41767,6 +41781,10 @@ impl MeshNode {
     /// §12 step 4, the response half: an enrollment call that
     /// produced a response promotes the incarnation captured at its
     /// own REQUEST decode — and only that one (R2).
+    ///
+    /// [`Promotion::TenantFull`] tells the response path that the
+    /// Admitted verdict it is about to send did NOT take effect, so it
+    /// must not reach the visitor as an admission (ANCHOR-04).
     #[cfg(feature = "webrtc")]
     pub(crate) fn promote_on_enrollment_response(
         &self,
@@ -41776,12 +41794,12 @@ impl MeshNode {
         receiving_session_id: u64,
         tenant: Option<super::rtc::TenantId>,
         device: Option<EntityId>,
-    ) -> bool {
+    ) -> Promotion {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
-            return false;
+            return Promotion::NotPromoted;
         };
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
-            return false;
+            return Promotion::NotPromoted;
         }
         // R3-A: the in-flight slot is released **only** for the
         // call that owned it, and only when its own reservation is
@@ -41796,7 +41814,7 @@ impl MeshNode {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
                 stats.note_admission_promotion_orphaned();
             }
-            return false;
+            return Promotion::NotPromoted;
         };
         self.release_enrollment_slot_of(node_id, session_id);
         self.promote_admission_with_grant(node_id, session_id, endpoint, tenant, device)

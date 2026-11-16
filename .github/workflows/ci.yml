@@ -7069,7 +7069,7 @@ jobs:
             --floor rtc_classifier=2 \
             --floor rtc_admission_probes=11 \
             --floor rtc_signalling=14 \
-            --floor rtc_admission=26 \
+            --floor rtc_admission=27 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
             --floor natsim_browser=49 \
