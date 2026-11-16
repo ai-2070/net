@@ -3414,4 +3414,106 @@ mod floor_coherence_tests {
             "a set compiled before the floor holds a floored right"
         );
     }
+
+    /// A context as `verify_admission` would compile it for `subject` at
+    /// `at`, at leaf `generation`, pinned to the registry's current epoch.
+    fn admitted(
+        registry: &SubnetFloorRegistry,
+        subject: &EntityKeypair,
+        at: &[u8],
+        rights: SubnetRights,
+        generation: u32,
+    ) -> VerifiedSubnetContext {
+        let config = config();
+        VerifiedSubnetContext {
+            authority: config.authority.clone(),
+            attachment: TopologySubnetId::new(at),
+            scope: TopologySubnetId::new(at),
+            topology_epoch: 0,
+            subject: subject.entity_id().clone(),
+            subject_node: subject.entity_id().node_id(),
+            session_id: 7,
+            rights,
+            generation,
+            subnet_auth_epoch: registry.auth_epoch(&config.authority),
+            expires_at: now() + DAY,
+            credential_set_hash: [0x5A; 32],
+        }
+    }
+
+    /// SUBNET-01 for SUBJECT floors: a subject floor moves no auth epoch,
+    /// so the epoch-only fence passed a context verified just before the
+    /// floor landed. The floor's own invalidation scan ran before the
+    /// install and found nothing to drop, so the revoked right stayed
+    /// admitted until the peer reconnected. The fence must re-read the
+    /// subject floor and roll the install back.
+    #[test]
+    fn a_subject_floor_landing_mid_admission_is_caught_by_the_fence() {
+        use super::super::admission::SubnetContextStore;
+        let registry = SubnetFloorRegistry::new();
+        let contexts = SubnetContextStore::new();
+        let config = config();
+        let peer = EntityKeypair::from_bytes([0x56; 32]);
+        let node = peer.entity_id().node_id();
+
+        // Verification passed against an empty registry.
+        let ctx = admitted(&registry, &peer, &[3, 7], SubnetRights::ROUTE, 1);
+        // The floor lands, and its scan runs, before the install.
+        let floor = subject_floor(&peer, &[3], SubnetRights::ROUTE, 2, 1);
+        assert!(registry.apply_subject(&floor, &config).unwrap());
+        assert_eq!(
+            contexts.invalidate_subject(&config.authority, peer.entity_id(), &registry),
+            0
+        );
+        contexts.install(node, ctx.clone());
+
+        assert_eq!(
+            contexts.fence_installed(node, &ctx, 0, &registry, false),
+            Err(SubnetAuthError::Revoked),
+            "a subject floor raised mid-admission must refuse the admission"
+        );
+        assert!(
+            contexts.get_for_session(node, ctx.session_id).is_none(),
+            "the fenced install is rolled back"
+        );
+    }
+
+    /// The fence judges a subject floor exactly, as verification does: a
+    /// leaf re-issued at or above the floor is admitted, a delegated leaf
+    /// never meets one, and a right the floor does not name is untouched.
+    #[test]
+    fn the_admission_fence_judges_subject_floors_exactly() {
+        use super::super::admission::SubnetContextStore;
+        let registry = SubnetFloorRegistry::new();
+        let contexts = SubnetContextStore::new();
+        let config = config();
+        let peer = EntityKeypair::from_bytes([0x57; 32]);
+        let node = peer.entity_id().node_id();
+        let floor = subject_floor(&peer, &[3], SubnetRights::ROUTE, 2, 1);
+        assert!(registry.apply_subject(&floor, &config).unwrap());
+
+        let reissued = admitted(&registry, &peer, &[3, 7], SubnetRights::ROUTE, 2);
+        contexts.install(node, reissued.clone());
+        assert_eq!(
+            contexts.fence_installed(node, &reissued, 0, &registry, false),
+            Ok(())
+        );
+        assert!(contexts
+            .get_for_session(node, reissued.session_id)
+            .is_some());
+
+        assert_eq!(
+            contexts.fence_installed(node, &reissued, 0, &registry, true),
+            Err(SubnetAuthError::Revoked),
+            "a delegated leaf never meets a subject floor"
+        );
+
+        let attach = admitted(&registry, &peer, &[3, 7], SubnetRights::ATTACH, 1);
+        contexts.install(node, attach.clone());
+        assert_eq!(
+            contexts.fence_installed(node, &attach, 0, &registry, false),
+            Ok(()),
+            "ATTACH is not floored"
+        );
+    }
 }

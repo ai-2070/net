@@ -21169,23 +21169,21 @@ impl MeshNode {
 
         self.subnet_contexts.install(from_node, ctx.clone());
         // SUBNET-01 publication fence. Verification captured the auth
-        // epoch before it read any floor, so a floor raised since then
-        // has moved the epoch past `ctx`'s. Re-read it AFTER the install:
-        // either it still matches (any later floor's invalidation scan
-        // runs after this install and sees the context), or a revocation
+        // epoch before it read any floor, so a subtree floor raised since
+        // then has moved the epoch past `ctx`'s; a subject floor moves no
+        // epoch and is re-read directly. Re-read AFTER the install: either
+        // nothing moved (any later revocation's invalidation scan runs
+        // after this install and sees the context), or a revocation
         // landed mid-admission and this context must not be reported
         // admitted. Removal is conditional on the context still being
         // exactly this one, so a concurrent re-admission is never undone.
-        let topology_now = self.subnet_topology_epoch.load(Ordering::Acquire);
-        let auth_now = self.subnet_floors.auth_epoch(&ctx.authority);
-        if ctx.topology_epoch != topology_now || ctx.subnet_auth_epoch != auth_now {
-            self.subnet_contexts.forget_if_same(from_node, &ctx);
-            return Err(if ctx.topology_epoch != topology_now {
-                SubnetAuthError::WrongTopologyEpoch
-            } else {
-                SubnetAuthError::Revoked
-            });
-        }
+        self.subnet_contexts.fence_installed(
+            from_node,
+            &ctx,
+            self.subnet_topology_epoch.load(Ordering::Acquire),
+            &self.subnet_floors,
+            matches!(set, SubnetCredentialSet::OneHop { .. }),
+        )?;
         Ok(ctx)
     }
 
