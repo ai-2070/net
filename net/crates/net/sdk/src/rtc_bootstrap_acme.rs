@@ -156,7 +156,11 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
 ///   `/tmp/net-mesh-acme`) would be served as this anchor's
 ///   certificate;
 /// - on Unix, **group- or world-writable** — another user could
-///   replace it after this check.
+///   replace it after this check;
+/// - on Unix, for a `private` entry (the TLS key and the ACME account
+///   file), **readable by group or other** — another local user may
+///   already have read the key this anchor would serve with. The
+///   certificate is public and keeps its 0644.
 ///
 /// The key's own 0600 mode (R5b) does not authenticate a
 /// pre-existing cache: it is the mode of what THIS process writes,
@@ -165,7 +169,7 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
 /// On Windows there is no ownership/mode view in `std`; only the
 /// symlink refusal applies, and the default cache lives under the
 /// per-user profile, whose ACL is the user's.
-fn check_cache_entry(path: &Path) -> Result<bool, BootstrapError> {
+fn check_cache_entry(path: &Path, private: bool) -> Result<bool, BootstrapError> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -191,7 +195,8 @@ fn check_cache_entry(path: &Path) -> Result<bool, BootstrapError> {
         let euid = unsafe { libc::geteuid() };
         if meta.uid() != euid {
             return Err(BootstrapError::Acme(format!(
-                "the ACME cache entry {} is owned by uid {}, not this user (uid {euid}) —                  refusing to serve or extend a cache another user controls",
+                "the ACME cache entry {} is owned by uid {}, not this user (uid {euid}) — \
+                 refusing to serve or extend a cache another user controls",
                 path.display(),
                 meta.uid()
             )));
@@ -199,12 +204,91 @@ fn check_cache_entry(path: &Path) -> Result<bool, BootstrapError> {
         let mode = meta.mode() & 0o777;
         if mode & 0o022 != 0 {
             return Err(BootstrapError::Acme(format!(
-                "the ACME cache entry {} has mode {mode:o}, writable by group or other —                  refusing a cache another user could replace",
+                "the ACME cache entry {} has mode {mode:o}, writable by group or other — \
+                 refusing a cache another user could replace",
+                path.display()
+            )));
+        }
+        if private && mode & 0o077 != 0 {
+            return Err(BootstrapError::Acme(format!(
+                "the ACME cache entry {} has mode {mode:o}, readable by group or other — \
+                 refusing private key material another user may already have read",
                 path.display()
             )));
         }
     }
+    #[cfg(not(unix))]
+    let _ = private;
     Ok(true)
+}
+
+/// Every directory ABOVE the cache must not let another user swap the
+/// cache out from under the per-entry checks (TLS-06 follow-up): an
+/// ancestor another (non-root) user owns, or one others may write without
+/// the sticky bit, lets them rename the checked cache directory away and
+/// put their own in its place between the check and the read.
+///
+/// Checked along both the configured path and its canonical form (a
+/// symlinked component is judged by its owner — its permission bits mean
+/// nothing — and its target's ancestors are checked through the canonical
+/// path). An ancestor that does not exist yet is skipped: the cache
+/// creates it private. Unix only, like the ownership checks; on Windows
+/// the default cache lives under the per-user profile.
+#[cfg(unix)]
+fn check_cache_ancestors(cache_dir: &Path) -> Result<(), BootstrapError> {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: `geteuid` takes no arguments, touches no memory and
+    // cannot fail; it is unsafe only because it is `extern`.
+    let euid = unsafe { libc::geteuid() };
+    let absolute = std::path::absolute(cache_dir).map_err(|e| {
+        BootstrapError::Acme(format!(
+            "resolving the ACME cache path {}: {e}",
+            cache_dir.display()
+        ))
+    })?;
+    let mut ancestors: Vec<PathBuf> = absolute
+        .ancestors()
+        .skip(1)
+        .map(Path::to_path_buf)
+        .collect();
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        ancestors.extend(canonical.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    for dir in ancestors {
+        let meta = match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(BootstrapError::Acme(format!(
+                    "inspecting {} above the ACME cache: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        if meta.uid() != euid && meta.uid() != 0 {
+            return Err(BootstrapError::Acme(format!(
+                "{} above the ACME cache is owned by uid {}, not this user or root — \
+                 its owner could replace the cache; point --acme-cache at a private directory",
+                dir.display(),
+                meta.uid()
+            )));
+        }
+        let mode = meta.mode();
+        if !meta.file_type().is_symlink() && mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(BootstrapError::Acme(format!(
+                "{} above the ACME cache has mode {:o}, writable by others without the sticky \
+                 bit — they could replace the cache; point --acme-cache at a private directory",
+                dir.display(),
+                mode & 0o7777
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_cache_ancestors(_cache_dir: &Path) -> Result<(), BootstrapError> {
+    Ok(())
 }
 
 /// Every level of the cache this config reads or writes, each
@@ -214,15 +298,16 @@ fn check_cache_entry(path: &Path) -> Result<bool, BootstrapError> {
 fn check_cache(config: &AcmeConfig) -> Result<(), BootstrapError> {
     let dir = domain_cache_dir(config);
     let (cert, key) = cache_paths(&dir);
-    for path in [
-        config.cache_dir.clone(),
-        directory_cache_dir(config),
-        dir,
-        cert,
-        key,
-        account_path(config),
+    check_cache_ancestors(&config.cache_dir)?;
+    for (path, private) in [
+        (config.cache_dir.clone(), false),
+        (directory_cache_dir(config), false),
+        (dir, false),
+        (cert, false),
+        (key, true),
+        (account_path(config), true),
     ] {
-        check_cache_entry(&path)?;
+        check_cache_entry(&path, private)?;
     }
     Ok(())
 }
@@ -1028,6 +1113,73 @@ mod tests {
             "a symlinked domain directory is refused"
         );
         assert!(renew_at(&config, DEFAULT_RENEWAL_HORIZON).is_none());
+    }
+
+    /// TLS-06 follow-up: a private key (or ACME account file) other users
+    /// can READ is refused, though only writability was checked before; the
+    /// public certificate keeps its 0644.
+    #[cfg(unix)]
+    #[test]
+    fn a_cached_key_others_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().unwrap();
+        let config = AcmeConfig::new(
+            "http://d/",
+            "localhost",
+            "o@example.invalid",
+            base.path().join("acme"),
+        );
+        let dir = prepare_cache(&config).unwrap();
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 3600);
+        write_cache(&dir, &cert_pem, &key_pem).unwrap();
+        assert!(
+            prepare_cache(&config).is_ok(),
+            "the premise: a private cache"
+        );
+
+        let (_cert, key) = cache_paths(&dir);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            prepare_cache(&config).is_err(),
+            "a world-readable private key is refused"
+        );
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            prepare_cache(&config).is_err(),
+            "a group-readable private key is refused"
+        );
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(prepare_cache(&config).is_ok());
+    }
+
+    /// TLS-06 follow-up: a directory ABOVE the cache that others may write
+    /// (without the sticky bit) lets them swap the checked cache for their
+    /// own, so it is refused; with the sticky bit it is fine (`/tmp`).
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_under_a_directory_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().unwrap();
+        let shared = base.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let config = AcmeConfig::new(
+            "http://d/",
+            "localhost",
+            "o@example.invalid",
+            shared.join("acme"),
+        );
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            prepare_cache(&config).is_err(),
+            "a world-writable, non-sticky parent is refused"
+        );
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(
+            prepare_cache(&config).is_ok(),
+            "a sticky shared parent cannot have its entries swapped by others"
+        );
     }
 
     /// R4 (round two): a leaf whose validity has not STARTED is not
