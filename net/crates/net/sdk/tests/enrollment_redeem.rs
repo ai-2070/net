@@ -380,7 +380,10 @@ async fn bundle_preparation_that_crosses_expiry_does_not_first_issue() {
         fx.service.local_addr().port(),
         ApprovalMode::Preauthorized,
         fx.service.enrollment_key(),
-        Duration::from_secs(2),
+        // Long enough that a slow runner still claims inside the window
+        // (whole-second expiry), short enough that waiting it out stays
+        // inside the 10 s redemption deadline.
+        Duration::from_secs(5),
     );
     fx.service
         .ledger()
@@ -422,7 +425,10 @@ async fn a_committed_issuance_is_still_recovered_after_expiry() {
         fx.service.local_addr().port(),
         ApprovalMode::Preauthorized,
         fx.service.enrollment_key(),
-        Duration::from_secs(2),
+        // Long enough that a slow runner still claims inside the window
+        // (whole-second expiry), short enough that waiting it out stays
+        // inside the 10 s redemption deadline.
+        Duration::from_secs(5),
     );
     fx.service
         .ledger()

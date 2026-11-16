@@ -230,11 +230,31 @@ fn nibble_hex(n: u8) -> char {
 
 /// Current unix-seconds, or 0 if the clock is before the epoch. Shared with the
 /// operator facade so both read time the same way.
+///
+/// **Never decreasing within this process.** ENR-03 judges a final issuance
+/// at the commit-time sample taken AFTER the bundle preparation, and the
+/// preparation signs its receipt with a sample of this same clock; the
+/// commit time must therefore never be earlier than the receipt's. A wall
+/// clock stepped back between the two used to break that (the receipt dated
+/// past expiry, the commit sample back inside the window). The latest value
+/// returned is the floor of every later one.
 pub(crate) fn now_unix() -> u64 {
+    static LATEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    monotonic_unix(&LATEST, wall_unix())
+}
+
+fn wall_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// `wall`, raised to the latest value `latest` has returned.
+fn monotonic_unix(latest: &std::sync::atomic::AtomicU64, wall: u64) -> u64 {
+    latest
+        .fetch_max(wall, std::sync::atomic::Ordering::AcqRel)
+        .max(wall)
 }
 
 /// A pre-authorization to *ask* to join a mesh — **not a key**.
@@ -1444,6 +1464,23 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// ENR-03 follow-up: the enrollment clock never steps back, so a
+    /// commit-time sample taken after a receipt was signed is never earlier
+    /// than the receipt's time, whatever the wall clock does in between.
+    #[test]
+    fn the_enrollment_clock_never_goes_back() {
+        let latest = std::sync::atomic::AtomicU64::new(0);
+        assert_eq!(super::monotonic_unix(&latest, 1_000), 1_000);
+        assert_eq!(
+            super::monotonic_unix(&latest, 900),
+            1_000,
+            "a step back is floored"
+        );
+        assert_eq!(super::monotonic_unix(&latest, 1_001), 1_001);
+        let now = super::now_unix();
+        assert!(super::now_unix() >= now);
+    }
+
     use super::*;
     use crate::delegation::DEFAULT_DELEGATION_DEPTH;
 
