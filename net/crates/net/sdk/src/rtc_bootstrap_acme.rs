@@ -74,6 +74,11 @@ pub(crate) async fn obtain_certificate(
     if let Some(cached) = read_cache(&dir, &config.domain, now_unix()) {
         return Ok(cached);
     }
+    if adopt_legacy_pair(config, &dir) {
+        if let Some(cached) = read_cache(&dir, &config.domain, now_unix()) {
+            return Ok(cached);
+        }
+    }
     let (cert_pem, key_pem) = order_certificate(config, challenges).await?;
     write_cache(&dir, &cert_pem, &key_pem)?;
     read_cache(&dir, &config.domain, now_unix()).ok_or_else(|| {
@@ -128,9 +133,14 @@ fn directory_cache_dir(config: &AcmeConfig) -> PathBuf {
 /// directory's namespace (TLS-02):
 /// `<cache_dir>/directory-<id>/<domain>/`.
 pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
-    // A domain is a DNS name: letters, digits, `-`, `.`. Anything
-    // else is replaced rather than trusted as a path component.
-    let safe: String = config
+    directory_cache_dir(config).join(safe_domain(config))
+}
+
+/// The domain as a path component. A domain is a DNS name: letters,
+/// digits, `-`, `.`. Anything else is replaced rather than trusted as
+/// a path component.
+fn safe_domain(config: &AcmeConfig) -> String {
+    config
         .domain
         .chars()
         .map(|c| {
@@ -140,8 +150,87 @@ pub(crate) fn domain_cache_dir(config: &AcmeConfig) -> PathBuf {
                 '_'
             }
         })
-        .collect();
-    directory_cache_dir(config).join(safe)
+        .collect()
+}
+
+/// Where this domain's pair lived before TLS-02 namespaced the cache by
+/// issuing directory: `<cache_dir>/<domain>/`.
+fn legacy_domain_cache_dir(config: &AcmeConfig) -> PathBuf {
+    config.cache_dir.join(safe_domain(config))
+}
+
+/// Whether THIS directory's account is the only ACME account in the
+/// cache. Ordering a certificate needs an account, and accounts were
+/// always saved per directory, so then every certificate this cache was
+/// ever ordered under came from this directory.
+fn only_account_is_this_directory(config: &AcmeConfig) -> bool {
+    let Ok(entries) = std::fs::read_dir(&config.cache_dir) else {
+        return false;
+    };
+    let ours = account_path(config);
+    let mut accounts = entries.filter_map(Result::ok).filter(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(ACCOUNT_FILE_PREFIX) && name.ends_with(".json")
+    });
+    matches!(
+        (accounts.next(), accounts.next()),
+        (Some(only), None) if only.path() == ours
+    )
+}
+
+/// The TLS-02 upgrade: adopt this domain's pre-TLS-02 pair into the
+/// issuing directory's namespace, so an anchor that already holds a good
+/// certificate does not place a new order (and spend rate limit) just
+/// because the layout changed. Returns whether a pair was adopted.
+///
+/// Adopted only when the pair can be attributed to THIS directory —
+/// its account is the only one in the cache — which is exactly the
+/// staging-then-production case TLS-02 exists for, refused; only through
+/// the same trust checks the cache itself gets (TLS-06: no symlink, this
+/// user's, not writable by others, the key private); and only a pair that
+/// qualifies for the domain now. It is copied, not moved: the legacy
+/// files stay where an older build looks for them. Anything else adopts
+/// nothing and the anchor orders as usual.
+fn adopt_legacy_pair(config: &AcmeConfig, dir: &Path) -> bool {
+    let legacy = legacy_domain_cache_dir(config);
+    let (cert, key) = cache_paths(&legacy);
+    if !cert.exists() || !key.exists() || !only_account_is_this_directory(config) {
+        return false;
+    }
+    for (path, private) in [
+        (legacy.clone(), false),
+        (cert.clone(), false),
+        (key.clone(), true),
+    ] {
+        if let Err(e) = check_cache_entry(&path, private) {
+            tracing::warn!(error = %e, "ACME: not adopting the pre-namespace cached certificate");
+            return false;
+        }
+    }
+    if read_cache(&legacy, &config.domain, now_unix()).is_none() {
+        return false;
+    }
+    let (Ok(cert_pem), Ok(key_pem)) = (
+        std::fs::read_to_string(&cert),
+        std::fs::read_to_string(&key),
+    ) else {
+        return false;
+    };
+    match write_cache(dir, &cert_pem, &key_pem) {
+        Ok(()) => {
+            tracing::info!(
+                from = %legacy.display(),
+                to = %dir.display(),
+                "ACME: adopted the cached certificate into its directory's namespace"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "ACME: could not adopt the pre-namespace cached certificate");
+            false
+        }
+    }
 }
 
 /// Is `path` safe to trust as part of the cache (TLS-06)?
@@ -978,6 +1067,72 @@ mod tests {
              sleeping out the staging certificate's renewal horizon"
         );
         assert!(renew_at(&staging, DEFAULT_RENEWAL_HORIZON).is_some());
+    }
+
+    /// TLS-02 upgrade: a pair cached under the pre-namespace layout
+    /// (`<cache>/<domain>/`) is adopted when this directory's account is
+    /// the only one in the cache, so an upgraded anchor does not re-order
+    /// a certificate it already holds. With another directory's account
+    /// beside it the pair cannot be attributed — it may be staging's — and
+    /// nothing is adopted.
+    ///
+    /// Inverse: no adoption, and every upgraded anchor places a new order.
+    #[test]
+    fn a_pre_namespace_pair_is_adopted_only_when_attributable() {
+        let production = |base: &Path| {
+            AcmeConfig::new(
+                "https://acme-v02.api.letsencrypt.org/directory",
+                "localhost",
+                "o@example.invalid",
+                base.into(),
+            )
+        };
+        let seed_legacy = |config: &AcmeConfig| {
+            let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
+            write_cache(&legacy_domain_cache_dir(config), &cert_pem, &key_pem).unwrap();
+            write_private_key(&account_path(config), "{}").unwrap();
+        };
+        let now = now_unix();
+
+        let base = tempfile::tempdir().unwrap();
+        let config = production(base.path());
+        seed_legacy(&config);
+        let dir = prepare_cache(&config).unwrap();
+        assert!(read_cache(&dir, "localhost", now).is_none(), "the premise");
+        assert!(adopt_legacy_pair(&config, &dir), "the only account is ours");
+        assert!(read_cache(&dir, "localhost", now).is_some());
+        assert!(renew_at(&config, DEFAULT_RENEWAL_HORIZON).is_some());
+        assert!(
+            read_cache(&legacy_domain_cache_dir(&config), "localhost", now).is_some(),
+            "copied, not moved: an older build still finds it"
+        );
+
+        let base = tempfile::tempdir().unwrap();
+        let config = production(base.path());
+        seed_legacy(&config);
+        let staging = AcmeConfig::new(
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+            "localhost",
+            "o@example.invalid",
+            base.path().into(),
+        );
+        write_private_key(&account_path(&staging), "{}").unwrap();
+        let dir = prepare_cache(&config).unwrap();
+        assert!(
+            !adopt_legacy_pair(&config, &dir),
+            "another directory's account is present: the pair may be its"
+        );
+        assert!(read_cache(&dir, "localhost", now).is_none());
+
+        let base = tempfile::tempdir().unwrap();
+        let config = production(base.path());
+        let (_ca, cert_pem, key_pem) = issue_for("localhost", 90 * 24 * 3600);
+        write_cache(&legacy_domain_cache_dir(&config), &cert_pem, &key_pem).unwrap();
+        let dir = prepare_cache(&config).unwrap();
+        assert!(
+            !adopt_legacy_pair(&config, &dir),
+            "no account at all: nothing attributes the pair"
+        );
     }
 
     /// R4c: the renewal owner wakes at `not_after - horizon`.

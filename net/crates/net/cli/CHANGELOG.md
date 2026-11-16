@@ -10,6 +10,15 @@ and output shape.
 
 ## Unreleased — local file-safety fixes
 
+- `anchor serve` caches ACME certificates per issuing directory
+  (`<acme-cache>/directory-<id>/<domain>/`). A certificate already cached
+  under an explicit `--acme-cache` in the old `<acme-cache>/<domain>/`
+  layout is adopted on first start when that directory's ACME account is
+  the only one in the cache; otherwise the anchor orders a fresh one. The
+  default cache moved from the shared temp directory to
+  `<local data>/net-mesh/acme`, and nothing is adopted from the old shared
+  location, which another local user could write: an anchor on the default
+  cache places one new order on its first start after upgrading.
 - `transfer recv-blob` stages into a fresh, exclusively created
   `<out>.partial.<nonce>` instead of truncating a shared `<out>.partial`.
   Concurrent receives to one `--out` no longer corrupt each other, and a
