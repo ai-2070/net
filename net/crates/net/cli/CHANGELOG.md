@@ -15,19 +15,25 @@ and output shape.
   Concurrent receives to one `--out` no longer corrupt each other, and a
   pre-existing file or symlink at the old staging name is never truncated.
   Scripts that cleaned up a failed receive by the exact `<out>.partial` name
-  should match `<out>.partial.*`.
+  must not simply delete every `<out>.partial.*` instead: another receive to
+  the same `--out` may still be writing its own. Remove only a staging file
+  known to be stale. (For an `--out` name too long to carry the suffix, the
+  staging file is `.netmesh-partial.<nonce>` in the same directory.)
 - `identity generate` without `--force` is now no-clobber at publication,
   not only at its existence pre-check: two concurrent runs to one absent
   `--out` can no longer both succeed with the second replacing the first's
   seed. The loser exits 2 ("publication is no-clobber").
 - `channel issue-grant` refuses an `--out` that names `--root-identity`,
   and with `--force` refuses to replace any seed-bearing file (case
-  variant, symlink or hard link included). It no longer truncates a
+  variant, symlink or hard link included), and any destination it cannot
+  read or that is not a regular file. The seed check runs just before the
+  atomic rename, not inside it: it catches an `--out` that names a key file,
+  not a different process writing a seed to that path at the same instant. It no longer truncates a
   `<out>.tmp-channel-grant` sibling: staging is a fresh, exclusively
   created `.<name>.stage.*` file.
 - `cap announce --out` refuses an `--out` that names `--key`, and refuses
   to replace any seed-bearing file (case variant, symlink or hard link
-  included) instead of truncating it. Replacing an older announcement at
+  included), unreadable file or non-regular file instead of truncating it. Replacing an older announcement at
   `--out` still works; it is now an atomic staged rename, so a symlinked
   `--out` is replaced rather than written through.
 - `org audience-keygen --out` and `invite create --out` are now no-clobber

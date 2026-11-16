@@ -178,7 +178,8 @@ fn check_cache_entry(path: &Path) -> Result<bool, BootstrapError> {
     };
     if meta.file_type().is_symlink() {
         return Err(BootstrapError::Acme(format!(
-            "the ACME cache entry {} is a symbolic link — refusing to trust a cache              another user may control; point --acme-cache at a private directory",
+            "the ACME cache entry {} is a symbolic link — refusing to trust a cache \
+             another user may control; point --acme-cache at a private directory",
             path.display()
         )));
     }
@@ -888,7 +889,8 @@ mod tests {
         );
         assert!(
             renew_at(&production, DEFAULT_RENEWAL_HORIZON).is_none(),
-            "production has nothing cached, so it orders now instead of              sleeping out the staging certificate's renewal horizon"
+            "production has nothing cached, so it orders now instead of \
+             sleeping out the staging certificate's renewal horizon"
         );
         assert!(renew_at(&staging, DEFAULT_RENEWAL_HORIZON).is_some());
     }

@@ -827,13 +827,13 @@ impl AtomicFileWriter {
 }
 
 /// A fresh `<out>.partial.<nonce>` sibling path for the atomic write. The
-/// nonce (pid + wall-clock nanos) makes it unique per invocation; it is still
-/// opened `create_new`, so a collision fails closed rather than sharing.
+/// nonce (pid + wall-clock nanos + process-local sequence) makes it unique per
+/// invocation; it is still opened `create_new`, so a collision fails closed
+/// rather than sharing. For an `--out` name too long to carry the suffix
+/// within the filesystem's name limit it is `.netmesh-partial.<nonce>` in the
+/// same directory instead (see [`staging_sibling`](crate::commands::org::staging_sibling)).
 fn partial_path(out: &std::path::Path) -> PathBuf {
-    let mut name = out.file_name().unwrap_or_default().to_os_string();
-    name.push(".partial.");
-    name.push(crate::commands::org::stage_nonce());
-    out.with_file_name(name)
+    crate::commands::org::staging_sibling(out, "", "partial")
 }
 
 /// MiB/s over the elapsed duration; `0.0` for a zero-length interval.

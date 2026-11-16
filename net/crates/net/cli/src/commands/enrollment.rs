@@ -1635,6 +1635,13 @@ pub async fn run_invite(
                 request["channel"] = json!(channel);
                 request["channel_rights"] = json!(rights);
             }
+            // Captured before `node_request` takes the state dir: the
+            // recovery hint below must name the same node.
+            let state_dir_hint = args
+                .state_dir
+                .as_ref()
+                .map(|d| format!(" --state-dir {:?}", d.display().to_string()))
+                .unwrap_or_default();
             let mut reply = node_request(args.state_dir, profile_name, request).await?;
             if reply["bearer"] == Value::Bool(true) {
                 eprintln!(
@@ -1651,7 +1658,8 @@ pub async fn run_invite(
                     // token that never reached `--out` can be withdrawn.
                     if let Some(offer) = reply["offer_id"].as_str() {
                         eprintln!(
-                            "note: invite {offer} was created but its token was not written;                              withdraw it with `net-mesh invite revoke {offer}`."
+                            "note: invite {offer} was created but its token was not written; \
+                             withdraw it with `net-mesh invite revoke {offer}{state_dir_hint}`."
                         );
                     }
                     return Err(e);

@@ -362,6 +362,8 @@ fn issue_grant_force_still_replaces_an_older_grant() {
 
     issue_grant(dir.path(), &root, &out, &["--force"]).code(0);
     let second = std::fs::read_to_string(&out).expect("second grant");
+    // Each grant carries a random nonce, so a real replacement differs.
+    assert_ne!(second, first, "--force left the older grant in place");
     assert!(second.contains("grant_hex"), "{second}");
     assert!(!has_stage_temp(dir.path()), "replace left a staging temp");
 }

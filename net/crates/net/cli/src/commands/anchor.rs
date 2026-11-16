@@ -1270,7 +1270,8 @@ fn default_acme_cache_dir() -> Result<PathBuf, CliError> {
         .map(|d| d.join("net-mesh").join("acme"))
         .ok_or_else(|| {
             invalid_args(
-                "no per-user data directory is available for the ACME cache; pass                  --acme-cache <DIR> (a private directory this user owns)",
+                "no per-user data directory is available for the ACME cache; pass \
+                 --acme-cache <DIR> (a private directory this user owns)",
             )
         })
 }
@@ -2257,14 +2258,16 @@ mod tests {
         let net_sdk::rtc_bootstrap::BootstrapTls::Acme(acme) = &resolved.tls else {
             panic!("ACME was asked for");
         };
-        assert!(
-            !acme.cache_dir.starts_with(std::env::temp_dir()),
-            "the default cache must not live in the shared temp dir: {}",
-            acme.cache_dir.display()
+        // The default is the per-user data directory, never a shared temp
+        // directory. Asserted by equality rather than "not under temp_dir()",
+        // which would reject a valid XDG_DATA_HOME that happens to live there.
+        assert_eq!(
+            acme.cache_dir,
+            dirs::data_local_dir()
+                .expect("data local directory")
+                .join("net-mesh")
+                .join("acme"),
         );
-        if let Some(local) = dirs::data_local_dir() {
-            assert_eq!(acme.cache_dir, local.join("net-mesh").join("acme"));
-        }
     }
 
     /// ANCHOR-01: the native mesh socket — which the public browser

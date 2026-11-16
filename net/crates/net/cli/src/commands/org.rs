@@ -2048,6 +2048,29 @@ pub(crate) fn stage_nonce() -> String {
     format!("{pid}.{nanos}.{seq}")
 }
 
+/// The longest file-name component the common filesystems accept (255 bytes
+/// on ext4/XFS/APFS, 255 UTF-16 units on NTFS).
+const MAX_NAME_COMPONENT: usize = 255;
+
+/// A unique staging sibling of `final_path`, named
+/// `<prefix><file name>.<infix>.<nonce>` so an operator can tell which output
+/// it belongs to. The nonce adds ~40 bytes, so for a destination name already
+/// near the component limit that name could not be created at all and a valid
+/// long `--out` became unusable; it then falls back to the short
+/// `.netmesh-<infix>.<nonce>` in the same directory. Uniqueness comes from the
+/// nonce either way, and the caller still creates it `create_new`.
+pub(crate) fn staging_sibling(final_path: &Path, prefix: &str, infix: &str) -> PathBuf {
+    let nonce = stage_nonce();
+    let mut name = std::ffi::OsString::from(prefix);
+    name.push(final_path.file_name().unwrap_or_default());
+    name.push(format!(".{infix}.{nonce}"));
+    if name.len() <= MAX_NAME_COMPONENT {
+        final_path.with_file_name(name)
+    } else {
+        final_path.with_file_name(format!(".netmesh-{infix}.{nonce}"))
+    }
+}
+
 /// Stage `bytes` as a temp file in the SAME directory as `final_path`
 /// (`create_new` + `fsync`; on Unix mode 0600 when `secret`, else 0644; on
 /// Windows the file inherits the parent directory's DACL). The temp is
@@ -2068,11 +2091,7 @@ pub(crate) async fn stage_beside(
             })?;
         }
     }
-    let file_name = final_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("artifact");
-    let tmp = final_path.with_file_name(format!(".{file_name}.stage.{}", stage_nonce()));
+    let tmp = staging_sibling(final_path, ".", "stage");
     let tmp_owned = tmp.clone();
     // Wrap the copied payload so it scrubs on EVERY exit of the blocking task
     // (open/write/sync failure, success, or unwind) — not only a success tail
@@ -2317,7 +2336,9 @@ pub(crate) async fn publish_beside(
 /// variants, symlinks, hard links, and `..` traversal alike.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SeedArtifact {
-    /// Absent, binary, unreadable, or not seed-bearing.
+    /// Absent, binary, or not seed-bearing. (A destination that cannot be
+    /// read or is not a regular file is not classified at all — see
+    /// [`classify_seed_artifact`].)
     None,
     /// An org ROOT key file (`seed_hex` + `org_id_hex`). Signs every membership
     /// certificate and every revocation floor; unrecoverable if destroyed.
@@ -2343,11 +2364,32 @@ impl SeedArtifact {
 }
 
 /// Classify the artifact at `path` by content.
-pub(crate) async fn classify_seed_artifact(path: &Path) -> SeedArtifact {
-    // Absent, binary, or unreadable — nothing we can identify as key material,
-    // and any real failure surfaces from the publish itself.
-    let Ok(mut text) = tokio::fs::read_to_string(path).await else {
-        return SeedArtifact::None;
+///
+/// `Err` carries why the destination could NOT be classified, and the caller
+/// must then refuse to replace it: an existing file this process cannot read
+/// (or cannot even stat) may well be a seed, so treating it as "no seed
+/// material" let a forced publish's `rename` replace it unseen. A destination
+/// that exists but is not a regular file (directory, FIFO, socket, device) is
+/// refused the same way, before any read — reading a FIFO blocks forever.
+/// Symlinks are followed: the content they name is what a reader would load.
+pub(crate) async fn classify_seed_artifact(path: &Path) -> Result<SeedArtifact, String> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err("it is not a regular file".into()),
+        // Absent (or a dangling symlink): nothing to lose.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SeedArtifact::None),
+        Err(e) => return Err(format!("it cannot be inspected ({e})")),
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("it cannot be read ({e}), so it cannot be shown not to be a key"))?;
+    let mut text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // Binary: seed files are TOML text, so this is not key material.
+        Err(e) => {
+            zeroize_slice(&mut e.into_bytes());
+            return Ok(SeedArtifact::None);
+        }
     };
     // The text may BE the seed; scrub it before returning on EVERY branch.
     // NEVER interpolate the parse error — its `Display` embeds the offending
@@ -2371,12 +2413,12 @@ pub(crate) async fn classify_seed_artifact(path: &Path) -> SeedArtifact {
         .and_then(|v| v.as_str())
         .is_some_and(|k| k == "subnet-authority-key");
     zeroize_string(&mut text);
-    match (has_seed, has_org_id, is_subnet_key) {
+    Ok(match (has_seed, has_org_id, is_subnet_key) {
         (true, true, _) => SeedArtifact::OrgKey,
         (true, false, true) => SeedArtifact::SubnetKey,
         (true, false, false) => SeedArtifact::Identity,
         _ => SeedArtifact::None,
-    }
+    })
 }
 
 /// The publish-time rule for every verb that can replace a file:
@@ -2397,11 +2439,27 @@ pub(crate) async fn classify_seed_artifact(path: &Path) -> SeedArtifact {
 /// org key path replaced the org root with an operator identity and exited 0.
 /// Keying on the KIND rather than on mere presence closes that without
 /// refusing the legitimate same-kind replace each verb's `--force` exists for.
+///
+/// It fails closed: a destination that cannot be read, or is not a regular
+/// file, is refused rather than assumed seed-free.
+///
+/// **Scope.** This is a check made just before the publishing `rename`, not
+/// part of it: no portable primitive replaces a path only if it still names
+/// the inode that was inspected. It therefore catches the operator mistakes it
+/// exists for (an `--out` that names a key file, however spelled), but not a
+/// DIFFERENT process writing a seed to the same path in the instant between
+/// this check and the rename.
 pub(crate) async fn refuse_replacing_foreign_seed(
     path: &Path,
     publishing: SeedArtifact,
 ) -> Result<(), CliError> {
-    let found = classify_seed_artifact(path).await;
+    let found = classify_seed_artifact(path).await.map_err(|why| {
+        invalid_args(format!(
+            "refusing to overwrite {}: {why}. A forced publish replaces only a file it can \
+             confirm is not a different kind of key; remove or fix the destination first.",
+            path.display(),
+        ))
+    })?;
     if found == SeedArtifact::None || found == publishing {
         return Ok(());
     }
@@ -2531,5 +2589,105 @@ mod tests {
             2,
             "staging residue left behind"
         );
+    }
+
+    /// A destination name near the 255-byte component limit has no room for
+    /// the staging suffix; the stage falls back to a short name in the same
+    /// directory instead of making the `--out` unusable.
+    #[test]
+    fn staging_sibling_stays_within_the_name_limit() {
+        let dir = Path::new("some").join("dir");
+        let short = staging_sibling(&dir.join("grant.json"), ".", "stage");
+        let short_name = short.file_name().unwrap().to_str().unwrap();
+        assert!(short_name.starts_with(".grant.json.stage."), "{short_name}");
+        assert_eq!(short.parent(), Some(dir.as_path()));
+
+        let long = staging_sibling(&dir.join("g".repeat(250)), ".", "stage");
+        let long_name = long.file_name().unwrap().to_str().unwrap();
+        assert!(long_name.len() <= MAX_NAME_COMPONENT, "{}", long_name.len());
+        assert!(long_name.starts_with(".netmesh-stage."), "{long_name}");
+        assert_eq!(long.parent(), Some(dir.as_path()));
+    }
+
+    /// Red-witness: with the nonce appended to a 250-byte name, the staging
+    /// file could not be created (ENAMETOOLONG / ERROR_FILENAME_EXCED_RANGE),
+    /// so both publish modes failed for a valid `--out`.
+    #[tokio::test]
+    async fn a_long_out_name_publishes_in_both_modes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("n".repeat(250));
+        publish_beside(&out, b"first", false, false, SeedArtifact::None)
+            .await
+            .expect("no-clobber publish of a long name");
+        publish_beside(&out, b"second", false, true, SeedArtifact::None)
+            .await
+            .expect("forced publish of a long name");
+        assert_eq!(std::fs::read(&out).expect("read"), b"second");
+        assert_eq!(
+            dir_names(dir.path()).len(),
+            1,
+            "staging residue left behind"
+        );
+    }
+
+    /// A forced publish replaces only what it could classify. A destination
+    /// that is not a regular file is refused before it is read.
+    #[tokio::test]
+    async fn a_forced_publish_refuses_a_destination_that_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).expect("dir at --out");
+        let err = publish_beside(&out, b"x", false, true, SeedArtifact::None)
+            .await
+            .expect_err("a directory is not replaced");
+        assert!(format!("{err}").contains("not a regular file"), "{err}");
+        assert!(out.is_dir());
+        assert_eq!(dir_names(dir.path()), vec![std::ffi::OsString::from("out")]);
+    }
+
+    /// A FIFO at `--out` used to hang the forced publish: the seed guard read
+    /// it. It is now refused from its metadata, without opening it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forced_publish_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&out)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            publish_beside(&out, b"x", false, true, SeedArtifact::None),
+        )
+        .await
+        .expect("the forced publish blocked on the FIFO");
+        let err = result.expect_err("a FIFO is not replaced");
+        assert!(format!("{err}").contains("not a regular file"), "{err}");
+    }
+
+    /// An existing file the CLI cannot read may be a key: it used to be
+    /// classified "no seed material" and replaced by the forced rename. It is
+    /// now refused, and left in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forced_publish_refuses_an_unreadable_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("key.toml");
+        std::fs::write(&out, b"seed_hex = \"00\"\n").expect("plant");
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read(&out).is_ok() {
+            // Running as root: permission bits do not stop the read, so
+            // there is no unreadable file to test with.
+            return;
+        }
+        let err = publish_beside(&out, b"x", false, true, SeedArtifact::None)
+            .await
+            .expect_err("an unreadable destination is not replaced");
+        assert!(format!("{err}").contains("cannot be read"), "{err}");
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(std::fs::read(&out).expect("read"), b"seed_hex = \"00\"\n");
     }
 }
