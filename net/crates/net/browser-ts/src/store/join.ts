@@ -793,6 +793,22 @@ export function joinStore<S extends object, A extends ActionSpec, I extends Inpu
       }
       // Stated first: a join or resume from here on carries it.
       replica.interest = next;
+      if (replica.state === 'fenced') {
+        // A refused request fenced this replica, and the owner may have
+        // dropped the handle with that refusal (a refused deferred
+        // projection forgets it). The caller asking again is what lifts a
+        // fence; waiting for `ready()` here waited for a frame nothing
+        // would send, and an `int` on a forgotten handle is only answered
+        // `closed`, which leaves the fence standing. A fresh join carries
+        // the new interest set (and the desired audience) instead; a
+        // transition still in flight can never install over it.
+        const requests = [replica.join()];
+        openTransition(null);
+        const ready = handle.ready();
+        ready.catch(() => undefined);
+        await send(framesOf(requests));
+        return ready;
+      }
       const h = replica.handle;
       if (h === null || replica.state !== 'ready') {
         // Not installed yet. The join in flight may carry the OLD set,

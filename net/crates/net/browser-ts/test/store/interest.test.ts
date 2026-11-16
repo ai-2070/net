@@ -275,6 +275,34 @@ describe('interest', () => {
     expect(keys.every(key => key === 'player')).toBe(true);
   });
 
+  it('a setInterest after a refused one lifts the fence instead of waiting forever', async () => {
+    // The refusal fenced the replica. Once the policy allows the read
+    // again, the caller's retry must reach the owner and install — it
+    // used to await a `ready()` no frame would ever settle.
+    const readable = { value: true };
+    const { mesh } = serve(request => request.type !== 'read' || readable.value);
+    const replica = join(mesh.node(NEAR), []);
+    await replica.ready();
+
+    // A refused TRANSITION fences the replica (an `int` refusal settles
+    // through its own correlation and leaves it unfenced).
+    readable.value = false;
+    const refused = await replica.setAudience(['crew']).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect((refused as StoreError).code).toBe('forbidden');
+    await settle();
+
+    readable.value = true;
+    const retried = await Promise.race([
+      replica.setInterest(cellsAround(5, 5, { size: SIZE })).then(() => 'installed'),
+      new Promise(resolve => setTimeout(() => resolve('stuck'), 2000)),
+    ]);
+    expect(retried).toBe('installed');
+    expect(Object.keys(replica.getState().ships).length).toBeGreaterThan(0);
+  });
+
   it('a superseded pre-ready setInterest sends nothing, even when the sets join to the same string', async () => {
     // Keys may contain NUL, so `['a', 'b']` and `['a\u0000b']` were equal
     // to the old NUL-joined comparison: the superseded call thought it
