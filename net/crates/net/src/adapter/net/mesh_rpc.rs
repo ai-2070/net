@@ -4382,11 +4382,11 @@ fn prepare_response_to_caller(
                             payload = enrollment_refusal_frame(
                                 &payload,
                                 ENROLLMENT_REJECT_DENIED,
-                                "the game holds as many players as this anchor admits                                  for one game; retry shortly",
+                                "the game holds as many players as this anchor admits for one game; retry shortly",
                             )
                             .ok_or_else(|| {
                                 AdapterError::Connection(
-                                    "enrollment refused at the player cap; the refusal                                      could not be encoded, nothing was sent"
+                                    "enrollment refused at the player cap; the refusal could not be encoded, nothing was sent"
                                         .into(),
                                 )
                             })?;

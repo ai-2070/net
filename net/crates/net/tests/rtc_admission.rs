@@ -1043,6 +1043,12 @@ async fn an_admitted_outcome_refused_at_the_tenant_cap_reaches_the_client_as_a_r
         7,
         "coded DENIED, as the handler's own full-game preflight answers"
     );
+    let len = u32::from_le_bytes(body[7..11].try_into().unwrap()) as usize;
+    let message = std::str::from_utf8(&body[11..11 + len]).expect("a UTF-8 message");
+    assert_eq!(
+        message, "the game holds as many players as this anchor admits for one game; retry shortly",
+        "the visitor reads one plain sentence"
+    );
 
     assert!(
         anchor.peer_is_provisional(client_id),
