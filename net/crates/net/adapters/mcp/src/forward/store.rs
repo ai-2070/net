@@ -624,12 +624,25 @@ pub fn validate_ref_name(name: &str) -> Result<(), StoreError> {
 /// and `x.pins`) staged through ONE name while their locks never serialized
 /// them (PSTORE-03). The sequence is process-wide, so two saves in one
 /// process never share a name either; create it with `create_new`.
+///
+/// A store whose filename is already near the 255-byte component limit has
+/// no room for the suffix, and the save would fail with ENAMETOOLONG; it then
+/// stages under the short `.net-mesh-store.tmp.<pid>.<seq>` beside it, still
+/// unique by pid and sequence.
 fn staging_path(path: &Path) -> PathBuf {
+    /// The longest file-name component the common filesystems accept (255
+    /// bytes on ext4/XFS/APFS, 255 UTF-16 units on NTFS).
+    const MAX_NAME_COMPONENT: usize = 255;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut os = path.as_os_str().to_os_string();
-    os.push(format!(".tmp.{}.{seq}", std::process::id()));
-    PathBuf::from(os)
+    let suffix = format!(".tmp.{}.{seq}", std::process::id());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(&suffix);
+    if name.len() <= MAX_NAME_COMPONENT {
+        path.with_file_name(name)
+    } else {
+        path.with_file_name(format!(".net-mesh-store{suffix}"))
+    }
 }
 
 #[cfg(test)]
@@ -651,6 +664,34 @@ mod tests {
             staging_path(&dir.join("x.json")),
             staging_path(&dir.join("x.json"))
         );
+    }
+
+    /// A store filename near the 255-byte limit has no room for the staging
+    /// suffix; the stage falls back to a short name in the same directory
+    /// instead of failing the save with ENAMETOOLONG.
+    #[test]
+    fn a_near_limit_store_name_stages_within_the_name_limit() {
+        let dir = std::path::Path::new("some").join("dir");
+        let long = staging_path(&dir.join("s".repeat(250)));
+        let name = long.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 255, "{}", name.len());
+        assert!(name.starts_with(".net-mesh-store.tmp."), "{name}");
+        assert_eq!(long.parent(), Some(dir.as_path()));
+    }
+
+    /// Red-witness: with the suffix appended to a 250-byte store name the
+    /// staging file could not be created, so a valid custom store path could
+    /// never be saved.
+    #[tokio::test]
+    async fn a_near_limit_store_path_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f".repeat(250));
+        ForwardingStore::mutate(path.clone(), |s| {
+            s.set_secret("t", "Authorization", AllowList::default(), None, false)
+        })
+        .await
+        .expect("a near-limit store name saves");
+        assert!(tokio::fs::metadata(&path).await.is_ok(), "store persisted");
     }
 
     fn allow(providers: ProviderScope, caps: &[&str]) -> AllowList {
