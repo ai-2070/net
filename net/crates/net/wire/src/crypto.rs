@@ -24,6 +24,13 @@ const NOISE_PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Domain-separated Noise prologue binding `(src_node_id, dest_node_id)`
 /// into the handshake transcript.
 ///
+/// The mesh passes each id's 32-bit ROUTING projection, not the full
+/// node id: `(node_id as u32) as u64`, the low 32 bits zero-extended.
+/// The routing header carries only 32-bit ids, so that is what both ends
+/// (and any relay) can see; the full id travels inside the
+/// AEAD-protected msg1 payload. A peer implementing the handshake must
+/// apply the same projection or its transcript will not match.
+///
 /// Both direct and relayed handshakes use this construction. A relay
 /// that rewrites either node id in the outer addressing (routing header
 /// for routed handshakes, or the caller's own `peer_node_id` argument

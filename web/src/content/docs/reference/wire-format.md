@@ -160,8 +160,11 @@ holder with the negotiated prologue, the responder's static public key and the
 handshake messages can recompute it, so keys derived from it alone would be
 readable by every PSK holder and would lose forward secrecy. The prologue tag
 `net-handshake-v2` versions this derivation on every handshake path: mesh
-handshakes use `"net-handshake-v2" ‖ src_node_id (u64 LE) ‖ dest_node_id (u64 LE)`,
-and the point-to-point adapter's handshake the 16-byte tag alone. A peer on the
+handshakes use `"net-handshake-v2" ‖ routing_id(src_node_id) (u64 LE) ‖ routing_id(dest_node_id) (u64 LE)`,
+where `routing_id(x) = (x as u32) as u64` (the low 32 bits, zero-extended: the
+routing header carries only 32-bit ids, so the prologue binds what both ends and
+any relay can see; the full node id travels inside the AEAD-protected msg1
+payload), and the point-to-point adapter's handshake the 16-byte tag alone. A peer on the
 earlier hash-only derivation (`net-handshake-v1`, or no prologue) fails the
 handshake at msg1 rather than establishing a session it cannot decrypt.
 
