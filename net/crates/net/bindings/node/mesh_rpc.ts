@@ -2310,6 +2310,21 @@ export function reportObserverError(error: unknown): void {
   }
 }
 
+/** Swallow a rejection of `value` if it is a thenable; ignore anything else. */
+function consumeRejection(value: unknown): void {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return
+  try {
+    const then = (value as { then?: unknown }).then
+    if (typeof then === 'function') {
+      then.call(value, undefined, () => {
+        // Deliberately ignored: the error sink itself failed.
+      })
+    }
+  } catch {
+    // A throwing `then` getter on the sink's result is ignored too.
+  }
+}
+
 /**
  * Run an observer so that neither a synchronous throw nor a rejected
  * Promise escapes: both go to {@link reportObserverError}. Same shape
@@ -2320,14 +2335,19 @@ export function reportObserverError(error: unknown): void {
  */
 export function callObserverIsolated(
   run: () => unknown,
-  onError: (error: unknown) => void = reportObserverError,
+  onError: (error: unknown) => unknown = reportObserverError,
 ): void {
   const report = (error: unknown): void => {
+    let sunk: unknown
     try {
-      onError(error)
+      sunk = onError(error)
     } catch {
       // An onError that itself throws must not escape either.
+      return
     }
+    // An `async` onError that rejects must not escape as an unhandled
+    // rejection either, as in the SDK's `callIsolated`.
+    consumeRejection(sunk)
   }
   let result: unknown
   try {

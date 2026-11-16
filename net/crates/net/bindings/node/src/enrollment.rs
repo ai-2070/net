@@ -454,7 +454,7 @@ impl OperatorEnrollment {
             validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
         );
         let inner = self.inner.clone();
-        let bytes = request_bytes.as_ref().to_vec();
+        let bytes = request_bytes.into_vec();
         let out = off_thread(move || inner.handle_join_request(&bytes, ttl, depth)).await?;
         Ok(Buffer::from(out))
     }

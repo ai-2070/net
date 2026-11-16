@@ -2083,11 +2083,7 @@ mod mesh_bindings {
 
             let batch = net::event::Batch {
                 shard_id: 0,
-                events: vec![net::event::InternalEvent::new(
-                    bytes::Bytes::copy_from_slice(data.as_ref()),
-                    0,
-                    0,
-                )],
+                events: vec![net::event::InternalEvent::new(data.into_bytes(), 0, 0)],
                 sequence_start: 0,
                 process_nonce: net::event::batch_process_nonce(),
             };
@@ -2374,10 +2370,7 @@ mod mesh_bindings {
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let payloads: Vec<bytes::Bytes> = events
-                .into_iter()
-                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
-                .collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(|b| b.into_bytes()).collect();
             node.send_on_stream(&stream.core, &payloads)
                 .await
                 .map_err(stream_error_to_napi)
@@ -2397,10 +2390,7 @@ mod mesh_bindings {
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let payloads: Vec<bytes::Bytes> = events
-                .into_iter()
-                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
-                .collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(|b| b.into_bytes()).collect();
             node.send_with_retry(&stream.core, &payloads, max_retries as usize)
                 .await
                 .map_err(stream_error_to_napi)
@@ -2423,10 +2413,7 @@ mod mesh_bindings {
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let payloads: Vec<bytes::Bytes> = events
-                .into_iter()
-                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
-                .collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(|b| b.into_bytes()).collect();
             node.send_blocking(&stream.core, &payloads)
                 .await
                 .map_err(stream_error_to_napi)
@@ -2573,7 +2560,7 @@ mod mesh_bindings {
                 .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
             let pub_cfg = config.unwrap_or_default().into_core()?;
             let publisher = net::adapter::net::ChannelPublisher::new(name, pub_cfg);
-            let payload_bytes = bytes::Bytes::copy_from_slice(payload.as_ref());
+            let payload_bytes = payload.into_bytes();
             let report = node
                 .publish(&publisher, payload_bytes)
                 .await

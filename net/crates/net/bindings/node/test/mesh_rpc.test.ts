@@ -27,6 +27,7 @@ import {
   BreakerOpenError,
   CircuitBreaker,
   appError,
+  callObserverIsolated,
   defaultBreakerFailure,
   defaultRetryable,
   HedgePolicy,
@@ -1597,6 +1598,34 @@ describe('TypedMeshRpc.setObserver', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled)
       warn.mockRestore()
+    }
+  })
+
+  it('consumes the rejection of an async onError sink', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      callObserverIsolated(
+        () => {
+          throw new Error('observer boom')
+        },
+        async () => {
+          throw new Error('async sink boom')
+        },
+      )
+      callObserverIsolated(
+        async () => {
+          throw new Error('async observer boom')
+        },
+        async () => {
+          throw new Error('async sink boom')
+        },
+      )
+      await new Promise((r) => setTimeout(r, 20))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
     }
   })
 
