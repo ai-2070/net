@@ -80,7 +80,11 @@ impl PinState {
 }
 
 /// A failure loading or saving the pin store.
+///
+/// Non-exhaustive: a variant may be added (as `Stale` was) without breaking
+/// a caller, so match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PinStoreError {
     /// An I/O error reading or writing the store file.
     #[error("pin store I/O error at {path}: {reason}")]
@@ -199,19 +203,54 @@ impl LockGuard {
     }
 }
 
-/// Run a store commit on the blocking pool. The task runs to completion even
-/// if the returned future is dropped (Tokio never aborts started blocking
-/// work), which is what lets [`PinStore::mutate`] hand it the lock guard.
+/// Run a store commit on the blocking pool.
+///
+/// A commit that has STARTED runs to completion even if the returned future
+/// is dropped (Tokio never aborts started blocking work), which is what lets
+/// [`PinStore::mutate`] hand it the lock guard (CONSENT-01). A commit that
+/// is still QUEUED when the future is dropped does not run at all: it is
+/// abandoned, publishes nothing, and its captured lock guard is released
+/// when the task is reached. Detaching it instead published a mutation whose
+/// caller had already been cancelled — with no one left to learn whether
+/// it landed.
 async fn spawn_commit(
     path: &Path,
     commit: impl FnOnce() -> Result<(), PinStoreError> + Send + 'static,
 ) -> Result<(), PinStoreError> {
-    tokio::task::spawn_blocking(commit)
-        .await
-        .map_err(|e| PinStoreError::Io {
-            path: path.display().to_string(),
-            reason: format!("pin-store commit task panicked: {e}"),
-        })?
+    use std::sync::atomic::{AtomicU8, Ordering};
+    const QUEUED: u8 = 0;
+    const RUNNING: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// Marks a still-queued commit abandoned when the awaiting future goes.
+    struct AbandonIfQueued(std::sync::Arc<AtomicU8>);
+    impl Drop for AbandonIfQueued {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    let state = std::sync::Arc::new(AtomicU8::new(QUEUED));
+    let task_state = std::sync::Arc::clone(&state);
+    let _abandon = AbandonIfQueued(state);
+    tokio::task::spawn_blocking(move || {
+        if task_state
+            .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Abandoned while queued: publish nothing (`commit`, and any
+            // lock guard it captured, drop here).
+            return Ok(());
+        }
+        commit()
+    })
+    .await
+    .map_err(|e| PinStoreError::Io {
+        path: path.display().to_string(),
+        reason: format!("pin-store commit task panicked: {e}"),
+    })?
 }
 
 /// Test-only seams inside a commit: a pause between the fsynced staging write
@@ -952,6 +991,54 @@ mod tests {
                 (cap("b/z"), PinState::Pending),
             ],
         );
+    }
+
+    /// A commit whose caller was cancelled while the commit was still
+    /// QUEUED on the blocking pool publishes nothing; one that had started
+    /// would run to completion (CONSENT-01).
+    ///
+    /// Red: the detached task ran the queued commit anyway.
+    #[test]
+    fn a_commit_abandoned_while_queued_publishes_nothing() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (_dir, path) = store_path();
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Occupy the only blocking thread, so the commit below queues.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            {
+                let ran = ran.clone();
+                let commit = spawn_commit(&path, move || {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                });
+                tokio::pin!(commit);
+                // Poll once: the commit is now queued behind the blocker.
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut commit)
+                        .await
+                        .is_err(),
+                    "the commit cannot run while the pool is occupied"
+                );
+                // The caller goes away here.
+            }
+            release.send(()).expect("release");
+            blocker.await.expect("blocker");
+            // Drain the pool: the abandoned task has been reached.
+            tokio::task::spawn_blocking(|| ()).await.expect("drain");
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "an abandoned queued commit must not run"
+            );
+        });
     }
 
     /// The audit's seam: a raw `save` of a snapshot loaded before another
