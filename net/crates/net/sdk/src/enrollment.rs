@@ -231,30 +231,54 @@ fn nibble_hex(n: u8) -> char {
 /// Current unix-seconds, or 0 if the clock is before the epoch. Shared with the
 /// operator facade so both read time the same way.
 ///
-/// **Never decreasing within this process.** ENR-03 judges a final issuance
-/// at the commit-time sample taken AFTER the bundle preparation, and the
-/// preparation signs its receipt with a sample of this same clock; the
-/// commit time must therefore never be earlier than the receipt's. A wall
-/// clock stepped back between the two used to break that (the receipt dated
-/// past expiry, the commit sample back inside the window). The latest value
-/// returned is the floor of every later one.
+/// The wall clock, deliberately unlatched: it mints invites, validates
+/// bootstrap credentials and dates signed requests, all of which peers judge
+/// against their own clocks. A process-wide "never decreasing" floor froze it
+/// in the future after one forward step until restart. Ordering that one
+/// issuance needs is [`IssuanceClock`]'s job, scoped to that issuance.
 pub(crate) fn now_unix() -> u64 {
-    static LATEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    monotonic_unix(&LATEST, wall_unix())
-}
-
-fn wall_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-/// `wall`, raised to the latest value `latest` has returned.
-fn monotonic_unix(latest: &std::sync::atomic::AtomicU64, wall: u64) -> u64 {
-    latest
-        .fetch_max(wall, std::sync::atomic::Ordering::AcqRel)
-        .max(wall)
+/// A clock for ONE issuance, started at its claim (ENR-03).
+///
+/// The final issuance is judged at a commit-time sample taken AFTER the
+/// bundle is prepared, and the preparation signs its receipt with the wall
+/// clock in between; the commit time must never be earlier than that
+/// receipt's, or a wall clock stepped back between the two lets a receipt
+/// dated past expiry commit inside the window. So the commit time is the
+/// later of the wall clock and the claim time advanced by the MONOTONIC time
+/// elapsed since: a step back cannot pull it below the receipt, and nothing
+/// outlives the issuance, so a forward step is never latched.
+pub(crate) struct IssuanceClock {
+    started_unix: u64,
+    started: std::time::Instant,
+}
+
+impl IssuanceClock {
+    /// Start at `claim_unix`, the time the issuance was claimed at.
+    pub(crate) fn start(claim_unix: u64) -> Self {
+        Self {
+            started_unix: claim_unix,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// The commit-time sample: never earlier than the claim time plus the
+    /// monotonic time since (rounded up), nor than the wall clock.
+    pub(crate) fn now(&self) -> u64 {
+        self.at(now_unix(), self.started.elapsed())
+    }
+
+    fn at(&self, wall: u64, elapsed: Duration) -> u64 {
+        let elapsed_secs = elapsed
+            .as_secs()
+            .saturating_add(u64::from(elapsed.subsec_nanos() > 0));
+        wall.max(self.started_unix.saturating_add(elapsed_secs))
+    }
 }
 
 /// A pre-authorization to *ask* to join a mesh — **not a key**.
@@ -1468,17 +1492,38 @@ mod tests {
     /// commit-time sample taken after a receipt was signed is never earlier
     /// than the receipt's time, whatever the wall clock does in between.
     #[test]
-    fn the_enrollment_clock_never_goes_back() {
-        let latest = std::sync::atomic::AtomicU64::new(0);
-        assert_eq!(super::monotonic_unix(&latest, 1_000), 1_000);
+    fn the_issuance_clock_never_goes_back_within_an_issuance() {
+        let clock = super::IssuanceClock::start(1_000);
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(clock.at(1_000, ms(0)), 1_000);
+        // The receipt was signed at 1_001 (wall); the wall clock then steps
+        // back 900 s before the commit sample. The commit is never earlier
+        // than the receipt: the claim time plus the monotonic elapsed time.
         assert_eq!(
-            super::monotonic_unix(&latest, 900),
-            1_000,
-            "a step back is floored"
+            clock.at(100, ms(1_200)),
+            1_002,
+            "a step back is floored at the claim time plus elapsed (rounded up)"
         );
-        assert_eq!(super::monotonic_unix(&latest, 1_001), 1_001);
-        let now = super::now_unix();
-        assert!(super::now_unix() >= now);
+        assert_eq!(
+            clock.at(1_005, ms(1_200)),
+            1_005,
+            "the wall leads when later"
+        );
+    }
+
+    /// The reviewed defect: a process-wide floor latched a forward step
+    /// until restart, so every later invite, credential check and signed
+    /// request was dated in the future. Nothing outlives one issuance now.
+    #[test]
+    fn a_forward_step_is_not_latched_past_its_issuance() {
+        let stepped = super::IssuanceClock::start(1_000);
+        assert_eq!(
+            stepped.at(1_000 + 86_400, std::time::Duration::ZERO),
+            1_000 + 86_400
+        );
+        // The next issuance, after the clock is corrected, starts fresh.
+        let next = super::IssuanceClock::start(1_010);
+        assert_eq!(next.at(1_010, std::time::Duration::ZERO), 1_010);
     }
 
     use super::*;

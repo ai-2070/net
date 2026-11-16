@@ -340,6 +340,7 @@ fn decide(ctx: &Ctx, hh: &[u8; 32], plain: &[u8]) -> Result<RedeemOutcome, Refus
         return Err(Refusal::Invalid);
     }
     let now = super::now_unix();
+    let clock = super::IssuanceClock::start(now);
     match ledger.claim(&id, &claimant, now).map_err(refusal)? {
         ClaimOutcome::PendingApproval => Ok(RedeemOutcome::PendingApproval),
         ClaimOutcome::Ready => {
@@ -354,8 +355,9 @@ fn decide(ctx: &Ctx, hh: &[u8; 32], plain: &[u8]) -> Result<RedeemOutcome, Refus
             // during that preparation, so the receipt time never exceeds this
             // one: a bundle whose receipt postdates expiry is never committed.
             // Never earlier than the claim time, even if the clock stepped
-            // back. Recovery of an already committed issuance is unaffected.
-            let issue_now = now.max(super::now_unix());
+            // back between the receipt and here (`IssuanceClock`). Recovery
+            // of an already committed issuance is unaffected.
+            let issue_now = clock.now();
             let receipt_id = ledger
                 .issue(&id, &claimant, &bundle, issue_now)
                 .map_err(refusal)?;
