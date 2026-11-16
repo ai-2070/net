@@ -991,8 +991,15 @@ async fn run_snapshot(
     // tmp+rename layer alone closed the "truncated blob at the
     // documented path" hazard from #3; this commit closes the
     // crash-window hazard from #20.
-    let pid = std::process::id();
-    let tmp = args.out.with_extension(format!("tmp.{pid}"));
+    // The staging name keeps the full filename (`snap.json` and
+    // `snap.bin` never share one) and is unique per call (PSTORE-03).
+    let tmp = {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut os = args.out.as_os_str().to_os_string();
+        os.push(format!(".tmp.{}.{seq}", std::process::id()));
+        PathBuf::from(os)
+    };
     let bytes_owned = bytes.clone();
     let tmp_for_write = tmp.clone();
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {

@@ -268,22 +268,30 @@ impl ForwardingStore {
             reason: format!("serialize forwarding store: {e}"),
         })?;
 
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-
         // Owner-only from creation (0600 on Unix) — the store records
         // security-sensitive destination bindings and must never be briefly
         // group-/world-readable. The mode travels with the inode through the
         // atomic rename. (Windows scopes access via the per-user data dir ACL.)
+        // Exclusive and uniquely named (`staging_path`): a taken name is
+        // skipped, never truncated.
         use tokio::io::AsyncWriteExt;
         let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         // `tokio::fs::OpenOptions::mode` is an inherent unix method — no
         // `OpenOptionsExt` import needed (mirrors the pin store).
         #[cfg(unix)]
         opts.mode(0o600);
-        let mut f = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
+        let mut attempts = 0;
+        let (tmp, mut f) = loop {
+            let tmp = staging_path(&self.path);
+            match opts.open(&tmp).await {
+                Ok(f) => break (tmp, f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 64 => {
+                    attempts += 1;
+                }
+                Err(e) => return Err(StoreError::io(&tmp, e)),
+            }
+        };
         // From here the temp file exists, so any failure must not leave it
         // behind (it holds a partial policy and clutters the per-user data dir).
         // Do the write + fsync + rename in a fallible block and remove the temp
@@ -610,10 +618,40 @@ pub fn validate_ref_name(name: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// A unique staging name beside `path` that keeps its FULL filename:
+/// `<filename>.tmp.<pid>.<seq>`. `with_extension("tmp.<pid>")` replaced the
+/// extension instead, so two stores sharing a stem in one directory (`x.json`
+/// and `x.pins`) staged through ONE name while their locks never serialized
+/// them (PSTORE-03). The sequence is process-wide, so two saves in one
+/// process never share a name either; create it with `create_new`.
+fn staging_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::forward::DenialLevel;
+
+    /// PSTORE-03: stores sharing a stem never share a staging name, and two
+    /// saves of one store never do either.
+    #[test]
+    fn staging_names_keep_the_full_filename_and_are_unique() {
+        let dir = std::path::Path::new("dir");
+        let a = staging_path(&dir.join("profile.json"));
+        let b = staging_path(&dir.join("profile.pins"));
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name(&a).starts_with("profile.json.tmp."), "{}", name(&a));
+        assert!(name(&b).starts_with("profile.pins.tmp."), "{}", name(&b));
+        assert_ne!(
+            staging_path(&dir.join("x.json")),
+            staging_path(&dir.join("x.json"))
+        );
+    }
 
     fn allow(providers: ProviderScope, caps: &[&str]) -> AllowList {
         AllowList {

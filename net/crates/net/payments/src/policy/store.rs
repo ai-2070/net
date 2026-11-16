@@ -169,7 +169,7 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     // `core::canonical` — a different encoder entirely, untouched here.)
     let bytes = serde_json::to_vec(value).map_err(|e| StoreError::io(path, e))?;
 
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let tmp = staging_path(path);
     let result: Result<(), StoreError> = async {
         // Created with its permissions already in place — owner-only from
         // the instant the name exists. This is why it is a create rather
@@ -190,9 +190,11 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         let file = tokio::task::spawn_blocking(move || {
             match super::file_mode::create_owner_only(&tmp_for_create) {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Stale temp from a dead same-pid process. Remove and
-                    // retry once, so recovery needs no manual cleanup
-                    // while a live conflict still surfaces.
+                    // Stale temp from a dead same-pid process: the name is
+                    // unique within this one (`staging_path`), so nothing
+                    // live holds it. Remove and retry once, so recovery
+                    // needs no manual cleanup while a live conflict still
+                    // surfaces.
                     let _ = std::fs::remove_file(&tmp_for_create);
                     super::file_mode::create_owner_only(&tmp_for_create)
                 }
@@ -272,10 +274,40 @@ where
     Ok(result)
 }
 
+/// A unique staging name beside `path` that keeps its FULL filename:
+/// `<filename>.tmp.<pid>.<seq>`. `with_extension("tmp.<pid>")` replaced the
+/// extension instead, so two stores sharing a stem in one directory (`x.json`
+/// and `x.pins`) staged through ONE name while their locks never serialized
+/// them (PSTORE-03). The sequence is process-wide, so two saves in one
+/// process never share a name either; create it with `create_new`.
+fn staging_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// PSTORE-03: stores sharing a stem never share a staging name, and two
+    /// saves of one store never do either.
+    #[test]
+    fn staging_names_keep_the_full_filename_and_are_unique() {
+        let dir = std::path::Path::new("dir");
+        let a = staging_path(&dir.join("profile.json"));
+        let b = staging_path(&dir.join("profile.pins"));
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name(&a).starts_with("profile.json.tmp."), "{}", name(&a));
+        assert!(name(&b).starts_with("profile.pins.tmp."), "{}", name(&b));
+        assert_ne!(
+            staging_path(&dir.join("x.json")),
+            staging_path(&dir.join("x.json"))
+        );
+    }
 
     #[derive(Default, serde::Serialize, serde::Deserialize)]
     struct Counters {

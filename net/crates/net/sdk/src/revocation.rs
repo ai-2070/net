@@ -300,21 +300,18 @@ impl RevocationStore {
             io(e)
         })?;
 
-        // Durability (POSIX): `rename()` only updates the directory entry in
-        // memory; without fsyncing the parent directory a crash can revert to
-        // the old file, silently losing the just-persisted revocation (BUG #93,
-        // mirrors `redex/disk.rs`). Best-effort — a dir-fsync failure doesn't
-        // undo the completed rename, and Windows needs no directory fsync.
-        #[cfg(unix)]
-        {
-            let dir = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            if let Ok(dirf) = std::fs::File::open(dir) {
-                let _ = dirf.sync_all();
-            }
-        }
+        // Durability (CONSENT-02, as the pin store): the rename is reported
+        // committed only once it is on stable storage. POSIX `rename()`
+        // updates the directory entry in memory; a crash before the parent
+        // directory is fsynced can revert to the old file, silently undoing an
+        // update the caller was told succeeded. Elsewhere the renamed file
+        // itself is reopened and flushed. A failed barrier is an error: the
+        // new contents are in place but may not survive a crash, and saving
+        // again is safe.
+        crate::store_file::durability_barrier(path).map_err(|e| RevocationStoreError::Io {
+            path: path.display().to_string(),
+            reason: format!("saved, but not durably (the update may not survive a crash): {e}"),
+        })?;
         Ok(())
     }
 }
