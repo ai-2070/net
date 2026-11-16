@@ -133,11 +133,13 @@ pub trait ToolPaymentGate: Send + Sync {
 /// withdrawal has run, so it never removes a successor's offer. A failed
 /// serve drops it on the rollback path, withdrawing whatever it had
 /// published.
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
 pub(crate) struct OfferWithdrawal {
     withdraw: Box<dyn Fn(&str) + Send + Sync>,
     tool_ids: Vec<String>,
 }
 
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
 impl OfferWithdrawal {
     pub(crate) fn new(withdraw: impl Fn(&str) + Send + Sync + 'static) -> Self {
         Self {
@@ -152,6 +154,7 @@ impl OfferWithdrawal {
     }
 }
 
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
 impl Drop for OfferWithdrawal {
     fn drop(&mut self) {
         for tool_id in &self.tool_ids {
@@ -160,6 +163,7 @@ impl Drop for OfferWithdrawal {
     }
 }
 
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
 impl std::fmt::Debug for OfferWithdrawal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OfferWithdrawal")
