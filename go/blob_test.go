@@ -73,6 +73,31 @@ func TestBlobAdapterLegacyConstructorKeepsItsRedexLive(t *testing.T) {
 	}
 }
 
+// The constructor's early "already freed?" check read `redex.handle` without
+// the Redex lock while `Free` writes it under that lock: a data race the
+// -race run reports. Racing the two, the constructor must either succeed or
+// report the freed Redex as ErrBlob, and the race detector must stay quiet.
+func TestBlobAdapterConstructorRacesRedexFree(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		redex := NewRedex("")
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			redex.Free()
+		}()
+		a, err := NewMeshBlobAdapter(redex, "go-blob-free-race-"+strconv.Itoa(i), nil)
+		wg.Wait()
+		if err != nil {
+			if !errors.Is(err, ErrBlob) {
+				t.Fatalf("iteration %d: a freed Redex must be ErrBlob, got %v", i, err)
+			}
+			continue
+		}
+		_ = a.Close()
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Checked C-buffer copies
 // ---------------------------------------------------------------------------

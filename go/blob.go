@@ -153,7 +153,18 @@ type MeshBlobAdapter struct {
 // installed but should NOT be relied upon — pair every
 // constructor with `defer adapter.Close()`.
 func NewMeshBlobAdapter(redex *Redex, adapterID string, opts *MeshBlobAdapterOpts) (*MeshBlobAdapter, error) {
-	if redex == nil || redex.handle == nil {
+	if redex == nil {
+		return nil, fmt.Errorf("%w: redex handle is nil", ErrBlob)
+	}
+	// Read `handle` under the Redex lock: a concurrent `Free` writes it, so
+	// an unlocked read is a data race (the race detector flags it). Both
+	// construction paths below re-check it under the lock they hold across
+	// the native call; this early check only keeps the established error
+	// for an already-freed Redex.
+	redex.mu.RLock()
+	freed := redex.handle == nil
+	redex.mu.RUnlock()
+	if freed {
 		return nil, fmt.Errorf("%w: redex handle is nil", ErrBlob)
 	}
 	persistent := C.int(0)
