@@ -240,9 +240,12 @@ impl OrgRevocationState {
     /// expired entry let a candidate that dropped it be installed, after
     /// which a clock stepped back into the grant's window saw the grant valid
     /// again. The candidate must also not have marked the entry EARLIER than
-    /// this state did (it would drop it sooner); an unmarked candidate entry
-    /// is marked at its next prune, no earlier than now. Only an entry this
-    /// state's own next prune would drop is not required.
+    /// this state did, or would (it would drop it sooner): where this state
+    /// has not marked the entry yet, its first mark can be no earlier than
+    /// now nor than the entry's expiry, so a candidate mark below that bound
+    /// is refused; an unmarked candidate entry is marked at its next prune,
+    /// no earlier than now. Only an entry this state's own next prune would
+    /// drop is not required.
     pub fn grant_revocations_retained_by(
         &self,
         candidate: &OrgRevocationState,
@@ -261,9 +264,24 @@ impl OrgRevocationState {
                 .revoked_grants
                 .get(key)
                 .is_some_and(|retained| *retained >= *not_after);
-            let marked_no_earlier = match (seen, candidate.expired_seen.get(key)) {
-                (Some(ours), Some(theirs)) => *theirs >= ours,
-                _ => true,
+            let marked_no_earlier = match candidate.expired_seen.get(key) {
+                None => true,
+                Some(theirs) => {
+                    // Unmarked here: this state would mark it at the first
+                    // prune that sees it expired — no earlier than now, and
+                    // no earlier than its expiry. A candidate marked before
+                    // that drops it sooner (ORG-05 lost for this entry).
+                    let ours = seen.unwrap_or_else(|| {
+                        now_secs.max(
+                            not_after
+                                .saturating_add(
+                                    crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS,
+                                )
+                                .saturating_add(1),
+                        )
+                    });
+                    *theirs >= ours
+                }
             };
             retained && marked_no_earlier
         })
@@ -5165,6 +5183,52 @@ mod tests {
             installed.grant_revocations_retained_by(&dropped, past_grace),
             "past its grace the entry is ours to drop too"
         );
+    }
+
+    /// ORG-05 x ORG-01, the unmarked half: the installed state holds an
+    /// expired entry no prune has marked yet, so it would keep it until a
+    /// grace past its FIRST prune from now. A candidate carrying the same
+    /// entry marked long ago would drop it at its own first prune — a clock
+    /// then rolled back into the grant's window sees the grant valid again.
+    /// Such a candidate must be refused; one marked no earlier than the
+    /// installed state would mark it is accepted.
+    ///
+    /// Red: `(None, Some(_))` was accepted unconditionally.
+    #[test]
+    fn a_replacement_may_not_carry_an_older_mark_for_an_unmarked_entry() {
+        let now = current_timestamp();
+        let skew = crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let mut installed = OrgRevocationState::empty();
+        installed.merge_grant_revocations(&grant_revocation(now + 3_600), now);
+        // Long past expiry, and no prune has run on the installed state.
+        let later = now + 3_600 + skew + 30 * 24 * 60 * 60;
+        assert!(
+            installed.expired_seen.is_empty(),
+            "the installed entry is unmarked"
+        );
+
+        let mut marked_long_ago = installed.clone();
+        let key = *installed.revoked_grants.keys().next().expect("one entry");
+        marked_long_ago
+            .expired_seen
+            .insert(key, now + 3_600 + skew + 1);
+        assert!(
+            !installed.grant_revocations_retained_by(&marked_long_ago, later),
+            "a candidate whose old mark drops the entry at once must be refused"
+        );
+        assert_eq!(
+            marked_long_ago.clone().prune_expired_grants(later),
+            1,
+            "(and it would indeed drop it at its first prune)"
+        );
+
+        let mut marked_now = installed.clone();
+        marked_now.expired_seen.insert(key, later);
+        assert!(
+            installed.grant_revocations_retained_by(&marked_now, later),
+            "a mark no earlier than the installed state's own is accepted"
+        );
+        assert!(installed.grant_revocations_retained_by(&installed.clone(), later));
     }
 
     /// ORG-05: a forward wall-clock step that crosses a revoked grant's
