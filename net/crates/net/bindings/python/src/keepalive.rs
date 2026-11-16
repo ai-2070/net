@@ -86,6 +86,12 @@ struct Registry<N> {
     /// allocation, so its address (the key) cannot be reused by a
     /// different node while the marker exists; a marker is pruned once
     /// its node is gone, when no registration against it can arrive.
+    ///
+    /// What a dead marker retains is the node's bare allocation (its
+    /// fields are already dropped), and only until the next registry
+    /// operation of any kind — admit, forget or shutdown all prune. So
+    /// the retained memory is bounded by the nodes shut down and dropped
+    /// since the registry was last touched.
     shut_down: HashMap<NodeKey, Weak<N>>,
 }
 
@@ -120,6 +126,7 @@ impl<N> Registry<N> {
     }
 
     fn forget(&mut self, key: NodeKey, id: u64) {
+        self.prune_shut_down();
         if let Some(held) = self.held.get_mut(&key) {
             held.remove(&id);
             if held.is_empty() {
@@ -253,5 +260,21 @@ mod tests {
         assert!(reg.admit(&other, 3, entry(&slot)).is_none());
         assert!(reg.shut_down.is_empty());
         assert_eq!(reg.held.len(), 1);
+    }
+
+    #[test]
+    fn closing_any_handle_prunes_a_dead_shutdown_marker() {
+        let mut reg = Registry::<u8>::default();
+        let node = Arc::new(0u8);
+        reg.shut_down(&node);
+        drop(node);
+        assert_eq!(
+            reg.shut_down.len(),
+            1,
+            "nothing has touched the registry yet"
+        );
+        // An unrelated handle closing is enough to release the allocation.
+        reg.forget(0xdead, 1);
+        assert!(reg.shut_down.is_empty());
     }
 }

@@ -353,12 +353,16 @@ def test_cancelling_a_ready_pull_terminates_the_stream(mesh_pair) -> None:
     """
     from net import RpcCancelledError
 
+    import threading
+
     a, b = mesh_pair
     srv = MeshRpc(b)
+    all_sent = threading.Event()
 
     def _producer(_req: bytes, sink) -> None:
         for i in range(3):
             sink.send(str(i).encode())
+        all_sent.set()
         # Keep the stream open so the buffered chunks are not followed
         # by an EOF terminal while the client cancels.
         import time as _time
@@ -372,7 +376,12 @@ def test_cancelling_a_ready_pull_terminates_the_stream(mesh_pair) -> None:
         await asyncio.sleep(0.5)
         stream = await acli.call_streaming(b.node_id, "pull-cancel", b"go")
         assert await asyncio.wait_for(stream.__anext__(), timeout=2.0) == b"0"
-        # Let chunks 1 and 2 land in the client-side buffer.
+        # Synchronize with the producer rather than guessing: wait until
+        # chunks 1 and 2 have been SENT, then give loopback delivery a
+        # moment so the next pull is READY when it is cancelled (the path
+        # this test exists for; a pending pull is cancelled by a different
+        # path that never had the bug).
+        assert await asyncio.to_thread(all_sent.wait, 5.0), "producer stalled"
         await asyncio.sleep(0.5)
         pull = stream.__anext__()
         pull.cancel()
@@ -416,10 +425,9 @@ def test_a_registration_after_shutdown_is_not_retained(next_port) -> None:
     mesh.shutdown()
     assert before.is_closed(), "shutdown releases the services it swept"
 
-    try:
-        after = retained.serve("after-shutdown", _sync_echo)
-    except RuntimeError:
-        return  # refusing outright also leaves nothing retained
+    # Not wrapped in a broad `except RuntimeError`: the documented outcome
+    # is an already-closed handle, and any error here is a real failure.
+    after = retained.serve("after-shutdown", _sync_echo)
     assert after.is_closed(), (
         "a registration after a completed shutdown must not be retained"
     )
