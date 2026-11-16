@@ -169,7 +169,10 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     // `core::canonical` — a different encoder entirely, untouched here.)
     let bytes = serde_json::to_vec(value).map_err(|e| StoreError::io(path, e))?;
 
-    let tmp = staging_path(path);
+    // The staging name is chosen by the create below (a taken one is
+    // skipped); until then this placeholder only names errors.
+    let mut tmp = staging_path(path);
+    let mut created = false;
     let result: Result<(), StoreError> = async {
         // Created with its permissions already in place — owner-only from
         // the instant the name exists. This is why it is a create rather
@@ -179,31 +182,39 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         // There must be no window at all, not merely a short one.
         //
         // `create_new` also means a leftover temp from a crashed same-pid
-        // process cannot be silently reused with its old permissions.
+        // process cannot be silently reused with its old permissions. A
+        // taken name is skipped for the next candidate, never removed: an
+        // existing file there is not established to be ours.
         // Off the reactor: `create_owner_only` is synchronous, and on
         // Windows it is several blocking syscalls (token read, SDDL
         // conversion, `CreateFileW`). A custom store path on a network or
         // FUSE filesystem can make those slow, and every payment passes
         // through here — a stalled worker would stall concurrent
         // payments, not merely this one.
-        let tmp_for_create = tmp.clone();
-        let file = tokio::task::spawn_blocking(move || {
-            match super::file_mode::create_owner_only(&tmp_for_create) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Stale temp from a dead same-pid process: the name is
-                    // unique within this one (`staging_path`), so nothing
-                    // live holds it. Remove and retry once, so recovery
-                    // needs no manual cleanup while a live conflict still
-                    // surfaces.
-                    let _ = std::fs::remove_file(&tmp_for_create);
-                    super::file_mode::create_owner_only(&tmp_for_create)
+        let first = tmp.clone();
+        let store = path.to_path_buf();
+        let (staged, file) = tokio::task::spawn_blocking(move || {
+            const ATTEMPTS: usize = 64;
+            let mut candidate = first;
+            let mut attempt = 1;
+            loop {
+                match super::file_mode::create_owner_only(&candidate) {
+                    Ok(file) => return (candidate, Ok(file)),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < ATTEMPTS =>
+                    {
+                        attempt += 1;
+                        candidate = staging_path(&store);
+                    }
+                    Err(e) => return (candidate, Err(e)),
                 }
-                other => other,
             }
         })
         .await
-        .map_err(|e| StoreError::io(&tmp, e))?
         .map_err(|e| StoreError::io(&tmp, e))?;
+        let file = file.map_err(|e| StoreError::io(&staged, e))?;
+        tmp = staged;
+        created = true;
         let mut file = tokio::fs::File::from_std(file);
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&bytes)
@@ -220,7 +231,9 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     }
     .await;
 
-    if result.is_err() {
+    // Only a temp this save created is removed: a name it could not create
+    // belongs to someone else.
+    if result.is_err() && created {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     result
@@ -283,22 +296,30 @@ where
 ///
 /// A store whose filename is already near the 255-byte component limit has
 /// no room for the suffix, and the save would fail with ENAMETOOLONG; it then
-/// stages under the short `.net-mesh-store.tmp.<pid>.<seq>` beside it, still
-/// unique by pid and sequence.
+/// stages under a short name beside it (see [`sibling_path`]), still unique
+/// by pid and sequence.
 fn staging_path(path: &Path) -> PathBuf {
-    /// The longest file-name component the common filesystems accept (255
-    /// bytes on ext4/XFS/APFS, 255 UTF-16 units on NTFS).
-    const MAX_NAME_COMPONENT: usize = 255;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let suffix = format!(".tmp.{}.{seq}", std::process::id());
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(&suffix);
+    sibling_path(path, &format!(".tmp.{}.{seq}", std::process::id()))
+}
+
+/// `<filename><suffix>` beside `path` — or, when that would exceed the
+/// 255-byte file-name component limit (ext4/XFS/APFS bytes, NTFS UTF-16
+/// units), the short `.net-mesh-store.<id><suffix>`, where `<id>` is 16 hex
+/// digits of a hash of the store's filename. The short form is therefore
+/// specific to its store, never a name another store in the directory (or a
+/// file the operator chose) shares by construction.
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    const MAX_NAME_COMPONENT: usize = 255;
+    let file_name = path.file_name().unwrap_or_default();
+    let mut name = file_name.to_os_string();
+    name.push(suffix);
     if name.len() <= MAX_NAME_COMPONENT {
-        path.with_file_name(name)
-    } else {
-        path.with_file_name(format!(".net-mesh-store{suffix}"))
+        return path.with_file_name(name);
     }
+    let id: String = blake3::hash(file_name.as_encoded_bytes()).to_hex()[..16].to_string();
+    path.with_file_name(format!(".net-mesh-store.{id}{suffix}"))
 }
 
 #[cfg(test)]
@@ -331,8 +352,48 @@ mod tests {
         let long = staging_path(&dir.join("s".repeat(250)));
         let name = long.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.len() <= 255, "{}", name.len());
-        assert!(name.starts_with(".net-mesh-store.tmp."), "{name}");
+        assert!(name.starts_with(".net-mesh-store."), "{name}");
+        assert!(name.contains(".tmp."), "{name}");
         assert_eq!(long.parent(), Some(dir.as_path()));
+    }
+
+    /// A file already at the staging name is not this save's: it is skipped
+    /// for the next candidate and left untouched, never removed as stale.
+    /// (The next candidate is predicted from the process-wide sequence;
+    /// nextest runs each test in its own process, so nothing else advances
+    /// it in between.)
+    #[tokio::test]
+    async fn a_taken_staging_name_is_skipped_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let probe = staging_path(&path).to_string_lossy().into_owned();
+        let (head, seq) = probe.rsplit_once('.').unwrap();
+        let next = PathBuf::from(format!("{head}.{}", seq.parse::<u64>().unwrap() + 1));
+        std::fs::write(&next, b"not ours").unwrap();
+        mutate_json::<Counters, _, _>(&path, |s| {
+            *s.counts.entry("a".into()).or_default() += 1;
+        })
+        .await
+        .expect("the save stages past the taken name");
+        assert_eq!(std::fs::read(&next).unwrap(), b"not ours");
+        let loaded: Counters = load_json(&path).await.unwrap();
+        assert_eq!(loaded.counts["a"], 1);
+    }
+
+    /// The short fallback is specific to its store: two near-limit stores in
+    /// one directory never share a fallback prefix, and one store always
+    /// gets the same one.
+    #[test]
+    fn the_short_fallback_is_specific_to_its_store() {
+        let dir = std::path::Path::new("some").join("dir");
+        let prefix = |p: &std::path::Path| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n[..n.find(".tmp.").unwrap()].to_string()
+        };
+        let a = dir.join("a".repeat(250));
+        let b = dir.join("b".repeat(250));
+        assert_ne!(prefix(&staging_path(&a)), prefix(&staging_path(&b)));
+        assert_eq!(prefix(&staging_path(&a)), prefix(&staging_path(&a)));
     }
 
     /// Red-witness: with the suffix appended to a 250-byte store name the

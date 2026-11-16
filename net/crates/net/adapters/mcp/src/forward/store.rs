@@ -627,22 +627,37 @@ pub fn validate_ref_name(name: &str) -> Result<(), StoreError> {
 ///
 /// A store whose filename is already near the 255-byte component limit has
 /// no room for the suffix, and the save would fail with ENAMETOOLONG; it then
-/// stages under the short `.net-mesh-store.tmp.<pid>.<seq>` beside it, still
-/// unique by pid and sequence.
+/// stages under a short name beside it (see [`sibling_path`]), still unique
+/// by pid and sequence.
 fn staging_path(path: &Path) -> PathBuf {
-    /// The longest file-name component the common filesystems accept (255
-    /// bytes on ext4/XFS/APFS, 255 UTF-16 units on NTFS).
-    const MAX_NAME_COMPONENT: usize = 255;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let suffix = format!(".tmp.{}.{seq}", std::process::id());
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(&suffix);
+    sibling_path(path, &format!(".tmp.{}.{seq}", std::process::id()))
+}
+
+/// `<filename><suffix>` beside `path` — or, when that would exceed the
+/// 255-byte file-name component limit (ext4/XFS/APFS bytes, NTFS UTF-16
+/// units), the short `.net-mesh-store.<id><suffix>`, where `<id>` is 16 hex
+/// digits of a hash of the store's filename. The short form is therefore
+/// specific to its store, never a name another store in the directory (or a
+/// file the operator chose) shares by construction.
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    const MAX_NAME_COMPONENT: usize = 255;
+    let file_name = path.file_name().unwrap_or_default();
+    let mut name = file_name.to_os_string();
+    name.push(suffix);
     if name.len() <= MAX_NAME_COMPONENT {
-        path.with_file_name(name)
-    } else {
-        path.with_file_name(format!(".net-mesh-store{suffix}"))
+        return path.with_file_name(name);
     }
+    let id: String = {
+        use blake2::Digest as _;
+        blake2::Blake2s256::digest(file_name.as_encoded_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    path.with_file_name(format!(".net-mesh-store.{id}{suffix}"))
 }
 
 #[cfg(test)]
@@ -675,8 +690,25 @@ mod tests {
         let long = staging_path(&dir.join("s".repeat(250)));
         let name = long.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.len() <= 255, "{}", name.len());
-        assert!(name.starts_with(".net-mesh-store.tmp."), "{name}");
+        assert!(name.starts_with(".net-mesh-store."), "{name}");
+        assert!(name.contains(".tmp."), "{name}");
         assert_eq!(long.parent(), Some(dir.as_path()));
+    }
+
+    /// The short fallback is specific to its store: two near-limit stores in
+    /// one directory never share a fallback prefix, and one store always
+    /// gets the same one.
+    #[test]
+    fn the_short_fallback_is_specific_to_its_store() {
+        let dir = std::path::Path::new("some").join("dir");
+        let prefix = |p: &std::path::Path| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n[..n.find(".tmp.").unwrap()].to_string()
+        };
+        let a = dir.join("a".repeat(250));
+        let b = dir.join("b".repeat(250));
+        assert_ne!(prefix(&staging_path(&a)), prefix(&staging_path(&b)));
+        assert_eq!(prefix(&staging_path(&a)), prefix(&staging_path(&a)));
     }
 
     /// Red-witness: with the suffix appended to a 250-byte store name the
