@@ -140,12 +140,30 @@ session it arrived on.
 The four keys are expanded from the Noise `Split()` outputs — the secret the
 handshake's DH results feed through the chaining key — one output per direction,
 each under its own direction-named label, with the handshake hash appended to the
-KDF info purely as channel binding. The handshake hash is never key material on its
-own: it is public transcript (anyone holding the PSK can recompute it from the
-handshake messages), so keys derived from it alone would be readable by every PSK
-holder and would lose forward secrecy. The prologue tag `net-handshake-v2` versions
-this derivation; a peer on the earlier hash-only derivation (`net-handshake-v1`)
-fails the handshake at msg1 rather than establishing a session it cannot decrypt.
+KDF info purely as channel binding. Exactly, with `(k_i2r, k_r2i) = Split()` (Noise
+§5.2: the first output keys initiator→responder) and `h` the 32-byte handshake
+hash:
+
+```text
+KDF(ikm, info) = BLAKE2s-MAC(key = BLAKE2s-MAC(key = ikm, data = "net-kdf-v1"),
+                             data = info)            -- 32-byte keyed BLAKE2s
+
+packet  initiator→responder = KDF(k_i2r, "net-packet-i2r-v2"    ‖ h)
+packet  responder→initiator = KDF(k_r2i, "net-packet-r2i-v2"    ‖ h)
+route-hop initiator→responder = KDF(k_i2r, "net-route-hop-i2r-v2" ‖ h)
+route-hop responder→initiator = KDF(k_r2i, "net-route-hop-r2i-v2" ‖ h)
+```
+
+The initiator transmits on the `i2r` keys and receives on the `r2i` keys; the
+responder the reverse. The handshake hash is never key material on its own: a PSK
+holder with the negotiated prologue, the responder's static public key and the
+handshake messages can recompute it, so keys derived from it alone would be
+readable by every PSK holder and would lose forward secrecy. The prologue tag
+`net-handshake-v2` versions this derivation on every handshake path: mesh
+handshakes use `"net-handshake-v2" ‖ src_node_id (u64 LE) ‖ dest_node_id (u64 LE)`,
+and the point-to-point adapter's handshake the 16-byte tag alone. A peer on the
+earlier hash-only derivation (`net-handshake-v1`, or no prologue) fails the
+handshake at msg1 rather than establishing a session it cannot decrypt.
 
 `PacketCipher` wraps the AEAD primitive with the per-session monotonic counter for
 nonce generation.

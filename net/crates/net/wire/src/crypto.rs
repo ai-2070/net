@@ -39,11 +39,19 @@ const NOISE_PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
 /// on which every packet fails AEAD.
 pub fn handshake_prologue(src_node_id: u64, dest_node_id: u64) -> [u8; 32] {
     let mut buf = [0u8; 32];
-    buf[0..16].copy_from_slice(b"net-handshake-v2");
+    buf[0..16].copy_from_slice(HANDSHAKE_VERSION_TAG);
     buf[16..24].copy_from_slice(&src_node_id.to_le_bytes());
     buf[24..32].copy_from_slice(&dest_node_id.to_le_bytes());
     buf
 }
+
+/// The handshake version tag: the first 16 bytes of every
+/// [`handshake_prologue`], and the WHOLE prologue of a handshake that binds
+/// no node ids — [`NoiseHandshake::initiator`] / [`NoiseHandshake::responder`]
+/// (the point-to-point adapter). Every handshake path therefore carries it,
+/// so a peer on another session-key derivation fails at msg1 instead of
+/// completing a handshake whose session it cannot decrypt (NHS-01).
+pub const HANDSHAKE_VERSION_TAG: &[u8; 16] = b"net-handshake-v2";
 
 /// Error type for cryptographic operations
 #[derive(Debug, Clone)]
@@ -194,11 +202,15 @@ pub struct NoiseHandshake {
 }
 
 impl NoiseHandshake {
-    /// Create initiator handshake state with an empty prologue.
+    /// Create initiator handshake state whose prologue is the version tag
+    /// alone ([`HANDSHAKE_VERSION_TAG`]): for a handshake that binds no
+    /// node ids. It used to be EMPTY, so a peer on the earlier hash-only
+    /// key derivation completed this handshake and then failed every
+    /// packet; with the tag it fails at msg1.
     ///
     /// The initiator knows the responder's static public key.
     pub fn initiator(psk: &[u8; 32], responder_static: &[u8; 32]) -> Result<Self, CryptoError> {
-        Self::initiator_with_prologue(psk, responder_static, &[])
+        Self::initiator_with_prologue(psk, responder_static, HANDSHAKE_VERSION_TAG)
     }
 
     /// Create initiator handshake state with a caller-supplied prologue.
@@ -235,11 +247,12 @@ impl NoiseHandshake {
         })
     }
 
-    /// Create responder handshake state with an empty prologue.
+    /// Create responder handshake state whose prologue is the version tag
+    /// alone — the counterpart of [`Self::initiator`].
     ///
     /// The responder uses its static keypair for authentication.
     pub fn responder(psk: &[u8; 32], static_keypair: &StaticKeypair) -> Result<Self, CryptoError> {
-        Self::responder_with_prologue(psk, static_keypair, &[])
+        Self::responder_with_prologue(psk, static_keypair, HANDSHAKE_VERSION_TAG)
     }
 
     /// Create responder handshake state with a caller-supplied prologue.
@@ -2291,6 +2304,37 @@ mod tests {
     /// `ee`/`es`), and a v1 prologue peer cannot complete a handshake
     /// with a v2 one — the tag bump makes the NHS-01 key change fail
     /// loudly at msg1.
+    #[test]
+    fn nhs01_the_default_constructors_are_versioned_too() {
+        // The point-to-point adapter builds its handshakes with the default
+        // constructors. They carry the version tag, so an unversioned
+        // (empty-prologue, pre-v2) peer is refused at msg1 rather than
+        // completing a handshake whose session it cannot decrypt.
+        // Red: with an empty default prologue this msg1 authenticated.
+        let psk = [0x42u8; 32];
+        let responder_keypair = StaticKeypair::generate();
+        let mut legacy =
+            NoiseHandshake::initiator_with_prologue(&psk, &responder_keypair.public, &[]).unwrap();
+        let mut current = NoiseHandshake::responder(&psk, &responder_keypair).unwrap();
+        let m1 = legacy.write_message(b"").unwrap();
+        assert!(
+            current.read_message(&m1).is_err(),
+            "an unversioned msg1 must not authenticate to a default responder"
+        );
+
+        // Two default-constructed ends still agree with each other.
+        let mut i = NoiseHandshake::initiator(&psk, &responder_keypair.public).unwrap();
+        let mut r = NoiseHandshake::responder(&psk, &responder_keypair).unwrap();
+        let m1 = i.write_message(b"").unwrap();
+        r.read_message(&m1).unwrap();
+        let m2 = r.write_message(b"").unwrap();
+        i.read_message(&m2).unwrap();
+        assert_eq!(
+            i.into_session_keys().unwrap().tx_key,
+            r.into_session_keys().unwrap().rx_key
+        );
+    }
+
     #[test]
     fn nhs01_fresh_keys_per_handshake_and_v1_prologue_is_refused() {
         let psk = [0x42u8; 32];
