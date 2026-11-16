@@ -537,13 +537,20 @@ const TERMS: &str = r#"{"object":"net.pricing.terms@1"}"#;
 /// A payment gate that admits everything and records what it redeemed.
 struct RecordingAdmission {
     redeemed: std::sync::Mutex<Vec<(String, String, bool)>>,
+    /// Every offer publication / withdrawal, in order.
+    offers: std::sync::Mutex<Vec<String>>,
 }
 
 impl RecordingAdmission {
     fn new() -> Self {
         Self {
             redeemed: std::sync::Mutex::new(Vec::new()),
+            offers: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn offers(&self) -> Vec<String> {
+        self.offers.lock().unwrap().clone()
     }
 }
 
@@ -561,6 +568,21 @@ impl net_mcp::serve::PaymentAdmission for RecordingAdmission {
             binding.is_some(),
         ));
         Ok(())
+    }
+
+    fn publish_offer(&self, tool_id: &str, _pricing_terms: &str) -> Result<(), String> {
+        self.offers
+            .lock()
+            .unwrap()
+            .push(format!("publish:{tool_id}"));
+        Ok(())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.offers
+            .lock()
+            .unwrap()
+            .push(format!("withdraw:{tool_id}"));
     }
 }
 
@@ -991,4 +1013,74 @@ async fn two_publishers_on_one_node_merge_into_one_announcement() {
         "{names:?}"
     );
     drop((first, second));
+}
+
+/// A publication's quote authority follows its served tool set and its
+/// lifetime. Offers are published once the publication serves the tool; a
+/// colliding publication (fails at serve) publishes nothing — it used to
+/// replace the running publication's terms first; a refresh that drops a
+/// priced tool withdraws its offer; and dropping the publication withdraws
+/// the rest. Before, every offer stayed live in the engine after its
+/// handler was gone, so quotes kept being signed for an unserved tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publications_offers_follow_its_tool_set_and_lifetime() {
+    let host = Arc::new(build_mesh(&[0x5au8; 32]).await);
+    let owner = host.origin_hash();
+    let publisher = ServerPublisher::new(Arc::clone(&host));
+    let priced_config = |gate: &Arc<RecordingAdmission>| {
+        let mut config = WrapConfig::owner_only(hermes_impl(), owner);
+        config.pricing.insert("add".to_string(), TERMS.to_string());
+        config.payment_admission = Some(gate.clone());
+        config
+    };
+
+    let gate = Arc::new(RecordingAdmission::new());
+    let mut publication = publisher
+        .publish_tools(
+            &local_tools(),
+            Arc::new(LocalTools::default()) as Arc<dyn ToolInvoker>,
+            ctx(),
+            priced_config(&gate),
+        )
+        .await
+        .expect("publishes");
+    assert_eq!(gate.offers(), ["publish:add"]);
+
+    let rival = Arc::new(RecordingAdmission::new());
+    assert!(
+        publisher
+            .publish_tools(
+                &local_tools(),
+                Arc::new(LocalTools::default()) as Arc<dyn ToolInvoker>,
+                ctx(),
+                priced_config(&rival),
+            )
+            .await
+            .is_err(),
+        "the tool ids are already served"
+    );
+    assert!(
+        rival.offers().is_empty(),
+        "a colliding publication must not touch quote authority: {:?}",
+        rival.offers()
+    );
+
+    let only_echo: Vec<Tool> = local_tools()
+        .into_iter()
+        .filter(|t| t.name == "echo")
+        .collect();
+    publication.refresh(&only_echo).await.expect("refresh");
+    assert_eq!(gate.offers(), ["publish:add", "withdraw:add"]);
+
+    publication.refresh(&local_tools()).await.expect("refresh");
+    drop(publication);
+    assert_eq!(
+        gate.offers(),
+        ["publish:add", "withdraw:add", "publish:add", "withdraw:add"]
+    );
+
+    drop(publisher);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        host.shutdown().await.ok();
+    }
 }

@@ -2792,3 +2792,89 @@ async fn legacy_serve_a2a_ignores_the_service_and_revision_fields() {
         "the legacy path serves no describe"
     );
 }
+
+/// Logs offer publication / withdrawal; never asked to redeem here.
+#[derive(Default)]
+struct OfferLogGate {
+    log: parking_lot::Mutex<Vec<String>>,
+}
+
+impl OfferLogGate {
+    fn log(&self) -> Vec<String> {
+        self.log.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskAdmissionGate for OfferLogGate {
+    async fn redeem(&self, claim: TaskPaymentClaim<'_>) -> Result<TaskPaymentEvidence, GateDenial> {
+        Err(denial(
+            "unused",
+            "not under test",
+            claim.quote_id,
+            claim.tool_id,
+        ))
+    }
+
+    fn publish_offer(&self, tool_id: &str, _pricing_terms: &str) -> Result<(), String> {
+        self.log.lock().push(format!("publish:{tool_id}"));
+        Ok(())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.log.lock().push(format!("withdraw:{tool_id}"));
+    }
+}
+
+/// A paid catalog's quote authority lives exactly as long as its serving.
+/// It is published once this serve owns the A2A services; a SECOND serve
+/// on the node touches nothing (it used to publish its catalog's terms
+/// over the running one's and then fail to register); and dropping the
+/// serving withdraws it — before, the engine kept signing quotes for a
+/// task service nobody served.
+#[tokio::test]
+async fn a_paid_catalogs_offers_live_exactly_as_long_as_its_serving() {
+    let provider = mesh().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exec = ExecProbe::new(false);
+    let tool = format!("{A2A_TASK_SERVICE}/{SERVICE}");
+
+    let gate = Arc::new(OfferLogGate::default());
+    let config = A2aServiceConfig::new(catalog(vec![A2aServicePolicy::Paid(offer(true))]))
+        .with_journal(
+            A2aAdmissionJournal::open(&dir.path().join("a.json"))
+                .await
+                .expect("open"),
+        )
+        .with_payment(gate.clone() as Arc<dyn TaskAdmissionGate>);
+    let serving = provider
+        .serve_a2a_configured(TaskRegistry::new(), exec.executor(), config)
+        .expect("the first serve owns the services");
+    assert_eq!(gate.log(), [format!("publish:{tool}")]);
+
+    let second = Arc::new(OfferLogGate::default());
+    let config = A2aServiceConfig::new(catalog(vec![A2aServicePolicy::Paid(offer(true))]))
+        .with_journal(
+            A2aAdmissionJournal::open(&dir.path().join("b.json"))
+                .await
+                .expect("open"),
+        )
+        .with_payment(second.clone() as Arc<dyn TaskAdmissionGate>);
+    assert!(
+        provider
+            .serve_a2a_configured(TaskRegistry::new(), exec.executor(), config)
+            .is_err(),
+        "the A2A services are already served"
+    );
+    assert!(
+        second.log().is_empty(),
+        "a failed serve must not touch quote authority: {:?}",
+        second.log()
+    );
+
+    drop(serving);
+    assert_eq!(
+        gate.log(),
+        [format!("publish:{tool}"), format!("withdraw:{tool}")]
+    );
+}

@@ -991,6 +991,73 @@ async fn an_admitted_enrollment_outcome_promotes_the_session() {
     assert_eq!(anchor.rtc_stats().admission_rejected_outcome(), 0);
 }
 
+/// ANCHOR-04 × witness 7: when the tenant cap refuses the promotion an
+/// Admitted outcome announces, the visitor must be TOLD it was refused.
+///
+/// The handler's own occupancy check is a preflight, so two visitors
+/// can both be answered Admitted while one slot is left; the cap at
+/// promotion then refuses the second. Sending that Admitted reply anyway
+/// told the visitor it had joined while its session sat provisional
+/// until its 30 s clock dropped it, with no refusal to read or retry on.
+///
+/// Inverse: send the frame unchanged when promotion is refused at the cap
+/// — the client receives the Admitted body.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_admitted_outcome_refused_at_the_tenant_cap_reaches_the_client_as_a_refusal() {
+    use net::adapter::net::mesh_rpc::CallOptions;
+    use net::adapter::net::rtc::TenantId;
+
+    const GAME: TenantId = TenantId(0x6A3E);
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    // Every grant is for GAME, and GAME is already full.
+    anchor.set_enrollment_tenant_resolver(Some(Arc::new(|_chain: &[u8]| Some(GAME))));
+    anchor.set_enrollment_tenant_cap(Some(Arc::new(|tenant| (tenant == GAME).then_some(0))));
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(FixedOutcome(true)))
+        .expect("serve the enrollment service");
+
+    let reply = client
+        .call(
+            anchor.node_id(),
+            ENROLL_SERVICE,
+            Bytes::from_static(b"join request"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("the allow-list permits exactly this call");
+    let body = reply.body.as_ref();
+    assert_ne!(
+        body,
+        outcome_bytes(true).as_ref(),
+        "an admission the cap refused must not reach the client as Admitted"
+    );
+    assert_eq!(
+        &body[..5],
+        b"NMO1\x01",
+        "the client reads a Rejected outcome"
+    );
+    assert_eq!(
+        u16::from_le_bytes([body[5], body[6]]),
+        7,
+        "coded DENIED, as the handler's own full-game preflight answers"
+    );
+    let len = u32::from_le_bytes(body[7..11].try_into().unwrap()) as usize;
+    let message = std::str::from_utf8(&body[11..11 + len]).expect("a UTF-8 message");
+    assert_eq!(
+        message, "the game holds as many players as this anchor admits for one game; retry shortly",
+        "the visitor reads one plain sentence"
+    );
+
+    assert!(
+        anchor.peer_is_provisional(client_id),
+        "the refused session stays provisional"
+    );
+    assert_eq!(anchor.rtc_stats().admission_promoted(), 0);
+    assert_eq!(anchor.rtc_stats().admission_rejected_outcome(), 1);
+}
+
 /// WITNESS 8: the whole-session **frame** bound is enforced on the
 /// live ingress path, not merely defined. The 257th inbound frame
 /// from a provisional peer closes and reclaims the session (§12

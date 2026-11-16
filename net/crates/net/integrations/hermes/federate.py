@@ -28,9 +28,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import threading
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+
+from . import naming
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +41,21 @@ logger = logging.getLogger(__name__)
 #: toolset is the deferral unit — "total on the mesh, curated in the prompt").
 FEDERATED_TOOLSET = "net-federated"
 
-_NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_]+")
-
-
 def federated_tool_name(cap_id: str) -> str:
-    """A stable, Hermes-safe tool name for a discovered capability.
+    """A stable, Hermes-safe, collision-resistant tool name for a discovered
+    capability.
 
     Deterministic — the same ``provider/capability`` id always maps to the same
     name — so a promoted tool keeps its identity across polls / sessions. The id
-    is machine-namespaced (``<provider>/<tool>``): the ``provider/tool`` boundary
-    becomes ``__`` so the machine scope stays legible in the name
-    (``pc/terminal.run`` → ``net_mesh__pc__terminal_run``), and any other unsafe
-    run folds to a single ``_``."""
-    scoped = cap_id.replace("/", "__")
-    safe = _NAME_UNSAFE.sub("_", scoped).strip("_").lower()
-    return f"net_mesh__{safe}"[:110]
+    is machine-namespaced (``<provider>/<tool>``): each ``/`` becomes ``__`` so
+    the machine scope stays legible in the name (``pc/terminal_run`` →
+    ``net_mesh__pc__terminal_run``). An id that form would fold onto another
+    (``-``, ``.``, case, stray ``_``, length) gets a digest of the original id
+    appended instead — see :mod:`naming`."""
+    readable = (
+        cap_id.replace("/", "__") if naming.FEDERATED_READABLE.fullmatch(cap_id) else None
+    )
+    return naming.tool_name("net_mesh__", cap_id, readable, slash="__")
 
 
 def build_federated_schema(
@@ -139,6 +140,7 @@ class FederationPromoter:
         self._invoke = invoke  # async (cap_id, args) -> result JSON string
         self._check_fn = check_fn
         self._registered: Dict[str, str] = {}  # cap_id -> tool name
+        self._owners: Dict[str, str] = {}  # tool name -> the cap_id that owns it
 
     async def reconcile(self, capabilities: Sequence[Dict[str, Any]]) -> None:
         """Given the mesh's currently-discovered capability rows (from the
@@ -168,6 +170,19 @@ class FederationPromoter:
                 return
             schema = build_federated_schema(cap_id, detail, row.get("providers") or [])
             name = schema["name"]
+            owner = self._owners.get(name)
+            if owner is not None and owner != cap_id:
+                # The host replaces a same-name registration, so federating
+                # would hand `owner`'s tool to this capability (and a later
+                # retire of either would remove both). Refuse; the next
+                # reconcile retries once the name is free.
+                logger.warning(
+                    "net plugin: not federating %s: tool name %s is already owned by %s",
+                    cap_id,
+                    name,
+                    owner,
+                )
+                return
             self._registrar.register_federated(
                 name=name,
                 schema=schema,
@@ -179,17 +194,28 @@ class FederationPromoter:
             logger.warning("net plugin: could not federate %s: %s", cap_id, e)
             return
         self._registered[cap_id] = name
+        self._owners[name] = cap_id
         logger.info("net plugin: federated mesh capability %s -> tool %s", cap_id, name)
 
     def _retire(self, cap_id: str) -> None:
-        name = self._registered.pop(cap_id, None)
+        name = self._registered.get(cap_id)
         if name is None:
+            return
+        # Only the owning capability removes a registration.
+        if self._owners.get(name) != cap_id:
+            del self._registered[cap_id]
             return
         try:
             self._registrar.deregister_federated(name)
         except Exception as e:  # noqa: BLE001 — a failed retire must not sink the loop
+            # The host still holds the entry: keep it registered AND owned, so
+            # no other capability is federated over the name and the next
+            # reconcile (which retires every registered capability it no
+            # longer sees) retries the removal.
             logger.warning("net plugin: could not retire federated %s (%s): %s", cap_id, name, e)
             return
+        del self._registered[cap_id]
+        del self._owners[name]
         logger.info("net plugin: retired federated capability %s (tool %s)", cap_id, name)
 
     def _make_handler(self, cap_id: str) -> Callable:

@@ -1071,6 +1071,41 @@ pub struct SubnetFloorRegistry {
     auth_epochs: DashMap<[u8; 32], u64>,
     /// Subject floors keyed `(authority, topology_epoch, path, subject)`.
     subject_floors: DashMap<([u8; 32], u32, u32, [u8; 32]), SubjectFloorEntry>,
+    /// Test-only interleaving seam: runs once, right after a
+    /// [`Self::max_floor`] read, so a unit test can land a revocation
+    /// exactly between a verifier's floor check and its epoch capture.
+    #[cfg(test)]
+    after_floor_read: TestHook,
+}
+
+/// What accepting one floor fact did to the registry (SUBNET-07).
+///
+/// Two different facts, deliberately not one boolean: a fact can
+/// advance its key's revision WATERMARK without raising any
+/// enforceable generation. That watermark is still state — it is what
+/// makes an older signed fact stale — so it must be durably retained
+/// even though it revokes nothing and costs no invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FloorAcceptance {
+    /// The fact was accepted into the registry: it created its key or
+    /// advanced the key's revision watermark. Everything accepted must
+    /// be durably logged for a restart to reproduce the registry.
+    pub accepted: bool,
+    /// Enforceable state changed (some generation rose), so live
+    /// authority it covers must be invalidated. Implies `accepted`.
+    pub changed: bool,
+}
+
+/// One-shot test hook (see `SubnetFloorRegistry::after_floor_read`).
+#[cfg(test)]
+#[derive(Default)]
+struct TestHook(parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1096,8 +1131,10 @@ impl SubnetFloorRegistry {
     /// authority must equal the config's, and its issuer must be a
     /// configured root. Returns `Ok(true)` iff the floor changed
     /// *enforceable* state — and the auth epoch advanced with it.
-    /// Stale revisions and non-raising floors are `Ok(false)` no-ops
-    /// — replay/reorder can never roll backward.
+    /// Stale revisions are `Ok(false)` no-ops — replay/reorder can never
+    /// roll backward. A newer non-raising floor is also `Ok(false)`, but
+    /// it still advances the revision watermark; see
+    /// [`Self::apply_tracked`].
     ///
     /// The epoch advance is the expensive half of acceptance: the
     /// epoch is per AUTHORITY while floors are keyed per
@@ -1122,6 +1159,24 @@ impl SubnetFloorRegistry {
         floor: &SubnetRevocationFloor,
         config: &SubnetAuthorityConfig,
     ) -> Result<bool, SubnetAuthError> {
+        self.apply_tracked(floor, config).map(|a| a.changed)
+    }
+
+    /// [`Self::apply`], reporting acceptance and enforceable change
+    /// separately ([`FloorAcceptance`]). A newer revision that raises
+    /// nothing still advances the key's revision watermark (SUBNET-07):
+    /// the stream is ordered by revision, so once revision `r` is held an
+    /// older signed fact is stale whatever generation it carries.
+    ///
+    /// The floor is raised BEFORE the auth epoch advances. Verification
+    /// captures the epoch before reading floors, and that pairing is what
+    /// makes a verification racing this apply either see the raised floor
+    /// or pin the pre-advance epoch (SUBNET-01) — do not reorder.
+    pub fn apply_tracked(
+        &self,
+        floor: &SubnetRevocationFloor,
+        config: &SubnetAuthorityConfig,
+    ) -> Result<FloorAcceptance, SubnetAuthError> {
         if floor.scope.authority != config.authority {
             return Err(SubnetAuthError::WrongAuthority);
         }
@@ -1138,14 +1193,20 @@ impl SubnetFloorRegistry {
             floor.topology_epoch,
             floor.scope.path.raw(),
         );
+        let mut accepted = false;
         let mut changed = false;
         self.floors
             .entry(key)
             .and_modify(|e| {
-                if floor.revision > e.revision && floor.minimum_generation > e.minimum_generation {
+                if floor.revision > e.revision {
+                    // The watermark advances on every newer revision;
+                    // the generation only ever rises.
                     e.revision = floor.revision;
-                    e.minimum_generation = floor.minimum_generation;
-                    changed = true;
+                    accepted = true;
+                    if floor.minimum_generation > e.minimum_generation {
+                        e.minimum_generation = floor.minimum_generation;
+                        changed = true;
+                    }
                 }
             })
             .or_insert_with(|| {
@@ -1154,6 +1215,7 @@ impl SubnetFloorRegistry {
                 // it kills none, so it must not cost the
                 // authority-wide invalidation an epoch advance
                 // triggers. The entry is stored either way.
+                accepted = true;
                 changed = floor.minimum_generation > 0;
                 FloorEntry {
                     minimum_generation: floor.minimum_generation,
@@ -1166,7 +1228,7 @@ impl SubnetFloorRegistry {
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
         }
-        Ok(changed)
+        Ok(FloorAcceptance { accepted, changed })
     }
 
     /// Maximum applicable floor for a credential scoped at
@@ -1191,7 +1253,18 @@ impl SubnetFloorRegistry {
             }
             cursor = cursor.parent();
         }
+        #[cfg(test)]
+        if let Some(hook) = self.after_floor_read.0.lock().take() {
+            hook();
+        }
         max
+    }
+
+    /// Test-only: run `hook` once, right after the next
+    /// [`Self::max_floor`] read completes.
+    #[cfg(test)]
+    fn set_after_floor_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_floor_read.0.lock() = Some(Box::new(hook));
     }
 
     /// Current auth epoch for `authority` (0 until a floor applies).
@@ -1214,6 +1287,17 @@ impl SubnetFloorRegistry {
         floor: &SubnetSubjectFloor,
         config: &SubnetAuthorityConfig,
     ) -> Result<bool, SubnetAuthError> {
+        self.apply_subject_tracked(floor, config).map(|a| a.changed)
+    }
+
+    /// [`Self::apply_subject`], reporting acceptance (the revision
+    /// watermark advanced, or the key is new) separately from
+    /// enforceable change ([`FloorAcceptance`], SUBNET-07).
+    pub fn apply_subject_tracked(
+        &self,
+        floor: &SubnetSubjectFloor,
+        config: &SubnetAuthorityConfig,
+    ) -> Result<FloorAcceptance, SubnetAuthError> {
         if floor.scope.authority != config.authority {
             return Err(SubnetAuthError::WrongAuthority);
         }
@@ -1230,6 +1314,7 @@ impl SubnetFloorRegistry {
             floor.scope.path.raw(),
             *floor.subject.as_bytes(),
         );
+        let mut accepted = false;
         let mut changed = false;
         let raise = |generations: &mut [u32; 3], changed: &mut bool| {
             for (i, bit) in RIGHT_BITS.iter().enumerate() {
@@ -1244,10 +1329,12 @@ impl SubnetFloorRegistry {
             .and_modify(|e| {
                 if floor.revision > e.revision {
                     e.revision = floor.revision;
+                    accepted = true;
                     raise(&mut e.generations, &mut changed);
                 }
             })
             .or_insert_with(|| {
+                accepted = true;
                 let mut generations = [0u32; 3];
                 raise(&mut generations, &mut changed);
                 SubjectFloorEntry {
@@ -1255,7 +1342,7 @@ impl SubnetFloorRegistry {
                     generations,
                 }
             });
-        Ok(changed)
+        Ok(FloorAcceptance { accepted, changed })
     }
 
     /// Whether a subject floor refuses `subject` the `requested` rights
@@ -1338,6 +1425,104 @@ impl SubnetFloorRegistry {
         rights: SubnetRights,
     ) -> bool {
         self.subject_refuses(authority, topology_epoch, subject, target, rights, 0, true)
+    }
+
+    /// Whether a subject floor for `subject` held STRICTLY BELOW `scope`
+    /// refuses a right in `rights` to a leaf at `leaf_generation`
+    /// (`one_hop` never meets one) — the descendant half of the local
+    /// gateway `ROUTE` check (SUBNET-05). A `ROUTE` entry at `scope`
+    /// authorizes transitions anywhere inside it, so a floor removing
+    /// `ROUTE` from a descendant must reach the entry; the entry index
+    /// cannot express "ROUTE here except there", so the right is refused
+    /// for the whole entry (the conservative direction). Off-path: a
+    /// scan of the subject floors, only at gateway compile/invalidation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct verifier-owned input, mirroring subject_refuses"
+    )]
+    pub fn subject_refuses_below(
+        &self,
+        authority: &EntityId,
+        topology_epoch: u32,
+        subject: &EntityId,
+        scope: TopologySubnetId,
+        rights: SubnetRights,
+        leaf_generation: u32,
+        one_hop: bool,
+    ) -> bool {
+        if self.subject_floors.is_empty() {
+            return false;
+        }
+        let (auth, subj) = (*authority.as_bytes(), *subject.as_bytes());
+        self.subject_floors.iter().any(|e| {
+            let (k_auth, k_epoch, k_path, k_subj) = *e.key();
+            let path = TopologySubnetId::from_raw(k_path);
+            k_auth == auth
+                && k_epoch == topology_epoch
+                && k_subj == subj
+                && path != scope
+                && scope.is_ancestor_or_self_of(path)
+                && RIGHT_BITS.iter().enumerate().any(|(i, bit)| {
+                    let floor = e.value().generations[i];
+                    rights.contains(*bit) && floor > 0 && (one_hop || leaf_generation < floor)
+                })
+        })
+    }
+
+    /// The rights of a LOCAL gateway credential that subject floors
+    /// refuse (SUBNET-05): `ATTACH` judged at the node's attachment,
+    /// `ROUTE`/`EXPORT` at the credential scope or any ancestor, and
+    /// `ROUTE` additionally at any descendant (see
+    /// [`Self::subject_refuses_below`]). Returned as a raw mask; empty
+    /// when nothing is refused.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct verifier-owned input, mirroring subject_refuses"
+    )]
+    fn gateway_refused_rights(
+        &self,
+        authority: &EntityId,
+        topology_epoch: u32,
+        subject: &EntityId,
+        attachment: TopologySubnetId,
+        scope: TopologySubnetId,
+        rights: SubnetRights,
+        leaf_generation: u32,
+        one_hop: bool,
+    ) -> u8 {
+        let mut refused = 0u8;
+        for bit in RIGHT_BITS {
+            if !rights.contains(bit) {
+                continue;
+            }
+            let target = if bit == SubnetRights::ATTACH {
+                attachment
+            } else {
+                scope
+            };
+            let hit = self.subject_refuses(
+                authority,
+                topology_epoch,
+                subject,
+                target,
+                bit,
+                leaf_generation,
+                one_hop,
+            ) || (bit == SubnetRights::ROUTE
+                && self.subject_refuses_below(
+                    authority,
+                    topology_epoch,
+                    subject,
+                    scope,
+                    bit,
+                    leaf_generation,
+                    one_hop,
+                ));
+            if hit {
+                refused |= bit.bits();
+            }
+        }
+        refused
     }
 }
 
@@ -1493,6 +1678,15 @@ pub fn verify_credential_set(
     now_secs: u64,
     skew_secs: u64,
 ) -> Result<VerifiedSubnetAuthority, SubnetAuthError> {
+    // SUBNET-01: the auth epoch is captured BEFORE any floor is read.
+    // [`SubnetFloorRegistry::apply`] raises the floor first and advances
+    // the epoch second, so for every floor this verification reads
+    // stale, the epoch captured here is also from before that floor's
+    // advance — and a context pinning it fails currentness the moment
+    // the revocation lands. Capturing it after the floor checks (as
+    // this once did) let a floor raised between the two reads hand a
+    // revoked credential the NEW epoch, which passes currentness.
+    let subnet_auth_epoch = floors.auth_epoch(&config.authority);
     let leaf = set.leaf();
     if leaf.authority != config.authority {
         return Err(SubnetAuthError::WrongAuthority);
@@ -1578,7 +1772,7 @@ pub fn verify_credential_set(
         rights: leaf.rights,
         generation: leaf.generation,
         expires_at: leaf.not_after,
-        subnet_auth_epoch: floors.auth_epoch(&config.authority),
+        subnet_auth_epoch,
         credential_set_hash: set.credential_set_hash(),
     })
 }
@@ -1868,8 +2062,15 @@ pub struct VerifiedGatewayContext {
     pub subject: EntityId,
     /// Rights held over `scope`.
     pub rights: SubnetRights,
-    /// Leaf generation at verification time.
+    /// Leaf generation at verification time. For an entry the published
+    /// set merged from several credentials at one scope, the first
+    /// credential's; the set keeps each right's own standing
+    /// (see [`VerifiedGatewayContextSet::subject_floor_covers`]).
     pub generation: u32,
+    /// Whether the credential behind this entry is delegated (one hop
+    /// below a root issuer). A delegated leaf never meets a subject
+    /// floor. For a merged entry, the first credential's, as `generation`.
+    pub delegated: bool,
     /// Authority auth epoch at verification time.
     pub subnet_auth_epoch: u64,
     /// Leaf expiry (unix seconds, exclusive).
@@ -1969,6 +2170,28 @@ pub struct VerifiedGatewayContextSet {
     earliest_expiry: u64,
     /// Off-path scope index, and the thing that actually authorizes.
     index: GatewayScopeIndex,
+    /// Per entry (same order as `entries`), per right (indexed like
+    /// [`RIGHT_BITS`]): the STRONGEST subject-floor standing among the
+    /// credentials merged into that entry that hold the right — the
+    /// highest generation of a root-direct holder, or `None` when every
+    /// holder is delegated (a delegated leaf never meets a floor). A right
+    /// survives a subject floor while any of its holders does, so this is
+    /// what [`Self::subject_floor_covers`] judges it by.
+    floor_standing: Box<[[Option<u32>; 3]]>,
+}
+
+/// One credential's subject-floor standing for a right it holds: its
+/// generation when root-direct, `None` when delegated. `Option`'s order
+/// (`None` below every `Some`) is the strength order.
+fn floor_standing_of(entry: &VerifiedGatewayContext) -> [Option<u32>; 3] {
+    let standing = (!entry.delegated).then_some(entry.generation);
+    RIGHT_BITS.map(|bit| {
+        if entry.rights.contains(bit) {
+            standing
+        } else {
+            None
+        }
+    })
 }
 
 /// Ceiling on indexed lookups for one protected transition.
@@ -2181,6 +2404,44 @@ impl VerifiedGatewayContextSet {
     /// Tightest expiry across every entry.
     pub fn earliest_expiry(&self) -> u64 {
         self.earliest_expiry
+    }
+
+    /// Whether a subject floor refuses a right some entry holds
+    /// (SUBNET-05) — the test a subject floor for the LOCAL entity uses
+    /// to withdraw published gateway authority. Judged exactly as
+    /// [`compile_gateway_context`] judges it: each credential at its own
+    /// leaf generation, a delegated one never meeting a floor. Judging it
+    /// conservatively (as if every leaf were delegated) made ANY subject
+    /// floor naming the local entity — an unrelated one, or the retry of
+    /// one the installed credentials were already re-issued above —
+    /// withdraw a gateway whose credentials satisfy every floor.
+    ///
+    /// An entry merged from several credentials at one scope is judged per
+    /// right, by the strongest credential holding that right: a right is
+    /// refused only when every credential that supplies it is, which is
+    /// exactly when recompiling the credentials would lose it. A floor that
+    /// refuses one credential therefore no longer withdraws a right another
+    /// credential at that scope still supplies, nor a right the refused
+    /// credential never held.
+    pub fn subject_floor_covers(&self, floors: &SubnetFloorRegistry) -> bool {
+        self.entries
+            .iter()
+            .zip(self.floor_standing.iter())
+            .any(|(e, standing)| {
+                RIGHT_BITS.iter().zip(standing).any(|(&bit, &standing)| {
+                    e.rights.contains(bit)
+                        && floors.gateway_refused_rights(
+                            &e.authority,
+                            e.topology_epoch,
+                            &e.subject,
+                            e.attachment,
+                            e.scope,
+                            bit,
+                            standing.unwrap_or(0),
+                            standing.is_none(),
+                        ) != 0
+                })
+            })
     }
 }
 
@@ -2529,14 +2790,36 @@ pub fn compile_gateway_context(
     {
         return Err(SubnetAuthError::ScopeNotAncestor);
     }
+    // SUBNET-05: subject floors bind this node's OWN credentials too. A
+    // subject floor naming the local entity removes the named rights
+    // from the compiled entry exactly as it refuses them to a remote
+    // session — a delegated leaf never meets one, a root-direct leaf
+    // meets it at or above its generation. A credential left with no
+    // right is revoked outright, the same verdict a subtree floor gives.
+    let delegated = matches!(set, SubnetCredentialSet::OneHop { .. });
+    let refused = floors.gateway_refused_rights(
+        &verified.authority,
+        verified.topology_epoch,
+        &verified.subject,
+        local_attachment,
+        verified.scope,
+        verified.rights,
+        verified.generation,
+        delegated,
+    );
+    let rights = SubnetRights(verified.rights.bits() & !refused);
+    if rights.bits() == 0 {
+        return Err(SubnetAuthError::Revoked);
+    }
     Ok(VerifiedGatewayContext {
         authority: verified.authority,
         attachment: local_attachment,
         scope: verified.scope,
         topology_epoch: verified.topology_epoch,
         subject: verified.subject,
-        rights: verified.rights,
+        rights,
         generation: verified.generation,
+        delegated,
         subnet_auth_epoch: verified.subnet_auth_epoch,
         expires_at: verified.expires_at,
         credential_set_hash: verified.credential_set_hash,
@@ -2566,6 +2849,7 @@ pub fn build_gateway_context_set(
     compiled: Vec<VerifiedGatewayContext>,
 ) -> Result<VerifiedGatewayContextSet, SubnetAuthError> {
     let mut entries: Vec<VerifiedGatewayContext> = Vec::with_capacity(compiled.len());
+    let mut floor_standing: Vec<[Option<u32>; 3]> = Vec::with_capacity(compiled.len());
     for entry in compiled {
         if &entry.authority != authority {
             return Err(SubnetAuthError::WrongAuthority);
@@ -2580,14 +2864,22 @@ pub fn build_gateway_context_set(
                 return Err(SubnetAuthError::MixedGatewayEpochs);
             }
         }
-        match entries.iter_mut().find(|e| e.scope == entry.scope) {
-            Some(existing) => {
+        match entries.iter().position(|e| e.scope == entry.scope) {
+            Some(at) => {
+                let existing = &mut entries[at];
                 existing.rights = existing.rights.union(entry.rights);
                 // Keep the tightest expiry so the merged entry cannot
                 // outlive the shorter-lived credential behind it.
                 existing.expires_at = existing.expires_at.min(entry.expires_at);
+                // Each right keeps the strongest subject-floor standing
+                // among its holders: it survives a floor while any of
+                // them does.
+                for (have, add) in floor_standing[at].iter_mut().zip(floor_standing_of(&entry)) {
+                    *have = (*have).max(add);
+                }
             }
             None => {
+                floor_standing.push(floor_standing_of(&entry));
                 entries.push(entry);
                 // Enforced at each push, not after the loop: the cap
                 // is on DISTINCT scopes (an input merging down to few
@@ -2620,6 +2912,7 @@ pub fn build_gateway_context_set(
         subnet_auth_epoch,
         earliest_expiry,
         index,
+        floor_standing: floor_standing.into_boxed_slice(),
     })
 }
 
@@ -2848,5 +3141,515 @@ mod wire_kind_tests {
         for e in E::ALL {
             assert_eq!(e.to_string(), e.wire_kind());
         }
+    }
+}
+
+/// Floor-registry coherence witnesses: SUBNET-01 (epoch captured before
+/// floors), SUBNET-05 (subject floors bind local gateway authority) and
+/// SUBNET-07 (non-raising revisions are retained watermarks).
+#[cfg(test)]
+mod floor_coherence_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn root() -> EntityKeypair {
+        EntityKeypair::from_bytes([0x51; 32])
+    }
+
+    fn config() -> SubnetAuthorityConfig {
+        let root = root();
+        SubnetAuthorityConfig {
+            authority: root.entity_id().clone(),
+            roots: vec![root.entity_id().clone()],
+            maximum_grant_lifetime_secs: 7 * DAY,
+        }
+    }
+
+    fn now() -> u64 {
+        super::super::admission::unix_now_secs()
+    }
+
+    fn scope(path: &[u8]) -> SubnetRef {
+        SubnetRef {
+            authority: root().entity_id().clone(),
+            path: TopologySubnetId::new(path),
+        }
+    }
+
+    fn direct(
+        subject: &EntityKeypair,
+        at: &[u8],
+        rights: SubnetRights,
+        generation: u32,
+    ) -> SubnetCredentialSet {
+        let root = root();
+        SubnetCredentialSet::Direct(
+            SubnetGrant::try_issue(
+                &root,
+                root.entity_id().clone(),
+                TopologySubnetId::new(at),
+                0,
+                subject.entity_id().clone(),
+                rights,
+                generation,
+                now() - 60,
+                DAY,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn delegated(subject: &EntityKeypair, at: &[u8], rights: SubnetRights) -> SubnetCredentialSet {
+        let root = root();
+        let issuer = EntityKeypair::from_bytes([0x52; 32]);
+        let issuer_grant = SubnetIssuerGrant::try_issue(
+            &root,
+            root.entity_id().clone(),
+            TopologySubnetId::new(&[3]),
+            0,
+            issuer.entity_id().clone(),
+            SubnetRights::ALL,
+            1,
+            now() - 120,
+            2 * DAY,
+        )
+        .unwrap();
+        let leaf = SubnetGrant::try_issue(
+            &issuer,
+            root.entity_id().clone(),
+            TopologySubnetId::new(at),
+            0,
+            subject.entity_id().clone(),
+            rights,
+            99,
+            now() - 60,
+            DAY,
+        )
+        .unwrap();
+        SubnetCredentialSet::OneHop { issuer_grant, leaf }
+    }
+
+    fn floor(path: &[u8], generation: u32, revision: u64) -> SubnetRevocationFloor {
+        SubnetRevocationFloor::try_issue(&root(), scope(path), 0, generation, revision, now())
+            .unwrap()
+    }
+
+    fn subject_floor(
+        subject: &EntityKeypair,
+        path: &[u8],
+        rights: SubnetRights,
+        generation: u32,
+        revision: u64,
+    ) -> SubnetSubjectFloor {
+        SubnetSubjectFloor::try_issue(
+            &root(),
+            scope(path),
+            0,
+            subject.entity_id().clone(),
+            rights,
+            generation,
+            revision,
+            now(),
+        )
+        .unwrap()
+    }
+
+    /// SUBNET-01, deterministically: a revocation lands exactly between
+    /// the verifier's floor check and the end of verification. The
+    /// verification may pass (it read the old floor), but it must pin
+    /// the PRE-revocation epoch, so the resulting context fails
+    /// currentness against the advanced one. Capturing the epoch after
+    /// the floor read handed the revoked credential the new epoch.
+    #[test]
+    fn a_floor_raised_mid_verification_leaves_the_verified_epoch_stale() {
+        let registry = Arc::new(SubnetFloorRegistry::new());
+        let config = config();
+        let subject = EntityKeypair::from_bytes([0x53; 32]);
+        let set = direct(&subject, &[3, 7], SubnetRights::ATTACH, 0);
+        let epoch_before = registry.auth_epoch(&config.authority);
+
+        let (hook_registry, hook_config) = (registry.clone(), config.clone());
+        registry.set_after_floor_read(move || {
+            assert!(hook_registry
+                .apply(&floor(&[3], 1, 1), &hook_config)
+                .expect("the racing revocation applies"));
+        });
+        let verified =
+            verify_credential_set(&set, subject.entity_id(), &config, 0, &registry, now(), 30)
+                .expect("the floor read before the revocation passes");
+
+        let epoch_now = registry.auth_epoch(&config.authority);
+        assert_eq!(
+            epoch_now,
+            epoch_before + 1,
+            "the hook raised a floor mid-check"
+        );
+        assert_eq!(
+            verified.subnet_auth_epoch, epoch_before,
+            "a verification that read the pre-revocation floor must pin the \
+             pre-revocation epoch, never the new one"
+        );
+        assert_ne!(verified.subnet_auth_epoch, epoch_now);
+        // And with the floor in place, the same credential is revoked.
+        assert_eq!(
+            verify_credential_set(&set, subject.entity_id(), &config, 0, &registry, now(), 30),
+            Err(SubnetAuthError::Revoked)
+        );
+    }
+
+    /// SUBNET-07: a newer subtree revision that raises nothing still
+    /// advances the watermark, so an older signed fact is stale after it
+    /// — in memory, and (through `FloorAcceptance::accepted`) durably.
+    #[test]
+    fn a_non_raising_subtree_revision_is_a_retained_watermark() {
+        let registry = SubnetFloorRegistry::new();
+        let config = config();
+        let a = registry.apply_tracked(&floor(&[3], 2, 5), &config).unwrap();
+        assert_eq!(
+            a,
+            FloorAcceptance {
+                accepted: true,
+                changed: true
+            }
+        );
+        let epoch = registry.auth_epoch(&config.authority);
+
+        let a = registry.apply_tracked(&floor(&[3], 1, 7), &config).unwrap();
+        assert_eq!(
+            a,
+            FloorAcceptance {
+                accepted: true,
+                changed: false
+            },
+            "a newer, non-raising revision is accepted (watermark) but revokes nothing"
+        );
+        assert_eq!(
+            registry.auth_epoch(&config.authority),
+            epoch,
+            "and costs no epoch advance"
+        );
+
+        let a = registry.apply_tracked(&floor(&[3], 9, 6), &config).unwrap();
+        assert_eq!(
+            a,
+            FloorAcceptance::default(),
+            "revision 6 is older than the held watermark 7: stale"
+        );
+        assert_eq!(
+            registry.max_floor(&config.authority, 0, TopologySubnetId::new(&[3])),
+            2
+        );
+
+        // A placeholder (generation 0) floor on a new key is accepted
+        // state even though it changes nothing enforceable.
+        let a = registry.apply_tracked(&floor(&[4], 0, 1), &config).unwrap();
+        assert_eq!(
+            a,
+            FloorAcceptance {
+                accepted: true,
+                changed: false
+            }
+        );
+    }
+
+    /// SUBNET-07, subject floors: the watermark advance is reported as
+    /// accepted, so the durable log retains it.
+    #[test]
+    fn a_non_raising_subject_revision_is_reported_accepted() {
+        let registry = SubnetFloorRegistry::new();
+        let config = config();
+        let b = EntityKeypair::from_bytes([0x54; 32]);
+        let first = subject_floor(&b, &[3, 7], SubnetRights::ATTACH, 2, 1);
+        assert!(
+            registry
+                .apply_subject_tracked(&first, &config)
+                .unwrap()
+                .changed
+        );
+        let lower = subject_floor(&b, &[3, 7], SubnetRights::ATTACH, 1, 2);
+        assert_eq!(
+            registry.apply_subject_tracked(&lower, &config).unwrap(),
+            FloorAcceptance {
+                accepted: true,
+                changed: false
+            }
+        );
+        assert_eq!(
+            registry.subject_floor_state(
+                &config.authority,
+                0,
+                TopologySubnetId::new(&[3, 7]),
+                b.entity_id()
+            ),
+            (2, [2, 0, 0])
+        );
+    }
+
+    /// SUBNET-05: compiling the LOCAL gateway's credentials honours
+    /// subject floors naming the local entity — exactly the floored
+    /// rights are stripped, a credential with nothing left is revoked,
+    /// a `ROUTE` floor below the entry scope reaches the entry, and only
+    /// root-direct issuance at or above the floor keeps the right.
+    #[test]
+    fn subject_floors_strip_local_gateway_rights_at_compile() {
+        let registry = SubnetFloorRegistry::new();
+        let config = config();
+        let gw = EntityKeypair::from_bytes([0x55; 32]);
+        let attachment = TopologySubnetId::new(&[3]);
+        let compile_with = |set: &SubnetCredentialSet, floors: &SubnetFloorRegistry| {
+            compile_gateway_context(
+                set,
+                gw.entity_id(),
+                attachment,
+                &config,
+                0,
+                floors,
+                now(),
+                30,
+            )
+        };
+        let compile = |set: &SubnetCredentialSet| compile_with(set, &registry);
+        let export_wm = direct(&gw, &[3, 7, 1], SubnetRights::EXPORT, 1);
+        let route_vehicle = direct(
+            &gw,
+            &[3],
+            SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+            1,
+        );
+        assert!(compile(&export_wm).is_ok());
+        assert!(compile(&route_vehicle).is_ok());
+
+        // Remove the gateway's EXPORT at the world-model subtree.
+        let no_export = subject_floor(&gw, &[3, 7], SubnetRights::EXPORT, 2, 1);
+        assert!(registry.apply_subject(&no_export, &config).unwrap());
+        assert_eq!(
+            compile(&export_wm),
+            Err(SubnetAuthError::Revoked),
+            "an EXPORT-only credential under the floor is revoked outright"
+        );
+        let entry = compile(&route_vehicle).expect("EXPORT was not held here");
+        assert_eq!(
+            entry.rights,
+            SubnetRights::ATTACH.union(SubnetRights::ROUTE)
+        );
+        // Re-issuance at the floor generation restores it; delegation
+        // never meets a subject floor.
+        assert!(compile(&direct(&gw, &[3, 7, 1], SubnetRights::EXPORT, 2)).is_ok());
+        assert_eq!(
+            compile(&delegated(&gw, &[3, 7, 1], SubnetRights::EXPORT)),
+            Err(SubnetAuthError::Revoked)
+        );
+
+        // A ROUTE floor strictly BELOW the vehicle entry reaches it: the
+        // entry would otherwise authorize transitions inside the floored
+        // subtree. ATTACH (not named) survives.
+        let no_route = subject_floor(&gw, &[3, 7], SubnetRights::ROUTE, 2, 2);
+        assert!(registry.apply_subject(&no_route, &config).unwrap());
+        let entry = compile(&route_vehicle).expect("ATTACH survives");
+        assert_eq!(entry.rights, SubnetRights::ATTACH);
+
+        // The published-set coverage test sees the same thing.
+        let attach_only = direct(&gw, &[3], SubnetRights::ATTACH, 1);
+        let set =
+            build_gateway_context_set(&config.authority, vec![compile(&attach_only).unwrap()])
+                .unwrap();
+        assert!(
+            !set.subject_floor_covers(&registry),
+            "ATTACH is not floored"
+        );
+        let before_floors = SubnetFloorRegistry::new();
+        let wide = build_gateway_context_set(
+            &config.authority,
+            vec![compile_with(&route_vehicle, &before_floors).unwrap()],
+        )
+        .unwrap();
+        assert!(
+            wide.subject_floor_covers(&registry),
+            "a set compiled before the floor holds a floored right"
+        );
+    }
+
+    /// A context as `verify_admission` would compile it for `subject` at
+    /// `at`, at leaf `generation`, pinned to the registry's current epoch.
+    fn admitted(
+        registry: &SubnetFloorRegistry,
+        subject: &EntityKeypair,
+        at: &[u8],
+        rights: SubnetRights,
+        generation: u32,
+    ) -> VerifiedSubnetContext {
+        let config = config();
+        VerifiedSubnetContext {
+            authority: config.authority.clone(),
+            attachment: TopologySubnetId::new(at),
+            scope: TopologySubnetId::new(at),
+            topology_epoch: 0,
+            subject: subject.entity_id().clone(),
+            subject_node: subject.entity_id().node_id(),
+            session_id: 7,
+            rights,
+            generation,
+            subnet_auth_epoch: registry.auth_epoch(&config.authority),
+            expires_at: now() + DAY,
+            credential_set_hash: [0x5A; 32],
+        }
+    }
+
+    /// SUBNET-01 for SUBJECT floors: a subject floor moves no auth epoch,
+    /// so the epoch-only fence passed a context verified just before the
+    /// floor landed. The floor's own invalidation scan ran before the
+    /// install and found nothing to drop, so the revoked right stayed
+    /// admitted until the peer reconnected. The fence must re-read the
+    /// subject floor and roll the install back.
+    #[test]
+    fn a_subject_floor_landing_mid_admission_is_caught_by_the_fence() {
+        use super::super::admission::SubnetContextStore;
+        let registry = SubnetFloorRegistry::new();
+        let contexts = SubnetContextStore::new();
+        let config = config();
+        let peer = EntityKeypair::from_bytes([0x56; 32]);
+        let node = peer.entity_id().node_id();
+
+        // Verification passed against an empty registry.
+        let ctx = admitted(&registry, &peer, &[3, 7], SubnetRights::ROUTE, 1);
+        // The floor lands, and its scan runs, before the install.
+        let floor = subject_floor(&peer, &[3], SubnetRights::ROUTE, 2, 1);
+        assert!(registry.apply_subject(&floor, &config).unwrap());
+        assert_eq!(
+            contexts.invalidate_subject(&config.authority, peer.entity_id(), &registry),
+            0
+        );
+        contexts.install(node, ctx.clone());
+
+        assert_eq!(
+            contexts.fence_installed(node, &ctx, 0, &registry, false),
+            Err(SubnetAuthError::Revoked),
+            "a subject floor raised mid-admission must refuse the admission"
+        );
+        assert!(
+            contexts.get_for_session(node, ctx.session_id).is_none(),
+            "the fenced install is rolled back"
+        );
+    }
+
+    /// The fence judges a subject floor exactly, as verification does: a
+    /// leaf re-issued at or above the floor is admitted, a delegated leaf
+    /// never meets one, and a right the floor does not name is untouched.
+    #[test]
+    fn the_admission_fence_judges_subject_floors_exactly() {
+        use super::super::admission::SubnetContextStore;
+        let registry = SubnetFloorRegistry::new();
+        let contexts = SubnetContextStore::new();
+        let config = config();
+        let peer = EntityKeypair::from_bytes([0x57; 32]);
+        let node = peer.entity_id().node_id();
+        let floor = subject_floor(&peer, &[3], SubnetRights::ROUTE, 2, 1);
+        assert!(registry.apply_subject(&floor, &config).unwrap());
+
+        let reissued = admitted(&registry, &peer, &[3, 7], SubnetRights::ROUTE, 2);
+        contexts.install(node, reissued.clone());
+        assert_eq!(
+            contexts.fence_installed(node, &reissued, 0, &registry, false),
+            Ok(())
+        );
+        assert!(contexts
+            .get_for_session(node, reissued.session_id)
+            .is_some());
+
+        assert_eq!(
+            contexts.fence_installed(node, &reissued, 0, &registry, true),
+            Err(SubnetAuthError::Revoked),
+            "a delegated leaf never meets a subject floor"
+        );
+
+        let attach = admitted(&registry, &peer, &[3, 7], SubnetRights::ATTACH, 1);
+        contexts.install(node, attach.clone());
+        assert_eq!(
+            contexts.fence_installed(node, &attach, 0, &registry, false),
+            Ok(()),
+            "ATTACH is not floored"
+        );
+    }
+
+    /// SUBNET-05: an entry merged from several local gateway credentials at
+    /// one scope is judged per right, by the strongest credential holding
+    /// it. A floor refusing one credential withdraws nothing another
+    /// credential still supplies, nor a right the refused one never held;
+    /// a right every holder fails is still withdrawn.
+    ///
+    /// Inverse: the merged entry carries the weakest standing of all its
+    /// credentials, and a delegated EXPORT credential makes a ROUTE floor
+    /// that the root-direct ROUTE credential satisfies withdraw the gateway.
+    #[test]
+    fn a_merged_gateway_entry_is_floored_per_right_by_its_strongest_holder() {
+        let config = config();
+        let gw = EntityKeypair::from_bytes([0x58; 32]);
+        let entry =
+            |rights: SubnetRights, generation: u32, delegated: bool| VerifiedGatewayContext {
+                authority: root().entity_id().clone(),
+                attachment: TopologySubnetId::new(&[3, 7]),
+                scope: TopologySubnetId::new(&[3]),
+                topology_epoch: 0,
+                subject: gw.entity_id().clone(),
+                rights,
+                generation,
+                delegated,
+                subnet_auth_epoch: 0,
+                expires_at: now() + DAY,
+                credential_set_hash: [0; 32],
+            };
+        let covered = |set: &VerifiedGatewayContextSet, rights, generation| {
+            let registry = SubnetFloorRegistry::new();
+            let floor = subject_floor(&gw, &[3], rights, generation, 1);
+            assert!(registry.apply_subject(&floor, &config).unwrap());
+            set.subject_floor_covers(&registry)
+        };
+        let authority = root().entity_id().clone();
+
+        // A delegated EXPORT credential beside a root-direct ROUTE one.
+        let set = build_gateway_context_set(
+            &authority,
+            vec![
+                entry(SubnetRights::EXPORT, 0, true),
+                entry(SubnetRights::ROUTE, 5, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.entries().len(), 1, "the premise: one merged entry");
+        assert!(
+            !covered(&set, SubnetRights::ROUTE, 2),
+            "ROUTE's only holder is at generation 5, above the floor"
+        );
+        assert!(covered(&set, SubnetRights::ROUTE, 6), "the holder fails it");
+        assert!(
+            covered(&set, SubnetRights::EXPORT, 1),
+            "EXPORT's only holder is delegated"
+        );
+
+        // Both hold ROUTE: it survives while the root-direct holder does.
+        let set = build_gateway_context_set(
+            &authority,
+            vec![
+                entry(SubnetRights::ROUTE, 0, true),
+                entry(SubnetRights::ROUTE, 5, false),
+            ],
+        )
+        .unwrap();
+        assert!(!covered(&set, SubnetRights::ROUTE, 2));
+        assert!(covered(&set, SubnetRights::ROUTE, 6));
+
+        // Order does not matter: the weaker credential first or second.
+        let set = build_gateway_context_set(
+            &authority,
+            vec![
+                entry(SubnetRights::ROUTE, 5, false),
+                entry(SubnetRights::ROUTE, 1, false),
+            ],
+        )
+        .unwrap();
+        assert!(!covered(&set, SubnetRights::ROUTE, 2));
     }
 }

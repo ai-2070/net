@@ -266,11 +266,34 @@ async fn a_wrapped_paid_tool_serves_once_and_only_once_across_the_mesh() {
         },
         caller_mesh.origin_hash(),
     );
-    let minimal_terms = r#"{"object":"net.pricing.terms@1"}"#.to_string();
+    // Real announced terms for both: the engine admission takes them as
+    // its quote authority at publish (PAY-01), and refuses terms it could
+    // not quote on. The caller pays `add`'s; `echo`'s is never paid.
+    let capability = format!("{provider_id}/add");
+    let template = X402Carry::author(&PaymentRequirements {
+        scheme: MOCK_SCHEME.into(),
+        network: MOCK_NETWORK.into(),
+        amount: "2500".into(),
+        asset: "musd".into(),
+        pay_to: "mock-provider-settle-addr".into(),
+        max_timeout_seconds: 60,
+        extra: None,
+    })
+    .expect("author");
+    let announce = |capability: String| {
+        let terms = PricingTerms::new(
+            provider_keys.entity_id().clone(),
+            capability,
+            vec![template.clone()],
+            registry.reference().expect("registry reference"),
+        );
+        String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8")
+    };
+    let terms_json = announce(capability.clone());
+    config.pricing.insert("add".to_string(), terms_json.clone());
     config
         .pricing
-        .insert("add".to_string(), minimal_terms.clone());
-    config.pricing.insert("echo".to_string(), minimal_terms);
+        .insert("echo".to_string(), announce(format!("{provider_id}/echo")));
     config.payment_admission = Some(admission);
 
     let invoker = Arc::new(PaidTools::default());
@@ -298,26 +321,6 @@ async fn a_wrapped_paid_tool_serves_once_and_only_once_across_the_mesh() {
         .expect("a priced wrap publication with the engine gate publishes");
 
     // ── caller: the payment flow over the wire ─────────────────────
-    let capability = format!("{provider_id}/add");
-    let template = X402Carry::author(&PaymentRequirements {
-        scheme: MOCK_SCHEME.into(),
-        network: MOCK_NETWORK.into(),
-        amount: "2500".into(),
-        asset: "musd".into(),
-        pay_to: "mock-provider-settle-addr".into(),
-        max_timeout_seconds: 60,
-        extra: None,
-    })
-    .expect("author");
-    let terms = PricingTerms::new(
-        provider_keys.entity_id().clone(),
-        capability.clone(),
-        vec![template],
-        registry.reference().expect("registry reference"),
-    );
-    let terms_json =
-        String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
-
     let caller_keys = Arc::new(EntityKeypair::generate());
     let spend_path = dir.path().join("spend-policy.json");
     let flow = CallerPaymentFlow::new(

@@ -58,6 +58,8 @@ use super::behavior::org_call::{
     OrgCallProof, OrgStreamCallProof, RpcCallShape, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER,
 };
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
+#[cfg(feature = "webrtc")]
+use super::mesh::Promotion;
 use super::mesh::{MeshNode, PeerPublishOutcome, ReplySubscription};
 use super::org_admission_gate::{
     org_request_digest, CapabilityVisibility, OrgProviderPolicy, RegisteredRpcService,
@@ -4054,6 +4056,38 @@ fn admitted_chain(frame: &Bytes) -> Option<Vec<u8>> {
     chain.get(..len).map(<[u8]>::to_vec)
 }
 
+/// `reject::DENIED` from `sdk/src/enrollment.rs` — the code the SDK's
+/// enrollment handlers already answer a full game with.
+#[cfg(feature = "webrtc")]
+const ENROLLMENT_REJECT_DENIED: u16 = 7;
+
+/// `frame` (an RPC RESPONSE frame, route discriminator included) with its
+/// body replaced by a `JoinOutcome::Rejected { code, message }` in the
+/// pinned `b"NMO1"` wire form, status `Ok` — the shape an enrollment
+/// handler's own refusal takes. `None` when `frame` is not a decodable
+/// response.
+#[cfg(feature = "webrtc")]
+fn enrollment_refusal_frame(frame: &Bytes, code: u16, message: &str) -> Option<Bytes> {
+    const OUTCOME_MAGIC: [u8; 4] = *b"NMO1";
+    let head = frame.get(..RPC_FRAME_BODY_OFFSET)?;
+    RpcResponsePayload::decode(frame.slice(RPC_FRAME_BODY_OFFSET..)).ok()?;
+    let mut body = Vec::with_capacity(4 + 1 + 2 + 4 + message.len());
+    body.extend_from_slice(&OUTCOME_MAGIC);
+    body.push(1);
+    body.extend_from_slice(&code.to_le_bytes());
+    body.extend_from_slice(&u32::try_from(message.len()).ok()?.to_le_bytes());
+    body.extend_from_slice(message.as_bytes());
+    let response = RpcResponsePayload {
+        status: RpcStatus::Ok,
+        headers: Vec::new(),
+        body: Bytes::from(body),
+    };
+    let mut out = Vec::with_capacity(head.len() + response.encoded_len());
+    out.extend_from_slice(head);
+    response.encode_into(&mut out);
+    Some(Bytes::from(out))
+}
+
 /// Skip one `u32`-LE length-prefixed field, returning the remainder,
 /// or `None` when the prefix is truncated or overruns the buffer.
 /// Mirrors `Reader::take_lp` in `sdk/src/enrollment.rs`.
@@ -4241,7 +4275,8 @@ fn prepare_response_to_caller(
     fallback: ResponseRouteFallback,
 ) -> Result<PreparedResponse, AdapterError> {
     let payload = bound_response_packet(payload)?;
-    let fragmented = EventMeta::from_bytes(&payload)
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_mut))]
+    let mut fragmented = EventMeta::from_bytes(&payload)
         .is_some_and(|meta| meta.dispatch == crate::adapter::net::cortex::DISPATCH_RPC_RESPONSE)
         && RpcResponsePayload::decode(payload.slice(EVENT_META_SIZE..)).is_ok_and(|response| {
             response
@@ -4254,7 +4289,8 @@ fn prepare_response_to_caller(
     // funnels through here, so insert the RpcRouteV1 discriminator —
     // the reply channel's canonical hash — once, centrally. The
     // caller's mesh ingress selects exactly this dispatcher.
-    let payload = crate::adapter::net::cortex::insert_rpc_route(payload, reply_channel_hash);
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_mut))]
+    let mut payload = crate::adapter::net::cortex::insert_rpc_route(payload, reply_channel_hash);
     // §12 step 4: an enrollment RESPONSE leaving this anchor
     // promotes the session that asked for it — the exact
     // incarnation captured when the REQUEST was decoded, re-checked
@@ -4314,19 +4350,63 @@ fn prepare_response_to_caller(
             Some(true) => {
                 // P0 slice 2: the grant says which tenant this session
                 // was enrolled for, when the application resolves it.
-                let tenant = admitted_chain(&payload)
-                    .and_then(|chain| mesh.resolve_enrollment_tenant(&chain));
-                if mesh.promote_on_enrollment_response(
-                    node_id,
-                    reply_channel.as_str(),
-                    call_id,
-                    receiving_session_id,
-                    tenant,
-                ) {
-                    tracing::debug!(
-                        node_id = format!("{node_id:#x}"),
-                        "§12: enrollment admitted; session promoted"
-                    );
+                let chain = admitted_chain(&payload);
+                let tenant = chain
+                    .as_deref()
+                    .and_then(|chain| mesh.resolve_enrollment_tenant(chain));
+                // ANCHOR-03: and which device — which must be the
+                // participant this session is, or nothing promotes.
+                match mesh.enrollment_grant_device(node_id, chain.as_deref()) {
+                    Ok(device) => match mesh.promote_on_enrollment_response(
+                        node_id,
+                        reply_channel.as_str(),
+                        call_id,
+                        receiving_session_id,
+                        tenant,
+                        device,
+                    ) {
+                        Promotion::Promoted => {
+                            tracing::debug!(
+                                node_id = format!("{node_id:#x}"),
+                                "§12: enrollment admitted; session promoted"
+                            );
+                        }
+                        // ANCHOR-04: the cap refused the promotion this
+                        // Admitted verdict announces, so the verdict is
+                        // void. Sending it anyway told the visitor it had
+                        // joined while its session sat provisional until
+                        // its 30 s clock dropped it, with nothing it could
+                        // read or retry on. Answer the refusal instead —
+                        // the same one the handler's preflight gives.
+                        Promotion::TenantFull => {
+                            payload = enrollment_refusal_frame(
+                                &payload,
+                                ENROLLMENT_REJECT_DENIED,
+                                "the game holds as many players as this anchor admits for one game; retry shortly",
+                            )
+                            .ok_or_else(|| {
+                                AdapterError::Connection(
+                                    "enrollment refused at the player cap; the refusal could not be encoded, nothing was sent"
+                                        .into(),
+                                )
+                            })?;
+                            fragmented = false;
+                        }
+                        Promotion::NotPromoted => {}
+                    },
+                    Err(()) => {
+                        mesh.note_enrollment_rejected(
+                            node_id,
+                            reply_channel.as_str(),
+                            call_id,
+                            receiving_session_id,
+                        );
+                        tracing::debug!(
+                            node_id = format!("{node_id:#x}"),
+                            "§12: enrollment grant names another participant; \
+                             session stays provisional"
+                        );
+                    }
                 }
             }
             Some(false) => {
@@ -7733,7 +7813,11 @@ impl MeshNode {
     /// one-snapshot query makes that tear unrepresentable.
     ///
     /// Unowned public candidates are not returned — they are ordinary
-    /// public services, not exported-plane candidates. A candidate node
+    /// public services, not exported-plane candidates. Neither is a
+    /// candidate whose owner certificate has expired since ingest
+    /// (DISC-05): the projection carries the cert's deadline and the
+    /// query judges it against the current time, so verified ownership
+    /// lapses with the cert rather than with the announcement. A candidate node
     /// without a live AEAD entity pin is dropped: without the pin it has
     /// no entity-layer identity to authorize against, and org-protected
     /// RPC is direct-session-only regardless (OA2-E0.3). Results are in

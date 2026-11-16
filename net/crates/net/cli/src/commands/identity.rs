@@ -25,7 +25,7 @@ use clap::{Args, Subcommand};
 use net_sdk::identity::EntityId;
 use serde::{Deserialize, Serialize};
 
-use crate::commands::org::{refuse_replacing_foreign_seed, SeedArtifact};
+use crate::commands::org::{publish_beside, refuse_replacing_foreign_seed, SeedArtifact};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 use crate::secret::{zeroize_string, ScrubbedBytes, ScrubbedString};
@@ -271,7 +271,8 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
         // `issue-floors` and never reached the two verbs that write seed files.
         //
         // Replacing an identity with an identity stays allowed: that is the
-        // rotation `--force` exists for.
+        // rotation `--force` exists for. (Checked here for an early refusal;
+        // `publish_identity` re-applies it on the replacing publish.)
         refuse_replacing_foreign_seed(&path, SeedArtifact::Identity).await?;
     }
 
@@ -302,19 +303,7 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
             .map_err(|e| generic(format!("failed to serialize identity TOML: {e}")))?,
     );
 
-    // Atomic, mode-restricted publish. Pre-fix `tokio::fs::write`
-    // created the file with the process umask (commonly 0o644 —
-    // world-readable on most distros) and `enforce_strict_permissions`
-    // only chmod'd it down to 0o600 *after* the bytes had already
-    // landed on disk. A reader / backup agent / inotify-watcher in
-    // that window could grab the seed. Open the temp file with
-    // mode=0o600 in one syscall (Unix), write the seed into the
-    // already-restricted handle, and atomic-rename onto the final
-    // path so the visible file is either an intact prior identity
-    // or the new one - never a half-written world-readable seed.
-    let pid = std::process::id();
-    let tmp = path.with_extension(format!("tmp.{pid}"));
-    write_identity_atomically(&tmp, &path, toml_text.as_bytes()).await?;
+    publish_identity(&path, toml_text.as_bytes(), args.force).await?;
     enforce_strict_permissions(&path).await?;
 
     // Print the public summary on stdout — never the seed, even
@@ -332,6 +321,29 @@ async fn run_generate(args: GenerateArgs, output: Option<OutputFormat>) -> Resul
     emit_value(OutputFormat::resolve_oneshot(output), &summary)
         .map_err(|e| generic(format!("write summary: {e}")))?;
     Ok(())
+}
+
+/// Publish a serialized identity at `path`, carrying the overwrite policy all
+/// the way to the publish (CLI-03).
+///
+/// The `try_exists` check in [`run_generate`] is only a friendly early error:
+/// it used to be the ONLY no-clobber protection, because the publish ended in
+/// an unconditional `rename`. Two `identity generate --out P` runs (no
+/// `--force`) against an initially absent `P` could both pass the check, both
+/// report success, and the second silently replace the first's seed — which
+/// may already have been handed out. Now:
+///
+/// - without `force`: the staged seed is HARD-LINKED onto `path`, which fails
+///   closed if anything exists there by then (and never follows a leaf
+///   symlink);
+/// - with `force`: refuse to replace any OTHER kind of seed, then
+///   atomically `rename`.
+///
+/// Either way the seed is staged in a uniquely named `create_new` sibling with
+/// mode 0600 on Unix, so it is never world-readable, never half-written at the
+/// visible path, and a stale temp from a killed run never wedges the path.
+async fn publish_identity(path: &Path, toml: &[u8], force: bool) -> Result<(), CliError> {
+    publish_beside(path, toml, true, force, SeedArtifact::Identity).await
 }
 
 // =========================================================================
@@ -1030,6 +1042,92 @@ mod tests {
             "the seed-bearing temp {} must not be left on disk",
             tmp.display(),
         );
+    }
+
+    /// CLI-03 — the no-overwrite policy holds AT PUBLICATION, not only at the
+    /// `try_exists` pre-check. Simulates the losing side of the race: the
+    /// pre-check saw an absent path, then another `identity generate` published
+    /// there. The publish without `--force` must fail closed and leave the
+    /// winner's seed byte-identical, with no staging temp left behind.
+    ///
+    /// Red-witness: the old publish (`write_identity_atomically`, an
+    /// unconditional `rename`) replaced the winner's identity and returned Ok.
+    #[tokio::test]
+    async fn publish_without_force_never_replaces_an_identity_that_appeared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("operator.toml");
+        std::fs::write(
+            &path,
+            b"seed_hex = \"winner\"
+",
+        )
+        .expect("winner publishes");
+
+        let err = publish_identity(
+            &path,
+            b"seed_hex = \"loser\"
+",
+            false,
+        )
+        .await
+        .expect_err("a no-force publish onto an existing identity must fail");
+        assert!(
+            format!("{err}").contains("already exists"),
+            "the refusal must say why; got: {err}",
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"seed_hex = \"winner\"
+",
+            "the first identity was replaced"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "staging residue left behind: {names:?}");
+    }
+
+    /// CLI-03 positive control: `--force` still rotates an identity, and still
+    /// refuses to replace a different kind of seed (an org root key).
+    #[tokio::test]
+    async fn publish_with_force_rotates_identities_but_not_org_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("operator.toml");
+        std::fs::write(
+            &path,
+            b"seed_hex = \"old\"
+",
+        )
+        .expect("write");
+        publish_identity(
+            &path,
+            b"seed_hex = \"new\"
+",
+            true,
+        )
+        .await
+        .expect("forced rotation");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"seed_hex = \"new\"
+"
+        );
+
+        let org = dir.path().join("org.toml");
+        let org_text = b"seed_hex = \"root\"
+org_id_hex = \"ab\"
+";
+        std::fs::write(&org, org_text).expect("write");
+        publish_identity(
+            &org,
+            b"seed_hex = \"new\"
+",
+            true,
+        )
+        .await
+        .expect_err("an identity must never replace an org root");
+        assert_eq!(std::fs::read(&org).expect("read"), org_text);
     }
 
     /// §11 (second half) — a failed WRITE or SYNC must not orphan the temp.

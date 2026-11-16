@@ -585,6 +585,82 @@ impl ChannelConfig {
             .is_ok()
     }
 
+    /// Would an existing subscription still be admitted under **this**
+    /// config — the static admission policy that may have replaced the
+    /// one it was admitted under?
+    ///
+    /// The publish-time re-check and the periodic sweep re-verify a
+    /// retained token chain against the current roots, clock and
+    /// revocation floors, but nothing else re-asks the admission
+    /// questions. So replacing a channel's policy (re-registering the
+    /// exact name or the prefix, which the registry documents as
+    /// idempotent replacement) left every existing subscriber admitted
+    /// under the OLD one (CPOL-01): an open prefix replaced by an
+    /// [`OriginBinding`] kept a peer subscribed to another peer's
+    /// origin-suffixed channel, and a queue-group policy tightened from
+    /// [`QueueGroupPolicy::Unrestricted`] to `Deny` or `TokenBound` kept
+    /// every worker joined on its old channel grant.
+    ///
+    /// This is the structural part of the subscribe gate, evaluated
+    /// against facts the publisher already holds:
+    ///
+    /// - `channel` / `channel_hash` — the subscribed (concrete) channel,
+    ///   and `matched_prefix` — how *this* config resolved it (see
+    ///   [`ResolvedConfig::matched_prefix`]);
+    /// - `subscriber_origin` — the subscriber's pinned origin (or the
+    ///   bootstrap substitute the subscribe gate accepts), `None` when
+    ///   unknown, which fails an origin binding closed exactly as it does
+    ///   at subscribe time;
+    /// - `queue_group` — the group the subscriber joined, `None` for a
+    ///   broadcast subscriber;
+    /// - `admitted_grant` — the hash its retained chain was admitted on
+    ///   (`RetainedChain::grant_hash`), `None` when no chain is retained.
+    ///
+    /// On a token-gated channel the retained grant must answer the
+    /// question the *current* policy would ask: the group's
+    /// [`queue_group_hash`](super::queue_group_hash) for a `TokenBound`
+    /// worker, the channel's own hash for everyone else. A channel token
+    /// does not become a worker grant when the policy tightens, and a
+    /// group grant does not become a reader's token when it relaxes. The
+    /// chain itself (roots, time, revocation, signatures) is still the
+    /// caller's to re-verify against that hash.
+    ///
+    /// Capability filters are not re-evaluated: they match self-asserted
+    /// capabilities, are advisory by contract, and visibility is
+    /// re-checked by the publish path on its own.
+    pub fn retains_subscription(
+        &self,
+        channel: &str,
+        channel_hash: ChannelHash,
+        matched_prefix: Option<&str>,
+        subscriber_origin: Option<u64>,
+        queue_group: Option<&str>,
+        admitted_grant: Option<ChannelHash>,
+    ) -> bool {
+        if let Some(binding) = self.subscriber_origin_binding {
+            if !binding.authorizes(channel, matched_prefix, subscriber_origin) {
+                return false;
+            }
+        }
+        match (queue_group, self.queue_group_policy) {
+            (Some(_), QueueGroupPolicy::Deny) => false,
+            // A `TokenBound` join needs a group grant even when nothing
+            // else gates the channel (no roots refuses every join, as
+            // `can_join_queue_group` does).
+            (Some(group), QueueGroupPolicy::TokenBound) => {
+                !self.token_roots.is_empty()
+                    && admitted_grant == Some(super::name::queue_group_hash(channel, group))
+            }
+            // A token-gated policy with no roots admits no subscriber (no
+            // chain can anchor), so it retains none either — whatever grant
+            // a subscriber was admitted on under an earlier, rooted policy.
+            _ => {
+                !self.token_required()
+                    || (!self.token_roots.is_empty() && admitted_grant == Some(channel_hash))
+            }
+        }
+    }
+
     /// Like [`Self::reverify_subscribe`] but skips the per-link ed25519
     /// signature verification — for callers re-checking a chain whose
     /// signatures already verified once (immutable tokens). Time
@@ -2506,6 +2582,110 @@ mod tests {
                  channel being published to"
             );
         }
+    }
+
+    // ---- CPOL-01: the current policy re-asks existing memberships ----
+
+    #[test]
+    fn cpol01_retains_subscription_asks_the_current_origin_binding() {
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("svc.replies.{origin:016x}");
+        let hash = channel_hash(&name);
+        let open = ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap());
+        let bound = open.clone().with_subscriber_origin_binding(OB);
+        // An open family keeps everyone, whoever they are.
+        assert!(open.retains_subscription(&name, hash, Some("svc.replies."), None, None, None));
+        // Bound: the owner stays; another peer, or an unknown one, goes.
+        assert!(bound.retains_subscription(
+            &name,
+            hash,
+            Some("svc.replies."),
+            Some(origin),
+            None,
+            None
+        ));
+        assert!(!bound.retains_subscription(
+            &name,
+            hash,
+            Some("svc.replies."),
+            Some(1),
+            None,
+            None
+        ));
+        assert!(!bound.retains_subscription(&name, hash, Some("svc.replies."), None, None, None));
+    }
+
+    #[test]
+    fn cpol01_retains_subscription_asks_the_current_queue_group_policy() {
+        let name = "work/queue";
+        let hash = channel_hash(name);
+        let group_grant = queue_group_hash(name, "workers");
+        let root = EntityKeypair::generate().entity_id().clone();
+        let base = ChannelConfig::new(ChannelId::parse(name).unwrap());
+        let rooted = base.clone().with_token_roots(vec![root]);
+
+        // Deny refuses every worker, gated or not; broadcast is untouched.
+        let deny = base.clone().with_queue_group_policy(QueueGroupPolicy::Deny);
+        assert!(!deny.retains_subscription(name, hash, None, None, Some("workers"), None));
+        assert!(deny.retains_subscription(name, hash, None, None, None, None));
+
+        // TokenBound: only a grant naming the group keeps a worker — a
+        // reader's channel grant does not, and nothing does without roots.
+        let bound = rooted
+            .clone()
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+        assert!(bound.retains_subscription(
+            name,
+            hash,
+            None,
+            None,
+            Some("workers"),
+            Some(group_grant)
+        ));
+        assert!(!bound.retains_subscription(name, hash, None, None, Some("workers"), Some(hash)));
+        assert!(!bound.retains_subscription(name, hash, None, None, Some("workers"), None));
+        let rootless = base
+            .clone()
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+        assert!(!rootless.retains_subscription(
+            name,
+            hash,
+            None,
+            None,
+            Some("workers"),
+            Some(group_grant)
+        ));
+        // A broadcast reader under TokenBound still needs its channel grant.
+        assert!(bound.retains_subscription(name, hash, None, None, None, Some(hash)));
+        assert!(!bound.retains_subscription(name, hash, None, None, None, Some(group_grant)));
+
+        // Relaxed back to Unrestricted, a group grant is not a channel
+        // token: the worker needs what a fresh join would need.
+        assert!(rooted.retains_subscription(name, hash, None, None, Some("workers"), Some(hash)));
+        assert!(!rooted.retains_subscription(
+            name,
+            hash,
+            None,
+            None,
+            Some("workers"),
+            Some(group_grant)
+        ));
+        // An open channel asks for no grant at all.
+        assert!(base.retains_subscription(name, hash, None, None, Some("workers"), None));
+
+        // A token-gated policy with no roots admits no fresh subscriber,
+        // so it keeps none on the grant a rooted policy admitted it on.
+        // Red: the previous check accepted the retained channel grant.
+        let rootless_gated = base.clone().with_require_token(true);
+        assert!(!rootless_gated.retains_subscription(name, hash, None, None, None, Some(hash)));
+        assert!(!rootless_gated.retains_subscription(
+            name,
+            hash,
+            None,
+            None,
+            Some("workers"),
+            Some(hash)
+        ));
     }
 
     // ---- H3 (2026-07-31 audit): origin-bound channel families ----

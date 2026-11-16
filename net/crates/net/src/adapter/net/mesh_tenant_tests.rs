@@ -50,6 +50,8 @@ fn install(ctx: &DispatchCtx, peer: u64, addr: SocketAddr, tenant: Option<Tenant
                 promoted_at: std::time::Instant::now(),
                 session_id: peer,
                 tenant,
+                device: None,
+                enrolled_origin: None,
             },
         },
     );
@@ -371,4 +373,282 @@ async fn holding_an_announcement_records_its_origins_tenant() {
         .map(|e| e.value().tenant)
         .expect("a signed direct announcement is held for replay");
     assert_eq!(held, Some(GAME_A));
+}
+
+/// A one-link enrollment grant `root → subject`, serialized as the
+/// enrollment service answers it.
+fn grant_for(subject: &EntityId) -> Vec<u8> {
+    TokenChain::single(PermissionToken::issue(
+        &EntityKeypair::generate(),
+        subject.clone(),
+        TokenScope::SUBSCRIBE,
+        0x1234,
+        3600,
+        0,
+    ))
+    .to_bytes()
+}
+
+/// ANCHOR-03: with subject binding on, an Admitted grant binds only
+/// the session whose participant it names — the grant's leaf subject
+/// must derive the session's node id. A grant for another device, or
+/// one that does not parse, binds nothing (promote nothing); with
+/// binding off the legacy behaviour is unchanged.
+///
+/// Inverse: drop the `subject.node_id() != node_id` comparison and the
+/// stranger's grant binds.
+#[tokio::test]
+async fn an_enrollment_grant_binds_only_the_participant_it_names() {
+    let node = node().await;
+    let device = EntityKeypair::generate();
+    let stranger = EntityKeypair::generate();
+    let session_of_device = device.entity_id().node_id();
+    let session_of_stranger = stranger.entity_id().node_id();
+    let grant = grant_for(device.entity_id());
+
+    assert_eq!(
+        node.enrollment_grant_device(session_of_stranger, Some(&grant)),
+        Ok(None),
+        "binding off: unchanged, nothing recorded"
+    );
+    node.set_enrollment_subject_binding(true);
+    assert_eq!(
+        node.enrollment_grant_device(session_of_device, Some(&grant)),
+        Ok(Some(device.entity_id().clone())),
+        "the device's own session is bound to it"
+    );
+    assert_eq!(
+        node.enrollment_grant_device(session_of_stranger, Some(&grant)),
+        Err(()),
+        "device D's grant must not promote a session that is not D"
+    );
+    assert_eq!(
+        node.enrollment_grant_device(session_of_device, Some(b"not a chain")),
+        Err(()),
+        "an unreadable grant binds nothing"
+    );
+    assert_eq!(
+        node.enrollment_grant_device(session_of_device, None),
+        Err(())
+    );
+}
+
+/// ANCHOR-03: a session admitted on a grant announces as the granted
+/// device and as nobody else. The direct-announcement path already ties
+/// `entity.node_id()` to the session's node id; this holds the admitted
+/// session to the exact device its grant named.
+///
+/// Inverse: drop the granted-device check from
+/// `handle_capability_announcement` and the other entity is held.
+#[tokio::test]
+async fn an_admitted_session_announces_only_as_its_granted_device() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    let speaker = EntityKeypair::generate();
+    let origin = speaker.entity_id().node_id();
+    let announce = |ctx: &DispatchCtx| {
+        let mut ann = CapabilityAnnouncement::new(
+            origin,
+            speaker.entity_id().clone(),
+            1,
+            crate::adapter::net::behavior::capability::CapabilitySet::new(),
+        );
+        ann.sign(&speaker);
+        MeshNode::handle_capability_announcement(&ann.to_bytes(), origin, ctx);
+    };
+    let admit_as = |ctx: &DispatchCtx, device: [u8; 32]| {
+        if let Some(mut entry) = ctx.peers.get_mut(&origin) {
+            entry.admission = PeerAdmission::Admitted {
+                promoted_at: std::time::Instant::now(),
+                session_id: origin,
+                tenant: None,
+                device: Some(device),
+                enrolled_origin: None,
+            };
+        }
+    };
+
+    install(&ctx, origin, "127.0.0.1:9".parse().unwrap(), None);
+    admit_as(&ctx, *EntityKeypair::generate().entity_id().as_bytes());
+    announce(&ctx);
+    assert!(
+        !ctx.relay_announcements.contains_key(&origin),
+        "an entity other than the granted device is not ingested"
+    );
+    assert!(node.peer_entity_id(origin).is_none(), "nor pinned");
+
+    admit_as(&ctx, *speaker.entity_id().as_bytes());
+    announce(&ctx);
+    assert!(
+        ctx.relay_announcements.contains_key(&origin),
+        "the positive control: the granted device's own announcement is held"
+    );
+}
+
+/// ANCHOR-04, concurrently: the witness below promotes sequentially, so a
+/// check-then-commit promotion (count, then promote, under no common lock)
+/// would pass it too. Here eight promotions for one tenant capped at 1 are
+/// released together on separate threads; exactly one may take the slot.
+///
+/// Inverse: release the admission lock between the count and the promotion
+/// in `promote_admission_with_grant` and more than one promotes.
+#[tokio::test]
+async fn concurrent_promotions_never_exceed_a_tenant_cap() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    node.set_enrollment_tenant_cap(Some(Arc::new(|tenant| (tenant == GAME_A).then_some(1))));
+    let peers: Vec<(u64, SocketAddr)> = (0..8u64)
+        .map(|i| {
+            (
+                0xE0 + i,
+                format!("127.0.0.1:{}", 21 + i).parse().expect("addr"),
+            )
+        })
+        .collect();
+    for &(peer, addr) in &peers {
+        install(&ctx, peer, addr, None);
+        make_provisional(&ctx, peer);
+    }
+    let barrier = std::sync::Barrier::new(peers.len());
+    let admitted = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for &(peer, addr) in &peers {
+            let (node, barrier, admitted) = (&node, &barrier, &admitted);
+            s.spawn(move || {
+                let session = node.peer_session_id(peer).expect("session");
+                barrier.wait();
+                if node.promote_admission_with_tenant(
+                    peer,
+                    session,
+                    PeerAddr::Udp(addr),
+                    Some(GAME_A),
+                ) {
+                    admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert_eq!(
+        admitted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "concurrent promotions must not exceed the cap"
+    );
+    assert_eq!(node.tenant_peer_count(GAME_A), 1);
+}
+
+/// ANCHOR-04: a tenant's player cap is enforced AT promotion,
+/// atomically with it. The enrollment handler's occupancy check is a
+/// per-call preflight: with a cap of 1 and nobody admitted, two
+/// visitors answered concurrently both saw room, both responses
+/// promoted, and the game held two. Here two provisional sessions are
+/// promoted for the same capped tenant — exactly what those two
+/// responses do — and only the first is admitted; another tenant is
+/// unaffected; and the slot comes back when the admitted session goes.
+///
+/// The race itself (both handlers observing zero) is not reproduced:
+/// the invariant tested is that the count and the promotion are one
+/// step, so whichever promotion runs second sees the first.
+///
+/// Inverse: drop the cap check from `promote_admission_with_grant`
+/// and the second promotion succeeds.
+#[tokio::test]
+async fn a_capped_tenant_is_full_at_promotion_not_only_at_the_handler() {
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    node.set_enrollment_tenant_cap(Some(Arc::new(|tenant| (tenant == GAME_A).then_some(1))));
+    let addrs: [SocketAddr; 4] = [
+        "127.0.0.1:11".parse().unwrap(),
+        "127.0.0.1:12".parse().unwrap(),
+        "127.0.0.1:13".parse().unwrap(),
+        "127.0.0.1:14".parse().unwrap(),
+    ];
+    for (peer, addr) in [0xD1u64, 0xD2, 0xD3, 0xD4].into_iter().zip(addrs) {
+        install(&ctx, peer, addr, None);
+        make_provisional(&ctx, peer);
+    }
+    let promote = |peer: u64, addr: SocketAddr, tenant| {
+        let session = node.peer_session_id(peer).expect("session");
+        node.promote_admission_with_tenant(peer, session, PeerAddr::Udp(addr), Some(tenant))
+    };
+
+    assert!(
+        promote(0xD1, addrs[0], GAME_A),
+        "the first player takes the slot"
+    );
+    assert!(
+        !promote(0xD2, addrs[1], GAME_A),
+        "a second concurrent admission must not exceed the cap"
+    );
+    assert!(node.peer_is_provisional(0xD2), "it stays provisional");
+    assert_eq!(node.tenant_peer_count(GAME_A), 1);
+    assert!(
+        promote(0xD3, addrs[2], GAME_B),
+        "an uncapped tenant is not affected"
+    );
+
+    // The admitted player leaves: its slot is free again.
+    ctx.peers.remove(&0xD1);
+    assert!(
+        promote(0xD4, addrs[3], GAME_A),
+        "a released slot is reusable"
+    );
+    assert_eq!(node.tenant_peer_count(GAME_A), 1);
+}
+
+/// **The promotion an Admitted enrollment reply follows does not cost
+/// the reply its subscription** (CPOL-01 × §12).
+///
+/// A provisional session subscribes to its own enrollment reply channel
+/// under the bootstrap exception: it has no pinned identity, so the
+/// origin binding is judged by the origin the session bound. The
+/// response path promotes the session and only then publishes the
+/// Admitted reply on that channel. The fan-out's policy re-check asked
+/// for the subscriber's origin again — the session was no longer
+/// provisional and still unpinned, so it got none, the origin binding
+/// refused, and the subscription was evicted with the reply that had
+/// just enrolled the session: every real enrollment timed out (the SDK
+/// `enrollment_over_rtc` witnesses, the browser acceptance run).
+///
+/// Inverse: drop the `enrolled_reply_origin` fallback from
+/// `MeshNode::subscription_origin` (or stop recording the origin at
+/// promotion) and the post-promotion assertion fails.
+#[tokio::test]
+async fn a_promoted_session_keeps_its_enrollment_reply_origin_for_the_fan_out() {
+    use crate::adapter::net::rtc::enroll_reply_channel;
+
+    let node = node().await;
+    let ctx = node.dispatch_ctx();
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let origin = 0x0123_4567_89ab_cdefu64;
+    install(&ctx, 0xC2, addr, None);
+    make_provisional(&ctx, 0xC2);
+    if let Some(mut entry) = ctx.peers.get_mut(&0xC2) {
+        assert!(entry.admission.bind_origin(origin), "first claim binds");
+    }
+    let reply = ChannelName::new(&enroll_reply_channel(origin)).unwrap();
+    let foreign = ChannelName::new(&enroll_reply_channel(origin ^ 1)).unwrap();
+    assert_eq!(
+        node.subscription_origin(0xC2, &reply),
+        Some(origin),
+        "provisional: the bootstrap exception the subscribe gate admitted it under"
+    );
+
+    let session = node.peer_session_id(0xC2).expect("session");
+    assert!(node.promote_admission_with_tenant(0xC2, session, PeerAddr::Udp(addr), None));
+    assert!(!node.peer_is_provisional(0xC2));
+    assert!(
+        node.peer_entity_ids.get(&0xC2).is_none(),
+        "the premise: promoted, not yet announced, so not pinned"
+    );
+    assert_eq!(
+        node.subscription_origin(0xC2, &reply),
+        Some(origin),
+        "admitted and unpinned: its reply subscription is judged by the origin it \
+         was admitted under, so the Admitted reply is delivered"
+    );
+    assert_eq!(
+        node.subscription_origin(0xC2, &foreign),
+        None,
+        "and only on its own reply channel — no other origin is vouched for"
+    );
 }

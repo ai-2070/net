@@ -225,6 +225,63 @@ pub async fn run(
         return view.emit(output);
     }
 
+    // A delegation gate must start from its revocation floors. Load the
+    // configured store once, up front — before any mesh or child exists — and
+    // refuse to start when it is unreadable or corrupt: a fresh gate's empty
+    // registry would otherwise admit a chain the store revokes (CONSENT-03).
+    // An absent store is an empty one (the first-run contract of
+    // `RevocationStore::load`) and starts normally. Later reload failures
+    // keep last-known floors inside the gate, which also refuses delegated
+    // invokes until its own first load succeeds.
+    //
+    // A delegation gate never runs without a store: when neither
+    // `--revocation-store` nor a per-user default path resolves, wrap refuses
+    // rather than silently starting a gate with no revocation checking.
+    //
+    // The load is a blocking read + parse, so it runs on the blocking pool
+    // and under the `--timeout` deadline like the rest of startup. The loaded
+    // snapshot also seeds the gate (`with_initial_revocations`), so the
+    // floors checked here are the floors the first invoke is judged by, even
+    // if the file is removed or rolled back before that invoke.
+    let revocation_store = match &args.owner_root {
+        Some(_) => Some(
+            args.revocation_store
+                .clone()
+                .or_else(net_sdk::revocation::default_revocation_store_path)
+                .ok_or_else(|| {
+                    invalid_args(
+                        "net-mesh wrap: no revocation-store path could be resolved for the \
+                         delegation gate (no per-user data directory); pass \
+                         --revocation-store <PATH>",
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let initial_revocations = match &revocation_store {
+        Some(p) => {
+            let path = p.clone();
+            let loaded = crate::deadline::run_optional(deadline, async move {
+                tokio::task::spawn_blocking(move || {
+                    net_sdk::revocation::RevocationStore::load(&path)
+                })
+                .await
+                .map_err(|e| generic(format!("revocation store load task failed: {e}")))?
+                .map_err(|e| {
+                    generic(format!(
+                        "net-mesh wrap: refusing to start the delegation gate: its revocation \
+                         store could not be loaded ({e}). Without it, already-revoked delegation \
+                         chains would be admitted. Repair the store, or point --revocation-store \
+                         at the intended one."
+                    ))
+                })
+            })
+            .await?;
+            Some(loaded)
+        }
+        None => None,
+    };
+
     // Operator identity — owner-only keys on this node's origin. An enrolled
     // device (`--joined`) runs as its enrolled identity instead.
     let identity = match &args.joined {
@@ -333,12 +390,12 @@ pub async fn run(
         // Honor a machine-shared revocation store so an operator can revoke a
         // gateway's access without restarting this provider. Falls back to the
         // per-user default path when the flag is omitted.
-        let rev_path = args
-            .revocation_store
-            .clone()
-            .or_else(net_sdk::revocation::default_revocation_store_path);
+        let rev_path = revocation_store.clone();
         if let Some(p) = &rev_path {
             gate = gate.with_revocation_store(p.clone());
+        }
+        if let Some(store) = &initial_revocations {
+            gate = gate.with_initial_revocations(store);
         }
         config.delegation = Some(std::sync::Arc::new(gate));
         eprintln!(

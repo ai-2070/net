@@ -174,6 +174,18 @@ describe('entity writes', () => {
     expect(() => host.setEntity('toString' as never, 'x', 1 as never)).toThrow(/no per-entity parser/);
   });
 
+  it('treat an id containing NUL as an ordinary id on every write path', () => {
+    // STORE-01 is fixed at the encoding (visibility paths keep their
+    // segments apart), so NUL is just a character: refusing it here only
+    // made an entity a full snapshot can install one the per-entity writes
+    // could neither update nor remove.
+    const { host } = serve();
+    host.setEntity('ships', 's0_0\u0000x', { x: 1, z: 1 });
+    expect(host.getState().ships['s0_0\u0000x']).toEqual({ x: 1, z: 1 });
+    host.setEntity('ships', 's0_0\u0000x', undefined);
+    expect(Object.prototype.hasOwnProperty.call(host.getState().ships, 's0_0\u0000x')).toBe(false);
+  });
+
   it('store an id of __proto__ as data, not as a prototype', () => {
     const { host } = serve();
     host.setEntity('ships', '__proto__', { x: 1, z: 1 });

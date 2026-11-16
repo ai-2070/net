@@ -17,7 +17,10 @@
 //!   half-written file, and every read-modify-write goes through
 //!   [`PinStore::mutate`] under a cross-process advisory lock, so a stale
 //!   snapshot can never clobber a concurrent change and resurrect a removed
-//!   consent decision. The file is owner-only (0600 on Unix).
+//!   consent decision. A raw [`PinStore::save`] is a compare-and-swap under
+//!   the same lock: it refuses ([`PinStoreError::Stale`]) once the file has
+//!   changed since its snapshot was read. The file is owner-only (0600 on
+//!   Unix).
 //!
 //! **The lock protocol is the contract** (bridge-SDK doctrine #1): this is the
 //! only implementation, ever — adapters and language bindings consume it from
@@ -77,7 +80,11 @@ impl PinState {
 }
 
 /// A failure loading or saving the pin store.
+///
+/// Non-exhaustive: a variant may be added (as `Stale` was) without breaking
+/// a caller, so match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PinStoreError {
     /// An I/O error reading or writing the store file.
     #[error("pin store I/O error at {path}: {reason}")]
@@ -94,6 +101,29 @@ pub enum PinStoreError {
         path: String,
         /// Why it failed to parse.
         reason: String,
+    },
+    /// The new snapshot was renamed into place — it is **visible** to every
+    /// reader — but the durability barrier that commits the rename to disk
+    /// failed, so a crash or power loss may still revert to the previous
+    /// store (on POSIX, the parent directory's fsync failed). The change is
+    /// **not acknowledged**: a caller must not report it as committed, and
+    /// retrying the same mutation is safe (pin operations are idempotent).
+    #[error("pin store at {path} was updated but not durably committed: {reason}")]
+    NotDurable {
+        /// The file path involved.
+        path: String,
+        /// The stringified durability-barrier failure.
+        reason: String,
+    },
+    /// [`PinStore::save`] refused to publish: the store file changed after
+    /// this snapshot was loaded (or last saved), so publishing it would
+    /// silently undo that change — e.g. resurrect an approval another
+    /// process just removed. Nothing was written. Reload and reapply, or
+    /// use [`PinStore::mutate`], which does both under the store lock.
+    #[error("pin store at {path} changed since this snapshot was loaded; reload it or use mutate")]
+    Stale {
+        /// The file path involved.
+        path: String,
     },
 }
 
@@ -173,12 +203,122 @@ impl LockGuard {
     }
 }
 
+/// Run a store commit on the blocking pool.
+///
+/// A commit that has STARTED runs to completion even if the returned future
+/// is dropped (Tokio never aborts started blocking work), which is what lets
+/// [`PinStore::mutate`] hand it the lock guard (CONSENT-01). A commit that
+/// is still QUEUED when the future is dropped does not run at all: it is
+/// abandoned, publishes nothing, and its captured lock guard is released
+/// when the task is reached. Detaching it instead published a mutation whose
+/// caller had already been cancelled — with no one left to learn whether
+/// it landed.
+async fn spawn_commit(
+    path: &Path,
+    commit: impl FnOnce() -> Result<(), PinStoreError> + Send + 'static,
+) -> Result<(), PinStoreError> {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    const QUEUED: u8 = 0;
+    const RUNNING: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// Marks a still-queued commit abandoned when the awaiting future goes.
+    struct AbandonIfQueued(std::sync::Arc<AtomicU8>);
+    impl Drop for AbandonIfQueued {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    let state = std::sync::Arc::new(AtomicU8::new(QUEUED));
+    let task_state = std::sync::Arc::clone(&state);
+    let _abandon = AbandonIfQueued(state);
+    tokio::task::spawn_blocking(move || {
+        if task_state
+            .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Abandoned while queued: publish nothing (`commit`, and any
+            // lock guard it captured, drop here).
+            return Ok(());
+        }
+        commit()
+    })
+    .await
+    .map_err(|e| PinStoreError::Io {
+        path: path.display().to_string(),
+        reason: format!("pin-store commit task panicked: {e}"),
+    })?
+}
+
+/// Test-only seams inside a commit: a pause between the fsynced staging write
+/// and the rename that publishes it (the window CONSENT-01 is about), and an
+/// injected durability-barrier failure (CONSENT-02).
+#[cfg(test)]
+mod commit_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    pub(super) struct Pause {
+        /// Signalled when a commit to the path reaches the pause point.
+        pub(super) entered: mpsc::Sender<()>,
+        /// The commit resumes when this receives (or after a bounded wait,
+        /// so a failing test cannot wedge a blocking thread forever).
+        pub(super) release: mpsc::Receiver<()>,
+    }
+
+    static PAUSES: parking_lot::Mutex<Option<HashMap<PathBuf, Pause>>> =
+        parking_lot::Mutex::new(None);
+
+    /// Pause the next commit to `path` (one-shot).
+    pub(super) fn install(path: &Path, pause: Pause) {
+        PAUSES
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), pause);
+    }
+
+    static BARRIER_FAILURES: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Make the next durability barrier for `path` fail (one-shot).
+    pub(super) fn fail_next_barrier(path: &Path) {
+        BARRIER_FAILURES.lock().push(path.to_path_buf());
+    }
+
+    pub(super) fn take_barrier_failure(path: &Path) -> bool {
+        let mut failures = BARRIER_FAILURES.lock();
+        match failures.iter().position(|p| p == path) {
+            Some(i) => {
+                failures.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn before_publish(path: &Path) {
+        let pause = PAUSES.lock().as_mut().and_then(|m| m.remove(path));
+        if let Some(p) = pause {
+            let _ = p.entered.send(());
+            let _ = p.release.recv_timeout(Duration::from_secs(30));
+        }
+    }
+}
+
 /// The persisted, machine-shared set of pins.
 #[derive(Debug, Clone)]
 pub struct PinStore {
     path: PathBuf,
     /// Keyed by `CapabilityId` display form for stable, provider-bound records.
     pins: BTreeMap<String, PinState>,
+    /// The exact file bytes this snapshot was loaded from (or last saved
+    /// as); `None` when the file did not exist. [`save`](Self::save)
+    /// publishes only while the file still holds exactly these bytes.
+    baseline: Option<Vec<u8>>,
 }
 
 // On-disk shape. A struct wrapper (not a bare map) leaves room for a future
@@ -209,11 +349,16 @@ impl PinStore {
                         reason: e.to_string(),
                     })?;
                 let pins = file.pins.into_iter().map(|p| (p.cap_id, p.state)).collect();
-                Ok(Self { path, pins })
+                Ok(Self {
+                    path,
+                    pins,
+                    baseline: Some(bytes),
+                })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 path,
                 pins: BTreeMap::new(),
+                baseline: None,
             }),
             Err(e) => Err(PinStoreError::Io {
                 path: path.display().to_string(),
@@ -225,18 +370,65 @@ impl PinStore {
     /// Persist the store atomically: write a sibling temp file, then rename it
     /// over the target (an atomic replace on both Unix and Windows), so a
     /// concurrent reader sees either the old or the new file, never a partial.
-    pub async fn save(&self) -> Result<(), PinStoreError> {
-        let io_err = |e: std::io::Error| PinStoreError::Io {
-            path: self.path.display().to_string(),
-            reason: e.to_string(),
-        };
-
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
-            }
+    ///
+    /// This publishes the whole snapshot; it does not merge. It is therefore a
+    /// **compare-and-swap**: under the store's cross-process lock it re-reads
+    /// the file and publishes only if the file still holds exactly the bytes
+    /// this snapshot was loaded from (or last saved as). If anything changed
+    /// it — another process's [`mutate`](Self::mutate), the pin CLI — the save
+    /// is refused with [`PinStoreError::Stale`] and nothing is written, so a
+    /// stale snapshot can never undo a newer decision (resurrect a removed
+    /// approval). Prefer [`mutate`](Self::mutate) for read-modify-write: it
+    /// cannot go stale.
+    ///
+    /// After a successful save (or a [`NotDurable`](PinStoreError::NotDurable)
+    /// one, whose snapshot is already visible) this handle's baseline is the
+    /// snapshot just published, so saving the same handle again works. A save
+    /// whose future is dropped mid-commit still completes under the lock, but
+    /// the handle keeps its old baseline and its next save is refused as
+    /// stale — reload it.
+    pub async fn save(&mut self) -> Result<(), PinStoreError> {
+        let published = self.encode()?;
+        let guard = LockGuard::acquire(&self.path).await?;
+        let store = self.clone();
+        let result = spawn_commit(&self.path, move || {
+            let _guard = guard;
+            store.check_unchanged_blocking()?;
+            store.save_blocking()
+        })
+        .await;
+        if matches!(result, Ok(()) | Err(PinStoreError::NotDurable { .. })) {
+            self.baseline = Some(published);
         }
+        result
+    }
 
+    /// Refuse with [`PinStoreError::Stale`] unless the store file still holds
+    /// exactly this snapshot's `baseline` bytes. Run with
+    /// the store lock held, so the answer stays true until the publish.
+    fn check_unchanged_blocking(&self) -> Result<(), PinStoreError> {
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(PinStoreError::Io {
+                    path: self.path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
+        };
+        if current == self.baseline {
+            Ok(())
+        } else {
+            Err(PinStoreError::Stale {
+                path: self.path.display().to_string(),
+            })
+        }
+    }
+
+    /// The on-disk encoding of this snapshot (deterministic: the pins are a
+    /// `BTreeMap`, so equal snapshots encode to equal bytes).
+    fn encode(&self) -> Result<Vec<u8>, PinStoreError> {
         let file = PinFile {
             pins: self
                 .pins
@@ -247,55 +439,78 @@ impl PinStore {
                 })
                 .collect(),
         };
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| PinStoreError::Io {
+        serde_json::to_vec_pretty(&file).map_err(|e| PinStoreError::Io {
             path: self.path.display().to_string(),
             reason: format!("serialize pin store: {e}"),
-        })?;
+        })
+    }
 
-        // A per-process-unique temp name so two writers don't clobber each
-        // other's temp file mid-write (the final rename is still last-wins).
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
+    /// The synchronous body of [`save`](Self::save): staging write, fsync,
+    /// rename. Run on the blocking pool — and, under [`mutate`](Self::mutate),
+    /// inside the one task that also owns the store lock.
+    fn save_blocking(&self) -> Result<(), PinStoreError> {
+        use std::io::Write as _;
+        let io_err = |e: std::io::Error| PinStoreError::Io {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        };
 
-        // Create the temp owner-only (0600) *from the start*, then write into
-        // it — the store records security-sensitive consent decisions, so it
-        // must never be even briefly world-/group-readable. Creating first and
-        // chmod'ing after left a window under a permissive umask where the
-        // freshly-written file was readable (and a crash before the chmod left a
-        // umask-perms `.tmp` behind). Truncate so a stale same-pid temp from a
-        // prior crash cannot leave trailing bytes. The 0600 mode travels with
-        // the inode through the atomic rename below. (The `mode` is Unix-only;
-        // on Windows the per-user data dir already scopes access via inherited
-        // ACLs, and the create/write/rename path is otherwise identical.)
-        use tokio::io::AsyncWriteExt;
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts.open(&tmp).await.map_err(io_err)?;
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(io_err)?;
+            }
+        }
+
+        let bytes = self.encode()?;
+
+        // An exclusively-created, per-save-unique staging file named after the
+        // **full** store filename (`<file>.tmp.<pid>.<seq>`), owner-only (0600)
+        // from the start — the store records security-sensitive consent
+        // decisions, so it must never be even briefly world-/group-readable.
+        // Never `with_extension`: that replaced the extension, so
+        // `profile.json` and `profile.pins` staged through one shared
+        // `profile.tmp.<pid>` and could publish each other's bytes, while their
+        // full-filename `.lock` sidecars never serialized them (PSTORE-03).
+        // `create_new` means a stale or concurrent temp is skipped, never
+        // truncated. See `crate::store_file`.
+        let (tmp, mut f) = crate::store_file::create_staging(&self.path).map_err(io_err)?;
         // Write, fsync, then atomically rename. `sync_all` before the rename so
         // a crash right after the rename can never surface an empty/truncated
         // store — the bytes are durable before they become the live file.
-        let written: Result<(), PinStoreError> = async {
-            f.write_all(&bytes).await.map_err(io_err)?;
-            f.flush().await.map_err(io_err)?;
-            f.sync_all().await.map_err(io_err)?;
-            Ok(())
-        }
-        .await;
+        let written = f
+            .write_all(&bytes)
+            .and_then(|()| f.flush())
+            .and_then(|()| f.sync_all());
         drop(f);
 
-        let result = match written {
-            Ok(()) => tokio::fs::rename(&tmp, &self.path).await.map_err(io_err),
-            Err(e) => Err(e),
-        };
+        #[cfg(test)]
+        commit_hooks::before_publish(&self.path);
+
+        let result = written.and_then(|()| std::fs::rename(&tmp, &self.path));
         // On any failure, remove the temp so a failed save never leaks a
-        // `.tmp.<pid>` sibling in the store directory.
+        // `.tmp.<pid>.<seq>` sibling in the store directory.
         if result.is_err() {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = std::fs::remove_file(&tmp);
         }
-        result
+        result.map_err(io_err)?;
+
+        // Published. `rename` only updates the directory entry in memory: on
+        // POSIX, without an fsync of the parent directory a power loss can
+        // bring back the previous store — e.g. resurrect an approval the
+        // operator was just told was rejected (CONSENT-02). The barrier is
+        // part of the commit, so its failure fails the save with
+        // `NotDurable` rather than being acknowledged as success.
+        #[cfg(test)]
+        if commit_hooks::take_barrier_failure(&self.path) {
+            return Err(PinStoreError::NotDurable {
+                path: self.path.display().to_string(),
+                reason: "injected durability-barrier failure (test seam)".to_string(),
+            });
+        }
+        crate::store_file::durability_barrier(&self.path).map_err(|e| PinStoreError::NotDurable {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        })
     }
 
     /// Atomically apply a mutation under a **cross-process exclusive lock**, so
@@ -308,16 +523,30 @@ impl PinStore {
     /// The lock is taken on a sidecar `.lock` file, not the store itself, since
     /// the atomic-rename save replaces the store file and would drop a lock
     /// held on it.
+    ///
+    /// **Cancellation-safe.** Dropping the returned future before the commit
+    /// starts publishes nothing. Once the commit has started it always runs to
+    /// completion *with the lock still held*: the staging write, fsync and
+    /// rename run as one blocking task that owns the lock guard, so the lock
+    /// is released only after that filesystem work finishes, never when the
+    /// waiter goes away. (Releasing it on cancellation let a later rejection
+    /// in another process commit first, after which the orphaned rename
+    /// landed and reinstated the older, still-approved snapshot — CONSENT-01.)
     pub async fn mutate<R, F>(path: impl Into<PathBuf>, f: F) -> Result<R, PinStoreError>
     where
         F: FnOnce(&mut PinStore) -> R,
     {
         let path = path.into();
-        // Hold the lock guard across the whole transaction; it releases on drop.
-        let _guard = LockGuard::acquire(&path).await?;
+        let guard = LockGuard::acquire(&path).await?;
         let mut store = PinStore::load(&path).await?;
         let result = f(&mut store);
-        store.save().await?;
+        // The guard moves INTO the commit task and drops only when that task
+        // returns — whether or not anyone is still awaiting it.
+        spawn_commit(&path, move || {
+            let _guard = guard;
+            store.save_blocking()
+        })
+        .await?;
         Ok(result)
     }
 
@@ -572,7 +801,7 @@ impl PinStore {
     }
 
     /// Begin watching for approved-set changes, discarding the initial
-    /// snapshot. Convenience over [`snapshot_and_watch`] when the caller has
+    /// snapshot. Convenience over [`snapshot_and_watch`](Self::snapshot_and_watch) when the caller has
     /// already read the current set.
     pub async fn watch(path: impl Into<PathBuf>) -> Result<PinWatcher, PinStoreError> {
         Ok(Self::snapshot_and_watch(path).await?.1)
@@ -764,6 +993,127 @@ mod tests {
         );
     }
 
+    /// A commit whose caller was cancelled while the commit was still
+    /// QUEUED on the blocking pool publishes nothing; one that had started
+    /// would run to completion (CONSENT-01).
+    ///
+    /// Red: the detached task ran the queued commit anyway.
+    #[test]
+    fn a_commit_abandoned_while_queued_publishes_nothing() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (_dir, path) = store_path();
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Occupy the only blocking thread, so the commit below queues.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            {
+                let ran = ran.clone();
+                let commit = spawn_commit(&path, move || {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                });
+                tokio::pin!(commit);
+                // Poll once: the commit is now queued behind the blocker.
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut commit)
+                        .await
+                        .is_err(),
+                    "the commit cannot run while the pool is occupied"
+                );
+                // The caller goes away here.
+            }
+            release.send(()).expect("release");
+            blocker.await.expect("blocker");
+            // Drain the pool: the abandoned task has been reached.
+            tokio::task::spawn_blocking(|| ()).await.expect("drain");
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "an abandoned queued commit must not run"
+            );
+        });
+    }
+
+    /// The audit's seam: a raw `save` of a snapshot loaded before another
+    /// process removed an approval must not republish that approval. The
+    /// save is refused as stale and the removal stands.
+    ///
+    /// Red-witness: the previous `save` published the old snapshot
+    /// unconditionally, so `b/x` came back approved.
+    #[tokio::test]
+    async fn a_stale_snapshot_save_cannot_resurrect_a_removed_approval() {
+        let (_dir, path) = store_path();
+        let x = cap("b/x");
+        let y = cap("b/y");
+        PinStore::mutate(&path, |s| s.approve(&x)).await.unwrap();
+
+        let mut stale = PinStore::load(&path).await.unwrap();
+        assert!(stale.is_approved(&x));
+        // Another process removes the approval.
+        PinStore::mutate(&path, |s| s.remove(&x)).await.unwrap();
+        // The stale holder adds an unrelated pin and saves its whole snapshot.
+        stale.request(&y);
+        let err = stale.save().await.unwrap_err();
+        assert!(
+            matches!(err, PinStoreError::Stale { .. }),
+            "expected Stale, got {err:?}"
+        );
+
+        let now = PinStore::load(&path).await.unwrap();
+        assert!(!now.is_approved(&x), "the removed approval was resurrected");
+        assert_eq!(now.state(&y), None, "a refused save wrote nothing");
+    }
+
+    /// A snapshot loaded while the store did not exist goes stale once
+    /// anyone creates it.
+    #[tokio::test]
+    async fn a_save_from_an_absent_store_is_stale_once_the_store_exists() {
+        let (_dir, path) = store_path();
+        let mut early = PinStore::load(&path).await.unwrap();
+        PinStore::mutate(&path, |s| s.approve(&cap("b/x")))
+            .await
+            .unwrap();
+        early.approve(&cap("b/y"));
+        assert!(matches!(
+            early.save().await,
+            Err(PinStoreError::Stale { .. })
+        ));
+        let now = PinStore::load(&path).await.unwrap();
+        assert_eq!(now.approved(), vec![cap("b/x")]);
+    }
+
+    /// The compare-and-swap does not get in the way of a sole writer: a
+    /// handle saves repeatedly (its baseline follows its own publishes),
+    /// and a store left unchanged by others saves fine.
+    #[tokio::test]
+    async fn an_unchanged_store_saves_and_the_handle_can_save_again() {
+        let (_dir, path) = store_path();
+        let mut store = PinStore::load(&path).await.unwrap();
+        store.approve(&cap("b/a"));
+        store.save().await.unwrap();
+        store.approve(&cap("b/b"));
+        store
+            .save()
+            .await
+            .expect("the handle's own publish is its baseline");
+
+        // A reader-only load does not disturb anyone's baseline.
+        let _reader = PinStore::load(&path).await.unwrap();
+        store.remove(&cap("b/a"));
+        store.save().await.unwrap();
+        assert_eq!(
+            PinStore::load(&path).await.unwrap().approved(),
+            vec![cap("b/b")]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn saved_store_is_owner_only() {
@@ -783,11 +1133,59 @@ mod tests {
             "the pin store records consent decisions and must be owner-only",
         );
         // A successful save must leave no umask-perms temp sibling behind.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        assert_no_staging_left(&path);
+    }
+
+    /// No `<file>.tmp.*` staging sibling survives in the store's directory.
+    fn assert_no_staging_left(path: &Path) {
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
         assert!(
-            !tmp.exists(),
-            "no leftover temp file after a successful save"
+            leftovers.is_empty(),
+            "leftover staging files: {leftovers:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stores_sharing_a_stem_never_publish_each_others_bytes() {
+        // PSTORE-03: `profile.json` and `profile.pins` are independent stores
+        // with independent `.lock` sidecars, so their saves run concurrently.
+        // With `with_extension("tmp.<pid>")` both staged through one
+        // `profile.tmp.<pid>`: one save truncated the other's temp and renamed
+        // the wrong snapshot over its own target (or failed when the shared
+        // temp had already been renamed away). Each store must only ever hold
+        // its own pins.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("profile.json");
+        let b = dir.path().join("profile.pins");
+        for i in 0..40 {
+            let (ra, rb) = tokio::join!(
+                tokio::spawn(PinStore::mutate(a.clone(), move |s| {
+                    s.approve(&cap(&format!("a/cap{i}")))
+                })),
+                tokio::spawn(PinStore::mutate(b.clone(), move |s| {
+                    s.approve(&cap(&format!("b/cap{i}")))
+                })),
+            );
+            ra.unwrap().unwrap();
+            rb.unwrap().unwrap();
+        }
+        for (path, own, other) in [(&a, "a/", "b/"), (&b, "b/", "a/")] {
+            let store = PinStore::load(path).await.unwrap();
+            let approved: Vec<String> = store.approved().iter().map(|c| c.display()).collect();
+            assert_eq!(approved.len(), 40, "{}: {approved:?}", path.display());
+            assert!(
+                approved
+                    .iter()
+                    .all(|c| c.starts_with(own) && !c.starts_with(other)),
+                "{} holds another store's pins: {approved:?}",
+                path.display(),
+            );
+        }
+        assert_no_staging_left(&a);
     }
 
     #[tokio::test]
@@ -805,6 +1203,100 @@ mod tests {
             PinStore::load(&path).await.unwrap().state(&cap("b/echo")),
             Some(PinState::Pending),
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_mutation_holds_the_lock_until_its_commit_lands() {
+        // CONSENT-01. X is approved. Mutation A (an unrelated request for Y)
+        // loads that snapshot and starts its commit; its waiter is then
+        // cancelled. A rejection of X (mutation B) must not be able to commit
+        // until A's already-started publication has finished — otherwise B
+        // lands first and A's orphaned rename then reinstates the older
+        // snapshot with X approved again.
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, path) = store_path();
+        PinStore::mutate(path.clone(), |s| s.approve(&cap("b/x")))
+            .await
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        commit_hooks::install(
+            &path,
+            commit_hooks::Pause {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+        let a = tokio::spawn(PinStore::mutate(path.clone(), |s| s.request(&cap("b/y"))));
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("A's commit reached its publication step");
+        a.abort();
+        assert!(a.await.unwrap_err().is_cancelled(), "A's waiter is gone");
+
+        let b = tokio::spawn(PinStore::mutate(path.clone(), |s| s.remove(&cap("b/x"))));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !b.is_finished(),
+            "the rejection committed while a cancelled commit still owned the store",
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(b.await.unwrap().unwrap(), "the rejection removed X");
+        let store = PinStore::load(&path).await.unwrap();
+        assert!(
+            !store.is_approved(&cap("b/x")),
+            "a stale snapshot reinstated a rejected approval",
+        );
+        assert_eq!(
+            store.state(&cap("b/y")),
+            Some(PinState::Pending),
+            "A's started commit still completed",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_is_not_acknowledged_without_its_durability_barrier() {
+        // CONSENT-02: a rejection published by rename but whose directory
+        // entry never reached disk can be undone by a power loss, restoring
+        // the approval. The barrier is part of the commit: when it fails the
+        // mutation reports `NotDurable`, never success.
+        let (_dir, path) = store_path();
+        PinStore::mutate(path.clone(), |s| s.approve(&cap("b/x")))
+            .await
+            .unwrap();
+
+        commit_hooks::fail_next_barrier(&path);
+        let err = PinStore::mutate(path.clone(), |s| s.remove(&cap("b/x")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PinStoreError::NotDurable { .. }),
+            "a failed barrier must not acknowledge the rejection: {err:?}",
+        );
+        // The rename itself already happened (visible, just unconfirmed), and
+        // a retry is idempotent and succeeds once the barrier does.
+        assert!(!PinStore::load(&path)
+            .await
+            .unwrap()
+            .is_approved(&cap("b/x")));
+        assert!(!PinStore::mutate(path.clone(), |s| s.remove(&cap("b/x")))
+            .await
+            .unwrap());
+        assert_no_staging_left(&path);
+    }
+
+    #[test]
+    fn the_durability_barrier_succeeds_on_a_published_store() {
+        // The real barrier (parent-directory fsync on POSIX; reopen + flush
+        // elsewhere) on a freshly published store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        std::fs::write(&path, b"{}").unwrap();
+        crate::store_file::durability_barrier(&path).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

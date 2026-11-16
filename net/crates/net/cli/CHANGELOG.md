@@ -8,6 +8,53 @@ full per-release story for the whole system lives in the release notes; this
 is the subset that reaches this binary's command surface — flags, exit codes,
 and output shape.
 
+## Unreleased — local file-safety fixes
+
+- `anchor serve` caches ACME certificates per issuing directory
+  (`<acme-cache>/directory-<id>/<domain>/`). A certificate already cached
+  under an explicit `--acme-cache` in the old `<acme-cache>/<domain>/`
+  layout is adopted on first start when the cached chain verifies for the
+  domain against the platform trust store, so a staging certificate is
+  never adopted; otherwise the anchor orders a fresh one. The
+  default cache moved from the shared temp directory to
+  `<local data>/net-mesh/acme`, and nothing is adopted from the old shared
+  location, which another local user could write: an anchor on the default
+  cache places one new order on its first start after upgrading.
+- `transfer recv-blob` stages into a fresh, exclusively created
+  `<out>.partial.<nonce>` instead of truncating a shared `<out>.partial`.
+  Concurrent receives to one `--out` no longer corrupt each other, and a
+  pre-existing file or symlink at the old staging name is never truncated.
+  Scripts that cleaned up a failed receive by the exact `<out>.partial` name
+  must not simply delete every `<out>.partial.*` instead: another receive to
+  the same `--out` may still be writing its own. Remove only a staging file
+  known to be stale. (For an `--out` name too long to carry the suffix, the
+  staging file is `.netmesh-partial.<nonce>` in the same directory.)
+- `identity generate` without `--force` is now no-clobber at publication,
+  not only at its existence pre-check: two concurrent runs to one absent
+  `--out` can no longer both succeed with the second replacing the first's
+  seed. The loser exits 2 ("publication is no-clobber").
+- `channel issue-grant` refuses an `--out` that names `--root-identity`,
+  and with `--force` refuses to replace any seed-bearing file (case
+  variant, symlink or hard link included), and any destination it cannot
+  read or that is not a regular file. The seed check runs just before the
+  atomic rename, not inside it: it catches an `--out` that names a key file,
+  not a different process writing a seed to that path at the same instant. It no longer truncates a
+  `<out>.tmp-channel-grant` sibling: staging is a fresh, exclusively
+  created `.<name>.stage.*` file.
+- `cap announce --out` refuses an `--out` that names `--key`, and refuses
+  to replace any seed-bearing file (case variant, symlink or hard link
+  included), unreadable file or non-regular file instead of truncating it. Replacing an older announcement at
+  `--out` still works; it is now an atomic staged rename, so a symlinked
+  `--out` is replaced rather than written through.
+- `org audience-keygen --out` and `invite create --out` are now no-clobber
+  at publication, like `identity generate`: a file that appears at `--out`
+  after the existence pre-check (a concurrent run's audience or token, a
+  seed) is never replaced; the loser exits 2. Staging is a fresh,
+  exclusively created `.<name>.stage.*` file, so a leftover
+  `<out>.tmp-netmesh-audience` / `<out>.tmp-netmesh-join` no longer fails
+  the verb. When `invite create` cannot write its token, it names the
+  already-created offer so it can be withdrawn with `invite revoke`.
+
 ## Unreleased — managed nodes, join links, relations and leave
 
 **Browsers for your games (`anchor serve`)**

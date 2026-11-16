@@ -33,7 +33,7 @@ For `wrap`, startup also includes child MCP initialization, tool discovery and p
 
 For `mcp serve`, the budget ends when the shim is ready to process protocol input. It covers identity loading and mesh attachment, not waiting for the client's initialize request or the running session. Startup failure emits no protocol output; a started shim continues until EOF or operator shutdown.
 
-Blob receive applies the same deadline to attachment and each network wait. Disk writes count toward elapsed budget but are not cancelled; final rename proceeds normally after the complete stream is acquired. Timeout leaves the destination unchanged but may leave `<out>.partial` staging bytes. This is not a resumable download or a guarantee that total wall-clock time stays within the budget.
+Blob receive applies the same deadline to attachment and each network wait. Disk writes count toward elapsed budget but are not cancelled; final rename proceeds normally after the complete stream is acquired. Timeout leaves the destination unchanged but may leave `<out>.partial.<nonce>` staging bytes. This is not a resumable download or a guarantee that total wall-clock time stays within the budget.
 
 One-shot output defaults to table on a TTY and JSON otherwise; streams default to text/NDJSON. ICE commits emit one `{preview, commit}` result; the pre-confirmation preview goes to stderr, and failure/refusal emits no success payload on stdout. `--yes` skips the ICE prompt in TTY and non-TTY use without bypassing signature or policy checks. Without it, TTY use requires typed `YES` and unattended commits exit 8. Dry-run retains its preview-only shape without confirmation. `mcp serve` stdout is protocol traffic, not ordinary command JSON.
 
@@ -238,7 +238,7 @@ net-mesh --output ndjson anchor serve \
 - **`--insecure-permissions`** accepts key files with loose permissions, as a checked-out dev folder often has. Never use it on a real anchor.
 - **Ready** is the NDJSON line carrying `credential_endpoint`. Open the page after it.
 - **`--allow-origin` is matched exactly**, scheme and port included: list the origin the page is actually served from (the example allows the page on port 8443 over either scheme).
-- **Secure context.** Browsers treat `localhost` as one, so on one machine the page itself may be plain HTTP. Across a LAN, serve the page over HTTPS too, and move the anchor's `--bind`, `--listen` and `--rtc-bind` from `127.0.0.1` to the LAN address and add `--rtc-stun-bind <lan-ip>:0`: a browser with no camera or microphone permission lists no interfaces, so it needs a STUN endpoint to gather a candidate other players can reach (the RTC socket does not serve one). The certificate must then name that address, since `--url` and the page's origin use it: `mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 <lan-host-or-ip>`. Use the LAN address in `--url` and `--allow-origin`, and have every machine trust your mkcert CA.
+- **Secure context.** Browsers treat `localhost` as one, so on one machine the page itself may be plain HTTP. Across a LAN, serve the page over HTTPS too, and move the anchor's `--listen` and `--rtc-bind` from `127.0.0.1` to the LAN address (leave `--bind`, the native mesh socket, on loopback: browsers never use it) and add `--rtc-stun-bind <lan-ip>:0`: a browser with no camera or microphone permission lists no interfaces, so it needs a STUN endpoint to gather a candidate other players can reach (the RTC socket does not serve one). The certificate must then name that address, since `--url` and the page's origin use it: `mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 <lan-host-or-ip>`. Use the LAN address in `--url` and `--allow-origin`, and have every machine trust your mkcert CA.
 - **Pointing the page at it.** Read the anchor URL from the page's query string (`?anchor=https://localhost:8444`), falling back to the public anchor.
 
 ## Serve IPv4 and IPv6 players
@@ -278,7 +278,7 @@ net-mesh anchor serve --psk-file psk.hex --url https://anchor.example.com \
 
 With `rtc-bootstrap`, add `--inspect-target` to an otherwise configured `anchor serve` invocation. It reports mesh/HTTPS/RTC/STUN bind selections (a dual-stack anchor's extra listeners and IPv6 RTC socket as `listen_additional`, `acme_challenge_bind_additional`, `rtc_bind_v6` and `rtc_public_addr_v6`, omitted when absent), TLS certificate/key paths or ACME cache/challenge settings, and a public credential-issuer fingerprint. No PSK/TLS file is read, socket opened, certificate ordered or identity generated. Profile configuration is read for selection validation/disclosure; profile identity, remote target and bind defaults remain unused by standalone serving.
 
-The same resolved values drive execution. Existing defaults remain mesh `0.0.0.0:0`, HTTPS `0.0.0.0:8443`, RTC on the mesh IP with an ephemeral port, and no second STUN socket. The identity remains ephemeral and is reported unavailable during inspection. Port `0` means runtime allocation, not an observed bound endpoint; null advertised addresses with runtime provenance are unresolved until startup. Inspection is not TLS/content validation, authorization approval or proof of reachability. Malformed listener addresses and a STUN public override without its bind fail before mesh startup.
+The same resolved values drive execution. Defaults are mesh `127.0.0.1:0` (loopback: the native socket accepts the PSK every browser credential carries, so it is not reachable unless `--bind` says so), HTTPS `0.0.0.0:8443`, RTC on `0.0.0.0` with an ephemeral port (on the `--bind` IP when one is given), and no second STUN socket. The identity remains ephemeral and is reported unavailable during inspection. Port `0` means runtime allocation, not an observed bound endpoint; null advertised addresses with runtime provenance are unresolved until startup. Inspection is not TLS/content validation, authorization approval or proof of reachability. Malformed listener addresses and a STUN public override without its bind fail before mesh startup.
 
 ## `net-mesh transfer`
 
@@ -294,7 +294,7 @@ Fetch verified chunks into a file:
 net-mesh transfer recv-blob --blob-ref <REF> --out <PATH> [--from <NODE>] [REMOTE FLAGS]
 ```
 
-Writes go to `<PATH>.partial`, then flush/close and rename to the final path. A failed fetch leaves the previous final file untouched and may leave the partial file for inspection. Local I/O failures and SDK failures need not have the same exit code.
+Writes go to a fresh, exclusively created `<PATH>.partial.<nonce>`, then flush/close and rename to the final path, so concurrent receives to one path never share a staging file. A failed fetch leaves the previous final file untouched and may leave the partial file for inspection. Local I/O failures and SDK failures need not have the same exit code.
 
 ### `send-blob`
 

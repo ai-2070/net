@@ -547,7 +547,7 @@ impl DeckClient {
     /// substrate defaults.
     #[napi(factory)]
     pub async fn new(
-        operator_seed: Buffer,
+        #[napi(ts_arg_type = "Buffer")] operator_seed: crate::common::JsBytes,
         meshos_config: Option<crate::meshos::MeshOsConfigJs>,
         deck_config: Option<DeckClientConfigJs>,
     ) -> Result<DeckClient> {

@@ -231,6 +231,22 @@ struct Game {
     /// for longer than [`OpenGames::idle_after`] has no invite left
     /// that could enroll, and may be reclaimed.
     last_issued: AtomicU64,
+    /// The latest deadline of any invite this incarnation issued (unix
+    /// seconds; 0 before the first). Reclamation also waits for it, so an
+    /// invite of a removed incarnation has always expired: the next lookup
+    /// re-creates the game under the SAME derived root with an empty
+    /// binding map, and an invite still valid then would enroll in the
+    /// replacement. `idle_after` alone guaranteed that only when configured
+    /// at least as long as the invite lifetime, which nothing enforced.
+    invites_until: AtomicU64,
+    /// The issuance gate, and whether this incarnation has been reclaimed
+    /// (ANCHOR-06). An open-game issuance holds it from its check through
+    /// advancing `last_issued`; reclamation takes it to re-judge idleness
+    /// and mark the game reclaimed before removing it. So either the
+    /// issuance lands first and reclamation sees the fresh `last_issued`
+    /// and keeps the game, or reclamation lands first and the issuance sees
+    /// `true` and does not issue from the removed incarnation.
+    reclaimed: Mutex<bool>,
 }
 
 impl Game {
@@ -277,6 +293,10 @@ impl Game {
 
 /// Bindings past which expired entries are swept on the next insert.
 const PRUNE_AT: usize = 4096;
+
+/// Lookups an open-game issuance makes before giving up when every game it
+/// found had been reclaimed before it could issue (ANCHOR-06).
+const OPEN_ISSUE_ATTEMPTS: usize = 4;
 
 /// **Open games**: admit any game, from any page, without registering
 /// it first ([`GameRegistry::with_open_games`]).
@@ -599,33 +619,65 @@ impl GameRegistry {
     /// Drop the open games idle past [`OpenGames::idle_after`]. Only a
     /// game with no invite left that could enroll goes.
     fn reclaim_idle(&self, now: u64) {
+        let gone = self.idle_candidates(now);
+        if !gone.is_empty() && self.reclaim(&gone, now) {
+            self.write_state();
+        }
+    }
+
+    /// The keys of the open games idle at `now`, sampled under the read
+    /// lock. Candidates only: any of them may issue before
+    /// [`Self::reclaim`] takes the write lock.
+    fn idle_candidates(&self, now: u64) -> Vec<String> {
         let Some(open) = self.open.as_ref() else {
-            return;
+            return Vec::new();
         };
         let idle = open.config.idle_after.as_secs();
-        let gone: Vec<String> = self
-            .games
+        self.games
             .read()
             .iter()
-            .filter(|(_, g)| {
-                g.origin.is_some()
-                    && g.last_issued.load(Ordering::Relaxed).saturating_add(idle) < now
-            })
+            .filter(|(_, g)| g.origin.is_some() && g.is_idle(idle, now))
             .map(|(key, _)| key.clone())
-            .collect();
-        if gone.is_empty() {
-            return;
-        }
-        {
-            let mut games = self.games.write();
-            let mut by_root = self.by_root.write();
-            for key in &gone {
-                if let Some(game) = games.remove(key) {
-                    by_root.remove(game.root.entity_id().as_bytes());
-                }
+            .collect()
+    }
+
+    /// Remove those of `candidates` that are STILL idle at `now`; whether
+    /// any went.
+    ///
+    /// ANCHOR-06: the candidates were sampled without the write lock, so a
+    /// candidate may have issued a credential since (advancing its
+    /// `last_issued`), or been reclaimed and re-created as a new
+    /// incarnation. Each is re-judged here, under the write lock and its
+    /// own issuance gate, and marked reclaimed before it is removed — so a
+    /// game that just issued a credential is kept, and a request already
+    /// holding the removed incarnation cannot issue from it afterwards.
+    fn reclaim(&self, candidates: &[String], now: u64) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return false;
+        };
+        let idle = open.config.idle_after.as_secs();
+        let mut games = self.games.write();
+        let mut by_root = self.by_root.write();
+        let mut any = false;
+        for key in candidates {
+            let Some(game) = games.get(key).cloned() else {
+                continue;
+            };
+            if game.origin.is_none() {
+                continue;
             }
+            {
+                let mut reclaimed = game.reclaimed.lock();
+                if *reclaimed || !game.is_idle(idle, now) {
+                    continue;
+                }
+                *reclaimed = true;
+            }
+            games.remove(key);
+            by_root.remove(game.root.entity_id().as_bytes());
+            any = true;
         }
-        self.write_state();
+        any
     }
 
     /// Append one open game to the state file.
@@ -734,6 +786,26 @@ impl GameRegistry {
     pub fn tenant_of_chain(&self, chain: &[u8]) -> Option<net::adapter::net::rtc::TenantId> {
         let chain = DelegationChain::from_bytes(chain).ok()?;
         self.game_by_root(&chain.root()).map(|g| g.tenant)
+    }
+
+    /// The most sessions `tenant` may hold admitted here (ANCHOR-04):
+    /// [`OpenGames::max_players_per_game`] when `tenant` is an open game
+    /// this registry holds and open games are capped; `None` otherwise
+    /// (registered games are not capped).
+    #[cfg(feature = "webrtc")]
+    ///
+    /// A tenant this registry no longer holds — an open game reclaimed
+    /// between grant resolution and promotion — is capped at ZERO: an
+    /// uncapped answer would promote a visitor of a removed game past every
+    /// ceiling.
+    pub fn player_cap_of_tenant(&self, tenant: net::adapter::net::rtc::TenantId) -> Option<usize> {
+        let cap = self.open_max_players_per_game()?;
+        let games = self.games.read();
+        match games.values().find(|g| g.tenant == tenant) {
+            Some(game) if game.origin.is_some() => Some(cap),
+            Some(_) => None,
+            None => Some(0),
+        }
     }
 
     /// The registered game ids, sorted. Open games are not listed.
@@ -862,7 +934,34 @@ impl GameRegistry {
         anchor: &AnchorCredentialParams,
         now: u64,
     ) -> Result<BrowserBootstrapCredential, GameAnchorError> {
-        let entry = self.open_game(origin, game, now)?;
+        // ANCHOR-06: the game looked up may be reclaimed before it issues.
+        // Issuance from a reclaimed incarnation is refused under its gate,
+        // and the next lookup re-creates the game (same derived root). The
+        // bound only matters if reclamation keeps winning, which needs an
+        // `idle_after` shorter than the time between lookup and issuance.
+        for _ in 0..OPEN_ISSUE_ATTEMPTS {
+            let entry = self.open_game(origin, game, now)?;
+            if let Some(credential) = self.issue_open_from(&entry, game, issuer, anchor, now)? {
+                return Ok(credential);
+            }
+        }
+        Err(GameAnchorError::OpenGamesFull)
+    }
+
+    /// Issue from the open game `entry` under its issuance gate, or `None`
+    /// when that incarnation has already been reclaimed (ANCHOR-06).
+    fn issue_open_from(
+        &self,
+        entry: &Game,
+        game: &str,
+        issuer: &Identity,
+        anchor: &AnchorCredentialParams,
+        now: u64,
+    ) -> Result<Option<BrowserBootstrapCredential>, GameAnchorError> {
+        let reclaimed = entry.reclaimed.lock();
+        if *reclaimed {
+            return Ok(None);
+        }
         if let Some(open) = self.open.as_ref() {
             let minute = now / 60;
             let mut window = open.window.lock();
@@ -879,7 +978,11 @@ impl GameRegistry {
             entry.admit_issuance(now)?;
             window.1 += 1;
         }
-        Ok(self.issue_for(&entry, issuer, anchor, now))
+        // Still under the gate: `last_issued` advances before any
+        // reclamation can re-judge this game.
+        let credential = self.issue_for(entry, issuer, anchor, now);
+        drop(reclaimed);
+        Ok(Some(credential))
     }
 
     fn issue_for(
@@ -896,6 +999,10 @@ impl GameRegistry {
             now,
         );
         entry.last_issued.fetch_max(now, Ordering::Relaxed);
+        entry.invites_until.fetch_max(
+            now.saturating_add(anchor.invite_ttl.as_secs()),
+            Ordering::Relaxed,
+        );
         entry
             .counters
             .credentials_issued
@@ -965,6 +1072,21 @@ impl GameRegistry {
                 "this anchor did not issue that invite".into(),
             );
         };
+        // ANCHOR-06: the whole admission runs under the incarnation's gate.
+        // Reclamation marks a game reclaimed under the same lock before it
+        // removes it, so a request that looked the game up just before
+        // reclamation cannot verify, bind and derive a grant from the
+        // removed incarnation afterwards.
+        let reclaimed = game.reclaimed.lock();
+        if *reclaimed {
+            game.counters
+                .enrollments_refused
+                .fetch_add(1, Ordering::Relaxed);
+            return rejected(
+                reject::UNKNOWN_INVITE,
+                "this anchor did not issue that invite".into(),
+            );
+        }
         let admitted = game
             .authority
             .verify_request(&request, &invite, now)
@@ -988,8 +1110,10 @@ impl GameRegistry {
                 ),
             );
         }
-        // Depth 0: a browser visitor extends nothing.
-        match DelegationChain::derive_device(&game.root, &request.device, grant_ttl, 0) {
+        // Depth 0: a browser visitor extends nothing. Still under the gate.
+        let derived = DelegationChain::derive_device(&game.root, &request.device, grant_ttl, 0);
+        drop(reclaimed);
+        match derived {
             Ok(chain) => {
                 game.counters
                     .enrollments_admitted
@@ -1098,7 +1222,19 @@ impl Game {
             window: Mutex::new((0, 0)),
             bound: Mutex::new(HashMap::new()),
             last_issued: AtomicU64::new(now),
+            invites_until: AtomicU64::new(0),
+            reclaimed: Mutex::new(false),
         }
+    }
+
+    /// Idle past `idle` seconds since its last issuance, at `now`, with
+    /// every invite it issued expired.
+    fn is_idle(&self, idle: u64, now: u64) -> bool {
+        self.last_issued
+            .load(Ordering::Relaxed)
+            .saturating_add(idle)
+            < now
+            && self.invites_until.load(Ordering::Relaxed) < now
     }
 }
 
@@ -1140,21 +1276,48 @@ pub fn serve_game_enrollment(
 ) -> Result<crate::mesh_rpc::ServeHandle, crate::mesh_rpc::ServeError> {
     // Each admitted session is promoted FOR ITS GAME: the core asks this
     // registry which game a grant belongs to, and keeps games apart.
+    //
+    // ANCHOR-03: and FOR ITS DEVICE. A join body is reusable by the
+    // device that signed it, so without this one device's body sent
+    // over several provisional sessions promoted every one of them;
+    // the core now promotes only the session whose participant is the
+    // grant's subject, and holds it to that identity afterwards.
+    //
+    // These are NODE-WIDE: installed before the service registers (a
+    // request answered in between must already be promoted under them),
+    // and the previous ones put back if registration fails — a duplicate
+    // `serve_game_enrollment` on a node that already serves enrollment
+    // must not leave the running service judged by another registry.
     #[cfg(feature = "webrtc")]
-    {
+    let previous = {
+        let binding = mesh.node().replace_enrollment_subject_binding(true);
+        // ANCHOR-04: the open-game player cap is enforced where the
+        // slot is actually taken — at promotion, atomically with it.
+        // The handler's occupancy check below stays as a preflight so
+        // a visitor to a full game reads a refusal, but two visitors
+        // answered concurrently both pass it.
+        let cap = {
+            let registry = registry.clone();
+            mesh.node()
+                .replace_enrollment_tenant_cap(Some(std::sync::Arc::new(move |tenant| {
+                    registry.player_cap_of_tenant(tenant)
+                })))
+        };
         let registry = registry.clone();
-        mesh.node()
-            .set_enrollment_tenant_resolver(Some(std::sync::Arc::new(move |chain: &[u8]| {
-                registry.tenant_of_chain(chain)
-            })));
-    }
+        let resolver = mesh
+            .node()
+            .replace_enrollment_tenant_resolver(Some(std::sync::Arc::new(
+                move |chain: &[u8]| registry.tenant_of_chain(chain),
+            )));
+        (binding, cap, resolver)
+    };
     // An open game may hold at most its cap of enrolled players here,
     // counted from the core's own sessions.
     #[cfg(feature = "webrtc")]
     let node = mesh.node().clone();
     // Raw bodies both ways: the core's promotion gate reads the
     // outcome's own `NMO1` framing (see `mesh_enroll`).
-    mesh.serve_rpc_raw_bytes(
+    let served = mesh.serve_rpc_raw_bytes(
         crate::mesh_enroll::ENROLLMENT_SERVICE,
         move |request: Vec<u8>| {
             let registry = registry.clone();
@@ -1173,7 +1336,15 @@ pub fn serve_game_enrollment(
                 Ok::<Vec<u8>, String>(registry.handle_join_request(&request, grant_ttl))
             }
         },
-    )
+    );
+    #[cfg(feature = "webrtc")]
+    if served.is_err() {
+        let (binding, cap, resolver) = previous;
+        mesh.node().replace_enrollment_subject_binding(binding);
+        mesh.node().set_enrollment_tenant_cap(cap);
+        mesh.node().set_enrollment_tenant_resolver(resolver);
+    }
+    served
 }
 
 #[cfg(test)]
@@ -1194,6 +1365,16 @@ mod tests {
             bootstrap_url: "https://anchor.example".into(),
             invite_ttl: DEFAULT_INVITE_TTL,
             psk_ttl: DEFAULT_PSK_TTL,
+        }
+    }
+
+    /// `params()` with invites lasting `invite_ttl` — for a test whose
+    /// `idle_after` is shorter than the default invite lifetime (an open
+    /// game is not reclaimed while an invite it issued can still enroll).
+    fn params_lasting(invite_ttl: Duration) -> AnchorCredentialParams {
+        AnchorCredentialParams {
+            invite_ttl,
+            ..params()
         }
     }
 
@@ -1589,27 +1770,57 @@ mod tests {
         let games = open_registry(open);
         let issuer = Identity::generate();
         let first = games
-            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW)
+            .issue_open_credential_at(
+                SITE_A,
+                "one",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                NOW,
+            )
             .unwrap();
         assert_eq!(
             games
-                .issue_open_credential_at(SITE_A, "two", &issuer, &params(), NOW + 1800)
+                .issue_open_credential_at(
+                    SITE_A,
+                    "two",
+                    &issuer,
+                    &params_lasting(Duration::from_secs(3600)),
+                    NOW + 1800
+                )
                 .unwrap_err(),
             GameAnchorError::OpenGamesFull
         );
         // Still in use: an issuance at NOW + 1800 restarts its idle clock.
         games
-            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW + 1800)
+            .issue_open_credential_at(
+                SITE_A,
+                "one",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                NOW + 1800,
+            )
             .unwrap();
         assert_eq!(
             games
-                .issue_open_credential_at(SITE_A, "two", &issuer, &params(), NOW + 3601)
+                .issue_open_credential_at(
+                    SITE_A,
+                    "two",
+                    &issuer,
+                    &params_lasting(Duration::from_secs(3600)),
+                    NOW + 3601
+                )
                 .unwrap_err(),
             GameAnchorError::OpenGamesFull,
             "idle for less than idle_after since its LAST issuance"
         );
         games
-            .issue_open_credential_at(SITE_A, "two", &issuer, &params(), NOW + 5401)
+            .issue_open_credential_at(
+                SITE_A,
+                "two",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                NOW + 5401,
+            )
             .unwrap();
         assert_eq!(
             games.open_root_of(SITE_A, "one"),
@@ -1622,6 +1833,182 @@ mod tests {
             NOW + 5402
         )));
         assert_eq!(games.open_stats().unwrap().games, 1);
+    }
+
+    /// ANCHOR-06, first schedule: a full-registry request samples a game
+    /// idle, then — before it takes the write lock — another request issues
+    /// a credential from that game. Reclamation must re-judge the game under
+    /// the write lock and keep it; pre-fix it removed every sampled key, and
+    /// the fresh, unexpired credential was refused as UNKNOWN_INVITE. The
+    /// interleaving is driven step by step through the two halves of
+    /// `reclaim_idle` rather than raced.
+    #[test]
+    fn reclamation_keeps_a_game_that_issued_after_it_was_sampled_idle() {
+        let mut open = OpenGames::new(None);
+        open.idle_after = Duration::from_secs(3600);
+        let games = open_registry(open);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(
+                SITE_A,
+                "one",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                NOW,
+            )
+            .unwrap();
+        let later = NOW + 3601;
+        let candidates = games.idle_candidates(later);
+        assert_eq!(candidates, vec![open_key(SITE_A, "one")], "sampled idle");
+        let fresh = games
+            .issue_open_credential_at(
+                SITE_A,
+                "one",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                later,
+            )
+            .unwrap();
+        assert!(
+            !games.reclaim(&candidates, later),
+            "re-judged under the write lock: no longer idle"
+        );
+        assert!(games.open_root_of(SITE_A, "one").is_some());
+        assert!(admitted(&games.handle_join_request_at(
+            &join(&fresh.invite),
+            DEFAULT_GRANT_TTL,
+            later + 1
+        )));
+    }
+
+    /// ANCHOR-06, second schedule: a request already holds a game's `Arc`
+    /// when reclamation removes it. Issuance from that removed incarnation
+    /// is refused under its gate (pre-fix it minted a credential no lookup
+    /// could resolve), and the public path re-creates the game and issues a
+    /// credential that enrolls.
+    #[test]
+    fn a_reclaimed_incarnation_issues_nothing_and_the_next_lookup_recreates_it() {
+        let mut open = OpenGames::new(None);
+        open.idle_after = Duration::from_secs(3600);
+        let games = open_registry(open);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(
+                SITE_A,
+                "one",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                NOW,
+            )
+            .unwrap();
+        let later = NOW + 3601;
+        let held = games.open_game(SITE_A, "one", later).unwrap();
+        assert!(games.reclaim(&games.idle_candidates(later), later));
+        assert_eq!(games.open_root_of(SITE_A, "one"), None, "reclaimed");
+        assert!(
+            games
+                .issue_open_from(
+                    &held,
+                    "one",
+                    &issuer,
+                    &params_lasting(Duration::from_secs(3600)),
+                    later
+                )
+                .unwrap()
+                .is_none(),
+            "the removed incarnation issues nothing"
+        );
+        let credential = games
+            .issue_open_credential_at(
+                SITE_A,
+                "one",
+                &issuer,
+                &params_lasting(Duration::from_secs(3600)),
+                later,
+            )
+            .unwrap();
+        assert!(admitted(&games.handle_join_request_at(
+            &join(&credential.invite),
+            DEFAULT_GRANT_TTL,
+            later + 1
+        )));
+    }
+
+    /// A game is not reclaimed while an invite it issued is still valid,
+    /// even when `idle_after` is configured shorter than the invite
+    /// lifetime: the replacement incarnation shares the root, so that
+    /// invite would enroll in it. Once every invite has expired, it goes.
+    ///
+    /// Red: idleness alone let the game go at `NOW + 61`.
+    #[test]
+    fn a_game_is_not_reclaimed_while_an_invite_it_issued_can_still_enroll() {
+        let mut open = OpenGames::new(None);
+        open.idle_after = Duration::from_secs(60);
+        let games = open_registry(open);
+        let issuer = Identity::generate();
+        let credential = games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW)
+            .unwrap();
+        let ttl = params().invite_ttl.as_secs();
+        assert!(ttl > 61, "premise: the invite outlives idle_after");
+
+        assert!(!games.reclaim(&games.idle_candidates(NOW + 61), NOW + 61));
+        assert!(games.open_root_of(SITE_A, "one").is_some(), "still held");
+        assert!(admitted(&games.handle_join_request_at(
+            &join(&credential.invite),
+            DEFAULT_GRANT_TTL,
+            NOW + 62
+        )));
+
+        let expired = NOW + ttl + 1;
+        assert!(games.reclaim(&games.idle_candidates(expired), expired));
+        assert_eq!(games.open_root_of(SITE_A, "one"), None);
+    }
+
+    /// A request that looked an open game up just before it was reclaimed
+    /// cannot enroll in the removed incarnation: the admission runs under
+    /// the incarnation's gate and refuses once it is marked reclaimed.
+    ///
+    /// Red: only issuance checked the mark; this enrollment was admitted.
+    #[test]
+    fn an_enrollment_against_a_reclaimed_incarnation_is_refused() {
+        let games = open_registry(OpenGames::new(None));
+        let issuer = Identity::generate();
+        let credential = games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW)
+            .unwrap();
+        let held = games.open_game(SITE_A, "one", NOW).unwrap();
+        // Reclamation has marked it (under the gate) but this request
+        // resolved the game before it was removed.
+        *held.reclaimed.lock() = true;
+        assert!(!admitted(&games.handle_join_request_at(
+            &join(&credential.invite),
+            DEFAULT_GRANT_TTL,
+            NOW + 1
+        )));
+    }
+
+    /// A tenant the registry no longer holds is capped at zero, never
+    /// uncapped; a registered game stays uncapped.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn an_unknown_open_tenant_is_capped_at_zero() {
+        let mut open = OpenGames::new(None);
+        open.max_players_per_game = Some(3);
+        let games = open_registry(open);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(SITE_A, "one", &issuer, &params(), NOW)
+            .unwrap();
+        let tenant = games.open_game(SITE_A, "one", NOW).unwrap().tenant;
+        assert_eq!(games.player_cap_of_tenant(tenant), Some(3));
+        let later = NOW + 365 * 24 * 60 * 60;
+        assert!(games.reclaim(&games.idle_candidates(later), later));
+        assert_eq!(
+            games.player_cap_of_tenant(tenant),
+            Some(0),
+            "a reclaimed game's visitor must not be promoted uncapped"
+        );
     }
 
     /// Inventing names does not multiply the budget: every open game
@@ -1728,6 +2115,44 @@ mod tests {
             .unwrap();
         assert_eq!(lines().len(), base + 3);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ANCHOR-04: the cap the core enforces at promotion is the open
+    /// game's player cap, for exactly the open games this registry
+    /// holds — never a registered game, and nothing when uncapped.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn the_promotion_cap_is_the_open_games_player_cap() {
+        let mut capped = OpenGames::new(None);
+        capped.max_players_per_game = Some(2);
+        let games = open_registry(capped);
+        let issuer = Identity::generate();
+        games
+            .issue_open_credential_at(SITE_A, "chess", &issuer, &params(), NOW)
+            .unwrap();
+        assert_eq!(
+            games.player_cap_of_tenant(GameRegistry::open_tenant_id(SITE_A, "chess")),
+            Some(2)
+        );
+        assert_eq!(
+            games.player_cap_of_tenant(GameRegistry::tenant_id("alpha")),
+            None,
+            "a registered game is not capped"
+        );
+        assert_eq!(
+            games.player_cap_of_tenant(GameRegistry::open_tenant_id(SITE_B, "chess")),
+            Some(0),
+            "a tenant this registry does not hold (e.g. an open game reclaimed \
+             since its grant was resolved) is capped at zero, never uncapped"
+        );
+        let uncapped = open_registry(OpenGames::new(None));
+        uncapped
+            .issue_open_credential_at(SITE_A, "chess", &issuer, &params(), NOW)
+            .unwrap();
+        assert_eq!(
+            uncapped.player_cap_of_tenant(GameRegistry::open_tenant_id(SITE_A, "chess")),
+            None
+        );
     }
 
     /// The player cap refuses an open game's visitor once its invite

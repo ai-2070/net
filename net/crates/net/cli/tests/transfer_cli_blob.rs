@@ -26,6 +26,22 @@ use net_sdk::{Mesh, MeshBuilder};
 
 const PSK_HEX: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
+/// Every `<name>.partial.<nonce>` staging file `recv-blob` left in `dir`
+/// for destination file name `name`. The staging name is unique per
+/// invocation (CLI-02), so tests look for the prefix rather than one path.
+fn partials(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let prefix = format!("{name}.partial.");
+    std::fs::read_dir(dir)
+        .expect("read out dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect()
+}
+
 fn psk() -> [u8; 32] {
     let bytes = hex::decode(PSK_HEX).expect("psk hex");
     bytes.try_into().expect("32-byte psk")
@@ -164,8 +180,8 @@ async fn recv_blob_fetches_byte_for_byte() {
     assert_eq!(got, bytes, "received blob differs from the holder's blob");
 
     // The atomic write must not leave a `.partial` sibling on success.
-    let partial = out_dir.path().join("received.bin.partial");
-    assert!(!partial.exists(), "stray .partial left behind: {partial:?}");
+    let left = partials(out_dir.path(), "received.bin");
+    assert!(left.is_empty(), "stray .partial left behind: {left:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -181,7 +197,6 @@ async fn recv_blob_deadline_preserves_destination_after_attachment() {
     let home = TempDir::new().unwrap();
     let out_dir = TempDir::new().unwrap();
     let destination = out_dir.path().join("received.bin");
-    let partial = out_dir.path().join("received.bin.partial");
     std::fs::write(&destination, b"existing destination").unwrap();
     for budget in ["0s", "1s"] {
         let mut args = vec![
@@ -204,7 +219,12 @@ async fn recv_blob_deadline_preserves_destination_after_attachment() {
             std::fs::read(&destination).unwrap(),
             b"existing destination"
         );
-        assert_eq!(partial.exists(), budget != "0s");
+        // Each attempt stages into its OWN partial; only the attempt that
+        // reached receive (the non-zero budget) leaves one behind.
+        assert_eq!(
+            partials(out_dir.path(), "received.bin").len(),
+            usize::from(budget != "0s")
+        );
     }
 }
 
@@ -250,7 +270,7 @@ async fn recv_blob_streams_a_multi_chunk_blob_byte_for_byte() {
         "multi-chunk blob differs from the holder's blob"
     );
     assert!(
-        !out_dir.path().join("big.bin.partial").exists(),
+        partials(out_dir.path(), "big.bin").is_empty(),
         "stray .partial left behind after a successful multi-chunk fetch"
     );
 }
@@ -289,8 +309,9 @@ async fn recv_blob_failure_leaves_partial_not_target() {
         !out_path.exists(),
         "the destination must not be committed on failure"
     );
-    assert!(
-        out_dir.path().join("never.bin.partial").exists(),
+    assert_eq!(
+        partials(out_dir.path(), "never.bin").len(),
+        1,
         "the .partial must be left in place for inspection on failure"
     );
 }

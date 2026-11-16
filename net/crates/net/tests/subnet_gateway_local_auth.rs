@@ -651,6 +651,7 @@ fn raw_entry(
         subject: local.entity_id().clone(),
         rights,
         generation: 1,
+        delegated: false,
         subnet_auth_epoch: 0,
         expires_at: now() + DAY,
         credential_set_hash: [0; 32],

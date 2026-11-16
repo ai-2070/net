@@ -62,23 +62,22 @@ impl KeychainSecretBackend {
     /// Enter or replace a secret value for `ref_name`. The operator/CLI entry
     /// path (`net secret set`) — never call it with a model-supplied value.
     pub async fn set(&self, ref_name: &str, value: &[u8]) -> Result<(), SecretBackendError> {
-        // Validate at entry with the same rules `get` enforces (via
-        // `ForwardedHeaderValue::new`), so an oversize / control-char value that
-        // could never be read back is rejected here rather than persisted and
-        // then failing at forward time. Runs before the keychain is touched.
+        // Validate at entry with the same rules `get` enforces, so an oversize /
+        // control-char value that could never be read back is rejected here
+        // rather than persisted and then failing at forward time. Runs before
+        // the keychain is touched — and before allocating a copy at all.
         ForwardedHeaderValue::validate(value)?;
-        let (service, ref_name, mut value) =
-            (self.service.clone(), ref_name.to_string(), value.to_vec());
+        // The plaintext copy for the keychain call is owned by the zeroizing
+        // wrapper from the moment it exists, so it is scrubbed on EVERY exit:
+        // a failed `entry(...)` (store init / entry construction), a failed
+        // `set_secret`, success, or a panic. (Scrubbing explicitly after the
+        // call missed the `entry(...)?` early return — MCP-08.)
+        let value = ForwardedHeaderValue::new(value.to_vec())?;
+        let (service, ref_name) = (self.service.clone(), ref_name.to_string());
         run_blocking(move || {
-            let result = entry(&service, &ref_name)?
-                .set_secret(&value)
-                .map_err(map_err);
-            // Scrub the plaintext copy we materialized for the keychain call,
-            // regardless of outcome — every other path in this module
-            // (`contains`, `get`, `ForwardedHeaderValue`) scrubs its buffer, and
-            // `set` was the one that dropped its copy in the clear.
-            zeroize_vec(&mut value);
-            result
+            entry(&service, &ref_name)?
+                .set_secret(value.expose())
+                .map_err(map_err)
         })
         .await
     }
@@ -104,16 +103,16 @@ impl SecretBackend for KeychainSecretBackend {
         ref_name: &str,
     ) -> Result<Option<ForwardedHeaderValue>, SecretBackendError> {
         let (service, ref_name) = (self.service.clone(), ref_name.to_string());
-        let bytes = run_blocking(move || match entry(&service, &ref_name)?.get_secret() {
-            Ok(b) => Ok(Some(b)),
+        // Wrap the plaintext the keychain hands back on the blocking thread,
+        // the moment it exists: a raw `Vec` riding the task's join handle
+        // would drop unscrubbed if this future were cancelled, and
+        // `ForwardedHeaderValue::new` scrubs a value it rejects.
+        run_blocking(move || match entry(&service, &ref_name)?.get_secret() {
+            Ok(b) => Ok(Some(ForwardedHeaderValue::new(b)?)),
             Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(e) => Err(map_err(e)),
         })
-        .await?;
-        match bytes {
-            Some(b) => Ok(Some(ForwardedHeaderValue::new(b)?)),
-            None => Ok(None),
-        }
+        .await
     }
 
     async fn contains(&self, ref_name: &str) -> Result<bool, SecretBackendError> {

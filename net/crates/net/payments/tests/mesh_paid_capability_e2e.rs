@@ -236,7 +236,7 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
     let terms = PricingTerms::new(
         provider_keys.entity_id().clone(),
         capability.clone(),
-        vec![template],
+        vec![template.clone()],
         registry.reference().expect("registry reference"),
     );
     let announced_terms =
@@ -265,12 +265,21 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
         .expect("a priced descriptor serves through the engine gate");
 
     // A second priced tool on the same gate — the target the wrong-tool
-    // reuse aims at. Its handler must never run; its price is a
-    // placeholder (the caller never pays it, it reuses fixture-tool's
-    // quote).
+    // reuse aims at. Its handler must never run; the caller never pays its
+    // price (it reuses fixture-tool's quote), but the price is real terms:
+    // the engine gate takes announced terms as its quote authority, and
+    // refuses a serve whose terms it could not quote on.
+    let other_terms = PricingTerms::new(
+        provider_keys.entity_id().clone(),
+        format!("{provider_id}/other-tool"),
+        vec![template],
+        registry.reference().expect("registry reference"),
+    );
+    let other_terms =
+        String::from_utf8(canonical_bytes(&other_terms).expect("canonicalize")).expect("utf8");
     let other_tool = metadata_for::<EchoReq, EchoResp>("other-tool")
         .description("A different priced tool.")
-        .pricing_terms(r#"{"object":"net.pricing.terms@1"}"#)
+        .pricing_terms(&other_terms)
         .build();
     let _served_other = provider_mesh
         .serve_tool_paid::<EchoReq, EchoResp, _, _>(

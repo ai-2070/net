@@ -494,3 +494,187 @@ fn a_standalone_channel_link_issues_one_chain_and_recovers_it_exactly() {
     let reopened = ChannelMembership::open(&dir).unwrap();
     assert!(reopened.chain().is_none() && reopened.left_at().is_some());
 }
+
+/// ENR-03, standalone path: the caller samples `now` when the request
+/// arrives, then the handler may wait for the ledger lock. A claim and first
+/// issuance must be judged at the ledger time, not that stale sample — here
+/// the sample still lies inside the invitation's window while the wall clock
+/// is already past its expiry. Pre-fix the stale time claimed and issued a
+/// chain; now the link is refused as expired and nothing is claimed.
+#[test]
+fn a_standalone_claim_is_judged_at_the_ledger_time_not_a_stale_caller_sample() {
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::standalone::{answer_standalone_redeem, SubnetRedeemRequest};
+    use net_sdk::enrollment::store::{EnrollmentLedger, LedgerLimits, OfferState};
+
+    const NODE: u64 = 0x0C4A_0002;
+    let operator = Identity::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = std::sync::Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    // Created 10 s ago with a 5 s window: expired by the wall clock now.
+    let created = now() - 10;
+    let link = MembershipInvite::sign(
+        &operator,
+        InviteSpec {
+            policy: InvitationPolicy::with_options(
+                created,
+                Duration::from_secs(5),
+                ApprovalMode::Preauthorized,
+            )
+            .unwrap(),
+            ..spec(
+                vec![Relation::Channel],
+                Some(offer(CHANNEL, TokenScope::SUBSCRIBE)),
+            )
+        },
+    )
+    .unwrap();
+    ledger.lock().offer(link.offer_spec(), created + 1).unwrap();
+    let issuers = vec![leaf_issuer(&operator, CHANNEL, TokenScope::SUBSCRIBE)];
+    let device = Identity::generate();
+
+    // The stale caller sample: inside the window.
+    let stale = created + 4;
+    let reply = answer_standalone_redeem(
+        &SubnetRedeemRequest::sign(&device, &link, NODE, stale)
+            .unwrap()
+            .to_bytes(),
+        Some(device.entity_id()),
+        NODE,
+        &ledger,
+        None,
+        None,
+        &issuers,
+        stale,
+    );
+    assert_eq!(reply, Err(Refusal::Expired));
+    let statuses = ledger.lock().statuses().unwrap();
+    assert!(
+        matches!(statuses[0].state, OfferState::Offered),
+        "nothing claimed: {:?}",
+        statuses[0].state
+    );
+}
+
+/// CISS-01: two grants for the same root/channel/rights, the expired one
+/// listed first. Coverage is scope only and `ChannelLeafIssuer::new` checks
+/// the signature, not the clock, so the stale grant installs and covers the
+/// offer; pre-fix selection stopped at it and every redemption — bundle and
+/// standalone — was refused as unavailable despite the live replacement.
+/// Now the first covering grant that can issue NOW is chosen, and the chain
+/// anchors at the replacement. Alone, the expired grant still issues
+/// nothing.
+#[test]
+fn an_expired_covering_grant_does_not_shadow_its_live_replacement() {
+    use net_sdk::enrollment::service::SharedLedger;
+    use net_sdk::enrollment::standalone::{answer_standalone_redeem, SubnetRedeemRequest};
+    use net_sdk::enrollment::store::{EnrollmentLedger, LedgerLimits};
+
+    const NODE: u64 = 0x0C4A_0003;
+    let operator = Identity::generate();
+    let full = rights(&[TokenScope::PUBLISH, TokenScope::SUBSCRIBE]);
+    let stale_grant = PermissionToken::try_issue(
+        &root(),
+        operator.entity_id().clone(),
+        full.union(TokenScope::DELEGATE),
+        channel(CHANNEL).hash(),
+        1,
+        1,
+    )
+    .unwrap();
+    // Past its `not_after` (exclusive): expired by the wall clock.
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(stale_grant.is_expired());
+    let stale = ChannelLeafIssuer::new(stale_grant, (**operator.keypair()).clone())
+        .expect("installs: the constructor checks the signature, not the clock");
+    let live = leaf_issuer(&operator, CHANNEL, full);
+    let live_grant = live
+        .issue(operator.entity_id(), TokenScope::PUBLISH)
+        .unwrap()
+        .tokens[0]
+        .to_bytes();
+    let o = offer(CHANNEL, TokenScope::PUBLISH);
+    assert!(stale.covers(&o) && live.covers(&o));
+
+    // Bundle issuance.
+    let device = Identity::generate();
+    let invite = MembershipInvite::sign(
+        &operator,
+        spec(vec![Relation::Mesh, Relation::Channel], Some(o.clone())),
+    )
+    .unwrap();
+    let intent = RedemptionIntent::for_invite(&invite, device.entity_id().clone()).unwrap();
+    assert_eq!(
+        issuer(&operator, vec![stale.clone()])
+            .issue(&invite, &intent)
+            .unwrap_err(),
+        Refusal::Unavailable,
+        "an expired grant alone still issues nothing"
+    );
+    let bytes = issuer(&operator, vec![stale.clone(), live.clone()])
+        .issue(&invite, &intent)
+        .expect("the live replacement issues");
+    let bundle = MembershipBundle::from_bytes(&bytes).unwrap();
+    bundle.verify_for(&invite, &intent).unwrap();
+    let chain = bundle.channel_chain().unwrap();
+    assert_eq!(
+        chain.tokens[0].to_bytes(),
+        live_grant,
+        "anchored at the live grant"
+    );
+    chain
+        .verify_authorizes(
+            TokenScope::PUBLISH,
+            channel(CHANNEL).hash(),
+            device.entity_id(),
+            &[root().entity_id().clone()],
+            &RevocationRegistry::new(),
+            0,
+        )
+        .unwrap();
+
+    // Standalone redemption.
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger: SharedLedger = std::sync::Arc::new(parking_lot::Mutex::new(
+        EnrollmentLedger::create(
+            &tmp.path().join("ledger"),
+            operator.entity_id().clone(),
+            LedgerLimits::default(),
+        )
+        .unwrap(),
+    ));
+    let link = MembershipInvite::sign(&operator, spec(vec![Relation::Channel], Some(o))).unwrap();
+    ledger.lock().offer(link.offer_spec(), now()).unwrap();
+    let redeemer = Identity::generate();
+    let reply = answer_standalone_redeem(
+        &SubnetRedeemRequest::sign(&redeemer, &link, NODE, now())
+            .unwrap()
+            .to_bytes(),
+        Some(redeemer.entity_id()),
+        NODE,
+        &ledger,
+        None,
+        None,
+        &[stale, live],
+        now(),
+    )
+    .expect("the live replacement issues");
+    let chain = reply.channel_chain().expect("a channel chain");
+    assert_eq!(
+        chain.tokens[0].to_bytes(),
+        live_grant,
+        "anchored at the live grant"
+    );
+    assert!(channel_chain_matches(
+        link.channel().unwrap(),
+        redeemer.entity_id(),
+        &chain
+    ));
+}

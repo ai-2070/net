@@ -1566,14 +1566,19 @@ def _redact_label(label: str, keys: frozenset) -> str:
     arbitrary keys; the redaction must too. Mirrors the Rust
     ``redact_label`` fix in CR-19.
 
-    Strategy: try the redact keys longest-first against the label
-    interior. The first key that matches (as the literal prefix
-    before the separator) wins. Keeps the shape of the substrate's
-    ``redact_label`` helper.
+    Strategy: the EARLIEST occurrence of the separator in the label
+    interior whose left half is one of ``keys`` wins — exactly the Rust
+    ``find_redactable_key_split`` and the TS ``redactableKeySplit``, so
+    the three bindings redact one report byte-identically. Every split is
+    tried because a key may itself contain the separator. With
+    overlapping keys (``a`` and ``a=b``) the earliest split hides the
+    most: ``MetadataEquals(a=b=secret)`` becomes
+    ``MetadataEquals(a=<redacted>)``. This used to take the LONGEST key,
+    which disagreed with the other bindings on such a label (cubic review
+    of PR #1426, TSDK-06 follow-up).
     """
     if not keys:
         return label
-    sorted_keys = sorted(keys, key=len, reverse=True)
 
     for prefix, suffix, sep, replacement in (
         ("MetadataEquals(", ")", "=", "MetadataEquals({key}=<redacted>)"),
@@ -1597,9 +1602,12 @@ def _redact_label(label: str, keys: frozenset) -> str:
         # `<key> contains "<pattern>` with the trailing `"` already
         # absorbed by the suffix, so the key+sep prefix check is
         # `<key> contains "`. Same shape; nothing special.
-        for key in sorted_keys:
-            if inner.startswith(f"{key}{sep}"):
+        at = inner.find(sep)
+        while at != -1:
+            key = inner[:at]
+            if key in keys:
                 return replacement.format(key=key)
+            at = inner.find(sep, at + len(sep))
         return label
     return label
 

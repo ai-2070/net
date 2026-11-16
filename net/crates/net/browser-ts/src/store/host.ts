@@ -435,21 +435,34 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
 
   const replies = new Map<string, TransportStream>();
   /**
-   * The derived stream id this store's traffic arrives on, once one
-   * frame has established it.
+   * The derived stream id each PEER's store traffic arrives on, once
+   * one of that peer's frames has established it.
    *
    * The label cannot be compared against an event: the event carries
    * the id the leaf DERIVED from it. And the derivation lives in Rust
-   * (`stream_id_from_label`), so this side cannot compute it without
-   * duplicating that hash and inviting drift. What it can do is learn
-   * it: the first store frame fixes the id, and every later frame must
-   * match. The window is exactly one frame wide and it is bounded by
-   * the checks that do not depend on the id at all — the peer is
-   * authenticated by the transport, a `join` must name this
-   * definition and version, and every other kind must name a handle
-   * this owner issued.
+   * (`stream_id_from_label`, xxh3), so this side cannot compute it
+   * without duplicating that hash and inviting drift. What it can do is
+   * learn it — but an accepted frame proves who sent it and which store
+   * it names, NOT that it rode the configured label. So the id learned
+   * from a peer binds only that peer (STORE-04): one global pin let the
+   * first admitted peer, joining on a stream of its choosing, make every
+   * later legitimate join on the configured label drop as
+   * `foreign-stream` for the life of the host.
+   *
+   * What identifies this store's traffic does not depend on the id at
+   * all — the peer is authenticated by the transport, a `join` must
+   * name this store, definition and version, and every other kind must
+   * name a handle this owner issued to that peer. The per-peer pin only
+   * keeps a peer's OTHER streams out of its own subscription; it is
+   * held while the peer holds a handle, so the table is bounded by live
+   * peers.
    */
-  let arrivesOn: string | null = null;
+  const arrivesOn = new Map<string, string>();
+  const stopPinPruning = owner.onMembership(() => {
+    if (arrivesOn.size === 0) return;
+    const live = new Set(owner.peers());
+    for (const peer of [...arrivesOn.keys()]) if (!live.has(peer)) arrivesOn.delete(peer);
+  });
   const pendingReplies = new Map<string, Promise<TransportStream>>();
   const dropped: Record<string, number> = {};
   let closed = false;
@@ -642,12 +655,6 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       dropped['no-payload'] = (dropped['no-payload'] ?? 0) + 1;
       return;
     }
-    const arrived = event.streamId;
-    if (arrivesOn !== null && arrived !== undefined && arrived !== arrivesOn) {
-      // Another stream on this session. Not this store's traffic.
-      dropped['foreign-stream'] = (dropped['foreign-stream'] ?? 0) + 1;
-      return;
-    }
     let text: string;
     try {
       text = decoder.decode(payload);
@@ -662,6 +669,14 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     const authenticated = peerHexOf(peer);
     if (authenticated === null) {
       dropped['unusable-peer'] = (dropped['unusable-peer'] ?? 0) + 1;
+      return;
+    }
+    const arrived = event.streamId;
+    const pinned = arrivesOn.get(authenticated);
+    if (pinned !== undefined && arrived !== undefined && arrived !== pinned) {
+      // Another stream of THIS peer's. Not its store traffic. Another
+      // peer's pin never applies here (STORE-04).
+      dropped['foreign-stream'] = (dropped['foreign-stream'] ?? 0) + 1;
       return;
     }
     // Pin the stream id from a frame the OWNER ACCEPTED, never from
@@ -691,8 +706,15 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
       }
     }
     const outcome = owner.receive(text, authenticated);
-    if (arrived !== undefined && arrivesOn === null && outcome.refused === null) {
-      arrivesOn = arrived;
+    if (
+      arrived !== undefined &&
+      pinned === undefined &&
+      outcome.refused === null &&
+      // Only while the peer holds a handle: an accepted `leave` must not
+      // leave a pin behind that membership pruning already passed over.
+      owner.peers().includes(authenticated)
+    ) {
+      arrivesOn.set(authenticated, arrived);
     }
     dispatched(outcome);
   });
@@ -768,6 +790,7 @@ export function hostStore<S extends object, A extends ActionSpec, I extends Inpu
     closed = true;
     stopSweep();
     unsubscribe();
+    stopPinPruning();
 
     const goodbye = owner.farewell();
     await Promise.all(

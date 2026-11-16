@@ -273,7 +273,7 @@ NET_MESH_INVITE_SCHEMA: Dict[str, Any] = {
         "`join` with the string — plus your mesh's root FINGERPRINT to confirm "
         "out of band (evil-twin defense). This is an operator action that "
         "authorizes a device to join the mesh you control; it does NOT invoke a "
-        "capability. Requires the node to run under your root identity."
+        "capability. Requires your root identity."
     ),
     "parameters": {
         "type": "object",

@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,6 +72,11 @@ pub enum DelegationReject {
     /// The chain itself failed to verify (root anchor / revocation / validity /
     /// continuity / scope); carries the underlying token-error kind.
     Chain(String),
+    /// A revocation store is configured but has never loaded successfully
+    /// (unreadable or corrupt since the gate was built), so the gate has no
+    /// revocation floors to check against and admits nothing delegated until
+    /// it does. Carries the load error.
+    RevocationUnavailable(String),
 }
 
 impl std::fmt::Display for DelegationReject {
@@ -93,6 +98,15 @@ impl std::fmt::Display for DelegationReject {
             }
             Self::Replay => write!(f, "delegation nonce already seen (replay)"),
             Self::Chain(k) => write!(f, "delegation chain does not verify: {k}"),
+            // This text is returned to the remote caller (the wire error's
+            // message), so it must not carry the load error: that names the
+            // provider's local store path and filesystem / parser details.
+            // The detail is logged locally where the load fails, and stays
+            // available in the variant's payload.
+            Self::RevocationUnavailable(_) => write!(
+                f,
+                "the provider's revocation store has not loaded yet; delegated invokes are refused"
+            ),
         }
     }
 }
@@ -133,10 +147,17 @@ pub struct DelegationGate {
     /// Optional machine-shared revocation store. When set, each verify reloads
     /// its floors into `revocation` (cheap JSON read) *before* the chain check,
     /// so an operator's `RevocationStore::revoke_below` reaches a running
-    /// provider without a restart. Floors are monotonic, so a transient read
-    /// error just keeps the last-known floors (logged, never fail-open into
-    /// *granting* — the chain must still root-anchor + verify).
+    /// provider without a restart. Floors are monotonic, so once a load has
+    /// succeeded a later read error just keeps the last-known floors (logged).
+    /// Before the first successful load there ARE no known floors — an empty
+    /// registry would admit an already-revoked chain — so delegated invokes
+    /// are refused until one succeeds (see `revocations_loaded`).
     revocation_store: Option<PathBuf>,
+    /// Whether `revocation_store` has loaded successfully at least once. An
+    /// absent store file is a successful (empty) load — the established
+    /// first-run contract of [`RevocationStore::load`]; only an unreadable or
+    /// corrupt file leaves this unset.
+    revocations_loaded: AtomicBool,
 }
 
 impl std::fmt::Debug for DelegationGate {
@@ -163,14 +184,35 @@ impl DelegationGate {
             nonces: Mutex::new(HashMap::new()),
             audit: None,
             revocation_store: None,
+            revocations_loaded: AtomicBool::new(false),
         }
     }
 
     /// Honor a machine-shared [`RevocationStore`] at `path`: each verify reloads
     /// its floors first, so an operator's revocation of a delegated gateway
     /// reaches this running provider without a restart.
+    ///
+    /// **Fail-closed cold start:** until the store has loaded successfully once
+    /// (a missing file counts — it is an empty store), every delegated invoke
+    /// is rejected with [`DelegationReject::RevocationUnavailable`]. After that,
+    /// a failed reload keeps the last-known floors.
     pub fn with_revocation_store(mut self, path: impl Into<PathBuf>) -> Self {
         self.revocation_store = Some(path.into());
+        self
+    }
+
+    /// Seed the gate with a snapshot of its revocation store that the caller
+    /// has already loaded (e.g. a startup preflight), so the gate starts WARM:
+    /// its floors are in the registry and the store counts as loaded.
+    ///
+    /// Without this, the gate's first floors come from its first verify. A
+    /// store that was deleted or rolled back between the preflight and that
+    /// verify would then load as empty — a successful load — and the cold
+    /// gate would admit a chain the preflighted store revoked. Floors only
+    /// rise, so once seeded a later absent or older store cannot lower them.
+    pub fn with_initial_revocations(self, store: &RevocationStore) -> Self {
+        store.apply_to(&self.revocation);
+        self.revocations_loaded.store(true, Ordering::Release);
         self
     }
 
@@ -252,7 +294,7 @@ impl DelegationGate {
         //     provider. The presenter is the leaf itself (step [2] already bound
         //     the caller to the leaf), so `verify` enforces root-anchor +
         //     continuity + scope + revocation + time bounds.
-        self.refresh_revocations();
+        self.refresh_revocations()?;
         chain
             .verify(&leaf, &self.owner_root, &self.revocation, self.skew_secs)
             .map_err(|e| DelegationReject::Chain(format!("{e:?}")))?;
@@ -274,18 +316,34 @@ impl DelegationGate {
         Ok(leaf)
     }
 
-    /// Reload the shared revocation floors into `revocation` (monotonic). A
-    /// read/parse error keeps the last-known floors and logs — never opens a
-    /// hole, since the chain must still root-anchor + verify regardless.
-    fn refresh_revocations(&self) {
-        if let Some(path) = &self.revocation_store {
-            match RevocationStore::load(path) {
-                // Floors and revoked subjects both land in the registry,
-                // which `chain.verify` consults for every link.
-                Ok(store) => store.apply_to(&self.revocation),
-                Err(e) => eprintln!(
-                    "net wrap: revocation store unreadable ({e}); keeping last-known floors"
-                ),
+    /// Reload the shared revocation floors into `revocation` (monotonic).
+    ///
+    /// A read/parse error after a successful load keeps the last-known floors
+    /// and logs. A read/parse error before ANY successful load is a rejection:
+    /// the registry then holds no floors at all, and verifying against it
+    /// would admit a chain the store revokes (CONSENT-03).
+    fn refresh_revocations(&self) -> Result<(), DelegationReject> {
+        let Some(path) = &self.revocation_store else {
+            return Ok(());
+        };
+        match RevocationStore::load(path) {
+            // Floors and revoked subjects both land in the registry,
+            // which `chain.verify` consults for every link.
+            Ok(store) => {
+                store.apply_to(&self.revocation);
+                self.revocations_loaded.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(e) if self.revocations_loaded.load(Ordering::Acquire) => {
+                eprintln!("net wrap: revocation store unreadable ({e}); keeping last-known floors");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "net wrap: revocation store unreadable ({e}) and never loaded; \
+                     refusing delegated invokes until it loads"
+                );
+                Err(DelegationReject::RevocationUnavailable(e.to_string()))
             }
         }
     }
@@ -728,6 +786,143 @@ mod tests {
         .with_revocation_store(&path);
         let env = envelope(&helper, TOOL, ARGS, now_secs(), 1);
         assert!(g.verify(TOOL, ARGS, &chain, &env).is_err());
+    }
+
+    #[test]
+    fn a_cold_gate_with_an_unloadable_store_admits_nothing_delegated() {
+        // CONSENT-03: the machine's gateway delegation is revoked in the
+        // store, then the store becomes corrupt and the provider restarts. A
+        // fresh gate has an empty registry; verifying against it would admit
+        // the revoked chain. Until the store loads once, nothing is admitted.
+        let (root, machine, gateway) = identities();
+        let chain = chain_for(&root, &machine, &gateway).to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        RevocationStore::revoke_below(&path, machine.entity_id(), 1).unwrap();
+        let revoked = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let g = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path);
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
+        assert!(
+            matches!(
+                g.verify(TOOL, ARGS, &chain, &env),
+                Err(DelegationReject::RevocationUnavailable(_))
+            ),
+            "a cold gate must not verify against an empty registry",
+        );
+
+        // Once the store loads, its floor applies: the revoked chain is still
+        // refused, now for the right reason.
+        std::fs::write(&path, &revoked).unwrap();
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 2);
+        assert!(matches!(
+            g.verify(TOOL, ARGS, &chain, &env),
+            Err(DelegationReject::Chain(_))
+        ));
+    }
+
+    #[test]
+    fn a_gate_seeded_by_the_preflight_keeps_its_floors_if_the_store_then_disappears() {
+        // `wrap` loads the store before it starts. If the file is then
+        // removed before the first invoke, the gate's own first load reads
+        // it as an empty store — a successful load — so an unseeded cold
+        // gate would admit the revoked chain. Seeded with the preflight's
+        // snapshot, the floor is already in place and only rises.
+        let (root, machine, gateway) = identities();
+        let chain = chain_for(&root, &machine, &gateway).to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        RevocationStore::revoke_below(&path, machine.entity_id(), 1).unwrap();
+        let preflight = RevocationStore::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let unseeded = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path);
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
+        assert!(
+            unseeded.verify(TOOL, ARGS, &chain, &env).is_ok(),
+            "precondition: an unseeded cold gate reads the vanished store as empty"
+        );
+
+        let seeded = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path)
+        .with_initial_revocations(&preflight);
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 2);
+        assert!(
+            matches!(
+                seeded.verify(TOOL, ARGS, &chain, &env),
+                Err(DelegationReject::Chain(_))
+            ),
+            "the preflighted floor must still refuse the revoked chain"
+        );
+    }
+
+    #[test]
+    fn the_unloaded_store_rejection_does_not_tell_the_caller_the_store_path() {
+        // The rejection's text is the remote caller's wire message.
+        let reject = DelegationReject::RevocationUnavailable(
+            "C:\\Users\\op\\AppData\\Local\\net-mesh\\revocations.json: expected value at line 1"
+                .into(),
+        );
+        let message = reject.to_string();
+        assert!(!message.contains("revocations.json"), "{message}");
+        assert!(!message.contains("line 1"), "{message}");
+        assert!(message.contains("not loaded"), "{message}");
+    }
+
+    #[test]
+    fn a_warm_gate_keeps_last_known_floors_when_a_reload_fails() {
+        // The established warm behaviour is unchanged: after one successful
+        // load, an unreadable store keeps the learned floors (the revoked
+        // chain stays refused) and does not stop unrevoked delegates.
+        let (root, machine, gateway) = identities();
+        let chain = chain_for(&root, &machine, &gateway).to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.json");
+        let g = DelegationGate::new(
+            root.entity_id().clone(),
+            Arc::new(RevocationRegistry::new()),
+        )
+        .with_revocation_store(&path);
+
+        // A missing store is a successful, empty first load.
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
+        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok());
+
+        // An unreadable store after a good load: last-known (empty) floors,
+        // so the unrevoked delegate is still admitted.
+        std::fs::write(&path, b"{ not json").unwrap();
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 2);
+        assert!(g.verify(TOOL, ARGS, &chain, &env).is_ok());
+
+        // Learn a revocation, then lose the store again: the floor sticks.
+        std::fs::remove_file(&path).unwrap();
+        RevocationStore::revoke_below(&path, machine.entity_id(), 1).unwrap();
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 3);
+        assert!(matches!(
+            g.verify(TOOL, ARGS, &chain, &env),
+            Err(DelegationReject::Chain(_))
+        ));
+        std::fs::write(&path, b"{ not json").unwrap();
+        let env = envelope(&gateway, TOOL, ARGS, now_secs(), 4);
+        assert!(
+            matches!(
+                g.verify(TOOL, ARGS, &chain, &env),
+                Err(DelegationReject::Chain(_))
+            ),
+            "a learned floor survives a later unreadable store",
+        );
     }
 
     #[test]

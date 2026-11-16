@@ -90,11 +90,7 @@ impl LockGuard {
     pub async fn acquire(store_path: &Path) -> Result<Self, StoreError> {
         const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
-        // Sidecar path from the raw OS path bytes — not the lossy
-        // `display()` — so non-UTF-8 paths still lock the right file.
-        let mut lock_os = store_path.as_os_str().to_os_string();
-        lock_os.push(".lock");
-        let lock_path = PathBuf::from(lock_os);
+        let lock_path = lock_path_for(store_path);
 
         if let Some(parent) = lock_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -169,7 +165,10 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     // `core::canonical` — a different encoder entirely, untouched here.)
     let bytes = serde_json::to_vec(value).map_err(|e| StoreError::io(path, e))?;
 
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // The staging name is chosen by the create below (a taken one is
+    // skipped); until then this placeholder only names errors.
+    let mut tmp = staging_path(path);
+    let mut created = false;
     let result: Result<(), StoreError> = async {
         // Created with its permissions already in place — owner-only from
         // the instant the name exists. This is why it is a create rather
@@ -179,29 +178,39 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         // There must be no window at all, not merely a short one.
         //
         // `create_new` also means a leftover temp from a crashed same-pid
-        // process cannot be silently reused with its old permissions.
+        // process cannot be silently reused with its old permissions. A
+        // taken name is skipped for the next candidate, never removed: an
+        // existing file there is not established to be ours.
         // Off the reactor: `create_owner_only` is synchronous, and on
         // Windows it is several blocking syscalls (token read, SDDL
         // conversion, `CreateFileW`). A custom store path on a network or
         // FUSE filesystem can make those slow, and every payment passes
         // through here — a stalled worker would stall concurrent
         // payments, not merely this one.
-        let tmp_for_create = tmp.clone();
-        let file = tokio::task::spawn_blocking(move || {
-            match super::file_mode::create_owner_only(&tmp_for_create) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Stale temp from a dead same-pid process. Remove and
-                    // retry once, so recovery needs no manual cleanup
-                    // while a live conflict still surfaces.
-                    let _ = std::fs::remove_file(&tmp_for_create);
-                    super::file_mode::create_owner_only(&tmp_for_create)
+        let first = tmp.clone();
+        let store = path.to_path_buf();
+        let (staged, file) = tokio::task::spawn_blocking(move || {
+            const ATTEMPTS: usize = 64;
+            let mut candidate = first;
+            let mut attempt = 1;
+            loop {
+                match super::file_mode::create_owner_only(&candidate) {
+                    Ok(file) => return (candidate, Ok(file)),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < ATTEMPTS =>
+                    {
+                        attempt += 1;
+                        candidate = staging_path(&store);
+                    }
+                    Err(e) => return (candidate, Err(e)),
                 }
-                other => other,
             }
         })
         .await
-        .map_err(|e| StoreError::io(&tmp, e))?
         .map_err(|e| StoreError::io(&tmp, e))?;
+        let file = file.map_err(|e| StoreError::io(&staged, e))?;
+        tmp = staged;
+        created = true;
         let mut file = tokio::fs::File::from_std(file);
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&bytes)
@@ -218,7 +227,9 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     }
     .await;
 
-    if result.is_err() {
+    // Only a temp this save created is removed: a name it could not create
+    // belongs to someone else.
+    if result.is_err() && created {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     result
@@ -272,10 +283,170 @@ where
     Ok(result)
 }
 
+/// The lock sidecar for `store`: `<store>.lock`, exactly as every earlier
+/// version names it, so processes of different versions still exclude each
+/// other. Only a filename too long to take the `.lock` suffix within the
+/// 255-byte component limit — one no earlier version could lock at all —
+/// uses the bounded per-store name from [`sibling_path`] instead.
+fn lock_path_for(store: &Path) -> PathBuf {
+    // From the raw OS path bytes — not the lossy `display()` — so non-UTF-8
+    // paths still lock the right file.
+    let mut lock_os = store.as_os_str().to_os_string();
+    lock_os.push(".lock");
+    let legacy = PathBuf::from(lock_os);
+    if legacy.file_name().is_some_and(|n| n.len() <= 255) {
+        legacy
+    } else {
+        sibling_path(store, ".lock")
+    }
+}
+
+/// A unique staging name beside `path` that keeps its FULL filename:
+/// `<filename>.tmp.<pid>.<seq>`. `with_extension("tmp.<pid>")` replaced the
+/// extension instead, so two stores sharing a stem in one directory (`x.json`
+/// and `x.pins`) staged through ONE name while their locks never serialized
+/// them (PSTORE-03). The sequence is process-wide, so two saves in one
+/// process never share a name either; create it with `create_new`.
+///
+/// A store whose filename is already near the 255-byte component limit has
+/// no room for the suffix, and the save would fail with ENAMETOOLONG; it then
+/// stages under a short name beside it (see [`sibling_path`]), still unique
+/// by pid and sequence.
+fn staging_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sibling_path(path, &format!(".tmp.{}.{seq}", std::process::id()))
+}
+
+/// `<filename><suffix>` beside `path` — or, when that would exceed the
+/// 255-byte file-name component limit (ext4/XFS/APFS bytes, NTFS UTF-16
+/// units), the short `.net-mesh-store.<id><suffix>`, where `<id>` is 16 hex
+/// digits of a hash of the store's filename. The short form is therefore
+/// specific to its store, never a name another store in the directory (or a
+/// file the operator chose) shares by construction.
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    const MAX_NAME_COMPONENT: usize = 255;
+    let file_name = path.file_name().unwrap_or_default();
+    let mut name = file_name.to_os_string();
+    name.push(suffix);
+    if name.len() <= MAX_NAME_COMPONENT {
+        return path.with_file_name(name);
+    }
+    let id: String = blake3::hash(file_name.as_encoded_bytes()).to_hex()[..16].to_string();
+    path.with_file_name(format!(".net-mesh-store.{id}{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// PSTORE-03: stores sharing a stem never share a staging name, and two
+    /// saves of one store never do either.
+    #[test]
+    fn staging_names_keep_the_full_filename_and_are_unique() {
+        let dir = std::path::Path::new("dir");
+        let a = staging_path(&dir.join("profile.json"));
+        let b = staging_path(&dir.join("profile.pins"));
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name(&a).starts_with("profile.json.tmp."), "{}", name(&a));
+        assert!(name(&b).starts_with("profile.pins.tmp."), "{}", name(&b));
+        assert_ne!(
+            staging_path(&dir.join("x.json")),
+            staging_path(&dir.join("x.json"))
+        );
+    }
+
+    /// A store filename near the 255-byte limit has no room for the staging
+    /// suffix; the stage falls back to a short name in the same directory
+    /// instead of failing the save with ENAMETOOLONG.
+    #[test]
+    fn a_near_limit_store_name_stages_within_the_name_limit() {
+        let dir = std::path::Path::new("some").join("dir");
+        let long = staging_path(&dir.join("s".repeat(250)));
+        let name = long.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 255, "{}", name.len());
+        assert!(name.starts_with(".net-mesh-store."), "{name}");
+        assert!(name.contains(".tmp."), "{name}");
+        assert_eq!(long.parent(), Some(dir.as_path()));
+    }
+
+    /// A file already at the staging name is not this save's: it is skipped
+    /// for the next candidate and left untouched, never removed as stale.
+    /// (The next candidate is predicted from the process-wide sequence;
+    /// nextest runs each test in its own process, so nothing else advances
+    /// it in between.)
+    #[tokio::test]
+    async fn a_taken_staging_name_is_skipped_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let probe = staging_path(&path).to_string_lossy().into_owned();
+        let (head, seq) = probe.rsplit_once('.').unwrap();
+        let next = PathBuf::from(format!("{head}.{}", seq.parse::<u64>().unwrap() + 1));
+        std::fs::write(&next, b"not ours").unwrap();
+        mutate_json::<Counters, _, _>(&path, |s| {
+            *s.counts.entry("a".into()).or_default() += 1;
+        })
+        .await
+        .expect("the save stages past the taken name");
+        assert_eq!(std::fs::read(&next).unwrap(), b"not ours");
+        let loaded: Counters = load_json(&path).await.unwrap();
+        assert_eq!(loaded.counts["a"], 1);
+    }
+
+    /// The short fallback is specific to its store: two near-limit stores in
+    /// one directory never share a fallback prefix, and one store always
+    /// gets the same one.
+    #[test]
+    fn the_short_fallback_is_specific_to_its_store() {
+        let dir = std::path::Path::new("some").join("dir");
+        let prefix = |p: &std::path::Path| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n[..n.find(".tmp.").unwrap()].to_string()
+        };
+        let a = dir.join("a".repeat(250));
+        let b = dir.join("b".repeat(250));
+        assert_ne!(prefix(&staging_path(&a)), prefix(&staging_path(&b)));
+        assert_eq!(prefix(&staging_path(&a)), prefix(&staging_path(&a)));
+    }
+
+    /// Red-witness: with the suffix appended to a near-limit store name the
+    /// staging file (and, above 250 bytes, the `.lock` sidecar) could not be
+    /// created, so a valid custom store path could never be saved. Up to the
+    /// 255-byte limit itself.
+    #[tokio::test]
+    async fn a_near_limit_store_path_saves() {
+        for len in [250, 251, 255] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s".repeat(len));
+            mutate_json::<Counters, _, _>(&path, |s| {
+                *s.counts.entry("a".into()).or_default() += 1;
+            })
+            .await
+            .unwrap_or_else(|e| panic!("a {len}-byte store name saves: {e}"));
+            let loaded: Counters = load_json(&path).await.unwrap();
+            assert_eq!(loaded.counts["a"], 1, "{len}");
+        }
+    }
+
+    /// The lock sidecar keeps the name every earlier version uses whenever it
+    /// fits, so processes of different versions still exclude each other.
+    #[test]
+    fn the_lock_sidecar_keeps_its_name_when_it_fits() {
+        let dir = std::path::Path::new("some").join("dir");
+        assert_eq!(
+            lock_path_for(&dir.join("state.json")),
+            dir.join("state.json.lock")
+        );
+        assert_eq!(
+            lock_path_for(&dir.join("s".repeat(250))),
+            dir.join(format!("{}.lock", "s".repeat(250)))
+        );
+        let long = lock_path_for(&dir.join("s".repeat(251)));
+        let name = long.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 255 && name.ends_with(".lock"), "{name}");
+        assert_eq!(long.parent(), Some(dir.as_path()));
+    }
 
     #[derive(Default, serde::Serialize, serde::Deserialize)]
     struct Counters {

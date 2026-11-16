@@ -64,7 +64,7 @@ fn as_enroll_err(e: Error) -> Error {
 }
 
 /// [`entity_id_from_buffer`] with an `enrollment: ` error.
-fn entity_id(buf: &Buffer) -> Result<net::adapter::net::identity::EntityId> {
+fn entity_id(buf: &[u8]) -> Result<net::adapter::net::identity::EntityId> {
     entity_id_from_buffer(buf).map_err(as_enroll_err)
 }
 
@@ -445,7 +445,7 @@ impl OperatorEnrollment {
     #[napi]
     pub async fn handle_join_request(
         &self,
-        request_bytes: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request_bytes: crate::common::JsBytes,
         grant_ttl_seconds: f64,
         max_depth: Option<u8>,
     ) -> Result<Buffer> {
@@ -454,7 +454,7 @@ impl OperatorEnrollment {
             validate_ttl_seconds("grantTtlSeconds", grant_ttl_seconds).map_err(enroll_err)?,
         );
         let inner = self.inner.clone();
-        let bytes = request_bytes.as_ref().to_vec();
+        let bytes = request_bytes.into_vec();
         let out = off_thread(move || inner.handle_join_request(&bytes, ttl, depth)).await?;
         Ok(Buffer::from(out))
     }
@@ -462,7 +462,10 @@ impl OperatorEnrollment {
     /// Revoke a device: raise its revocation floor (kills all current
     /// delegations) and stamp the inventory. Reads the system clock.
     #[napi]
-    pub async fn revoke(&self, device: Buffer) -> Result<()> {
+    pub async fn revoke(
+        &self,
+        #[napi(ts_arg_type = "Buffer")] device: crate::common::JsBytes,
+    ) -> Result<()> {
         let id = entity_id(&device)?;
         let inner = self.inner.clone();
         off_thread(move || inner.revoke(&id))
@@ -486,7 +489,10 @@ impl OperatorEnrollment {
     /// Prune a device from the inventory entirely (orthogonal to revoking
     /// its floor). Returns whether a record existed.
     #[napi]
-    pub async fn forget(&self, device: Buffer) -> Result<bool> {
+    pub async fn forget(
+        &self,
+        #[napi(ts_arg_type = "Buffer")] device: crate::common::JsBytes,
+    ) -> Result<bool> {
         let id = entity_id(&device)?;
         let inner = self.inner.clone();
         off_thread(move || inner.forget(&id))

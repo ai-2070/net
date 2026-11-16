@@ -11,7 +11,7 @@
 // tests against a live mesh land alongside B7 cross-language
 // integration coverage.
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   classifyError,
@@ -27,6 +27,7 @@ import {
   BreakerOpenError,
   CircuitBreaker,
   appError,
+  callObserverIsolated,
   defaultBreakerFailure,
   defaultRetryable,
   HedgePolicy,
@@ -1535,6 +1536,111 @@ describe('TypedMeshRpc.setObserver', () => {
     expect(typeof installed).toBe('function')
     rpc.setObserver(null)
     expect(installed).toBeNull()
+  })
+
+  // NCALL-03: the installed wrapper runs inside a native threadsafe
+  // function, where an escaping throw becomes `napi_fatal_exception` and
+  // an `async` observer's rejection an unhandled rejection. Neither may
+  // escape the wrapper; both surface as a process warning.
+  const RAW_EVT: RawRpcCallEvent = {
+    caller: 1n,
+    callee: 2n,
+    method: 'svc.obs',
+    latencyMs: 1,
+    statusKind: 'ok',
+    requestBytes: 0,
+    responseBytes: 0,
+    direction: 'outbound',
+    tsUnixMs: 1n,
+  }
+
+  function installWith(handler: (evt: RpcCallEvent) => unknown) {
+    let installed: ((evt: RawRpcCallEvent) => void) | null | undefined
+    const rpc = new TypedMeshRpc(
+      stubRpcForObserver((o) => {
+        installed = o
+      }),
+    )
+    rpc.setObserver(handler as (evt: RpcCallEvent) => void)
+    return installed!
+  }
+
+  it('contains a synchronously throwing observer', () => {
+    const warn = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+    try {
+      const installed = installWith(() => {
+        throw new Error('observer boom')
+      })
+      expect(() => installed(RAW_EVT)).not.toThrow()
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0][0])).toContain('observer boom')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('consumes an async observer rejection instead of leaving it unhandled', async () => {
+    const warn = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const installed = installWith(async () => {
+        throw new Error('async observer boom')
+      })
+      expect(() => installed(RAW_EVT)).not.toThrow()
+      // Let the rejection settle and Node's unhandled-rejection
+      // detection run (it fires after the microtask queue drains).
+      await new Promise((r) => setTimeout(r, 20))
+      expect(unhandled).toEqual([])
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0][0])).toContain('async observer boom')
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      warn.mockRestore()
+    }
+  })
+
+  it('consumes the rejection of an async onError sink', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      callObserverIsolated(
+        () => {
+          throw new Error('observer boom')
+        },
+        async () => {
+          throw new Error('async sink boom')
+        },
+      )
+      callObserverIsolated(
+        async () => {
+          throw new Error('async observer boom')
+        },
+        async () => {
+          throw new Error('async sink boom')
+        },
+      )
+      await new Promise((r) => setTimeout(r, 20))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it('still contains a throw when the warning sink itself fails', () => {
+    const warn = vi.spyOn(process, 'emitWarning').mockImplementation(() => {
+      throw new Error('sink boom')
+    })
+    try {
+      const installed = installWith(() => {
+        throw { toString: () => { throw new Error('unprintable') } }
+      })
+      expect(() => installed(RAW_EVT)).not.toThrow()
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
 

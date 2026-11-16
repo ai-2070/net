@@ -119,6 +119,14 @@ pub struct PaymentServeHandle {
 /// to `provider` (the same [`InProcessProvider`] local flows use).
 /// Provider policy runs inside quote issuance; the engine's replay index
 /// and idempotency make the pay service safe under retries.
+///
+/// **Quotes are issued only on published terms.** A remote request's
+/// template must be byte-identical to an `accepts[]` entry published for
+/// the capability's tool on the provider's engine
+/// ([`crate::engine::PaymentEngine::publish_offers`]) — which the
+/// engine-backed gates do as their serving paths announce a price — or it
+/// is refused. A provider that serves this wire without publishing any
+/// terms quotes nothing (fail closed).
 pub fn serve_payments(
     mesh: &Mesh,
     provider: Arc<InProcessProvider>,
@@ -202,19 +210,21 @@ pub fn serve_payments(
                     )
                     .map_err(|e| e.to_string())?;
 
-                // From here the caller identity is proven, not claimed.
-                let issued = provider
-                    .quote(
-                        &verified.caller,
-                        provider.provider_id(),
-                        &verified.capability,
-                        &template,
-                        // The hash rides inside the signed request, so a
-                        // relay cannot add, drop, or rewrite the input a
-                        // quote is bound to.
-                        verified.input_hash.as_deref(),
-                    )
-                    .await;
+                // From here the caller identity is proven, not claimed —
+                // but the template is still only the caller's *choice*. The
+                // price, recipient, asset, scheme and network the provider
+                // signs are the ones it published for this tool; a request
+                // naming anything else (a smaller amount, its own `payTo`)
+                // is refused, never signed (`quote_published`).
+                let issued = provider.quote_published(
+                    &verified.caller,
+                    &verified.capability,
+                    &template,
+                    // The hash rides inside the signed request, so a
+                    // relay cannot add, drop, or rewrite the input a
+                    // quote is bound to.
+                    verified.input_hash.as_deref(),
+                );
                 let quote_bytes = match issued {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -480,6 +490,18 @@ impl net_sdk::tool_payment::ToolPaymentGate for EngineToolPaymentGate {
         // so the fail-closed mapping cannot drift — see `flow::redeem_via_engine`.
         crate::flow::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
     }
+
+    /// The served descriptor's announced terms become the engine's quote
+    /// authority for the tool (see [`crate::engine::PaymentEngine::publish_offers`]).
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        self.engine
+            .publish_offers(tool_id, pricing_terms.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.engine.withdraw_offers(tool_id);
+    }
 }
 
 /// The provider-side gate for **paid A2A tasks**
@@ -512,5 +534,17 @@ impl net_sdk::a2a_payment::TaskAdmissionGate for EngineTaskAdmissionGate {
         // Single denial-render site, shared with the tool gate's mapping
         // — see `flow::redeem_task_via_engine`.
         crate::flow::redeem_task_via_engine(&self.engine, claim).await
+    }
+
+    /// The catalog's announced terms become the engine's quote authority
+    /// for the task tool (see [`crate::engine::PaymentEngine::publish_offers`]).
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        self.engine
+            .publish_offers(tool_id, pricing_terms.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.engine.withdraw_offers(tool_id);
     }
 }

@@ -233,21 +233,49 @@ pub struct VerifiedOwner {
     org: super::super::org::OrgId,
     /// The verified certificate's revocation generation.
     generation: u32,
+    /// DISC-05: the unix second from which the verified certificate is
+    /// no longer valid — its `not_after` plus the clock-skew tolerance
+    /// ingest verified it with, i.e. exactly the deadline ingest's own
+    /// window check would enforce. Ownership is proven only while the
+    /// certificate is; the announcement (and its public capability) can
+    /// outlive it, so every ownership query re-checks this deadline
+    /// instead of reporting a projection verified once at ingest
+    /// forever.
+    valid_until: u64,
 }
 
 impl VerifiedOwner {
     /// In-crate constructor — the verification bridge is the only
-    /// legitimate producer; everything else consumes.
+    /// legitimate producer; everything else consumes. `valid_until`
+    /// is the unix second at which the verified certificate stops
+    /// being valid (see [`Self::valid_until`]).
     pub(crate) fn new(
         member: &crate::adapter::net::identity::EntityId,
         org: super::super::org::OrgId,
         generation: u32,
+        valid_until: u64,
     ) -> Self {
         Self {
             member: *member.as_bytes(),
             org,
             generation,
+            valid_until,
         }
+    }
+
+    /// The unix second from which the verified certificate is no
+    /// longer valid (its `not_after` plus the ingest skew tolerance).
+    #[inline]
+    pub fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
+
+    /// Whether the verified ownership still holds at `now_secs`
+    /// (unix seconds). Boundary matches the certificate's own window
+    /// check: `now == valid_until` means no longer valid.
+    #[inline]
+    pub fn is_current_at(&self, now_secs: u64) -> bool {
+        now_secs < self.valid_until
     }
 
     /// The verified publishing entity.
