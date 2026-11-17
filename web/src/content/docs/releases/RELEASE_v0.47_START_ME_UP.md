@@ -189,7 +189,7 @@ The C ABI is unchanged.
 
 Bump to 0.47.0 and rebuild, **on every node at once**: a 0.47 node cannot talk to a 0.46 one. Upgrade a browser game's anchor and its pages together.
 
-- **Hermes:** every machine's node identity changes. Update `NET_MESH_PEERS` on other machines and `net wrap --allow <origin>` lists, move same-root providers to `--owner-root`, and re-enroll devices whose operator is a Hermes node. `NET_MESH_NODE_SEED` cannot be set to the root seed, so the node cannot keep running as the root.
+- **Hermes:** every machine's node identity changes. Update `NET_MESH_PEERS` on other machines and `net-mesh wrap --allow <origin>` lists, move same-root providers to `--owner-root`, and re-enroll devices whose operator is a Hermes node. `NET_MESH_NODE_SEED` cannot be set to the root seed, so the node cannot keep running as the root.
 - **Anchors:** if a native peer reached the anchor's mesh socket from another host, pass `--bind <ip>:<port>` explicitly. The anchor warns, because the bootstrap PSK in every browser credential also opens that socket. An anchor on the default ACME cache orders one new certificate on its first start; one with an explicit `--acme-cache` reuses its certificate when the chain verifies for the domain.
 - **Custom enrollment handlers** on the core: answer real grants and call `MeshNode::set_enrollment_subject_binding(true)`.
 - **`wrap`:** make sure its revocation store exists and loads, or pass `--revocation-store`.
