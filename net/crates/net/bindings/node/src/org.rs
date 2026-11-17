@@ -166,13 +166,17 @@ impl OrgClient {
     /// signed proof is bound to one call id, so any second attempt must be a
     /// fresh call the application makes deliberately.
     #[napi]
-    pub async fn call_bytes(&self, service: String, request: Buffer) -> Result<Buffer> {
+    pub async fn call_bytes(
+        &self,
+        service: String,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
+    ) -> Result<Buffer> {
         // Snapshot first: if `close()` lands after this line, the clone keeps
         // the lease and node reference alive until the call completes.
         let client = self.inner.load_full().ok_or_else(|| {
             Error::from_reason("org:credentials:closed: this OrgClient has been closed")
         })?;
-        let body = bytes::Bytes::from(request.to_vec());
+        let body = request.into_bytes();
         let reply = client.call_bytes(&service, body).await.map_err(org_error)?;
         Ok(Buffer::from(reply.to_vec()))
     }
@@ -188,11 +192,15 @@ impl OrgClient {
     /// `callSubnet`: the caller names no subnet, joins no subnet, and
     /// receives no subnet context.
     #[napi]
-    pub async fn call_exported_bytes(&self, service: String, request: Buffer) -> Result<Buffer> {
+    pub async fn call_exported_bytes(
+        &self,
+        service: String,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
+    ) -> Result<Buffer> {
         let client = self.inner.load_full().ok_or_else(|| {
             Error::from_reason("org:credentials:closed: this OrgClient has been closed")
         })?;
-        let body = bytes::Bytes::from(request.to_vec());
+        let body = request.into_bytes();
         let reply = client
             .call_exported_bytes(&service, body)
             .await
@@ -222,7 +230,7 @@ impl OrgClient {
     pub async fn call_streaming_bytes(
         &self,
         service: String,
-        request: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
         deadline_ms: Option<u32>,
         cancel_token: Option<BigInt>,
     ) -> Result<crate::mesh_rpc::RpcStream> {
@@ -233,7 +241,7 @@ impl OrgClient {
             Some(t) => crate::common::bigint_u64(t)?,
             None => 0,
         };
-        let body = bytes::Bytes::from(request.to_vec());
+        let body = request.into_bytes();
         let inner = client
             .call_streaming_bytes_deadline(
                 &service,

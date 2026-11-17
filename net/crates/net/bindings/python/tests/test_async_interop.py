@@ -341,6 +341,99 @@ def test_streaming_mid_iter_cancel_terminates_stream(mesh_pair) -> None:
     assert asyncio.run(_run())
 
 
+def test_cancelling_a_ready_pull_terminates_the_stream(mesh_pair) -> None:
+    """PYBR-02: cancel a pull whose chunk is already buffered.
+
+    The bridge polls the Rust pull before its cancellation receiver, so
+    the pull resolves with the buffered chunk, and the cancelled Python
+    future then discards it. Before the fix nothing cancelled the
+    substrate call: the chunk was silently lost and the stream carried
+    on to a clean EOF. A cancelled pull must terminate the WHOLE stream
+    with a cancellation error instead.
+    """
+    from net import RpcCancelledError
+
+    import threading
+
+    a, b = mesh_pair
+    srv = MeshRpc(b)
+    all_sent = threading.Event()
+
+    def _producer(_req: bytes, sink) -> None:
+        for i in range(3):
+            sink.send(str(i).encode())
+        all_sent.set()
+        # Keep the stream open so the buffered chunks are not followed
+        # by an EOF terminal while the client cancels.
+        import time as _time
+
+        _time.sleep(3.0)
+
+    h = srv.serve_streaming("pull-cancel", _producer, 60_000)
+
+    async def _run() -> list:
+        acli = AsyncMeshRpc(a)
+        await asyncio.sleep(0.5)
+        stream = await acli.call_streaming(b.node_id, "pull-cancel", b"go")
+        assert await asyncio.wait_for(stream.__anext__(), timeout=2.0) == b"0"
+        # Synchronize with the producer rather than guessing: wait until
+        # chunks 1 and 2 have been SENT, then give loopback delivery a
+        # moment so the next pull is READY when it is cancelled (the path
+        # this test exists for; a pending pull is cancelled by a different
+        # path that never had the bug).
+        assert await asyncio.to_thread(all_sent.wait, 5.0), "producer stalled"
+        await asyncio.sleep(0.5)
+        pull = stream.__anext__()
+        pull.cancel()
+        await asyncio.sleep(0.3)
+        rest = []
+        with pytest.raises(RpcCancelledError):
+            while True:
+                rest.append(await asyncio.wait_for(stream.__anext__(), timeout=5.0))
+        return rest
+
+    try:
+        rest = asyncio.run(_run())
+        # Whatever drained before the terminal, it is never the chunk the
+        # cancelled pull consumed.
+        assert b"1" not in rest
+    finally:
+        h.close()
+
+
+def test_a_registration_after_shutdown_is_not_retained(next_port) -> None:
+    """PYBR-01: shutdown is terminal for node-owned registrations.
+
+    An AsyncMeshRpc owns its own reference to the node, so it can still
+    register after ``NetMesh.shutdown()`` has swept the node's services.
+    That registration used to be held in a fresh keepalive bucket that
+    no later shutdown would sweep (a repeated shutdown returns early),
+    keeping the service and node alive for the life of the process. It
+    is now refused: the handle comes back already closed.
+    """
+    mesh = NetMesh(
+        bind_addr=next_port(),
+        psk="42" * 32,
+        heartbeat_interval_ms=200,
+        permissive_channels=True,
+    )
+    mesh.start()
+    retained = AsyncMeshRpc(mesh)
+    before = retained.serve("before-shutdown", _sync_echo)
+    assert not before.is_closed()
+
+    mesh.shutdown()
+    assert before.is_closed(), "shutdown releases the services it swept"
+
+    # Not wrapped in a broad `except RuntimeError`: the documented outcome
+    # is an already-closed handle, and any error here is a real failure.
+    after = retained.serve("after-shutdown", _sync_echo)
+    assert after.is_closed(), (
+        "a registration after a completed shutdown must not be retained"
+    )
+    after.close()
+
+
 def test_async_netmesh_shares_handshake_with_sync_netmesh(mesh_pair) -> None:
     """`AsyncNetMesh(mesh)` doesn't re-handshake — the same peer
     connection set up by the sync `NetMesh.connect/.accept` is

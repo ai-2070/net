@@ -609,6 +609,65 @@ impl InProcessProvider {
     pub fn now_ns(&self) -> u64 {
         self.clock.now_ns()
     }
+
+    /// Issue a quote for a request that arrived from **another node** —
+    /// the `net.payments.quote.v1` service's issuance path.
+    ///
+    /// The remote requester chose the template, so it is not authority
+    /// for anything: only terms this provider published for the
+    /// capability's tool ([`PaymentEngine::publish_offers`], which every
+    /// engine-backed gate calls as its serving path announces a price)
+    /// can be signed — byte for byte, so the amount, `payTo`, asset,
+    /// scheme and network are all the provider's. A template that is not
+    /// one of them, or a tool with nothing published, is refused before
+    /// admission or signing (see [`PaymentEngine::issue_offered_quote`]).
+    pub fn quote_published(
+        &self,
+        caller: &EntityId,
+        capability: &str,
+        template: &X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
+    ) -> Result<Vec<u8>, ChannelError> {
+        self.issue(caller, capability, template, input_hash, true)
+    }
+
+    fn issue(
+        &self,
+        caller: &EntityId,
+        capability: &str,
+        template: &X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
+        published_only: bool,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let now_ns = self.clock.now_ns();
+        let issued = if published_only {
+            self.engine.issue_offered_quote(
+                caller.clone(),
+                capability,
+                template.clone(),
+                input_hash,
+                now_ns,
+                self.ttl_ns,
+            )
+        } else {
+            self.engine.issue_quote(
+                caller.clone(),
+                capability,
+                template.clone(),
+                input_hash,
+                now_ns,
+                self.ttl_ns,
+            )
+        };
+        let quote = issued.map_err(|e| ChannelError {
+            message: e.to_string(),
+            retryable: false,
+        })?;
+        crate::core::canonical::canonical_bytes(&quote).map_err(|e| ChannelError {
+            message: e.to_string(),
+            retryable: false,
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -633,26 +692,12 @@ impl ProviderChannel for InProcessProvider {
         // it here only short-circuits that path and reclassifies a policy
         // `Denied` as a transport `Failed`.
         let _ = provider;
-        // Provider policy runs inside issue_quote — never quote a caller
-        // you'd deny.
-        let quote = self
-            .engine
-            .issue_quote(
-                caller.clone(),
-                capability,
-                template.clone(),
-                input_hash,
-                self.clock.now_ns(),
-                self.ttl_ns,
-            )
-            .map_err(|e| ChannelError {
-                message: e.to_string(),
-                retryable: false,
-            })?;
-        crate::core::canonical::canonical_bytes(&quote).map_err(|e| ChannelError {
-            message: e.to_string(),
-            retryable: false,
-        })
+        // In-process the template is this process's own choice (it is the
+        // provider's process), so it is signed as given. Provider policy
+        // runs inside issuance — never quote a caller you'd deny. A quote
+        // request that arrived from another node goes through
+        // [`Self::quote_published`] instead.
+        self.issue(caller, capability, template, input_hash, false)
     }
 
     async fn pay(

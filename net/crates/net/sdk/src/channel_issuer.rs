@@ -95,8 +95,15 @@ impl ChannelLeafIssuer {
         self.grant.scope.intersect(CHANNEL_LINK_RIGHTS)
     }
 
-    /// Whether this issuer can mint exactly `offer`: the same root and
-    /// canonical channel, and rights within the grant.
+    /// Whether this issuer's grant is scoped to mint exactly `offer`: the
+    /// same root and canonical channel, and rights within the grant.
+    ///
+    /// Scope only: a covering grant may still be outside its validity
+    /// window (expired after installation, or installed already expired —
+    /// [`Self::new`] checks the signature, not the clock), in which case
+    /// [`Self::issue`] refuses. Selection among several issuers goes through
+    /// `issue_covering` (crate-internal), which falls through to the next
+    /// covering one.
     pub fn covers(&self, offer: &crate::enrollment::invite::ChannelOffer) -> bool {
         &offer.root == self.root()
             && offer.channel.hash() == self.channel_hash()
@@ -134,4 +141,27 @@ impl ChannelLeafIssuer {
             tokens: vec![self.grant.clone(), leaf],
         })
     }
+}
+
+/// Mint `subject`'s chain for `offer` from the first issuer in `issuers`
+/// that both covers the offer AND can issue under it now.
+///
+/// CISS-01: selection used to stop at the first [`ChannelLeafIssuer::covers`]
+/// match. Coverage is scope only, so an expired grant listed ahead of its
+/// live replacement shadowed it — every redemption of that channel was
+/// refused as unavailable until the stale entry was removed or reordered.
+/// Eligibility is judged by the issuance itself ([`ChannelLeafIssuer::issue`]
+/// re-validates the grant's window against the current clock on every
+/// call), so a candidate that cannot issue now is skipped rather than
+/// chosen, and no separate, raceable "is it live" pre-check is needed.
+/// `None` when no configured issuer can honour the offer.
+pub(crate) fn issue_covering(
+    issuers: &[ChannelLeafIssuer],
+    offer: &crate::enrollment::invite::ChannelOffer,
+    subject: &EntityId,
+) -> Option<TokenChain> {
+    issuers
+        .iter()
+        .filter(|issuer| issuer.covers(offer))
+        .find_map(|issuer| issuer.issue(subject, offer.rights).ok())
 }

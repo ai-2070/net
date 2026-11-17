@@ -224,6 +224,15 @@ impl AcmeConfig {
         }
     }
 
+    /// Where the certificate for this domain, issued by this
+    /// directory, is cached: `<cache_dir>/directory-<id>/<domain>/`,
+    /// where `<id>` names [`Self::directory_url`]. A certificate
+    /// belongs to the directory that issued it, so staging and
+    /// production never share one (TLS-02).
+    pub fn certificate_cache_dir(&self) -> PathBuf {
+        crate::rtc_bootstrap_acme::domain_cache_dir(self)
+    }
+
     /// Verify the directory connection against these roots instead
     /// of the platform store — see [`Self::directory_roots`].
     pub fn with_directory_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {

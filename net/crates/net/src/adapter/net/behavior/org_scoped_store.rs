@@ -36,7 +36,8 @@ use std::sync::Arc;
 
 use super::org::OrgId;
 use super::org_grant::CapabilityAuthorityId;
-use super::org_revocation::OrgRevocationState;
+use super::org_grant_revocation::RevokedGrantKind;
+use super::org_revocation::{OrgRevocationState, RevokedGrantKey};
 use super::org_scoped_ingest::{
     CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
 };
@@ -1166,6 +1167,54 @@ impl ScopedDiscoveryState {
         retract.len()
     }
 
+    /// Dirty the capabilities whose provider set changed because a
+    /// capability-grant REVOCATION landed (ORG-02).
+    ///
+    /// The grant-revocation counterpart of [`Self::note_floors_raised`]: query
+    /// currentness already hides a record whose grant its issuer revoked, so the
+    /// revocation moves a capability's visible provider set with no store
+    /// mutation, and must dirty and wake exactly like a floor raise or a consumer
+    /// projection keeps serving a provider whose grant was withdrawn. Only
+    /// `Capability` revocations name scoped records (a dispatcher grant never
+    /// authorizes discovery). A record is retracted on the transition out of the
+    /// floor-visible set, so a repeated revocation or an install-snapshot replay
+    /// retracts nothing twice. Grant revocations are rare, so the floor-visible
+    /// set is scanned rather than indexed by grant. Returns how many records
+    /// this revocation retracted.
+    pub(crate) fn note_grants_revoked(&mut self, revoked: &[RevokedGrantKey]) -> usize {
+        let revoked: BTreeSet<(OrgId, [u8; 32])> = revoked
+            .iter()
+            .filter(|(_, kind, _)| *kind == RevokedGrantKind::Capability)
+            .map(|(org, _, grant_id)| (*org, *grant_id))
+            .collect();
+        if revoked.is_empty() {
+            return 0;
+        }
+        let mut retract: BTreeSet<ScopedKey> = BTreeSet::new();
+        for keys in self.index.floor_visible_by_provider.values() {
+            for key in keys {
+                let CapabilityAudienceScope::Grant { grant_id, .. } = &key.0 else {
+                    continue;
+                };
+                let Some(record) = self.store.live_record(key) else {
+                    continue;
+                };
+                if revoked.contains(&(*record.owner_org(), *grant_id)) {
+                    retract.insert(key.clone());
+                }
+            }
+        }
+        let mut global = BTreeSet::new();
+        let mut owner = BTreeSet::new();
+        for key in &retract {
+            note_removed_record(&self.index, key, &mut global, &mut owner);
+            self.index.retract_floor_visibility(key);
+            self.forget_live_expiry(key);
+        }
+        self.record_change(&global, &owner);
+        retract.len()
+    }
+
     /// Test-only: advance the query-visible generation and dirty `capability`
     /// exactly as a real mutation would, without constructing one.
     ///
@@ -1711,8 +1760,27 @@ impl PrivateDiscoveryDrains {
 /// returned — the exact `cert.generation < floor` gate the ingest path applied,
 /// re-evaluated against the CURRENT floor view so a post-insert revocation
 /// retracts the record without a re-announce or sweep.
+///
+/// ORG-02: a GRANT-scoped record is likewise current only while its grant is
+/// unrevoked. Ingest verified the grant against the issuer's revocation view of
+/// that instant; a capability-grant revocation applied since withdraws the
+/// grant's DISCOVER authority, so the record stops being returned at once —
+/// the same read-time retraction a floor raise gets. The record's `owner_org`
+/// is the grant's issuer (ingest requires it), which is the org whose
+/// revocations count.
 fn is_current(cap: &VerifiedScopedCapability, floors: &OrgRevocationState) -> bool {
     floors.floor_for(cap.owner_org(), cap.provider()) <= cap.provider_cert_generation()
+        && !grant_revoked(cap, floors)
+}
+
+/// Whether `cap` is grant-scoped and its grant has been revoked by its issuer.
+fn grant_revoked(cap: &VerifiedScopedCapability, floors: &OrgRevocationState) -> bool {
+    match cap.scope() {
+        CapabilityAudienceScope::Grant { grant_id, .. } => {
+            floors.is_grant_revoked(cap.owner_org(), RevokedGrantKind::Capability, grant_id)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

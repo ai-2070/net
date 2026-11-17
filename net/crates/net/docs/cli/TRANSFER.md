@@ -113,8 +113,11 @@ once (default: the SDK's `DEFAULT_FETCH_CONCURRENCY`).
 
 ## 4. Atomicity guarantees
 
-- **`recv-blob`** writes to a `<out>.partial` sibling, then renames over
-  `<out>` on success. A reader never observes a half-written target.
+- **`recv-blob`** writes to a fresh `<out>.partial.<nonce>` sibling,
+  created exclusively (it never truncates or follows anything already
+  there), then renames it over `<out>` on success. A reader never observes
+  a half-written target, and concurrent receives to the same `<out>` each
+  stage into their own file — the last commit wins with an intact payload.
 - **`recv-dir`** delegates to `fetch_dir`, which reconstructs into a
   sibling temp directory and atomically renames it into place
   (`FETCH_DIR_ATOMIC_PLAN.md`, commit 636d31e). On any failure it rolls
@@ -128,9 +131,9 @@ backup-and-rollback design.
 
 ## 5. Failure modes + recovery
 
-- **`<out>.partial` left behind (`recv-blob`)** — the fetch or the rename
-  failed. The partial is *not* auto-cleaned so you can inspect it; delete
-  it and re-run once the cause (network, disk space) is resolved.
+- **`<out>.partial.<nonce>` left behind (`recv-blob`)** — the fetch or the
+  rename failed. The partial is *not* auto-cleaned so you can inspect it
+  (each attempt leaves its own; match `<out>.partial.*`); delete it and re-run once the cause (network, disk space) is resolved.
 - **`recv-dir` failure** — the target is untouched; no partial directory
   is left in place (the temp dir is cleaned up on rollback). Re-run.
 - **Network drop mid-transfer** — the engine retries failed chunks within
@@ -249,7 +252,7 @@ bytes are partitioned. The `recv-dir` summary reports
 
 `send-blob` and `recv-blob` **stream to and from disk** — they never hold
 the whole blob in memory. `recv-blob` writes each verified chunk to
-`<out>.partial` as it arrives; `send-blob` reads the source (file or
+its `<out>.partial.<nonce>` staging file as it arrives; `send-blob` reads the source (file or
 stdin) one chunk at a time, hashing and (with `--store`) persisting each
 before reading the next. Peak memory is roughly **one chunk** (4 MiB), so
 the practical size ceiling for a single file is free disk, not RAM.

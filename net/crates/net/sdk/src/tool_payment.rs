@@ -96,6 +96,80 @@ pub trait ToolPaymentGate: Send + Sync {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), GateDenial>;
+
+    /// The serving path is about to announce `pricing_terms` (canonical
+    /// `net.pricing.terms@1` JSON) for `tool_id`: make them the
+    /// provider's quote authority. An engine-backed gate registers them so
+    /// the provider signs quotes only on the terms it announced — a quote
+    /// request's template is the requester's choice, never authority for
+    /// the price or recipient. `Err(reason)` refuses the serve.
+    ///
+    /// The default does nothing, for gates with no quote issuance of their
+    /// own (scripted test gates). `Mesh::serve_tool_paid` calls it once the
+    /// tool is registered and before its handler is served.
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        let _ = (tool_id, pricing_terms);
+        Ok(())
+    }
+
+    /// The serving path stopped (or never started) serving `tool_id` that
+    /// it published terms for: withdraw them as quote authority, so the
+    /// provider stops signing quotes a caller would pay for with no handler
+    /// left to serve them. Quotes already signed are unaffected. Called on
+    /// every rollback of a failed serve and when the serving handle is
+    /// released. The default does nothing, like the default `publish_offer`.
+    fn withdraw_offer(&self, tool_id: &str) {
+        let _ = tool_id;
+    }
+}
+
+/// Withdraws, when dropped, the offers a serving path published as quote
+/// authority (`publish_offer` on a [`ToolPaymentGate`] or
+/// [`TaskAdmissionGate`](crate::a2a_payment::TaskAdmissionGate)).
+///
+/// A serving handle holds one as its FIRST field, so the offers are
+/// withdrawn before its handler registrations are released: no other serve
+/// can claim the same tool id (and publish its own terms) until this
+/// withdrawal has run, so it never removes a successor's offer. A failed
+/// serve drops it on the rollback path, withdrawing whatever it had
+/// published.
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
+pub(crate) struct OfferWithdrawal {
+    withdraw: Box<dyn Fn(&str) + Send + Sync>,
+    tool_ids: Vec<String>,
+}
+
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
+impl OfferWithdrawal {
+    pub(crate) fn new(withdraw: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            withdraw: Box::new(withdraw),
+            tool_ids: Vec::new(),
+        }
+    }
+
+    /// Record `tool_id` as published, to withdraw on drop.
+    pub(crate) fn published(&mut self, tool_id: String) {
+        self.tool_ids.push(tool_id);
+    }
+}
+
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
+impl Drop for OfferWithdrawal {
+    fn drop(&mut self) {
+        for tool_id in &self.tool_ids {
+            (self.withdraw)(tool_id);
+        }
+    }
+}
+
+#[cfg(all(feature = "cortex", any(feature = "tool", feature = "net")))]
+impl std::fmt::Debug for OfferWithdrawal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OfferWithdrawal")
+            .field("tool_ids", &self.tool_ids)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Object tag of the failure schematic. SDK wire vocabulary (like

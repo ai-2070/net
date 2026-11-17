@@ -25,7 +25,9 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
 use net::adapter::net::behavior::fold::capability_bridge::{may_execute, owner_org_for};
 use net::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert, OrgRevocationBundle};
-use net::adapter::net::behavior::org_authority::NodeAuthority;
+use net::adapter::net::behavior::org_authority::{
+    NodeAuthority, OrgAuthorityError, OwnerAudienceCredential,
+};
 use net::adapter::net::behavior::org_revocation::{OrgRevocationStore, ProvisioningExpectation};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -240,6 +242,37 @@ async fn install_refuses_foreign_authority() {
     );
 }
 
+/// ORG-03: the runtime install boundary refuses an authority whose owner
+/// audience names another org. `NodeAuthority`'s fields are public, so an
+/// object assembled outside `NodeAuthority::open` reaches the install path
+/// with whatever audience it carries; pairing org A's audience with this
+/// org's membership would seal the owner-private catalog under A's key.
+#[tokio::test]
+async fn install_refuses_an_audience_of_another_org() {
+    let node = build_node().await;
+    let dir = scratch_dir("install-audience");
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 3600).expect("issue");
+    let mut authority = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt");
+    let foreign_org = OrgKeypair::from_bytes([0x99u8; 32]).org_id();
+    authority.audience = OwnerAudienceCredential::generate(foreign_org);
+    let err = node
+        .install_node_authority(Arc::new(authority))
+        .expect_err("a foreign-org audience must not install");
+    assert!(
+        matches!(
+            err,
+            OrgAuthorityError::AudienceForeignOrg { audience_org, owner_org }
+                if audience_org == foreign_org && owner_org == org().org_id()
+        ),
+        "expected AudienceForeignOrg, got {err:?}"
+    );
+    assert!(
+        node.node_authority().is_none(),
+        "the refused authority must not be published"
+    );
+}
+
 /// Review-8 §4: an installed revocation store never lowers — a
 /// stale independently opened store is refused; the same store is
 /// idempotent.
@@ -289,6 +322,99 @@ async fn store_replacement_never_lowers_the_live_view() {
         5,
         "live floor must remain 5"
     );
+}
+
+/// ORG-01: replacement dominance covers GRANT revocations, not only floors.
+/// A candidate store with equal floors (here: none at all — an older backup)
+/// that lacks an unexpired capability-grant revocation must not replace the
+/// installed one, or the withdrawn grant becomes usable again with no new
+/// root signature. A candidate holding the revocation for a shorter horizon
+/// is refused too; one that holds it at least as long is accepted.
+#[tokio::test]
+async fn store_replacement_never_drops_a_grant_revocation() {
+    use net::adapter::net::behavior::org_grant_revocation::{
+        OrgGrantRevocationBundle, RevokedGrant, RevokedGrantKind,
+    };
+    use net::adapter::net::behavior::org_revocation::OrgRevocationError;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let revoked = |not_after: u64| RevokedGrant {
+        kind: RevokedGrantKind::Capability,
+        grant_id: [0x5Cu8; 32],
+        not_after,
+    };
+    let bundle = |not_after: u64| {
+        OrgGrantRevocationBundle::try_issue(&org(), [revoked(not_after)]).expect("issue bundle")
+    };
+    let open = |tag: &str| {
+        Arc::new(
+            OrgRevocationStore::init(
+                scratch_dir(tag).join("revocation-state.json"),
+                ProvisioningExpectation::MayBeFresh,
+            )
+            .expect("init store"),
+        )
+    };
+
+    let node = build_node().await;
+    let installed = open("grant-rev-installed");
+    installed
+        .apply_grant_revocations(&bundle(now + 3_600))
+        .expect("revoke the grant");
+    node.install_org_revocation_store(installed.clone())
+        .expect("install");
+
+    // An older backup: no floors to compare, and no grant revocation.
+    let backup = open("grant-rev-backup");
+    let err = node
+        .install_org_revocation_store(backup)
+        .expect_err("a store lacking the grant revocation must not replace the installed one");
+    assert!(
+        matches!(err, OrgRevocationError::GrantRevocationsNotRetained { .. }),
+        "expected GrantRevocationsNotRetained, got {err:?}"
+    );
+
+    // The same revocation retained for a SHORTER time would re-enable the
+    // grant sooner — refused as well.
+    let shorter = open("grant-rev-shorter");
+    shorter
+        .apply_grant_revocations(&bundle(now + 60))
+        .expect("revoke with an earlier horizon");
+    assert!(
+        matches!(
+            node.install_org_revocation_store(shorter),
+            Err(OrgRevocationError::GrantRevocationsNotRetained { .. })
+        ),
+        "a shorter retention horizon must be refused"
+    );
+
+    assert!(
+        Arc::ptr_eq(
+            &node.org_revocation_store().expect("still installed"),
+            &installed
+        ),
+        "every refused candidate leaves the installed store live"
+    );
+    assert!(node
+        .org_revocation_store()
+        .expect("installed")
+        .snapshot()
+        .is_grant_revoked(&org().org_id(), RevokedGrantKind::Capability, &[0x5Cu8; 32]));
+
+    // Positive control: a candidate that retains the revocation is accepted.
+    let dominating = open("grant-rev-dominating");
+    dominating
+        .apply_grant_revocations(&bundle(now + 3_600))
+        .expect("revoke on the candidate");
+    node.install_org_revocation_store(dominating.clone())
+        .expect("a dominating candidate installs");
+    assert!(Arc::ptr_eq(
+        &node.org_revocation_store().expect("installed"),
+        &dominating
+    ));
 }
 
 /// Review-9 red 1: installing a store whose floors ALREADY rose
@@ -2126,17 +2252,19 @@ async fn dropping_a_node_unsubscribes_its_raise_callback() {
     node.install_org_revocation_store(store.clone())
         .expect("install");
     // Rewritten 2026-09-22 (named, plan §2.3), extended 2026-10-17 for
-    // grant revocation: installation registers exactly THREE subscribers —
-    // the node's own raise callback, the protected-call registry's second
-    // `subscribe_floors_raised` feed, and the registry's
-    // `subscribe_grants_revoked` feed. The teardown property below is
-    // unchanged and guards strictly more: ALL of them must be gone after
-    // the drop.
+    // grant revocation, and again for ORG-02: installation registers
+    // exactly FOUR subscribers — the node's own raise callback, the node's
+    // own grant-revocation callback (scoped-discovery retraction), the
+    // protected-call registry's second `subscribe_floors_raised` feed, and
+    // the registry's `subscribe_grants_revoked` feed. The teardown property
+    // below is unchanged and guards strictly more: ALL of them must be gone
+    // after the drop.
     assert_eq!(
         store.subscriber_count(),
-        3,
-        "installation registers exactly three subscribers: the node's own \
-         raise callback and the protected-call registry's floor and grant feeds"
+        4,
+        "installation registers exactly four subscribers: the node's own \
+         raise and grant callbacks and the protected-call registry's floor \
+         and grant feeds"
     );
 
     // Drop the node (the test holds the only strong Arc, and an
@@ -2228,9 +2356,9 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
     // over every snapshotted callback, not just one.
     assert_eq!(
         store.subscriber_count(),
-        3,
-        "§2.3: the node's callback plus the protected-call registry's floor \
-         and grant feeds"
+        4,
+        "§2.3 + ORG-02: the node's raise and grant callbacks plus the \
+         protected-call registry's floor and grant feeds"
     );
 
     // Project ownership under the installed store (cert generation 4).
@@ -2263,6 +2391,48 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         "the snapshot captures both live callbacks — inertness is asserted \
          below over every one of them"
     );
+    // ORG-02: the grant-revocation callbacks (the node's own and the
+    // registry's feed) are snapshotted the same way.
+    let grant_snapshot = store.snapshot_grant_subscribers_for_test();
+    assert_eq!(
+        grant_snapshot.len(),
+        2,
+        "the node's grant callback and the registry's grant feed"
+    );
+    // Sentinels for what the grant callbacks actually do: the node's
+    // callback advances its routing-authority epoch (the probe holds the
+    // authority past teardown), and the registry's feed bumps the
+    // protected-call registry's authority epoch. The registry is held only
+    // WEAKLY — a strong handle would keep its subscriptions alive past the
+    // node's teardown and change what this test is about. A grant key that
+    // matches no record or scoped row changes nothing else.
+    let routing_epoch = node.org_routing_epoch_probe_for_test();
+    let registry = Arc::downgrade(
+        &net::adapter::net::cortex::rpc::protected_call_registry_for(
+            node.protected_call_registry_key(),
+        ),
+    );
+    let registry_epoch = || registry.upgrade().map(|r| r.authority_epoch());
+    let revoked_grant = [(
+        org().org_id(),
+        net::adapter::net::behavior::org_grant_revocation::RevokedGrantKind::Capability,
+        [0x5au8; 32],
+    )];
+    // Positive control: invoked while the node is live, the snapshotted
+    // grant callbacks move both sentinels, so an inert result below is
+    // inertness, not a sentinel that never moves.
+    let (routing_live, registry_live) = (routing_epoch(), registry_epoch());
+    for callback in &grant_snapshot {
+        callback(&revoked_grant);
+    }
+    assert!(
+        routing_epoch() > routing_live,
+        "a live grant callback advances the routing authority"
+    );
+    assert!(
+        registry_epoch() > registry_live && registry_live.is_some(),
+        "a live grant feed bumps the protected-call registry"
+    );
 
     // Tear the node down: MeshNode::drop invalidates the owner token
     // BEFORE unsubscribing, so the count returns to baseline…
@@ -2279,5 +2449,29 @@ async fn a_snapshotted_raise_callback_is_inert_after_node_teardown() {
         owner_org_for(&fold, publisher_node_id),
         Some(org().org_id()),
         "a callback snapshotted before teardown must not retract the fold afterward",
+    );
+    // The grant callbacks snapshotted before teardown are inert too (their
+    // guards' leases are dead): invoked afterwards, the node's callback does
+    // not move the torn-down node's routing authority, the registry's feed
+    // has no registry left to reach, and the fold the test still holds is
+    // untouched. (The lease mechanism itself is witnessed in
+    // `org_revocation`, `a_snapshotted_grant_callback_is_inert_after_its_guard_drops`.)
+    assert_eq!(
+        registry_epoch(),
+        None,
+        "teardown releases the protected-call registry the feed would reach"
+    );
+    let routing_before = routing_epoch();
+    for callback in &grant_snapshot {
+        callback(&revoked_grant);
+    }
+    assert_eq!(
+        routing_epoch(),
+        routing_before,
+        "a grant callback snapshotted before teardown must not move the routing authority"
+    );
+    assert_eq!(
+        owner_org_for(&fold, publisher_node_id),
+        Some(org().org_id())
     );
 }

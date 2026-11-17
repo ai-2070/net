@@ -172,6 +172,10 @@ impl Mesh {
         F: Fn(JoinRequest) -> Fut + Clone + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
+        // ANCHOR-03: a grant promotes only the session of the device
+        // it names.
+        #[cfg(feature = "webrtc")]
+        self.node().set_enrollment_subject_binding(true);
         // R6: the outcome bytes travel RAW. A JSON-encoded
         // `Vec<u8>` is a JSON array of numbers, and the core's
         // promotion gate reads the body's own `NMO1` prefix — so a
@@ -204,6 +208,10 @@ impl Mesh {
         grant_ttl: Duration,
         max_depth: u8,
     ) -> Result<ServeHandle, ServeError> {
+        // ANCHOR-03: a grant promotes only the session of the device
+        // it names.
+        #[cfg(feature = "webrtc")]
+        self.node().set_enrollment_subject_binding(true);
         // R6: raw bodies, same reason as `serve_enrollment`.
         self.serve_rpc_raw_bytes(ENROLLMENT_SERVICE, move |req: Vec<u8>| {
             let operator = operator.clone();

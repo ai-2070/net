@@ -9,6 +9,8 @@ import { describe, expect, it } from 'vitest';
 
 import type { PredicateDebugReport } from '../src/capability-enhancements';
 import {
+  p,
+  predicateDebugReport,
   predicateDebugReportFromWire,
   redactMetadataKeys,
 } from '../src/capability-enhancements';
@@ -102,5 +104,61 @@ describe('redaction local properties', () => {
     const out = redactMetadataKeys(report, ['intent']);
     expect(out.total_candidates).toBe(100);
     expect(out.matched).toBe(42);
+  });
+
+  // TSDK-06 / CR-19: labels are matched literally, not by a grammar that
+  // assumes delimiter-free keys and single-line values. Mirrors the C
+  // ABI's `redact_label_handles_keys_containing_separator`.
+  const one = (label: string): PredicateDebugReport => ({
+    total_candidates: 1,
+    matched: 0,
+    clause_stats: [{ label, evaluated: 1, matched: 0 }],
+  });
+  const labelOf = (report: PredicateDebugReport): string => report.clause_stats[0]!.label;
+
+  it('redacts a MetadataEquals whose key contains "="', () => {
+    const report = predicateDebugReport(p.metadataEquals('credential=name', 'sk-secret'), [
+      { tags: [], metadata: {} },
+    ]);
+    expect(labelOf(report)).toBe('MetadataEquals(credential=name=sk-secret)');
+    const out = redactMetadataKeys(report, ['credential=name']);
+    expect(labelOf(out)).toBe('MetadataEquals(credential=name=<redacted>)');
+    expect(JSON.stringify(out)).not.toContain('sk-secret');
+    // The earliest split whose left half is a supplied key wins, as in C.
+    expect(labelOf(redactMetadataKeys(one('MetadataEquals(weird=key=sk-secret)'), ['weird=key']))).toBe(
+      'MetadataEquals(weird=key=<redacted>)',
+    );
+  });
+
+  it('redacts a MetadataEquals value containing line breaks', () => {
+    const report = predicateDebugReport(p.metadataEquals('api_key', 'line-one\nsk-secret\r\nend'), [
+      { tags: [], metadata: {} },
+    ]);
+    const out = redactMetadataKeys(report, ['api_key']);
+    expect(labelOf(out)).toBe('MetadataEquals(api_key=<redacted>)');
+    expect(JSON.stringify(out)).not.toContain('sk-secret');
+  });
+
+  it('redacts MetadataMatches and MetadataNumericAtLeast keys containing their separators', () => {
+    expect(
+      labelOf(redactMetadataKeys(one('MetadataMatches(a contains "b contains "sk-secret")'), ['a contains "b'])),
+    ).toBe('MetadataMatches(a contains "b contains "<redacted>")');
+    expect(labelOf(redactMetadataKeys(one('MetadataNumericAtLeast(a >= b >= 42)'), ['a >= b']))).toBe(
+      'MetadataNumericAtLeast(a >= b >= <redacted>)',
+    );
+    expect(labelOf(redactMetadataKeys(one('MetadataMatches(k contains "x\ny")'), ['k']))).toBe(
+      'MetadataMatches(k contains "<redacted>")',
+    );
+  });
+
+  it('leaves non-targeted keys, MetadataExists and look-alike keys alone', () => {
+    for (const label of [
+      'MetadataEquals(region=us-east)',
+      'MetadataExists(api_key)',
+      // `api` is not `api_key`: a key must match the whole left half.
+      'MetadataEquals(api_key_2=v)',
+    ]) {
+      expect(labelOf(redactMetadataKeys(one(label), ['api_key', 'api']))).toBe(label);
+    }
   });
 });

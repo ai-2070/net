@@ -46,15 +46,22 @@ struct EchoResp {
 }
 
 /// Records every redemption; admits unless the quote id is `q-deny`.
+/// Also logs every offer publication / withdrawal, in order.
 struct RecordingGate {
     redeemed: parking_lot::Mutex<Vec<(String, String, bool)>>,
+    offers: parking_lot::Mutex<Vec<String>>,
 }
 
 impl RecordingGate {
     fn new() -> Self {
         Self {
             redeemed: parking_lot::Mutex::new(Vec::new()),
+            offers: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    fn offers(&self) -> Vec<String> {
+        self.offers.lock().clone()
     }
 }
 
@@ -100,6 +107,15 @@ impl ToolPaymentGate for RecordingGate {
             });
         }
         Ok(())
+    }
+
+    fn publish_offer(&self, tool_id: &str, _pricing_terms: &str) -> Result<(), String> {
+        self.offers.lock().push(format!("publish:{tool_id}"));
+        Ok(())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.offers.lock().push(format!("withdraw:{tool_id}"));
     }
 }
 
@@ -350,6 +366,56 @@ async fn the_gated_path_requires_pricing_and_the_ungated_path_refuses_it() {
         matches!(&err, ServeError::UnenforceablePricing(id) if id == "paid_echo"),
         "{err}"
     );
+
+    mesh.shutdown().await.ok();
+}
+
+/// Quote authority lives exactly as long as the paid handler. It is
+/// published once this serve owns the tool id, a DUPLICATE serve touches
+/// nothing (it used to publish its terms over the running tool's and then
+/// fail with `AlreadyServing`), and dropping the handle withdraws it —
+/// before, the engine kept signing quotes for a tool nobody served.
+#[tokio::test]
+async fn a_paid_tools_offer_lives_exactly_as_long_as_its_handle() {
+    let mesh = MeshBuilder::new("127.0.0.1:0", &[0x63u8; 32])
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let priced = || {
+        metadata_for::<EchoReq, EchoResp>("paid_echo")
+            .pricing_terms(TERMS)
+            .build()
+    };
+    let echo = |req: EchoReq| async move {
+        Ok(EchoResp {
+            echoed: req.message,
+        })
+    };
+
+    let gate = Arc::new(RecordingGate::new());
+    let handle = mesh
+        .serve_tool_paid::<EchoReq, EchoResp, _, _>(priced(), gate.clone(), echo)
+        .expect("the first serve owns the tool");
+    assert_eq!(gate.offers(), ["publish:paid_echo"]);
+
+    let other = Arc::new(RecordingGate::new());
+    let err = match mesh.serve_tool_paid::<EchoReq, EchoResp, _, _>(priced(), other.clone(), echo) {
+        Ok(_) => panic!("a duplicate serve must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, ServeError::AlreadyServing(id) if id == "paid_echo"),
+        "{err}"
+    );
+    assert!(
+        other.offers().is_empty(),
+        "a duplicate serve must not touch quote authority: {:?}",
+        other.offers()
+    );
+
+    drop(handle);
+    assert_eq!(gate.offers(), ["publish:paid_echo", "withdraw:paid_echo"]);
 
     mesh.shutdown().await.ok();
 }

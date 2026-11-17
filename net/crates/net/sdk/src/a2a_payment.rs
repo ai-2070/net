@@ -107,6 +107,26 @@ pub struct TaskPaymentEvidence {
 pub trait TaskAdmissionGate: Send + Sync {
     /// Redeem `claim`, or refuse it.
     async fn redeem(&self, claim: TaskPaymentClaim<'_>) -> Result<TaskPaymentEvidence, GateDenial>;
+
+    /// A configured serve is about to announce `pricing_terms` for the
+    /// paid task tool `tool_id` (`net.a2a.task/{service_id}`): make them
+    /// the provider's quote authority — the twin of
+    /// [`ToolPaymentGate::publish_offer`](crate::tool_payment::ToolPaymentGate::publish_offer).
+    /// `Err(reason)` refuses the serve. The default does nothing.
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        let _ = (tool_id, pricing_terms);
+        Ok(())
+    }
+
+    /// The serving path stopped (or never started) serving `tool_id` that
+    /// it published terms for: withdraw them as quote authority, so the
+    /// provider stops signing quotes a caller would pay for with no handler
+    /// left to serve them. Quotes already signed are unaffected. Called on
+    /// every rollback of a failed serve and when the serving handle is
+    /// released. The default does nothing, like the default `publish_offer`.
+    fn withdraw_offer(&self, tool_id: &str) {
+        let _ = tool_id;
+    }
 }
 
 /// The caller's transport evidence for a paid task: what to present at

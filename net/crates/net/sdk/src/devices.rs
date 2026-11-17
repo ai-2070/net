@@ -46,10 +46,19 @@ pub fn default_device_registry_path() -> Option<PathBuf> {
 
 /// Errors from the device registry.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeviceRegistryError {
-    /// An I/O error touching the registry or its lock.
+    /// An I/O error touching the registry or its lock. Nothing was published:
+    /// the previous contents are still in place.
     #[error("device registry I/O at {path}: {reason}")]
     Io { path: String, reason: String },
+    /// The update WAS published (renamed into place, visible to every
+    /// reader) but the durability barrier after it failed, so it may not
+    /// survive a crash. Unlike [`Self::Io`] it must not be treated as "nothing
+    /// happened": a caller that rolls back its own side effects on this error
+    /// would contradict what readers already see. Saving again is safe.
+    #[error("device registry at {path} was saved, but not durably (the update may not survive a crash): {reason}")]
+    NotDurable { path: String, reason: String },
     /// The registry file exists but couldn't be parsed — surfaced (not silently
     /// treated as empty) so a typo never quietly drops the inventory.
     #[error("device registry at {path} is corrupt: {reason}")]
@@ -230,39 +239,41 @@ impl DeviceRegistry {
             reason: format!("serialize device registry: {e}"),
         })?;
 
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
+        // Exclusive, per-save-unique staging named after the FULL filename
+        // (owner-only on Unix), never `with_extension`: that collapsed e.g.
+        // `x.json` and `x.pins` onto one `x.tmp.<pid>` shared across
+        // independently-locked stores (PSTORE-03). See `crate::store_file`.
+        let (tmp, mut f) = crate::store_file::create_staging(path).map_err(io)?;
+        let written = {
             use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(io)?;
-            f.write_all(&bytes).map_err(io)?;
-            f.flush().map_err(io)?;
-            f.sync_all().map_err(io)?;
+            f.write_all(&bytes)
+                .and_then(|()| f.flush())
+                .and_then(|()| f.sync_all())
+        };
+        drop(f);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
         }
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             io(e)
         })?;
 
-        // Durability (POSIX): fsync the parent directory so the rename survives
-        // a crash (mirrors `revocation.rs` / `redex/disk.rs`). Best-effort;
-        // Windows needs no directory fsync.
-        #[cfg(unix)]
-        {
-            let dir = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            if let Ok(dirf) = std::fs::File::open(dir) {
-                let _ = dirf.sync_all();
+        // Durability (CONSENT-02, as the pin store): the rename is reported
+        // committed only once it is on stable storage. POSIX `rename()`
+        // updates the directory entry in memory; a crash before the parent
+        // directory is fsynced can revert to the old file, silently undoing an
+        // update the caller was told succeeded. Elsewhere the renamed file
+        // itself is reopened and flushed. A failed barrier is an error: the
+        // new contents are in place but may not survive a crash, and saving
+        // again is safe.
+        crate::store_file::durability_barrier(path).map_err(|e| {
+            DeviceRegistryError::NotDurable {
+                path: path.display().to_string(),
+                reason: e.to_string(),
             }
-        }
+        })?;
         Ok(())
     }
 }
@@ -383,6 +394,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("devices.json");
         assert!(DeviceRegistry::load(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn registries_sharing_a_stem_never_publish_each_others_records() {
+        // PSTORE-03: `inv.json` and `inv.devices` lock independent sidecars,
+        // so their saves run concurrently. A `with_extension("tmp.<pid>")`
+        // staging name put both through one `inv.tmp.<pid>`, letting one
+        // registry's snapshot be renamed over the other (or the second rename
+        // fail on a vanished temp). Each must hold exactly its own devices.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("inv.json");
+        let b = dir.path().join("inv.devices");
+        let rounds = 40;
+        let writer = |path: std::path::PathBuf, tag: &'static str| {
+            std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for i in 0..rounds {
+                    let (id, rec) = dev(&format!("{tag}{i}"));
+                    DeviceRegistry::record(&path, rec).unwrap();
+                    ids.push(id);
+                }
+                ids
+            })
+        };
+        let ta = writer(a.clone(), "a");
+        let tb = writer(b.clone(), "b");
+        let (ids_a, ids_b) = (ta.join().unwrap(), tb.join().unwrap());
+        for (path, ids, own) in [(&a, &ids_a, "a"), (&b, &ids_b, "b")] {
+            let reg = DeviceRegistry::load(path).unwrap();
+            assert_eq!(reg.len(), rounds, "{}", path.display());
+            for id in ids {
+                assert!(reg.get(id).is_some(), "{} lost a record", path.display());
+            }
+            assert!(
+                reg.list().iter().all(|r| r.name.starts_with(own)),
+                "{} holds another registry's devices",
+                path.display(),
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "leftover staging files: {leftovers:?}"
+        );
     }
 
     #[test]

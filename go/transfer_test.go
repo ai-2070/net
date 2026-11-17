@@ -222,6 +222,25 @@ func TestTransferDirManifestNotAManifest(t *testing.T) {
 	}
 }
 
+// GBLOB-02: `{0, 0}` postcard-decodes as a version-0 manifest with no
+// entries. Inspection used to return it as valid while FetchDir refused
+// the same reference; both now refuse an unsupported schema version.
+func TestTransferDirManifestUnsupportedVersion(t *testing.T) {
+	p := newTransferPair(t)
+	ref, err := p.adA.Publish("mesh://go/manifest-v0", []byte{0, 0})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	m, err := p.b.DirManifestRead(p.a.NodeID(), ref)
+	if !errors.Is(err, ErrDirInvalidManifest) {
+		t.Fatalf("version-0 manifest: want ErrDirInvalidManifest, got manifest %+v, err %v", m, err)
+	}
+	_, err = p.b.FetchDir(p.a.NodeID(), ref, filepath.Join(t.TempDir(), "out"))
+	if !errors.Is(err, ErrDirInvalidManifest) {
+		t.Fatalf("FetchDir of a version-0 manifest: want ErrDirInvalidManifest, got %v", err)
+	}
+}
+
 // A destination with no final name component (a filesystem root) cannot
 // host the sibling temp dir the atomic install needs: DirError::UnsafePath.
 func TestTransferFetchDirRefusesRootDestination(t *testing.T) {

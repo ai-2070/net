@@ -23,6 +23,8 @@
 
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { appError } from '../mesh_rpc'
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
 const { NetMesh, MeshRpc } = binding
@@ -253,6 +255,57 @@ describe('live nRPC registration through the Node binding', () => {
     expect(() => serverRpc.setObserver(null)).not.toThrow()
   }, 30_000)
 
+  // NCALL-03: the RAW native observer dispatch contains a failing
+  // observer. Pre-fix a plain TSFN `call` left the throw pending and
+  // napi-rs escalated it through `napi_fatal_exception` — an
+  // `uncaughtException` (which vitest reports as an unhandled error and
+  // which ends a default Node process) — and an `async` observer's
+  // rejection became an unhandled rejection.
+  it('a throwing or rejecting raw observer cannot escape the native dispatch', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.observed', async (req: Buffer) => req)
+
+    const escaped: unknown[] = []
+    const onEscape = (e: unknown) => escaped.push(e)
+    process.on('uncaughtException', onEscape)
+    process.on('unhandledRejection', onEscape)
+    try {
+      let syncCalls = 0
+      clientRpc.setObserver(() => {
+        syncCalls += 1
+        throw new Error('raw observer boom')
+      })
+      await clientRpc.call(server.nodeId(), 'live.observed', Buffer.from('a'))
+      for (let i = 0; i < 50 && syncCalls === 0; i++) await sleep(20)
+      expect(syncCalls).toBeGreaterThan(0)
+
+      let asyncCalls = 0
+      clientRpc.setObserver(async () => {
+        asyncCalls += 1
+        throw new Error('raw async observer boom')
+      })
+      await clientRpc.call(server.nodeId(), 'live.observed', Buffer.from('b'))
+      for (let i = 0; i < 50 && asyncCalls === 0; i++) await sleep(20)
+      expect(asyncCalls).toBeGreaterThan(0)
+      // Let unhandled-rejection detection run.
+      await sleep(50)
+
+      expect(escaped).toEqual([])
+      // And the RPC surface still works after both.
+      const resp = await clientRpc.call(
+        server.nodeId(),
+        'live.observed',
+        Buffer.from('after'),
+      )
+      expect(resp.toString()).toBe('after')
+    } finally {
+      clientRpc.setObserver(null)
+      process.off('uncaughtException', onEscape)
+      process.off('unhandledRejection', onEscape)
+      handle.close()
+    }
+  }, 30_000)
+
   it('close releases the node so the mesh can shut down', async () => {
     const { server, client, serverRpc, clientRpc } = await pair()
 
@@ -426,6 +479,64 @@ describe('forced drop releases handler handles on every public serve bridge', ()
 // SDK audit 2026-10-11: `handlerTimeoutMs` bounded only the TSFN dispatch,
 // and an `async` handler returns its Promise at once — so a handler whose
 // promise never settled held its task and in-flight slot forever.
+// NCALL-02: a raw handler that throws `appError` BEFORE returning its
+// Promise (synchronous validation) must surface the same Application
+// status as one that rejects. Only unary classified the synchronous
+// throw; the three streaming bridges sent it to the caller as Internal
+// (0x0006), discarding the status the raw API documents.
+describe('a synchronous appError throw keeps its status on every serve shape', () => {
+  const rejected = /status=0x8002/
+
+  // Deliberately NOT `async`: an async function never throws
+  // synchronously, it rejects, and that path was already classified.
+  const refuse = (): never => {
+    throw appError(0x8002, 'rejected')
+  }
+
+  it('unary', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.sync.unary', refuse)
+    await expect(
+      clientRpc.call(server.nodeId(), 'live.sync.unary', Buffer.from('x')),
+    ).rejects.toThrow(rejected)
+    handle.close()
+  }, 30_000)
+
+  it('server streaming', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serveStreaming('live.sync.streaming', refuse)
+    const stream = await clientRpc.callStreaming(
+      server.nodeId(),
+      'live.sync.streaming',
+      Buffer.from('x'),
+    )
+    await expect(stream.next()).rejects.toThrow(rejected)
+    stream.close()
+    handle.close()
+  }, 30_000)
+
+  it('client streaming', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serveClientStream('live.sync.clientstream', refuse)
+    const call = await clientRpc.callClientStream(
+      server.nodeId(),
+      'live.sync.clientstream',
+    )
+    await expect(call.finish()).rejects.toThrow(rejected)
+    handle.close()
+  }, 30_000)
+
+  it('duplex', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serveDuplex('live.sync.duplex', refuse)
+    const call = await clientRpc.callDuplex(server.nodeId(), 'live.sync.duplex')
+    await call.finishSending()
+    await expect(call.next()).rejects.toThrow(rejected)
+    await call.close()
+    handle.close()
+  }, 30_000)
+})
+
 describe('unary handler timeout bounds the promise, not just the dispatch', () => {
   it('cuts off a never-settling async handler at handlerTimeoutMs', async () => {
     const { server, serverRpc, clientRpc } = await pair()
@@ -468,6 +579,30 @@ describe('handlerTimeoutMs: 0 disables the cap without overflowing', () => {
 // A chunk must fit one packet (8104 bytes with its envelope); a larger
 // one ends the call with an explicit `server_error`, not a silent drop.
 // 7 KB is the largest round size under that.
+// NCALL-01 residual: an `async fn` binding runs its whole body on a
+// tokio worker after the Promise is returned, so a request Buffer it
+// copied there could already have been rewritten by the caller. The
+// copy now happens as napi converts the argument, on the JS thread.
+// Rewriting the Buffer the moment `call()` returns must not change what
+// the server receives. The old race depended on worker wake-up timing,
+// so this repeats the call; with the fix no iteration can differ.
+describe('a request Buffer is snapshotted when the call is made', () => {
+  it('rewriting it after call() returns does not change the request', async () => {
+    const { server, serverRpc, clientRpc } = await pair()
+    const handle = serverRpc.serve('live.snapshot', async (req: Buffer) => req)
+    const buf = Buffer.alloc(4096)
+    for (let i = 0; i < 50; i += 1) {
+      buf.fill(i)
+      const sent = Buffer.from(buf)
+      const pending = clientRpc.call(server.nodeId(), 'live.snapshot', buf)
+      buf.fill(0xff)
+      const echoed: Buffer = await pending
+      expect(echoed.equals(sent), `iteration ${i}`).toBe(true)
+    }
+    handle.close()
+  }, 60_000)
+})
+
 describe('streamed-call backpressure', () => {
   for (const kb of [1, 7]) {
     it(`sendWait delivers every ${kb} KB chunk in order`, async () => {
@@ -530,4 +665,47 @@ describe('streamed-call backpressure', () => {
     stream.close()
     handle.close()
   }, 60_000)
+
+  // NCALL-01: `send` returns true / `sendWait` resolves true once a chunk
+  // is ADMITTED to the per-call queue, and with a one-chunk window it then
+  // waits for credit. A handler that reuses one Buffer after admission must
+  // still deliver what it submitted: the binding snapshots the bytes at the
+  // call, it does not alias the Buffer (which put the LAST write on the wire
+  // for every chunk still queued).
+  for (const mode of ['send', 'sendWait'] as const) {
+    it(`${mode} delivers the submitted bytes of a reused Buffer`, async () => {
+      const { server, serverRpc, clientRpc } = await pair()
+      const n = 32
+      const handle = serverRpc.serveStreaming(
+        `live.reuse.${mode.toLowerCase()}`,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        async ([, sink]: [Buffer, any]) => {
+          const reused = Buffer.alloc(64)
+          for (let i = 0; i < n; i += 1) {
+            reused.fill(i)
+            const admitted = mode === 'send' ? sink.send(reused) : await sink.sendWait(reused)
+            expect(admitted).toBe(true)
+          }
+          // Overwrite once more after the last admission.
+          reused.fill(0xff)
+          return Buffer.alloc(0)
+        },
+      )
+      const stream = await clientRpc.callStreaming(
+        server.nodeId(),
+        `live.reuse.${mode.toLowerCase()}`,
+        Buffer.from('go'),
+        { streamWindowInitial: 1 },
+      )
+      const got: number[] = []
+      for (let c = await stream.next(); c !== null; c = await stream.next()) {
+        expect(c.length).toBe(64)
+        expect(c.every((b: number) => b === c[0])).toBe(true)
+        got.push(c[0])
+      }
+      expect(got).toEqual(Array.from({ length: n }, (_, i) => i))
+      stream.close()
+      handle.close()
+    }, 60_000)
+  }
 })

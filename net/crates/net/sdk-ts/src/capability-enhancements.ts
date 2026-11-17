@@ -1708,23 +1708,80 @@ export function redactMetadataKeys(
 }
 
 /**
- * Pre-compiled regexes for the three redactable metadata-clause
- * label shapes. The `^` / `$` anchors prevent accidental matches in
- * pathological clause values.
+ * The literal anchor, separator and rewrite for each redactable
+ * metadata-clause label shape.
+ *
+ * TSDK-06 / CR-19: these used to be regexes. `MetadataEquals` captured
+ * its key as `[^=]+`, so a key containing `=` (substrate metadata is an
+ * arbitrary `string → string` map) never matched and its value stayed
+ * in the label; and `.` does not cross a line break, so an equality
+ * value containing one escaped redaction even under an ordinary key.
+ * The labels are matched literally instead: strip the anchors, then try
+ * each separator occurrence earliest-first and take the first whose
+ * left half is a supplied key — the same rule as the C ABI's
+ * `redact_label` (`src/ffi/predicate_debug.rs`), which the Python SDK
+ * mirrors.
  */
-const META_EQUALS_RE = /^MetadataEquals\(([^=]+)=(.+)\)$/;
-const META_MATCHES_RE = /^MetadataMatches\((.+) contains "(.*)"\)$/;
-const META_NUMERIC_RE = /^MetadataNumericAtLeast\((.+) >= (.+)\)$/;
+const REDACTABLE_SHAPES: readonly {
+  readonly prefix: string;
+  readonly separator: string;
+  /** What the interior must end with after the value (the closing quote of a pattern literal). */
+  readonly valueSuffix: string;
+  readonly rewrite: (key: string) => string;
+}[] = [
+  {
+    prefix: 'MetadataEquals(',
+    separator: '=',
+    valueSuffix: '',
+    rewrite: (key) => `MetadataEquals(${key}=<redacted>)`,
+  },
+  {
+    prefix: 'MetadataMatches(',
+    separator: ' contains "',
+    valueSuffix: '"',
+    rewrite: (key) => `MetadataMatches(${key} contains "<redacted>")`,
+  },
+  {
+    prefix: 'MetadataNumericAtLeast(',
+    separator: ' >= ',
+    valueSuffix: '',
+    rewrite: (key) => `MetadataNumericAtLeast(${key} >= <redacted>)`,
+  },
+];
+
+/**
+ * The earliest occurrence of `separator` in `inner` whose left half is
+ * one of `keys`, or `-1`. Every split is tried because a key may itself
+ * contain the separator.
+ */
+function redactableKeySplit(
+  inner: string,
+  separator: string,
+  keys: ReadonlySet<string>,
+): number {
+  for (
+    let at = inner.indexOf(separator);
+    at !== -1;
+    at = inner.indexOf(separator, at + separator.length)
+  ) {
+    if (keys.has(inner.slice(0, at))) return at;
+  }
+  return -1;
+}
 
 function redactLabel(label: string, keys: ReadonlySet<string>): string {
-  let m: RegExpMatchArray | null;
-  if ((m = label.match(META_EQUALS_RE))) {
-    if (keys.has(m[1])) return `MetadataEquals(${m[1]}=<redacted>)`;
-  } else if ((m = label.match(META_MATCHES_RE))) {
-    if (keys.has(m[1])) return `MetadataMatches(${m[1]} contains "<redacted>")`;
-  } else if ((m = label.match(META_NUMERIC_RE))) {
-    if (keys.has(m[1])) return `MetadataNumericAtLeast(${m[1]} >= <redacted>)`;
+  if (keys.size === 0) return label;
+  for (const shape of REDACTABLE_SHAPES) {
+    if (!label.startsWith(shape.prefix) || !label.endsWith(')')) continue;
+    const inner = label.slice(shape.prefix.length, label.length - 1);
+    const at = redactableKeySplit(inner, shape.separator, keys);
+    if (at !== -1 && inner.endsWith(shape.valueSuffix)) {
+      return shape.rewrite(inner.slice(0, at));
+    }
+    // A label has exactly one shape; a non-targeted key passes through.
+    return label;
   }
+  // `MetadataExists`, every non-metadata leaf, and composites.
   return label;
 }
 

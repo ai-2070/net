@@ -256,6 +256,35 @@
           }
         ]
       }
+    },
+    {
+      "name": "overlapping_keys_take_the_earliest_split",
+      "summary": "Two redact keys where one is the other plus the separator and more (`a` / `a=b`, `x` / `x >= 1`): every binding takes the EARLIEST split whose left half is a redact key, which hides the most.",
+      "report": {
+        "total_candidates": 2,
+        "matched": 1,
+        "clause_stats": [
+          { "label": "MetadataEquals(a=b=secret)", "evaluated": 2, "matched": 1 },
+          {
+            "label": "MetadataNumericAtLeast(x >= 1 >= 5)",
+            "evaluated": 2,
+            "matched": 0
+          }
+        ]
+      },
+      "redact_keys": ["a=b", "a", "x >= 1", "x"],
+      "redacted_report": {
+        "total_candidates": 2,
+        "matched": 1,
+        "clause_stats": [
+          { "label": "MetadataEquals(a=<redacted>)", "evaluated": 2, "matched": 1 },
+          {
+            "label": "MetadataNumericAtLeast(x >= <redacted>)",
+            "evaluated": 2,
+            "matched": 0
+          }
+        ]
+      }
     }
   ]
 }

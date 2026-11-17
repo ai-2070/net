@@ -484,8 +484,11 @@ pub enum OrgAuthorityError {
         /// The candidate owner org.
         owner_org: OrgId,
     },
-    /// The org audience supplied to [`NodeAuthority::adopt_with_audience`]
-    /// belongs to a different org than the certificate being adopted.
+    /// An owner audience credential belongs to a different org than the
+    /// membership it is paired with: the audience supplied to
+    /// [`NodeAuthority::adopt_with_audience`], the `owner-audience.key` read by
+    /// [`NodeAuthority::open`], or the audience of an authority handed to
+    /// `MeshNode::install_node_authority`.
     AudienceForeignOrg {
         /// The org the supplied audience names.
         audience_org: OrgId,
@@ -627,7 +630,8 @@ impl std::fmt::Display for OrgAuthorityError {
                 owner_org,
             } => write!(
                 f,
-                "the supplied org audience belongs to org {audience_org}, not to the adopted                  membership's org {owner_org}"
+                "the owner audience credential belongs to org {audience_org}, not to the \
+                 membership's org {owner_org}"
             ),
             Self::PermissiveAudienceFile { path, mode } => write!(
                 f,
@@ -1083,6 +1087,12 @@ impl NodeAuthority {
             .inspect_err(|e| {
                 tracing::error!("node authority self-verification failed: {e}");
             })?;
+        // ORG-03: the audience credential names its org, and it must be THIS
+        // (now verified) membership's org. An authentic org-B membership paired
+        // with an org-A audience key (a provisioning mix-up) would otherwise
+        // load cleanly and seal B's owner-private catalog under A's discovery
+        // material.
+        audience_matches_owner(&audience, &config)?;
 
         Ok(Self {
             config,
@@ -1094,6 +1104,15 @@ impl NodeAuthority {
     /// The owning organization.
     pub fn owner_org(&self) -> OrgId {
         self.config.owner_org
+    }
+
+    /// Refuse an authority whose owner audience credential names a different
+    /// org than its membership (ORG-03). [`Self::open`] checks this at load;
+    /// `MeshNode::install_node_authority` re-checks it at the installation
+    /// boundary, because the fields are public and an authority can be
+    /// assembled without going through `open`.
+    pub fn check_audience_binding(&self) -> Result<(), OrgAuthorityError> {
+        audience_matches_owner(&self.audience, &self.config)
     }
 
     /// The authority directory's three file names, for tooling.
@@ -1114,6 +1133,22 @@ impl std::fmt::Debug for NodeAuthority {
             .field("revocation", &self.revocation)
             .finish()
     }
+}
+
+/// The audience credential's org must be the membership's org (ORG-03).
+fn audience_matches_owner(
+    audience: &OwnerAudienceCredential,
+    config: &NodeAuthorityConfig,
+) -> Result<(), OrgAuthorityError> {
+    if audience.owner_org != config.owner_org {
+        let err = OrgAuthorityError::AudienceForeignOrg {
+            audience_org: audience.owner_org,
+            owner_org: config.owner_org,
+        };
+        tracing::error!("{err}");
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn parse_membership(bytes: &[u8], path: &Path) -> Result<NodeAuthorityConfig, OrgAuthorityError> {
@@ -5089,6 +5124,40 @@ mod tests {
         assert_eq!(cred.owner_org, org_a.org_id());
         assert_eq!(cred.discovery_key(), &a_key);
         assert_eq!(cred.audience_handle, a_handle);
+    }
+
+    /// ORG-03: startup refuses an authority directory whose `owner-audience.key`
+    /// names a different org than its membership. A provisioning mix-up that
+    /// drops org A's audience key next to org B's membership must not load —
+    /// B's owner-private catalog would be sealed under A's discovery key.
+    #[test]
+    fn open_refuses_an_audience_key_of_another_org() {
+        let scratch = Scratch::new();
+        let kp = node_identity();
+        let org_b = OrgKeypair::from_bytes([0xB2u8; 32]);
+        let cert_b =
+            OrgMembershipCert::try_issue(&org_b, kp.entity_id().clone(), 1, 3600).expect("issue B");
+        NodeAuthority::adopt(scratch.dir(), cert_b, kp.entity_id(), 0, None).expect("adopt B");
+        // Positive control: the consistent directory opens.
+        NodeAuthority::open(scratch.dir(), kp.entity_id()).expect("consistent open");
+
+        let org_a = OrgKeypair::from_bytes([0xA1u8; 32]);
+        let foreign = OwnerAudienceCredential::generate(org_a.org_id());
+        std::fs::write(
+            scratch.dir().join(OWNER_AUDIENCE_FILE),
+            foreign.encode_config(),
+        )
+        .expect("write foreign audience");
+        let err = NodeAuthority::open(scratch.dir(), kp.entity_id())
+            .expect_err("an org-A audience beside an org-B membership must not load");
+        assert!(
+            matches!(
+                err,
+                OrgAuthorityError::AudienceForeignOrg { audience_org, owner_org }
+                    if audience_org == org_a.org_id() && owner_org == org_b.org_id()
+            ),
+            "expected AudienceForeignOrg(A beside B), got {err:?}",
+        );
     }
 
     /// Positive control: re-adopting under the SAME org still preserves the

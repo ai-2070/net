@@ -100,7 +100,8 @@ fn standalone_anchor_defaults_and_dispatch_consume_resolution() {
         String::from_utf8_lossy(&out.stderr)
     );
     let view: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(view["bind"], "0.0.0.0:0");
+    // ANCHOR-01: the native socket defaults to loopback; RTC stays public.
+    assert_eq!(view["bind"], "127.0.0.1:0");
     assert_eq!(view["listen"], "0.0.0.0:8443");
     assert_eq!(view["rtc_bind"], "0.0.0.0:0");
     assert_eq!(view["provenance"]["bind"], "default");

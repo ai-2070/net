@@ -153,7 +153,18 @@ type MeshBlobAdapter struct {
 // installed but should NOT be relied upon — pair every
 // constructor with `defer adapter.Close()`.
 func NewMeshBlobAdapter(redex *Redex, adapterID string, opts *MeshBlobAdapterOpts) (*MeshBlobAdapter, error) {
-	if redex == nil || redex.handle == nil {
+	if redex == nil {
+		return nil, fmt.Errorf("%w: redex handle is nil", ErrBlob)
+	}
+	// Read `handle` under the Redex lock: a concurrent `Free` writes it, so
+	// an unlocked read is a data race (the race detector flags it). Both
+	// construction paths below re-check it under the lock they hold across
+	// the native call; this early check only keeps the established error
+	// for an already-freed Redex.
+	redex.mu.RLock()
+	freed := redex.handle == nil
+	redex.mu.RUnlock()
+	if freed {
 		return nil, fmt.Errorf("%w: redex handle is nil", ErrBlob)
 	}
 	persistent := C.int(0)
@@ -184,6 +195,19 @@ func NewMeshBlobAdapter(redex *Redex, adapterID string, opts *MeshBlobAdapterOpt
 	}
 	cID := C.CString(adapterID)
 	defer C.free(unsafe.Pointer(cID))
+	// Hold the Redex read lock across the native call, as the v2
+	// constructor does (GBLOB-01). Passing a bare `redex.handle` left
+	// nothing keeping `redex` reachable once the field was loaded: when
+	// this call was the caller's last use of it, the GC could run the
+	// Redex finalizer (`Free`) before native construction cloned the
+	// inner Arc, and a live argument came back as a generic ErrBlob. The
+	// deferred unlock keeps `redex` reachable until the call returns,
+	// and the lock excludes an explicit concurrent `Free`.
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, fmt.Errorf("%w: redex: %w", ErrBlob, ErrShuttingDown)
+	}
 	h := C.net_mesh_blob_adapter_new(redex.handle, cID, persistent, overflowJSON)
 	if h == nil {
 		return nil, fmt.Errorf("%w: substrate returned null (check feature gates: dataforts,netdb,redex-disk)", ErrBlob)

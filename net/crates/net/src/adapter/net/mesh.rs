@@ -80,7 +80,7 @@ use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBER
 use super::channel::{
     queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry,
     ChannelHash, ChannelId, ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport,
-    QueueGroupPolicy, SubscriberRoster,
+    QueueGroupPolicy, SubscriberRoster, SubscriptionMode,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -2674,6 +2674,10 @@ struct DispatchCtx {
     /// without charging the peer's auth-failure budget twice. Accepted
     /// requests are deliberately absent — see [`MembershipRejection`].
     membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
+    /// Per-`(peer, channel hash)` operation-ordering fence, so a
+    /// delayed copy of a superseded Subscribe/Unsubscribe cannot undo
+    /// a later applied one (CHAN-04). See [`MembershipFence`].
+    membership_fence: Arc<DashMap<(u64, ChannelHash), MembershipFence>>,
     /// How long a [`MembershipRejection`] stays replayable. Sized at
     /// `2 ×` the sender's `membership_ack_timeout` — every retransmit
     /// of a request happens inside that one budget, so double it is
@@ -2875,6 +2879,9 @@ struct DispatchCtx {
     /// [`SubnetGatewayAuthorityState`] for why the two must not
     /// publish independently.
     subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Serializes gateway-member publication against a subject floor's
+    /// withdrawal of it (SUBNET-05) — see `MeshNode::subnet_gateway_publish`.
+    subnet_gateway_publish: Arc<parking_lot::Mutex<()>>,
     /// Typed protected-relay telemetry: envelopes forwarded, and
     /// authority denials split by exact [`ForwardDenial`] reason.
     ///
@@ -4243,6 +4250,43 @@ pub(crate) struct SubnetGatewayAuthorityState {
     pub(crate) boundaries: Option<Arc<SubnetBoundarySet>>,
 }
 
+/// Borrowed handles a subject floor uses to withdraw this node's own
+/// gateway authority (SUBNET-05). One shape for both arrival paths —
+/// the `&MeshNode` API and the dispatch context — so they cannot drift.
+struct LocalGatewayHandles<'a> {
+    /// This node's own entity: only a floor naming it reaches the
+    /// local gateway member.
+    entity: &'a EntityId,
+    /// The published gateway authority aggregate.
+    authority: &'a arc_swap::ArcSwap<SubnetGatewayAuthorityState>,
+    /// The gateway publication lock (`MeshNode::subnet_gateway_publish`).
+    publish: &'a parking_lot::Mutex<()>,
+}
+
+/// What one enrollment promotion attempt did (§12 step 4).
+#[cfg(feature = "webrtc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Promotion {
+    /// The session is admitted.
+    Promoted,
+    /// The tenant was at its player cap (ANCHOR-04): the session stays
+    /// provisional, and the Admitted verdict being answered is void.
+    TenantFull,
+    /// Nothing promoted for any other reason — not this call's
+    /// reservation, a replaced incarnation, an already-admitted session.
+    NotPromoted,
+}
+
+/// What committing one floor fact requires of the caller
+/// (`MeshNode::commit_floor_fact`).
+struct FloorCommitOutcome {
+    /// Live authority the fact covers must be invalidated.
+    enforce: bool,
+    /// `Err(StateNotPersisted)` while anything accepted is not durable —
+    /// reported only after the invalidation `enforce` demands.
+    persisted: Result<(), SubnetAuthError>,
+}
+
 /// How this node reaches a peer, and what the recorded address proves.
 ///
 /// Two different questions were previously answered by one address:
@@ -5261,19 +5305,123 @@ struct MembershipRejection {
 /// behavior you want anyway — rather than growing without bound.
 const MEMBERSHIP_DEDUPE_MAX: usize = 4096;
 
-/// Evict subscribers whose tokens have expired. Walks the roster by
-/// peer and, for every `require_token` channel they hold, runs the
-/// full token-cache check. Expired entries are revoked in the
-/// [`AuthGuard`] and removed from the [`SubscriberRoster`].
+/// Operation-ordering fence for one `(peer, channel)` membership
+/// (CHAN-04).
 ///
-/// Skip conditions (short-circuits to no-op):
+/// Membership requests are fire-and-forget datagrams retransmitted
+/// under ONE nonce, so the publisher can see a copy of a request
+/// arrive after a *later* request on the same membership was applied
+/// and acknowledged — the first `Subscribe` datagram delayed past its
+/// own retransmit and the `Unsubscribe` that followed it, say. Applying
+/// that copy re-adds a member the subscriber just removed (or, for a
+/// delayed `Unsubscribe`, removes a newer subscription).
 ///
-/// - No `token_cache`: `require_token` channels reject every
-///   subscribe anyway, so the roster contains no token-gated
-///   entries.
-/// - No `channel_configs`: nothing to check `require_token`
-///   against, so every roster entry is treated as open and left
-///   alone.
+/// The fence records the nonce of the operation most recently
+/// **applied** to this membership (`latest`) and the nonces it
+/// superseded (`retired`). A copy whose nonce is retired is a request
+/// the membership has already moved past: it is re-acked but not
+/// re-applied. A copy of `latest` is a retransmit of the current
+/// operation and is re-decided in full as before (a `Subscribe` re-runs
+/// `authorize_subscribe`, so current authorization is still rechecked
+/// on accepted retries). Rejected requests change no membership state
+/// and never enter the fence.
+///
+/// Ordering is known only for requests the publisher has *seen*: the
+/// wire carries random correlation nonces, not a per-membership
+/// generation, so a request none of whose copies arrived before a later
+/// one was applied cannot be ordered — and its sender got a timeout,
+/// not an acknowledgement, for it.
+#[derive(Debug, Clone)]
+struct MembershipFence {
+    /// Nonce of the operation currently in effect.
+    latest: u64,
+    /// When a copy of `latest` was last applied.
+    latest_at: std::time::Instant,
+    /// Superseded nonces with the instant each was superseded, oldest
+    /// first, bounded by [`MEMBERSHIP_FENCE_RETIRED_MAX`].
+    retired: Vec<(u64, std::time::Instant)>,
+}
+
+impl MembershipFence {
+    fn new(nonce: u64) -> Self {
+        Self {
+            latest: nonce,
+            latest_at: std::time::Instant::now(),
+            retired: Vec::new(),
+        }
+    }
+
+    fn is_retired(&self, nonce: u64, ttl: Duration) -> bool {
+        self.retired
+            .iter()
+            .any(|(n, at)| *n == nonce && at.elapsed() < ttl)
+    }
+
+    /// Whether dropping the entry could let a delayed copy through.
+    ///
+    /// A retired nonce inside the TTL fences copies directly. `latest`
+    /// matters too, even with nothing retired: its copies can still be
+    /// in flight for a TTL after the last one was applied, and the entry
+    /// is what lets the NEXT operation retire it. Dropping an entry whose
+    /// `latest` is that recent lets the next operation open a fresh entry
+    /// that never learned `latest`, so a delayed copy of it is re-applied
+    /// over the newer operation. Only an entry quiet on both counts is
+    /// safe to prune.
+    fn is_live(&self, ttl: Duration) -> bool {
+        self.latest_at.elapsed() < ttl || self.retired.iter().any(|(_, at)| at.elapsed() < ttl)
+    }
+
+    /// Record that `nonce` was just applied.
+    fn advance(&mut self, nonce: u64, ttl: Duration) {
+        if self.latest == nonce {
+            self.latest_at = std::time::Instant::now();
+            return;
+        }
+        self.retired.retain(|(_, at)| at.elapsed() < ttl);
+        self.retired.push((self.latest, std::time::Instant::now()));
+        if self.retired.len() > MEMBERSHIP_FENCE_RETIRED_MAX {
+            let excess = self.retired.len() - MEMBERSHIP_FENCE_RETIRED_MAX;
+            self.retired.drain(..excess);
+        }
+        self.latest = nonce;
+        self.latest_at = std::time::Instant::now();
+    }
+}
+
+/// Superseded nonces remembered per `(peer, channel)` membership. Each
+/// is a distinct request the subscriber issued within the fence TTL on
+/// ONE channel, so a handful covers any honest churn.
+const MEMBERSHIP_FENCE_RETIRED_MAX: usize = 8;
+
+/// Hard cap on fenced `(peer, channel)` memberships — the same bound
+/// and the same degradation as [`MEMBERSHIP_DEDUPE_MAX`]: at the cap,
+/// entries quiet for a full TTL are pruned (no copy of anything they
+/// remember can still be in flight), and if that does not make room a
+/// NEW membership goes unfenced (pre-fence behavior) rather than growing
+/// the map. Pruning never takes an entry that is still fencing: a
+/// steady-state subscription past the cap keeps its fence.
+const MEMBERSHIP_FENCE_MAX: usize = 4096;
+
+/// Evict subscribers the channel's **current** policy no longer
+/// admits. Walks the roster by peer and, for every channel they hold:
+///
+/// - re-asks the structural admission questions of the config the
+///   channel resolves to now ([`ChannelConfig::retains_subscription`]:
+///   origin binding, queue-group policy, and which hash a retained
+///   grant must answer), so a replaced policy cannot leave a
+///   subscription admitted under the old one standing (CPOL-01);
+/// - for every token-gated channel, runs the full chain re-check.
+///
+/// Failures are revoked in the [`AuthGuard`] and removed from the
+/// [`SubscriberRoster`].
+///
+/// Skip conditions:
+///
+/// - No `channel_configs`: nothing to check against, so every roster
+///   entry is treated as open and left alone.
+/// - No `token_cache`: the chain re-check is skipped (`require_token`
+///   channels reject every subscribe without one, so the roster holds
+///   no token-gated entries); the structural re-check still runs.
 ///
 /// Pulled into a free fn (not a method) so the sweep loop can
 /// call it without capturing `&self` through the async closure.
@@ -5285,11 +5433,9 @@ fn sweep_expired_subscribers(
     channel_configs: Option<&Arc<ChannelConfigRegistry>>,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
 ) {
-    let (Some(cache), Some(configs)) = (token_cache, channel_configs) else {
+    let Some(configs) = channel_configs else {
         return;
     };
-    let revocation = cache.revocation().as_ref();
-    let skew = cache.clock_skew_secs();
     // Snapshot (node_id, entity_id) pairs so we don't hold the
     // DashMap read guard across the chain checks below.
     let peers: Vec<(u64, EntityId)> = peer_entity_ids
@@ -5299,12 +5445,49 @@ fn sweep_expired_subscribers(
     for (node_id, entity_id) in peers {
         for channel_id in roster.channels_for(node_id) {
             let name = channel_id.name();
-            let Some(cfg) = configs.get_by_name(name.as_str()) else {
+            let Some(resolved) = configs.resolve_by_name(name.as_str()) else {
                 continue;
             };
+            let cfg = &resolved.config;
+            let evict = || {
+                guard.revoke_channel(subscriber_principal(node_id), name);
+                roster.remove(&channel_id, node_id);
+                subscriber_chains.remove(&(node_id, name.hash()));
+            };
+            // The structural re-check first (CPOL-01): cheap, and it is
+            // the only check an open channel gets. Only pinned peers are
+            // walked here, so the origin is the pinned one.
+            let group = match roster.subscriber_mode(node_id, &channel_id) {
+                Some(SubscriptionMode::QueueGroup(group)) => Some(group),
+                _ => None,
+            };
+            let admitted_grant = subscriber_chains
+                .get(&(node_id, name.hash()))
+                .map(|r| r.grant_hash);
+            if !cfg.retains_subscription(
+                name.as_str(),
+                name.hash(),
+                resolved.matched_prefix.as_deref(),
+                Some(entity_id.origin_hash()),
+                group.as_ref().map(|g| g.as_str()),
+                admitted_grant,
+            ) {
+                evict();
+                tracing::debug!(
+                    node_id = format!("{:#x}", node_id),
+                    channel = name.as_str(),
+                    "auth: evicted subscriber its channel's current admission policy no longer admits",
+                );
+                continue;
+            }
             if !cfg.token_required() {
                 continue;
             }
+            let Some(cache) = token_cache else {
+                continue;
+            };
+            let revocation = cache.revocation().as_ref();
+            let skew = cache.clock_skew_secs();
             // Re-verify the chain the subscriber presented at subscribe
             // time against the *current* clock + revocation floors.
             // Anything that fails — expiry, a revoked root or link, a
@@ -5327,9 +5510,7 @@ fn sweep_expired_subscribers(
                     cfg.reverify_subscribe(&r.chain, &entity_id, r.grant_hash, revocation, skew)
                 });
             if !authorized {
-                guard.revoke_channel(subscriber_principal(node_id), name);
-                roster.remove(&channel_id, node_id);
-                subscriber_chains.remove(&(node_id, name.hash()));
+                evict();
                 tracing::debug!(
                     node_id = format!("{:#x}", node_id),
                     channel = name.as_str(),
@@ -5822,6 +6003,18 @@ impl LocalServiceRegistry {
     }
 }
 
+/// The capability grant a granted-audience envelope was sealed under (ORG-02):
+/// its issuer (this provider's owner org) and its grant id — the key the
+/// grant-revocation denylist is looked up by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Only `granted_envelopes` (cortex) builds one; without cortex the send-path
+// filter still compiles against the always-empty `scoped_grants`.
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+struct ScopedEnvelopeGrant {
+    issuer_org: super::behavior::org::OrgId,
+    grant_id: [u8; 32],
+}
+
 /// One coherent publication of this node's local capability emission (Kyra OA3
 /// torn-snapshot invariant): the plaintext `public` announcement and the
 /// encrypted owner-scoped announcement bytes in `scoped` are stored and read as a
@@ -5864,6 +6057,14 @@ struct LocalCapabilityEmission {
     /// allocation.
     provider_grant_snapshot:
         Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
+    /// ORG-02: parallel to `scoped` — for each envelope, the capability grant
+    /// that sealed it (`None` for the owner envelope). A capability-grant
+    /// revocation swaps no registry pointer, so `provider_grant_snapshot`
+    /// cannot see it; the send path consults the live revocation view and
+    /// drops the envelope of every grant revoked since this emission was
+    /// built, so a former grantee stops receiving new private-discovery
+    /// updates the moment the provider applies the revocation.
+    scoped_grants: Vec<Option<ScopedEnvelopeGrant>>,
     /// The local-service-registry PRIVATIZATION generation this emission's
     /// public/scoped projection was derived from. The send path rejects the
     /// emission if it has advanced — a concurrent visibility change made a
@@ -10983,6 +11184,12 @@ pub(crate) struct HeldAnnouncement {
 pub type EnrollmentTenantResolver =
     Arc<dyn Fn(&[u8]) -> Option<super::rtc::TenantId> + Send + Sync>;
 
+/// The most sessions a tenant may hold admitted at once, or `None` for
+/// no cap. Installed by the application
+/// ([`MeshNode::set_enrollment_tenant_cap`]).
+#[cfg(feature = "webrtc")]
+pub type EnrollmentTenantCap = Arc<dyn Fn(super::rtc::TenantId) -> Option<usize> + Send + Sync>;
+
 /// When a hub replays held announcements to a newly attached peer (after
 /// the peer has had time to install the session, then once more).
 const REPLAY_SETTLE: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(2)];
@@ -12243,6 +12450,18 @@ pub struct MeshNode {
     /// ([`Self::set_enrollment_tenant_resolver`]). `None`: no tenants.
     #[cfg(feature = "webrtc")]
     enrollment_tenant_resolver: parking_lot::RwLock<Option<EnrollmentTenantResolver>>,
+    /// ANCHOR-03: bind an Admitted enrollment grant to the session it
+    /// promotes ([`Self::set_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    enrollment_subject_binding: AtomicBool,
+    /// ANCHOR-04: the per-tenant admitted-session cap
+    /// ([`Self::set_enrollment_tenant_cap`]).
+    #[cfg(feature = "webrtc")]
+    enrollment_tenant_cap: parking_lot::RwLock<Option<EnrollmentTenantCap>>,
+    /// ANCHOR-04: serializes the count-and-promote of a capped tenant,
+    /// so two promotions cannot both observe the last free slot.
+    #[cfg(feature = "webrtc")]
+    tenant_admission: parking_lot::Mutex<()>,
     /// §12 step 4: the session incarnation an in-flight enrollment
     /// call was decoded against, keyed by `(node_id, call_id)`.
     /// Promotion consumes it and re-verifies the binding — a
@@ -13069,6 +13288,10 @@ pub struct MeshNode {
     /// every node subscribed (the registry replaced the old
     /// single-slot callback).
     org_raise_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
+    /// ORG-02: the node's slot in the INSTALLED store's grant-revocation
+    /// subscriber registry, replaced with `org_raise_subscription` on every
+    /// store installation and dropped with it on teardown.
+    org_grant_subscription: Arc<parking_lot::Mutex<OrgRaiseSubscription>>,
     /// Review-11 P1: bumped ONLY by
     /// [`Self::set_owner_cert_emission`]. Store/authority
     /// (re)installations and floor raises are captured DIRECTLY by
@@ -13145,6 +13368,9 @@ pub struct MeshNode {
     /// nonce)`. Shared with `DispatchCtx` via `Arc` clone; see the
     /// field of the same name there and [`MembershipRejection`].
     membership_dedupe: Arc<DashMap<(u64, u64), MembershipRejection>>,
+    /// Membership operation-ordering fence. Shared with `DispatchCtx`
+    /// via `Arc` clone; see [`MembershipFence`].
+    membership_fence: Arc<DashMap<(u64, ChannelHash), MembershipFence>>,
     /// Verifier-side identity-proof challenges. Shared with
     /// `DispatchCtx` via `Arc` clone; see the field of the same name
     /// there.
@@ -13778,6 +14004,13 @@ pub struct MeshNode {
     /// [`SubnetGatewayAuthorityState`] for the torn-view hazard two
     /// independent publications carried.
     subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Serializes the gateway member's compile-and-publish
+    /// ([`Self::install_subnet_gateway_credentials`]) against a subject
+    /// floor withdrawing it (SUBNET-05). Without it an install that
+    /// compiled before a floor landed could publish AFTER the floor's
+    /// withdrawal scan, re-publishing the removed rights. Never held
+    /// across I/O; the boundaries writer does not take it.
+    subnet_gateway_publish: Arc<parking_lot::Mutex<()>>,
     /// Typed protected-relay telemetry: envelopes forwarded, and
     /// authority denials split by exact
     /// [`ForwardDenial`](super::subnet::ForwardDenial) reason.
@@ -15029,6 +15262,12 @@ impl MeshNode {
             #[cfg(feature = "webrtc")]
             enrollment_tenant_resolver: parking_lot::RwLock::new(None),
             #[cfg(feature = "webrtc")]
+            enrollment_subject_binding: AtomicBool::new(false),
+            #[cfg(feature = "webrtc")]
+            enrollment_tenant_cap: parking_lot::RwLock::new(None),
+            #[cfg(feature = "webrtc")]
+            tenant_admission: parking_lot::Mutex::new(()),
+            #[cfg(feature = "webrtc")]
             pending_promotions: Arc::new(DashMap::new()),
             #[cfg(feature = "webrtc")]
             rtc_dialogs: Arc::new(tokio::sync::Mutex::new(super::rtc::DialogTable::new())),
@@ -15252,6 +15491,7 @@ impl MeshNode {
             org_install_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
+            org_grant_subscription: Arc::new(parking_lot::Mutex::new(None)),
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_handshakes,
             pending_direct_initiators,
@@ -15292,6 +15532,7 @@ impl MeshNode {
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
             membership_dedupe: Arc::new(DashMap::new()),
+            membership_fence: Arc::new(DashMap::new()),
             identity_challenges,
             pending_identity_proofs: Arc::new(DashMap::new()),
             pending_subnet_admissions: Arc::new(DashMap::new()),
@@ -15401,6 +15642,7 @@ impl MeshNode {
                     boundaries: None,
                 },
             )),
+            subnet_gateway_publish: Arc::new(parking_lot::Mutex::new(())),
             protected_relay_stats: Arc::new(ProtectedRelayStats::new()),
             subnet_local_attachment,
             peer_subnets,
@@ -20715,6 +20957,18 @@ impl MeshNode {
         &self.subnet_floors
     }
 
+    /// Test-only (fixtures): the durable floor log, when configured — the
+    /// seam a witness uses to inject a refused write
+    /// ([`SubnetFloorStore::set_fail_writes`]).
+    ///
+    /// [`SubnetFloorStore::set_fail_writes`]: super::subnet::floor_store::SubnetFloorStore::set_fail_writes
+    #[cfg(feature = "fixtures")]
+    pub fn test_subnet_floor_store(
+        &self,
+    ) -> Option<&Arc<super::subnet::floor_store::SubnetFloorStore>> {
+        self.subnet_floor_store.as_ref()
+    }
+
     /// Session id of the live incarnation for `node_id`, or `None`
     /// when no session exists. A subnet presentation binds to this
     /// value, so a replaced incarnation invalidates outstanding
@@ -20946,6 +21200,22 @@ impl MeshNode {
         })?;
 
         self.subnet_contexts.install(from_node, ctx.clone());
+        // SUBNET-01 publication fence. Verification captured the auth
+        // epoch before it read any floor, so a subtree floor raised since
+        // then has moved the epoch past `ctx`'s; a subject floor moves no
+        // epoch and is re-read directly. Re-read AFTER the install: either
+        // nothing moved (any later revocation's invalidation scan runs
+        // after this install and sees the context), or a revocation
+        // landed mid-admission and this context must not be reported
+        // admitted. Removal is conditional on the context still being
+        // exactly this one, so a concurrent re-admission is never undone.
+        self.subnet_contexts.fence_installed(
+            from_node,
+            &ctx,
+            self.subnet_topology_epoch.load(Ordering::Acquire),
+            &self.subnet_floors,
+            matches!(set, SubnetCredentialSet::OneHop { .. }),
+        )?;
         Ok(ctx)
     }
 
@@ -21013,11 +21283,12 @@ impl MeshNode {
         contexts: &SubnetContextStore,
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
     ) -> Result<bool, SubnetAuthError> {
-        let changed = floors.apply(floor, config)?;
-        if changed {
-            if let Some(store) = store {
-                store.append(&SubnetControlFact::RevocationFloor(floor.clone()).to_bytes())?;
-            }
+        let commit = Self::commit_floor_fact(
+            store,
+            || SubnetControlFact::RevocationFloor(floor.clone()).to_bytes(),
+            || floors.apply_tracked(floor, config),
+        )?;
+        if commit.enforce {
             let epoch = floors.auth_epoch(&floor.scope.authority);
             let dropped = contexts.invalidate_stale_epoch(&floor.scope.authority, epoch);
             tracing::info!(
@@ -21026,7 +21297,114 @@ impl MeshNode {
                 "subnet: revocation floor accepted; invalidated stale session contexts"
             );
         }
-        Ok(changed)
+        // Invalidation above ran BEFORE a persistence failure is
+        // reported (SUBNET-04): the registry already enforces the floor,
+        // so nothing it revokes may stay live because the disk refused.
+        commit.persisted?;
+        Ok(commit.enforce)
+    }
+
+    /// Accept one floor fact into the registry and make it durable, as
+    /// ONE ordered step (SUBNET-03/04/07).
+    ///
+    /// With a store, acceptance runs under the store's commit lock, so
+    /// the order facts are accepted in is the order a restart replays
+    /// them in; every ACCEPTED fact is logged — including one that only
+    /// advances a revision watermark — and a fact whose write failed
+    /// stays pending, so a retry of the same signed fact persists it even
+    /// though the registry sees nothing new. Without a store there is no
+    /// durable order to keep.
+    ///
+    /// `enforce` is whether live authority must be invalidated: this call
+    /// changed enforceable state, or it is the retry of an earlier
+    /// enforceable acceptance whose write failed (invalidation is
+    /// idempotent, so repeating it is the safe direction). `persisted` is
+    /// `Err(StateNotPersisted)` while anything accepted is not durable.
+    fn commit_floor_fact(
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        fact_bytes: impl FnOnce() -> Vec<u8>,
+        accept: impl FnOnce() -> Result<super::subnet::FloorAcceptance, SubnetAuthError>,
+    ) -> Result<FloorCommitOutcome, SubnetAuthError> {
+        let Some(store) = store else {
+            let acceptance = accept()?;
+            return Ok(FloorCommitOutcome {
+                enforce: acceptance.changed,
+                persisted: Ok(()),
+            });
+        };
+        let commit = store.commit(&fact_bytes(), accept)?;
+        let enforce = commit.acceptance.changed || commit.was_pending_enforceable;
+        let involved = commit.acceptance.accepted || commit.was_pending;
+        // Not durable is reported whichever fact is still pending: a stale
+        // or no-op fact arriving while an earlier accepted one has not
+        // reached the disk retried that write (the commit flushes the whole
+        // queue) and must not report success when it failed again.
+        let persisted = if commit.durable {
+            Ok(())
+        } else {
+            if involved {
+                tracing::warn!(
+                    "subnet: floor accepted and enforced in memory but NOT durably logged; \
+                     re-apply the same fact to retry persistence"
+                );
+            } else {
+                tracing::warn!(
+                    "subnet: an earlier accepted floor is still NOT durably logged; \
+                     re-apply it (or any floor) to retry persistence"
+                );
+            }
+            Err(SubnetAuthError::StateNotPersisted)
+        };
+        Ok(FloorCommitOutcome { enforce, persisted })
+    }
+
+    /// SUBNET-05: withdraw this node's published gateway member when a
+    /// subject floor for the LOCAL entity covers a right it holds.
+    ///
+    /// A subject floor does not advance the authority-wide auth epoch,
+    /// so the epoch comparison that darkens a gateway set on a subtree
+    /// floor never fires for one; without this, rights removed from the
+    /// local entity stayed published, and exported registrations stayed
+    /// authorized. Withdrawal replaces the aggregate, so every export
+    /// stability stamp pinned to the old one is stale too. Coverage is
+    /// conservative (generation and delegation ignored, exactly as for
+    /// remote contexts): re-installing the credentials then decides
+    /// exactly, through [`compile_gateway_context`]'s subject-floor
+    /// check.
+    ///
+    /// Runs under the gateway publication lock, so an install that
+    /// compiled before the floor landed either published first (and is
+    /// withdrawn here) or compiles after it.
+    ///
+    /// [`compile_gateway_context`]: super::subnet::compile_gateway_context
+    fn withdraw_covered_local_gateway(
+        gateway: &LocalGatewayHandles<'_>,
+        authority: &EntityId,
+        floors: &SubnetFloorRegistry,
+    ) -> bool {
+        let _publication = gateway.publish.lock();
+        let covered = gateway
+            .authority
+            .load()
+            .gateway
+            .as_deref()
+            .is_some_and(|set| set.authority() == authority && set.subject_floor_covers(floors));
+        if covered {
+            // The gateway member cannot change while the publication
+            // lock is held; the rcu only preserves a concurrent
+            // boundaries publication.
+            gateway
+                .authority
+                .rcu(|current| SubnetGatewayAuthorityState {
+                    gateway: None,
+                    boundaries: current.boundaries.clone(),
+                });
+            tracing::warn!(
+                "subnet: a subject floor removed rights this node's own gateway credentials \
+                 held; local gateway authority withdrawn until credentials are re-installed"
+            );
+        }
+        covered
     }
 
     /// Apply a signed subject floor (NET_CLI_PLAN_V3 §6.1a): remove one
@@ -21046,7 +21424,18 @@ impl MeshNode {
             &self.subnet_floors,
             &self.subnet_contexts,
             self.subnet_floor_store.as_deref(),
+            &self.local_gateway_handles(),
         )
+    }
+
+    /// The handles a subject floor needs to withdraw this node's own
+    /// gateway authority (SUBNET-05).
+    fn local_gateway_handles(&self) -> LocalGatewayHandles<'_> {
+        LocalGatewayHandles {
+            entity: self.entity_id(),
+            authority: &self.subnet_gateway_authority,
+            publish: &self.subnet_gateway_publish,
+        }
     }
 
     fn apply_subject_floor_with(
@@ -21055,23 +21444,49 @@ impl MeshNode {
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        gateway: &LocalGatewayHandles<'_>,
     ) -> Result<bool, SubnetAuthError> {
-        let changed = floors.apply_subject(floor, config)?;
-        if changed {
-            // Durable before anything reports it committed (§6.1a item 2).
-            // On failure the stricter in-memory state stays; the caller
-            // sees `StateNotPersisted`, never success.
-            if let Some(store) = store {
-                store.append(&SubnetControlFact::SubjectFloor(floor.clone()).to_bytes())?;
-            }
+        let commit = Self::apply_subject_floor_tracked_with(
+            floor, config, floors, contexts, store, gateway,
+        )?;
+        commit.persisted?;
+        Ok(commit.enforce)
+    }
+
+    /// [`Self::apply_subject_floor_with`], reporting whether this fact
+    /// changed enforceable state separately from whether the store is
+    /// durable — the readback attests the two separately.
+    fn apply_subject_floor_tracked_with(
+        floor: &SubnetSubjectFloor,
+        config: &SubnetAuthorityConfig,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+        store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        gateway: &LocalGatewayHandles<'_>,
+    ) -> Result<FloorCommitOutcome, SubnetAuthError> {
+        // Durable before anything reports it committed (§6.1a item 2);
+        // acceptance and log order are one order (SUBNET-03). On a write
+        // failure the stricter in-memory state stays and the caller sees
+        // `StateNotPersisted`, never success — but only AFTER the
+        // invalidation below, which an I/O failure must not skip
+        // (SUBNET-04).
+        let commit = Self::commit_floor_fact(
+            store,
+            || SubnetControlFact::SubjectFloor(floor.clone()).to_bytes(),
+            || floors.apply_subject_tracked(floor, config),
+        )?;
+        if commit.enforce {
             let dropped =
                 contexts.invalidate_subject(&floor.scope.authority, &floor.subject, floors);
+            let withdrew_gateway = &floor.subject == gateway.entity
+                && Self::withdraw_covered_local_gateway(gateway, &floor.scope.authority, floors);
             tracing::info!(
                 dropped,
+                withdrew_gateway,
                 "subnet: subject floor accepted; dropped only the removed subject's contexts"
             );
         }
-        Ok(changed)
+        Ok(commit)
     }
 
     /// Answer one authenticated floor readback request (V3-4 slice 2): it
@@ -21113,9 +21528,25 @@ impl MeshNode {
         }
         let apply = match request.apply_fact()? {
             None => FloorApplyOutcome::NotRequested,
-            Some(floor) => match self.apply_subnet_subject_floor(&floor) {
-                Ok(true) => FloorApplyOutcome::Applied,
-                Ok(false) => FloorApplyOutcome::Unchanged,
+            // Whether this fact changed anything, judged apart from
+            // durability: a floor enforced in memory but not yet durable is
+            // "applied" with `persisted: false` below, never a refusal, and a
+            // stale fact is "unchanged" even while an earlier one is pending.
+            Some(floor) => match self
+                .subnet_authority_config(&floor.scope.authority)
+                .ok_or(SubnetAuthError::UnknownAuthority)
+                .and_then(|config| {
+                    Self::apply_subject_floor_tracked_with(
+                        &floor,
+                        config,
+                        &self.subnet_floors,
+                        &self.subnet_contexts,
+                        self.subnet_floor_store.as_deref(),
+                        &self.local_gateway_handles(),
+                    )
+                }) {
+                Ok(commit) if commit.enforce => FloorApplyOutcome::Applied,
+                Ok(_) => FloorApplyOutcome::Unchanged,
                 Err(e) => FloorApplyOutcome::Refused(e),
             },
         };
@@ -21125,13 +21556,22 @@ impl MeshNode {
             request.scope.path,
             &request.subject,
         );
+        // SUBNET-04: `persisted` attests actual durable coverage, not
+        // merely that a store is configured. Read AFTER the state above:
+        // a commit that changed that state either finished before this
+        // check (and its outcome is reported) or is still pending (and
+        // the answer is "not persisted").
+        let persisted = self
+            .subnet_floor_store
+            .as_deref()
+            .is_some_and(|store| store.is_durable());
         FloorStatusAttestation::sign(
             self.entity_keypair(),
             request.digest(),
             apply,
             revision,
             generations,
-            self.subnet_floor_store.is_some(),
+            persisted,
         )
     }
 
@@ -21221,6 +21661,7 @@ impl MeshNode {
             &self.subnet_floors,
             &self.subnet_contexts,
             self.subnet_floor_store.as_deref(),
+            &self.local_gateway_handles(),
         )
     }
 
@@ -21258,6 +21699,7 @@ impl MeshNode {
         floors: &SubnetFloorRegistry,
         contexts: &SubnetContextStore,
         store: Option<&super::subnet::floor_store::SubnetFloorStore>,
+        gateway: &LocalGatewayHandles<'_>,
     ) -> Result<SubnetControlOutcome, SubnetAuthError> {
         let fact = SubnetControlFact::from_bytes(bytes)?;
         let config = authorities
@@ -21269,7 +21711,7 @@ impl MeshNode {
                 Self::apply_floor_with(floor, config, floors, contexts, store)?
             }
             SubnetControlFact::SubjectFloor(floor) => {
-                Self::apply_subject_floor_with(floor, config, floors, contexts, store)?
+                Self::apply_subject_floor_with(floor, config, floors, contexts, store, gateway)?
             }
             _ => control.apply(
                 &fact,
@@ -21327,6 +21769,10 @@ impl MeshNode {
         sets: &[SubnetCredentialSet],
         after_capture: &(dyn Fn() + Sync),
     ) -> Result<(), SubnetAuthError> {
+        // Compile and publish as one step against a subject floor's
+        // withdrawal (SUBNET-05): a floor landing mid-compile either is
+        // seen by the compile below or withdraws what this publishes.
+        let _publication = self.subnet_gateway_publish.lock();
         if sets.is_empty() {
             self.publish_gateway_member_paced(None, after_capture);
             return Ok(());
@@ -21831,6 +22277,23 @@ impl MeshNode {
                     },
                 );
             }
+            // ORG-01: floors are only one dimension of the installed view.
+            // A candidate with equal or higher floors that lacks an
+            // unexpired capability/dispatcher grant revocation — an older
+            // backup, another node's store — would re-enable the withdrawn
+            // grant the instant it publishes, with no new root signature.
+            // Both views are frozen by the pin above, so this comparison and
+            // the swap below see the same entries.
+            if !current_view.grant_revocations_retained_by(
+                &candidate_view,
+                super::behavior::org::current_timestamp(),
+            ) {
+                return Err(
+                    super::behavior::org_revocation::OrgRevocationError::GrantRevocationsNotRetained {
+                        path: store.path().display().to_string(),
+                    },
+                );
+            }
         }
         if let Some(pause) = pause_before_swap {
             pause();
@@ -21929,6 +22392,41 @@ impl MeshNode {
                 );
             }
         });
+        // ORG-02: a capability-grant revocation retracts the grant's scoped-
+        // discovery records at query time, exactly as a floor raise retracts a
+        // revoked member's — so it must dirty those capabilities and wake
+        // consumers too, through the same node-global gated commit, behind the
+        // same store-identity gate.
+        let grant_subscription = {
+            let slot = self.org_revocation.clone();
+            let me = Arc::downgrade(&store);
+            let scoped_discovery = self.scoped_discovery.clone();
+            let scoped_publication = self.scoped_publication.clone();
+            let routing_authority = self.routing_authority.clone();
+            let routing_registry = self.routing_registry.clone();
+            store.subscribe_grants_revoked(move |revoked| {
+                let installed = slot.load_full();
+                let still_installed = match (&installed, me.upgrade()) {
+                    (Some(current), Some(me)) => Arc::ptr_eq(current, &me),
+                    _ => false,
+                };
+                if !still_installed {
+                    return;
+                }
+                // The revocation changes what the routing source may serve,
+                // whether or not it retracts a scoped row — same ordering as
+                // the floor callback above.
+                move_routing_authority(&routing_authority, &routing_registry, || {});
+                let retracted = scoped_publication
+                    .gated_commit(&scoped_discovery, |s| s.note_grants_revoked(revoked));
+                if retracted > 0 {
+                    tracing::info!(
+                        retracted,
+                        "grant revocation retracted scoped-discovery record(s)"
+                    );
+                }
+            })
+        };
         // Swap the node's observer slot: drop the guard held on the
         // outgoing store FIRST so a detached store neither keeps nor
         // steals this node's notifications (review-9 addendum). The old
@@ -21938,6 +22436,11 @@ impl MeshNode {
             let mut slot = self.org_raise_subscription.lock();
             slot.take();
             *slot = Some(subscription);
+        }
+        {
+            let mut slot = self.org_grant_subscription.lock();
+            slot.take();
+            *slot = Some(grant_subscription);
         }
         // OLB-2B-E3c: the swap and the routing-authority bump are ONE ordered
         // unit under the authority gate. Publishing the store first and bumping
@@ -22006,6 +22509,21 @@ impl MeshNode {
             tracing::info!(
                 retracted,
                 "store installation retracted scoped-discovery record(s)"
+            );
+        }
+        // ORG-02: the same install-time gap for grant revocations — a store
+        // installed after it learned a revocation fires no grant callback.
+        let revoked: Vec<super::behavior::org_revocation::RevokedGrantKey> = snapshot
+            .iter_revoked_grants()
+            .map(|(key, _)| *key)
+            .collect();
+        let retracted = self
+            .scoped_publication
+            .gated_commit(&self.scoped_discovery, |s| s.note_grants_revoked(&revoked));
+        if retracted > 0 {
+            tracing::info!(
+                retracted,
+                "store installation retracted grant-revoked scoped-discovery record(s)"
             );
         }
         // A visible store publication occurred (None→store or A→B).
@@ -22157,6 +22675,12 @@ impl MeshNode {
         authority
             .config
             .self_verify(self.identity.entity_id(), &candidate_store.snapshot())?;
+        // ORG-03: the owner audience must belong to the (just verified)
+        // membership's org. The authority's fields are public, so an object
+        // that never went through `NodeAuthority::open` reaches here too; an
+        // org-A audience paired with an org-B membership would seal B's
+        // owner-private catalog under A's discovery key.
+        authority.check_audience_binding()?;
         if let Some(pause) = pause_after_verify {
             pause();
         }
@@ -23276,9 +23800,19 @@ impl MeshNode {
         generation: u64,
         now_secs: u64,
         ttl: Duration,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<(Vec<u8>, ScopedEnvelopeGrant)> {
         use super::behavior::org_grant::CapabilityAuthorityId;
+        use super::behavior::org_revocation::OrgRevocationState;
         use super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+
+        // ORG-02: the grant-revocation view this emission is decided under. A
+        // revoked grant is inactive for emission; a revocation landing after
+        // this read is caught by the send path, which drops the envelope of
+        // any grant revoked since (see `scoped_unrevoked`).
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
 
         // Precompute each granted service's capability id ONCE (blake3 per tag),
         // then match records against it — O(services + services*records) rather
@@ -23308,6 +23842,7 @@ impl MeshNode {
                 &authority.owner_org(),
                 now_secs,
                 authority.config.verification_skew_secs,
+                floors,
             ) {
                 continue;
             }
@@ -23342,7 +23877,13 @@ impl MeshNode {
                 expires_at,
                 &descriptor,
             ) {
-                Ok(envelope) => envelopes.push(envelope.to_bytes()),
+                Ok(envelope) => envelopes.push((
+                    envelope.to_bytes(),
+                    ScopedEnvelopeGrant {
+                        issuer_org: grant.issuer_org,
+                        grant_id: grant.grant_id,
+                    },
+                )),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -23437,6 +23978,41 @@ impl MeshNode {
     /// floor publish, and no emission toggle occurred.
     fn security_stamp(&self) -> SendStamp {
         self.security_snapshot().stamp
+    }
+
+    /// ORG-02: the cached emission's scoped envelopes minus every granted
+    /// envelope whose capability grant the installed store now revokes.
+    ///
+    /// A grant revocation changes no registry pointer and no public cert, so
+    /// neither the provider-snapshot comparison nor the cert rebuild notices
+    /// it; without this the cached ciphertext sealed for the former grantee
+    /// kept shipping on every send until the grant expired. Owner envelopes
+    /// and grants still in force pass through unchanged — each envelope is
+    /// independently decryptable, so dropping one never tears another.
+    fn scoped_unrevoked(&self, cached: &LocalCapabilityEmission) -> Vec<Vec<u8>> {
+        debug_assert_eq!(cached.scoped.len(), cached.scoped_grants.len());
+        if cached.scoped_grants.iter().all(Option::is_none) {
+            return cached.scoped.clone();
+        }
+        let Some(store) = self.org_revocation.load_full() else {
+            return cached.scoped.clone();
+        };
+        let floors = store.snapshot();
+        cached
+            .scoped
+            .iter()
+            .zip(cached.scoped_grants.iter())
+            .filter(|(_, grant)| {
+                grant.is_none_or(|g| {
+                    !floors.is_grant_revoked(
+                        &g.issuer_org,
+                        super::behavior::org_grant_revocation::RevokedGrantKind::Capability,
+                        &g.grant_id,
+                    )
+                })
+            })
+            .map(|(envelope, _)| envelope.clone())
+            .collect()
     }
 
     /// Capture the [`SendStamp`] AND retain the exact authority/store
@@ -23547,6 +24123,11 @@ impl MeshNode {
             let desired = self.owner_cert_for_emission_at(now_secs);
             if desired == cached.public.owner_cert {
                 let bytes = cached.public.to_bytes();
+                // ORG-02: drop the envelope of every grant revoked since this
+                // emission was built. Read BEFORE the stability recheck below, so
+                // a revocation publishing after this read moves the stamp and the
+                // attempt retries against the new view.
+                let scoped = self.scoped_unrevoked(&cached);
                 if let Some(probe) = probe {
                     probe();
                 }
@@ -23607,7 +24188,7 @@ impl MeshNode {
                     // envelope embedding a stale cert cannot ship.
                     return Some(SendEmission {
                         public: bytes,
-                        scoped: cached.scoped.clone(),
+                        scoped,
                         exposure_generation: cached.exposure_revocation_generation,
                     });
                 }
@@ -24654,6 +25235,7 @@ impl MeshNode {
             .store(Some(Arc::new(LocalCapabilityEmission {
                 public: ann,
                 scoped: Vec::new(),
+                scoped_grants: Vec::new(),
                 // Scoped cleared ⇒ no sealing authority to track (Kyra B2).
                 scoped_authority: None,
                 // Scoped cleared ⇒ no sealing provider snapshot to track either
@@ -27848,6 +28430,7 @@ impl MeshNode {
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
             membership_dedupe: self.membership_dedupe.clone(),
+            membership_fence: self.membership_fence.clone(),
             membership_dedupe_ttl: self.config.membership_ack_timeout * 2,
             identity_challenges: self.identity_challenges.clone(),
             pending_identity_proofs: self.pending_identity_proofs.clone(),
@@ -27886,6 +28469,7 @@ impl MeshNode {
             peer_subnets: self.peer_subnets.clone(),
             subnet_contexts: self.subnet_contexts.clone(),
             subnet_gateway_authority: self.subnet_gateway_authority.clone(),
+            subnet_gateway_publish: self.subnet_gateway_publish.clone(),
             protected_relay_stats: self.protected_relay_stats.clone(),
             subnet_floors: self.subnet_floors.clone(),
             subnet_floor_store: self.subnet_floor_store.clone(),
@@ -30422,12 +31006,27 @@ impl MeshNode {
 
         // Case 1: msg2 for an in-flight initiator. Look up pending state
         // by routing id (that's how it was keyed on insert).
-        if let Some((_, pending)) = ctx.pending_handshakes.remove(&peer_routing_id) {
-            let PendingHandshake { mut noise, tx } = pending;
-            let result = (|| -> Result<(SessionKeys, [u8; 32]), CryptoError> {
-                noise.read_message(&parsed.payload)?;
-                noise.into_session_keys_with_binding()
-            })();
+        //
+        // NHS-03: the entry is consumed only once `read_message` has
+        // AUTHENTICATED msg2. Anyone who can put a routed HANDSHAKE on
+        // the wire naming this source can make this lookup hit; removing
+        // first let one forged datagram end the attempt and leave the
+        // genuine msg2 with no initiator. A rejected message leaves the
+        // state exactly as it was (snow restores the symmetric state and
+        // does not advance on a failed read — the direct inbox loop relies
+        // on the same property), so the attempt keeps waiting.
+        if let dashmap::mapref::entry::Entry::Occupied(mut slot) =
+            ctx.pending_handshakes.entry(peer_routing_id)
+        {
+            if let Err(e) = slot.get_mut().noise.read_message(&parsed.payload) {
+                tracing::debug!(
+                    error = %e,
+                    "routed handshake: msg2 rejected; pending initiation kept"
+                );
+                return;
+            }
+            let PendingHandshake { noise, tx } = slot.remove();
+            let result = noise.into_session_keys_with_binding();
             let _ = tx
                 .send(result.map(|(keys, handshake_hash)| {
                     (keys, handshake_hash, routing_header.hop_count)
@@ -32342,13 +32941,10 @@ impl MeshNode {
                             // peer. The forwarded ack keeps the same
                             // bytes — `from_peer` still points at the
                             // original sender, which is what the
-                            // recipient correlates on.
-                            Self::forward_punch_ack(
-                                ack,
-                                #[cfg(feature = "webrtc")]
-                                from_node,
-                                ctx,
-                            );
+                            // recipient correlates on — so it is only
+                            // forwarded when that claim is the
+                            // authenticated sender (NAT-08).
+                            Self::forward_punch_ack(ack, from_node, ctx);
                         }
                     }
                     rendezvous::RendezvousMsg::PunchReject(rej) => {
@@ -32490,6 +33086,11 @@ impl MeshNode {
                     &ctx.subnet_floors,
                     &ctx.subnet_contexts,
                     ctx.subnet_floor_store.as_deref(),
+                    &LocalGatewayHandles {
+                        entity: ctx.signing_identity.entity_id(),
+                        authority: &ctx.subnet_gateway_authority,
+                        publish: &ctx.subnet_gateway_publish,
+                    },
                 ) {
                     Ok(outcome) if outcome.applied => tracing::info!(
                         from_node = format!("{from_node:#x}"),
@@ -36751,36 +37352,39 @@ impl MeshNode {
                 // accepted request is deliberately NOT cached and is
                 // re-decided in full — see [`MembershipRejection`].
                 let replayed = Self::recorded_membership_rejection(from_node, nonce, ctx);
-                let (accepted, reason) = match replayed {
-                    Some(hit) => (false, hit.reason),
-                    None => Self::authorize_subscribe(
-                        &channel,
-                        from_node,
-                        token.as_deref(),
-                        queue_group.as_deref(),
-                        ctx,
-                    ),
+                let channel_hash = ChannelId::new(channel.clone()).hash();
+                // CHAN-04: decide AND apply under the membership's
+                // ordering fence. A copy of a Subscribe this membership
+                // has already moved past (an Unsubscribe was applied
+                // after it) is re-acked without re-adding the member.
+                let fenced =
+                    Self::fenced_membership_op(from_node, channel_hash, nonce, ctx, || {
+                        let decision = match replayed {
+                            Some(hit) => (false, hit.reason),
+                            None => Self::authorize_subscribe(
+                                &channel,
+                                from_node,
+                                token.as_deref(),
+                                queue_group.as_deref(),
+                                ctx,
+                            ),
+                        };
+                        if decision.0 {
+                            Self::apply_accepted_subscribe(&channel, from_node, queue_group, ctx);
+                        }
+                        (decision.0, decision)
+                    });
+                let Some((accepted, reason)) = fenced else {
+                    tracing::debug!(
+                        nonce,
+                        from = from_node,
+                        channel = %channel,
+                        "superseded membership Subscribe copy; re-acked, not re-applied"
+                    );
+                    Self::send_membership_ack(from_node, nonce, true, None, ctx);
+                    return;
                 };
                 if accepted {
-                    // Populate the AuthGuard fast path so publish
-                    // fan-out can admit this subscriber in <10 ns
-                    // without re-walking the ACL. Mirrors the
-                    // `roster.add_with_mode` below — both are
-                    // keyed on the channel name so they stay
-                    // consistent. Auth is mode-agnostic: a
-                    // subscriber's queue-group choice doesn't
-                    // change which capability tokens authorize the
-                    // channel.
-                    ctx.auth_guard
-                        .allow_channel(subscriber_principal(from_node), &channel);
-                    let id = ChannelId::new(channel);
-                    let mode = match queue_group {
-                        None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
-                        Some(name) => crate::adapter::net::channel::SubscriptionMode::QueueGroup(
-                            crate::adapter::net::channel::QueueGroupName::new(name),
-                        ),
-                    };
-                    ctx.roster.add_with_mode(id, from_node, mode);
                     Self::clear_auth_failures(from_node, ctx);
                 } else if replayed.is_none() {
                     // First time we've refused THIS request. A
@@ -36804,16 +37408,30 @@ impl MeshNode {
                 Self::send_membership_ack(from_node, nonce, accepted, reason, ctx);
             }
             MembershipMsg::Unsubscribe { channel, nonce } => {
-                // Revoke from the fast path first so any in-flight
-                // publish stops admitting this subscriber even
-                // before the roster update is visible.
-                ctx.auth_guard
-                    .revoke_channel(subscriber_principal(from_node), &channel);
-                let id = ChannelId::new(channel);
-                // Drop the retained subscribe chain so it can't be
-                // re-validated by the sweep and doesn't leak memory.
-                ctx.subscriber_chains.remove(&(from_node, id.hash()));
-                ctx.roster.remove(&id, from_node);
+                let id = ChannelId::new(channel.clone());
+                // CHAN-04: a copy of an Unsubscribe this membership has
+                // already moved past (a Subscribe was applied after it)
+                // must not remove the newer subscription.
+                let fenced = Self::fenced_membership_op(from_node, id.hash(), nonce, ctx, || {
+                    // Revoke from the fast path first so any in-flight
+                    // publish stops admitting this subscriber even
+                    // before the roster update is visible.
+                    ctx.auth_guard
+                        .revoke_channel(subscriber_principal(from_node), &channel);
+                    // Drop the retained subscribe chain so it can't be
+                    // re-validated by the sweep and doesn't leak memory.
+                    ctx.subscriber_chains.remove(&(from_node, id.hash()));
+                    ctx.roster.remove(&id, from_node);
+                    (true, ())
+                });
+                if fenced.is_none() {
+                    tracing::debug!(
+                        nonce,
+                        from = from_node,
+                        channel = %channel,
+                        "superseded membership Unsubscribe copy; re-acked, not re-applied"
+                    );
+                }
                 // Unsubscribe is always accepted — idempotent even if the
                 // peer wasn't actually subscribed.
                 Self::send_membership_ack(from_node, nonce, true, None, ctx);
@@ -40895,20 +41513,72 @@ impl MeshNode {
         expected_endpoint: PeerAddr,
         tenant: Option<super::rtc::TenantId>,
     ) -> bool {
+        self.promote_admission_with_grant(
+            node_id,
+            expected_session_id,
+            expected_endpoint,
+            tenant,
+            None,
+        ) == Promotion::Promoted
+    }
+
+    /// [`Self::promote_admission_with_tenant`], also recording the
+    /// device the grant was issued to (ANCHOR-03), which the caller has
+    /// already checked against `node_id`.
+    #[cfg(feature = "webrtc")]
+    fn promote_admission_with_grant(
+        &self,
+        node_id: u64,
+        expected_session_id: u64,
+        expected_endpoint: PeerAddr,
+        tenant: Option<super::rtc::TenantId>,
+        device: Option<EntityId>,
+    ) -> Promotion {
+        // ANCHOR-04: a capped tenant's slot is taken HERE, at the
+        // commit, under one lock — the count of admitted sessions and
+        // this promotion are one step. The enrollment handler's own
+        // occupancy check runs earlier and per call, so two visitors
+        // answered concurrently both saw the last free slot and both
+        // promoted. Nothing is reserved before this point, so a call
+        // that is cancelled, fails or is replaced, and a session that
+        // disconnects, holds no slot: the count is of sessions that are
+        // admitted now.
+        let cap = tenant.and_then(|tenant| {
+            let cap = self.enrollment_tenant_cap.read().clone()?;
+            cap(tenant).map(|max| (tenant, max))
+        });
+        let _slot = cap.map(|_| self.tenant_admission.lock());
+        if let Some((tenant, max)) = cap {
+            if self.tenant_peer_count(tenant) >= max {
+                if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
+                    stats.note_admission_rejected_outcome();
+                }
+                tracing::debug!(
+                    node_id = format!("{node_id:#x}"),
+                    "§12: tenant is at its player cap; session stays provisional"
+                );
+                return Promotion::TenantFull;
+            }
+        }
         let Some(mut entry) = self.peers.get_mut(&node_id) else {
-            return false;
+            return Promotion::NotPromoted;
         };
         let info = entry.value_mut();
         if info.session.session_id() != expected_session_id || info.addr() != expected_endpoint {
-            return false;
+            return Promotion::NotPromoted;
         }
         if !info.admission.is_provisional() {
-            return false;
+            return Promotion::NotPromoted;
         }
+        // The origin the reply subscription was admitted under; the
+        // Admitted reply this promotion precedes still rides it.
+        let enrolled_origin = info.admission.bound_origin();
         info.admission = super::rtc::PeerAdmission::Admitted {
             promoted_at: std::time::Instant::now(),
             session_id: expected_session_id,
             tenant,
+            device: device.map(|d| d.0),
+            enrolled_origin,
         };
         drop(entry);
         self.provisional_endpoints.remove(&expected_endpoint);
@@ -40927,7 +41597,7 @@ impl MeshNode {
         if tokio::runtime::Handle::try_current().is_ok() {
             self.spawn_relay_replay(node_id);
         }
-        true
+        Promotion::Promoted
     }
 
     /// Charge one enrollment REQUEST frame and reserve its
@@ -41056,7 +41726,8 @@ impl MeshNode {
             call_id,
             session,
             None,
-        )
+            None,
+        ) == Promotion::Promoted
     }
 
     /// Drive the rejection half by call id (R2 witness seam).
@@ -41150,6 +41821,10 @@ impl MeshNode {
     /// §12 step 4, the response half: an enrollment call that
     /// produced a response promotes the incarnation captured at its
     /// own REQUEST decode — and only that one (R2).
+    ///
+    /// [`Promotion::TenantFull`] tells the response path that the
+    /// Admitted verdict it is about to send did NOT take effect, so it
+    /// must not reach the visitor as an admission (ANCHOR-04).
     #[cfg(feature = "webrtc")]
     pub(crate) fn promote_on_enrollment_response(
         &self,
@@ -41158,12 +41833,13 @@ impl MeshNode {
         call_id: u64,
         receiving_session_id: u64,
         tenant: Option<super::rtc::TenantId>,
-    ) -> bool {
+        device: Option<EntityId>,
+    ) -> Promotion {
         let Some(origin) = self.provisional_reply_origin(node_id) else {
-            return false;
+            return Promotion::NotPromoted;
         };
         if reply_channel != super::rtc::enroll_reply_channel(origin) {
-            return false;
+            return Promotion::NotPromoted;
         }
         // R3-A: the in-flight slot is released **only** for the
         // call that owned it, and only when its own reservation is
@@ -41178,10 +41854,10 @@ impl MeshNode {
             if let Some(stats) = self.rtc_driver.as_ref().map(|d| d.stats()) {
                 stats.note_admission_promotion_orphaned();
             }
-            return false;
+            return Promotion::NotPromoted;
         };
         self.release_enrollment_slot_of(node_id, session_id);
-        self.promote_admission_with_tenant(node_id, session_id, endpoint, tenant)
+        self.promote_admission_with_grant(node_id, session_id, endpoint, tenant, device)
     }
 
     /// Install how this node maps an Admitted enrollment grant (the
@@ -41197,6 +41873,105 @@ impl MeshNode {
         *self.enrollment_tenant_resolver.write() = resolver;
     }
 
+    /// Cap how many sessions each tenant may hold **admitted** at once
+    /// (ANCHOR-04). `cap(tenant)` answers the ceiling, or `None` for an
+    /// uncapped tenant; `None` removes the cap entirely.
+    ///
+    /// The ceiling is enforced at promotion, atomically with it: a
+    /// promotion that would take the tenant past its ceiling promotes
+    /// nothing (the session stays provisional, counted as a rejected
+    /// outcome). An application's own occupancy check before it
+    /// answers is still useful — it gives the visitor a readable
+    /// refusal — but it is a preflight, not the admission transaction.
+    #[cfg(feature = "webrtc")]
+    pub fn set_enrollment_tenant_cap(&self, cap: Option<EnrollmentTenantCap>) {
+        *self.enrollment_tenant_cap.write() = cap;
+    }
+
+    /// **Bind every enrollment grant to the session it promotes**
+    /// (ANCHOR-03).
+    ///
+    /// With this on, an Admitted enrollment outcome promotes the
+    /// provisional session only when the grant it carries — a
+    /// serialized [`TokenChain`](super::identity::TokenChain) — names,
+    /// as its leaf subject, the participant that session IS: the
+    /// subject's [`EntityId::node_id`] must equal the session's node
+    /// id, which every direct announcement from the session must also
+    /// carry. The device is then recorded on the admitted session, and
+    /// a later direct announcement from it under any other entity is
+    /// refused. An outcome whose grant does not parse, or names
+    /// another participant, promotes nothing and is counted as a
+    /// rejection.
+    ///
+    /// Without it, one device's valid, reusable join body sent over
+    /// several provisional sessions (each its own participant) was
+    /// admitted on every one of them: the handler verified the device
+    /// and its invite, and promotion bound the call, the session and
+    /// the tenant — never the device to the session.
+    ///
+    /// The SDK's enrollment services (`serve_game_enrollment`,
+    /// `serve_enrollment`, `serve_enrollment_auto`) turn it on. A
+    /// custom enrollment handler registered directly on the core must
+    /// answer real grants and turn it on itself.
+    #[cfg(feature = "webrtc")]
+    pub fn set_enrollment_subject_binding(&self, enabled: bool) {
+        self.enrollment_subject_binding
+            .store(enabled, Ordering::Release);
+    }
+
+    /// [`Self::set_enrollment_subject_binding`], returning the setting it
+    /// replaced — so a caller that fails after installing its enrollment
+    /// policy can put the previous one back.
+    #[cfg(feature = "webrtc")]
+    pub fn replace_enrollment_subject_binding(&self, enabled: bool) -> bool {
+        self.enrollment_subject_binding
+            .swap(enabled, Ordering::AcqRel)
+    }
+
+    /// [`Self::set_enrollment_tenant_resolver`], returning the resolver it
+    /// replaced (see [`Self::replace_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    pub fn replace_enrollment_tenant_resolver(
+        &self,
+        resolver: Option<EnrollmentTenantResolver>,
+    ) -> Option<EnrollmentTenantResolver> {
+        std::mem::replace(&mut *self.enrollment_tenant_resolver.write(), resolver)
+    }
+
+    /// [`Self::set_enrollment_tenant_cap`], returning the cap it replaced
+    /// (see [`Self::replace_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    pub fn replace_enrollment_tenant_cap(
+        &self,
+        cap: Option<EnrollmentTenantCap>,
+    ) -> Option<EnrollmentTenantCap> {
+        std::mem::replace(&mut *self.enrollment_tenant_cap.write(), cap)
+    }
+
+    /// ANCHOR-03: which device an Admitted grant binds to `node_id`'s
+    /// session. `Ok(None)` when this node does not bind grants;
+    /// `Ok(Some(device))` when it does and the grant's leaf subject is
+    /// that session's participant; `Err(())` when it does and the grant
+    /// is unreadable or names someone else — promote nothing.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn enrollment_grant_device(
+        &self,
+        node_id: u64,
+        chain: Option<&[u8]>,
+    ) -> Result<Option<EntityId>, ()> {
+        if !self.enrollment_subject_binding.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let subject = chain
+            .and_then(|bytes| super::identity::TokenChain::from_bytes(bytes).ok())
+            .and_then(|chain| chain.tokens.last().map(|token| token.subject.clone()))
+            .ok_or(())?;
+        if subject.node_id() != node_id {
+            return Err(());
+        }
+        Ok(Some(subject))
+    }
+
     /// The tenant `chain` (an Admitted grant) belongs to, per the
     /// installed resolver.
     #[cfg(feature = "webrtc")]
@@ -41209,6 +41984,14 @@ impl MeshNode {
     #[cfg(feature = "webrtc")]
     pub fn peer_tenant(&self, node_id: u64) -> Option<super::rtc::TenantId> {
         self.peers.get(&node_id)?.admission.tenant()
+    }
+
+    /// The device (entity id bytes) `node_id`'s current session was
+    /// enrolled as, when this node binds grants to sessions
+    /// ([`Self::set_enrollment_subject_binding`]).
+    #[cfg(feature = "webrtc")]
+    pub fn peer_granted_device(&self, node_id: u64) -> Option<[u8; 32]> {
+        self.peers.get(&node_id)?.admission.granted_device()
     }
 
     /// How many current sessions were enrolled for `tenant`. A scan of
@@ -41821,9 +42604,21 @@ impl MeshNode {
         from_node: u64,
         ctx: &DispatchCtx,
     ) -> Option<u64> {
+        Self::bootstrap_reply_origin_in(&ctx.peers, channel, from_node)
+    }
+
+    /// [`Self::bootstrap_reply_origin`] over the peer table directly —
+    /// for the publish path, which holds the node rather than a
+    /// dispatch context.
+    #[cfg(feature = "webrtc")]
+    fn bootstrap_reply_origin_in(
+        peers: &DashMap<u64, PeerInfo>,
+        channel: &ChannelName,
+        from_node: u64,
+    ) -> Option<u64> {
         let claimed =
             super::rtc::PeerAdmission::origin_from_enroll_reply_channel(channel.as_str())?;
-        let entry = ctx.peers.get(&from_node)?;
+        let entry = peers.get(&from_node)?;
         let admission = entry.value().admission;
         if !admission.is_provisional() {
             return None;
@@ -42202,6 +42997,24 @@ impl MeshNode {
                 "capability: node_id mismatch (peer can only announce for itself)"
             );
             return;
+        }
+
+        // ANCHOR-03: a session admitted on an enrollment grant speaks
+        // as the device that grant named, and as nobody else.
+        #[cfg(feature = "webrtc")]
+        if ann.hop_count == 0 {
+            let granted = ctx
+                .peers
+                .get(&from_node)
+                .and_then(|peer| peer.value().admission.granted_device());
+            if granted.is_some_and(|device| device != ann.entity_id.0) {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    "capability: announcement entity is not the device this session \
+                     was enrolled as"
+                );
+                return;
+            }
         }
 
         // Origin self-check — if we're the origin, drop. A mesh
@@ -43597,13 +44410,32 @@ impl MeshNode {
     /// Wire bytes are preserved intact: `from_peer` still names
     /// the original sender so the recipient can correlate
     /// against its `pending_punch_acks` map.
+    ///
+    /// `from_node` is the authenticated session peer the ack arrived
+    /// from, and the ack is forwarded only when it is the `from_peer`
+    /// the ack claims (NAT-08). The recipient binds the ack to its
+    /// recorded coordinator, not to `from_peer` — this hop is the only
+    /// place the claim can be checked. Unchecked, any session peer of
+    /// the coordinator could send `PunchAck { from_peer: B, to_peer: A }`
+    /// and have it laundered into an authentic-looking coordinator
+    /// forward: A's waiter for B resolves early, a direct handshake
+    /// starts before B has punched, and B's real ack finds no waiter.
     #[cfg(feature = "nat-traversal")]
     fn forward_punch_ack(
         ack: super::traversal::rendezvous::PunchAck,
-        #[cfg(feature = "webrtc")] from_node: u64,
+        from_node: u64,
         ctx: &DispatchCtx,
     ) {
         use super::traversal::rendezvous::RendezvousMsg;
+
+        if ack.from_peer != from_node {
+            tracing::trace!(
+                from = format!("{:#x}", from_node),
+                claimed = format!("{:#x}", ack.from_peer),
+                "rendezvous: PunchAck origin is not its sender; not forwarding"
+            );
+            return;
+        }
 
         // **§12 F6, by the authenticated requester (R1).** This arm
         // used to gate `ack.to_peer` — the *recipient* — so an
@@ -44472,6 +45304,87 @@ impl MeshNode {
         );
     }
 
+    /// Run one membership operation `(from_node, channel_hash, nonce)`
+    /// behind the [`MembershipFence`]. Returns `None` — without calling
+    /// `apply` — when `nonce` is a request this membership has already
+    /// moved past (a delayed copy of a superseded operation). Otherwise
+    /// runs `apply`, which returns `(applied, out)`: `applied` says the
+    /// operation changed (or re-asserted) membership state and so
+    /// becomes the fence's `latest`; `out` is passed through.
+    ///
+    /// The fence check and `apply` run under the entry's lock, so two
+    /// copies racing on the same membership cannot interleave between
+    /// the check and the state change. `apply` must not touch
+    /// `membership_fence` (it would deadlock on its own shard).
+    fn fenced_membership_op<R>(
+        from_node: u64,
+        channel_hash: ChannelHash,
+        nonce: u64,
+        ctx: &DispatchCtx,
+        apply: impl FnOnce() -> (bool, R),
+    ) -> Option<R> {
+        use dashmap::mapref::entry::Entry;
+        let ttl = ctx.membership_dedupe_ttl;
+        let key = (from_node, channel_hash);
+        // Cap check BEFORE taking the entry: `len`/`retain` lock every
+        // shard, including the one the entry guard would hold. An
+        // operation on a fenced membership (the common case: retransmits
+        // and every Unsubscribe) touches one shard only; `len` is paid
+        // just for a membership the fence does not hold yet.
+        let mut may_insert = true;
+        if !ctx.membership_fence.contains_key(&key)
+            && ctx.membership_fence.len() >= MEMBERSHIP_FENCE_MAX
+        {
+            ctx.membership_fence.retain(|_, f| f.is_live(ttl));
+            may_insert = ctx.membership_fence.len() < MEMBERSHIP_FENCE_MAX;
+        }
+        match ctx.membership_fence.entry(key) {
+            Entry::Occupied(mut slot) => {
+                if slot.get().is_retired(nonce, ttl) {
+                    return None;
+                }
+                let (applied, out) = apply();
+                if applied {
+                    slot.get_mut().advance(nonce, ttl);
+                }
+                Some(out)
+            }
+            Entry::Vacant(slot) => {
+                let (applied, out) = apply();
+                if applied && may_insert {
+                    slot.insert(MembershipFence::new(nonce));
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// Install an accepted Subscribe: the AuthGuard fast path plus the
+    /// roster entry in the requested mode.
+    fn apply_accepted_subscribe(
+        channel: &ChannelName,
+        from_node: u64,
+        queue_group: Option<String>,
+        ctx: &DispatchCtx,
+    ) {
+        // Populate the AuthGuard fast path so publish fan-out can
+        // admit this subscriber in <10 ns without re-walking the ACL.
+        // Mirrors the `roster.add_with_mode` below — both are keyed on
+        // the channel name so they stay consistent. Auth is
+        // mode-agnostic: a subscriber's queue-group choice doesn't
+        // change which capability tokens authorize the channel.
+        ctx.auth_guard
+            .allow_channel(subscriber_principal(from_node), channel);
+        let id = ChannelId::new(channel.clone());
+        let mode = match queue_group {
+            None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
+            Some(name) => crate::adapter::net::channel::SubscriptionMode::QueueGroup(
+                crate::adapter::net::channel::QueueGroupName::new(name),
+            ),
+        };
+        ctx.roster.add_with_mode(id, from_node, mode);
+    }
+
     /// Send an `Ack` on the membership subprotocol back to `to_node`.
     /// Non-fatal if `to_node` is not in the peer map or the send fails;
     /// the requester will simply hit its ack timeout.
@@ -44529,6 +45442,42 @@ impl MeshNode {
 
     // ── Channel fan-out (ChannelPublisher) ─────────────────────────────
 
+    /// The origin an origin-bound channel's subscribe gate binds
+    /// `peer_id` to: its pinned entity's origin, or — only for a
+    /// provisional session on its own enrollment reply channel — the
+    /// bootstrap origin the gate accepts in its place (R6). `None` when
+    /// neither applies, which fails an origin binding closed.
+    ///
+    /// The fan-out's re-check (CPOL-01) must ask exactly what
+    /// `authorize_subscribe` asked, or it would evict the one
+    /// subscription the bootstrap exception exists for. That includes
+    /// the moment just after promotion: the session is no longer
+    /// provisional and has not announced yet, and the Admitted reply
+    /// that promoted it is published on that subscription next — so an
+    /// admitted session that is still unpinned is judged by the origin
+    /// it bound while provisional, on its own reply channel only
+    /// (`PeerAdmission::enrolled_reply_origin`).
+    fn subscription_origin(&self, peer_id: u64, channel: &ChannelName) -> Option<u64> {
+        let pinned = self
+            .peer_entity_ids
+            .get(&peer_id)
+            .map(|e| e.value().origin_hash());
+        #[cfg(feature = "webrtc")]
+        let pinned = pinned
+            .or_else(|| Self::bootstrap_reply_origin_in(&self.peers, channel, peer_id))
+            .or_else(|| {
+                self.peers.get(&peer_id).and_then(|entry| {
+                    entry
+                        .value()
+                        .admission
+                        .enrolled_reply_origin(channel.as_str())
+                })
+            });
+        #[cfg(not(feature = "webrtc"))]
+        let _ = channel;
+        pinned
+    }
+
     /// Build a [`ChannelPublisher`] recipe. Does NOT talk to the wire —
     /// combine with [`publish`](Self::publish) or
     /// [`publish_many`](Self::publish_many) to actually fan out.
@@ -44568,10 +45517,18 @@ impl MeshNode {
         // silently publishing to a channel whose own ACL it doesn't
         // match. Channels absent from the registry are treated as
         // open (permissive default).
-        let cfg_snapshot = self.channel_configs.as_ref().and_then(|cr| {
-            cr.get_by_name(publisher.channel().name().as_str())
-                .map(|c| c.clone())
-        });
+        //
+        // Resolved (not just looked up) so the fan-out's admission
+        // re-check knows which prefix matched — an origin binding needs
+        // it to find the dynamic suffix (CPOL-01).
+        let (cfg_snapshot, cfg_matched_prefix) = match self
+            .channel_configs
+            .as_ref()
+            .and_then(|cr| cr.resolve_by_name(publisher.channel().name().as_str()))
+        {
+            Some(resolved) => (Some(resolved.config), resolved.matched_prefix),
+            None => (None, None),
+        };
         if let Some(cfg) = cfg_snapshot.as_ref() {
             if cfg.publish_caps.is_some() || cfg.token_required() {
                 let self_caps = self
@@ -44608,34 +45565,74 @@ impl MeshNode {
                 // token-gated prefix publish, so the delegated-publish
                 // escape hatch was unreachable for that whole class of
                 // channel (M1).
+                //
+                // Candidate selection goes THROUGH the channel gate
+                // (CPOL-02): the cache's own filters (time,
+                // revocation, subject, scope) know nothing about this
+                // channel's `token_roots`, so the first cache hit can
+                // be a still-valid token from a since-rotated root
+                // while a token from the current root sits behind it
+                // in the same slot. Taking only the first hit failed
+                // the publish closed with a usable grant cached. Walk
+                // the held chain (still preferred when it verifies)
+                // and then every cached PUBLISH candidate, and accept
+                // the first one `can_publish` accepts. Every accepted
+                // chain has passed the full gate, so this only widens
+                // which *authorized* grant is found — never what is
+                // authorized.
                 let publish_hash = publisher.channel().hash();
                 let held = self
                     .published_chains
                     .get(&publish_hash)
                     .map(|c| c.value().clone());
                 let transient_revocation;
-                let (revocation, skew, chain) = match self.token_cache.as_ref() {
+                let (revocation, skew, candidates) = match self.token_cache.as_ref() {
                     Some(cache) => {
-                        let chain = held.or_else(|| {
+                        let mut candidates: Vec<TokenChain> = held.into_iter().collect();
+                        candidates.extend(
                             cache
-                                .get_for_action(&self_entity, TokenScope::PUBLISH, publish_hash)
-                                .map(TokenChain::single)
-                        });
-                        (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
+                                .candidates_for_action(
+                                    &self_entity,
+                                    TokenScope::PUBLISH,
+                                    publish_hash,
+                                )
+                                .into_iter()
+                                .map(TokenChain::single),
+                        );
+                        (
+                            cache.revocation().as_ref(),
+                            cache.clock_skew_secs(),
+                            candidates,
+                        )
                     }
                     None => {
                         transient_revocation = RevocationRegistry::new();
-                        (&transient_revocation, 0u64, held)
+                        (
+                            &transient_revocation,
+                            0u64,
+                            held.into_iter().collect::<Vec<_>>(),
+                        )
                     }
                 };
-                if !cfg.can_publish(
-                    &self_caps,
-                    &self_entity,
-                    publish_hash,
-                    chain.as_ref(),
-                    revocation,
-                    skew,
-                ) {
+                let gate = |chain: Option<&TokenChain>| {
+                    cfg.can_publish(
+                        &self_caps,
+                        &self_entity,
+                        publish_hash,
+                        chain,
+                        revocation,
+                        skew,
+                    )
+                };
+                // No candidate at all still runs the gate once with
+                // `None`: an untokened channel with only `publish_caps`
+                // must keep being decided by the cap filter alone.
+                let permitted = if candidates.is_empty() {
+                    gate(None)
+                } else {
+                    candidates.iter().any(|chain| gate(Some(chain)))
+                };
+                if !permitted {
                     return Err(AdapterError::Connection(
                         "channel: publish denied by channel ACL".into(),
                     ));
@@ -44771,6 +45768,29 @@ impl MeshNode {
         // type-level one, and two in-crate tests write `peer_subnets`
         // directly with no policy installed.
         let subnet_verdict_is_constant = matches!(visibility, Visibility::Global);
+        // CPOL-01: which structural admission questions this channel's
+        // CURRENT config asks, hoisted so an open channel pays nothing.
+        // A subscription admitted under a policy that has since been
+        // replaced is re-asked them here — the AuthGuard entry only
+        // records that SOME policy once admitted the peer.
+        let origin_bound = cfg_snapshot
+            .as_ref()
+            .is_some_and(|c| c.subscriber_origin_binding.is_some());
+        let group_restricted = cfg_snapshot
+            .as_ref()
+            .is_some_and(|c| c.queue_group_policy != QueueGroupPolicy::Unrestricted);
+        let policy_recheck = origin_bound || group_restricted || require_token;
+        // A subscriber the current policy no longer admits leaves the
+        // roster as well as the guard: queue-group selection runs before
+        // this filter with no alternate-member retry, so a denied peer
+        // left rostered would keep taking its group's copy (see the
+        // chain-failure arm below).
+        let evict = |peer_id: u64| {
+            auth_guard.revoke_channel(subscriber_principal(peer_id), &channel_name);
+            self.roster
+                .remove(&ChannelId::new(channel_name.clone()), peer_id);
+            self.subscriber_chains.remove(&(peer_id, channel_hash));
+        };
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
@@ -44808,6 +45828,44 @@ impl MeshNode {
             };
             if !admitted {
                 return false;
+            }
+            // (2b) The current admission policy (CPOL-01). An origin
+            // binding, a restricted queue-group policy, or the hash a
+            // retained grant must answer may all have changed since this
+            // peer was admitted; re-registering a name or prefix replaces
+            // its config without touching existing memberships.
+            if let (true, Some(cfg)) = (policy_recheck, cfg_snapshot.as_ref()) {
+                let origin = if origin_bound {
+                    self.subscription_origin(*peer_id, &channel_name)
+                } else {
+                    None
+                };
+                let group = if group_restricted {
+                    match self.roster.subscriber_mode(*peer_id, publisher.channel()) {
+                        Some(SubscriptionMode::QueueGroup(group)) => Some(group),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let admitted_grant = if require_token {
+                    self.subscriber_chains
+                        .get(&(*peer_id, channel_hash))
+                        .map(|r| r.grant_hash)
+                } else {
+                    None
+                };
+                if !cfg.retains_subscription(
+                    channel_name.as_str(),
+                    channel_hash,
+                    cfg_matched_prefix.as_deref(),
+                    origin,
+                    group.as_ref().map(|g| g.as_str()),
+                    admitted_grant,
+                ) {
+                    evict(*peer_id);
+                    return false;
+                }
             }
             if !require_token {
                 return true;
@@ -44876,7 +45934,6 @@ impl MeshNode {
                 _ => false,
             };
             if !chain_ok {
-                auth_guard.revoke_channel(origin, &channel_name);
                 // Evict from the roster too, not just the AuthGuard.
                 //
                 // Revoking only the guard left the peer rostered, and
@@ -44891,9 +45948,7 @@ impl MeshNode {
                 // disables it outright. Dropping the roster entry here
                 // makes the denial self-clearing on the path that
                 // observed it.
-                self.roster
-                    .remove(&ChannelId::new(channel_name.clone()), *peer_id);
-                self.subscriber_chains.remove(&(*peer_id, channel_hash));
+                evict(*peer_id);
                 return false;
             }
             true
@@ -46395,11 +47450,17 @@ impl MeshNode {
             // stored in `local_announcement` or sent. When no private service is
             // registered it is identical to the broadcast form.
             #[cfg(feature = "cortex")]
-            let (self_ann, scoped_envelopes, scoped_authority, provider_grant_snapshot) = {
+            let (
+                self_ann,
+                scoped_envelopes,
+                scoped_grants,
+                scoped_authority,
+                provider_grant_snapshot,
+            ) = {
                 let owner_scoped = self.rpc_local_services.owner_scoped_snapshot();
                 let granted = self.rpc_local_services.granted_snapshot();
                 if owner_scoped.is_empty() && granted.is_empty() {
-                    (broadcast_ann.clone(), Vec::new(), None, None)
+                    (broadcast_ann.clone(), Vec::new(), Vec::new(), None, None)
                 } else {
                     let mut self_caps = caps;
                     for svc in owner_scoped.iter().chain(granted.iter()) {
@@ -46435,6 +47496,9 @@ impl MeshNode {
                     // sealed under (owner audience / provider grant snapshot) so the
                     // send path refuses if that Arc is later replaced.
                     let mut scoped_envelopes: Vec<Vec<u8>> = Vec::new();
+                    // ORG-02: parallel to `scoped_envelopes` — the grant that
+                    // sealed each one (`None` for the owner envelope).
+                    let mut scoped_grants: Vec<Option<ScopedEnvelopeGrant>> = Vec::new();
                     let mut scoped_authority = None;
                     let mut provider_grant_snapshot = None;
                     if let (Some(authority), Some(cert)) =
@@ -46453,6 +47517,7 @@ impl MeshNode {
                                 ttl,
                             );
                             if !owner_env.is_empty() {
+                                scoped_grants.extend(owner_env.iter().map(|_| None));
                                 scoped_envelopes.extend(owner_env);
                                 scoped_authority = Some(Arc::clone(authority));
                             }
@@ -46467,7 +47532,10 @@ impl MeshNode {
                                 authority, cert, &snapshot, &granted, version, now_secs, ttl,
                             );
                             if !granted_env.is_empty() {
-                                scoped_envelopes.extend(granted_env);
+                                for (envelope, grant) in granted_env {
+                                    scoped_envelopes.push(envelope);
+                                    scoped_grants.push(Some(grant));
+                                }
                                 provider_grant_snapshot = Some(snapshot);
                             }
                         }
@@ -46475,6 +47543,7 @@ impl MeshNode {
                     (
                         a,
                         scoped_envelopes,
+                        scoped_grants,
                         scoped_authority,
                         provider_grant_snapshot,
                     )
@@ -46483,11 +47552,13 @@ impl MeshNode {
             #[cfg(not(feature = "cortex"))]
             let self_ann = broadcast_ann.clone();
             #[cfg(not(feature = "cortex"))]
-            let (scoped_envelopes, scoped_authority, provider_grant_snapshot): (
+            #[allow(clippy::type_complexity)]
+            let (scoped_envelopes, scoped_grants, scoped_authority, provider_grant_snapshot): (
                 Vec<Vec<u8>>,
+                Vec<Option<ScopedEnvelopeGrant>>,
                 Option<Arc<super::behavior::org_authority::NodeAuthority>>,
                 Option<Arc<super::behavior::org_grant_registry::ProviderGrantSnapshot>>,
-            ) = (Vec::new(), None, None);
+            ) = (Vec::new(), Vec::new(), None, None);
 
             // Self-index so local queries see our own caps. Always runs
             // regardless of rate limit — the self-index reflects the
@@ -46568,6 +47639,7 @@ impl MeshNode {
                 .store(Some(Arc::new(LocalCapabilityEmission {
                     public: broadcast_ann,
                     scoped: scoped_envelopes,
+                    scoped_grants,
                     scoped_authority,
                     provider_grant_snapshot,
                     exposure_revocation_generation,
@@ -49445,6 +50517,17 @@ impl MeshNode {
             // publishable.
             ApplyOutcome::Rejected => Ok(super::behavior::gang::ClaimOutcome::Lost),
         }
+    }
+
+    /// Test-only probe of the node's org routing-authority epoch, which
+    /// every live org revocation callback (floor raise or grant revocation)
+    /// advances. The probe holds the authority itself, so it still reads
+    /// after the node is torn down: a callback snapshotted before teardown
+    /// and invoked afterwards must leave it where it was.
+    #[doc(hidden)]
+    pub fn org_routing_epoch_probe_for_test(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
+        let authority = self.routing_authority.clone();
+        move || authority.epoch()
     }
 
     /// Test-only helper — translate a legacy
@@ -53423,6 +54506,7 @@ impl Drop for MeshNode {
         // `Weak<StoreCore>`. So a late callback neither starts nor is left
         // mid-retraction against a fold the node no longer owns.
         drop(self.org_raise_subscription.lock().take());
+        drop(self.org_grant_subscription.lock().take());
     }
 }
 
@@ -58524,6 +59608,185 @@ mod committed_flush_stall_tests {
     }
 }
 
+#[cfg(all(test, feature = "nat-traversal"))]
+mod punch_ack_forward_origin_tests {
+    //! NAT-08: the coordinator forwards a `PunchAck` only when its
+    //! claimed `from_peer` is the authenticated session peer it came
+    //! from.
+    use super::*;
+    use crate::adapter::net::traversal::rendezvous::PunchAck;
+    use std::net::SocketAddr;
+
+    const PEER_A: u64 = 0x0A0A;
+    const PEER_B: u64 = 0x0B0B;
+    const MALLORY: u64 = 0x0BAD;
+
+    fn install_peer_at(ctx: &DispatchCtx, peer: u64, addr: SocketAddr) {
+        ctx.peers.insert(
+            peer,
+            PeerInfo {
+                node_id: peer,
+                transport: PeerTransport::Direct {
+                    owned: PeerAddr::Udp(addr),
+                },
+                session: Arc::new(NetSession::new(
+                    SessionKeys {
+                        tx_key: [0x11u8; 32],
+                        rx_key: [0x22u8; 32],
+                        session_id: peer,
+                        remote_static_pub: [0x33u8; 32],
+                        route_hop_tx_key: [0x44u8; 32],
+                        route_hop_rx_key: [0x55u8; 32],
+                    },
+                    PeerAddr::Udp(addr),
+                    4,
+                    false,
+                )),
+                remote_static_pub: [0x33u8; 32],
+                last_initiator_ephemeral: None,
+                #[cfg(feature = "webrtc")]
+                admission: crate::adapter::net::rtc::PeerAdmission::default(),
+            },
+        );
+    }
+
+    /// A session peer of the coordinator (MALLORY) sends it an ack
+    /// claiming to be B, addressed to A. Forwarding it would launder the
+    /// claim into a coordinator-authenticated frame that A's recorded-
+    /// coordinator binding accepts, resolving A's waiter for B before B
+    /// has punched. It must not be relayed; B's own ack still is.
+    ///
+    /// Inverse: drop the `from_peer == from_node` check — the forged ack
+    /// reaches A's socket and the first assertion fails.
+    #[tokio::test]
+    async fn a_punch_ack_whose_origin_is_not_its_sender_is_not_forwarded() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(
+            EntityKeypair::generate(),
+            MeshNodeConfig::new(addr, [0x62u8; 32]),
+        )
+        .await
+        .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let a_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        install_peer_at(&ctx, PEER_A, a_socket.local_addr().expect("local_addr"));
+        install_peer_at(&ctx, PEER_B, "127.0.0.1:9".parse().unwrap());
+        install_peer_at(&ctx, MALLORY, "127.0.0.1:9".parse().unwrap());
+
+        let ack = PunchAck {
+            from_peer: PEER_B,
+            to_peer: PEER_A,
+            punch_id: 0,
+        };
+        MeshNode::forward_punch_ack(ack, MALLORY, &ctx);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            a_socket.try_recv(&mut buf).is_err(),
+            "an ack claiming B but sent by another peer must not be relayed to A"
+        );
+
+        // Positive control: B's own ack is relayed.
+        MeshNode::forward_punch_ack(ack, PEER_B, &ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), a_socket.recv(&mut buf))
+                .await
+                .is_ok(),
+            "an ack from its claimed origin is relayed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod routed_handshake_pending_tests {
+    //! NHS-03: a routed msg2 that fails Noise verification must not
+    //! consume the pending initiation it names.
+    use super::*;
+    use crate::adapter::net::crypto::StaticKeypair;
+    use std::net::SocketAddr;
+
+    const PSK: [u8; 32] = [0x6Eu8; 32];
+    const RESPONDER_ID: u64 = 0x0B0B_0000_0000_0B0B;
+
+    fn routed(noise_bytes: &[u8], src: u64, dest: u64) -> (ParsedPacket, RoutingHeader, PeerAddr) {
+        let source = PeerAddr::Udp("127.0.0.1:9".parse().unwrap());
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        let inner = builder.build_handshake(noise_bytes);
+        let parsed = ParsedPacket::parse(inner, source).expect("handshake packet parses");
+        let header = RoutingHeader::new(dest, src as u32, DEFAULT_HANDSHAKE_TTL);
+        (parsed, header, source)
+    }
+
+    /// One forged datagram — the right shape, the right routing source,
+    /// bytes that fail Noise authentication — used to remove the pending
+    /// entry before `read_message` ran, failing the waiter and leaving
+    /// the genuine msg2 with no initiator. It must now be dropped with
+    /// the state intact, and the genuine msg2 must still complete.
+    ///
+    /// Inverse: restore the remove-first lookup — the first assertion
+    /// fails (the entry is gone and the waiter holds an error).
+    #[tokio::test]
+    async fn a_forged_routed_msg2_leaves_the_pending_initiation_intact() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        let responder_static = StaticKeypair::generate();
+        let key = routing_id(RESPONDER_ID);
+
+        // The initiator half, registered exactly as `try_connect_via_once`
+        // does.
+        let prologue = handshake_prologue(routing_id(node.node_id), key);
+        let mut noise =
+            NoiseHandshake::initiator_with_prologue(&PSK, &responder_static.public, &prologue)
+                .unwrap();
+        let msg1 = noise.write_message(&node.node_id.to_le_bytes()).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        node.pending_handshakes
+            .insert(key, PendingHandshake { noise, tx });
+
+        // The genuine responder's msg2.
+        let mut responder =
+            NoiseHandshake::responder_with_prologue(&PSK, &responder_static, &prologue).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        let (resp_keys, resp_binding) = responder.into_session_keys_with_binding().unwrap();
+
+        // Forged: same length and ephemeral prefix, broken tag.
+        let mut forged = msg2.clone();
+        *forged.last_mut().unwrap() ^= 0x01;
+        let (parsed, header, source) = routed(&forged, RESPONDER_ID, node.node_id);
+        MeshNode::handle_routed_handshake(&parsed, &header, source, &ctx);
+
+        assert!(
+            node.pending_handshakes.contains_key(&key),
+            "a msg2 that fails Noise verification must not consume the pending initiation"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "the waiter must not be resolved by a rejected msg2"
+        );
+
+        // The genuine reply still finds its initiator and completes.
+        let (parsed, header, source) = routed(&msg2, RESPONDER_ID, node.node_id);
+        MeshNode::handle_routed_handshake(&parsed, &header, source, &ctx);
+        let (keys, binding, _hops) = rx
+            .try_recv()
+            .expect("the genuine msg2 resolves the waiter")
+            .expect("the genuine msg2 completes the handshake");
+        assert_eq!(binding, resp_binding);
+        assert_eq!(keys.tx_key, resp_keys.rx_key);
+        assert_eq!(keys.rx_key, resp_keys.tx_key);
+        assert!(
+            !node.pending_handshakes.contains_key(&key),
+            "a completed initiation is consumed"
+        );
+    }
+}
+
 #[cfg(test)]
 mod direct_handshake_inbox_tests {
     use super::{DirectHandshakeInbox, DIRECT_HANDSHAKE_INBOX_DEPTH};
@@ -59634,6 +60897,72 @@ mod oa34b2_query_currentness_tests {
         assert!(
             c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
             "the revoked provider stops resolving",
+        );
+        assert!(
+            c.private_discovery_generation() > before,
+            "the retraction advanced the private-discovery generation",
+        );
+        assert!(
+            changes.has_changed().expect("watch alive"),
+            "and published the change wake",
+        );
+    }
+
+    /// ORG-02 end-to-end (consumer side): a capability-grant revocation by the
+    /// grant's ISSUER, applied through the installed store, retracts the stored
+    /// granted record at query time AND dirties its capability — exactly as a
+    /// floor raise does. Without the currentness check the former grantee kept
+    /// resolving the provider until the grant expired; without the
+    /// subscription the retraction moved the visible set with no wake.
+    #[tokio::test]
+    async fn a_grant_revocation_retracts_scoped_discovery_and_wakes_consumers() {
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+        let p = EntityKeypair::from_bytes([0xB2u8; 32]);
+        let p_entity = p.entity_id().clone();
+        let n = current_timestamp();
+        let exp = n + 600;
+
+        let (g, s) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-a"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            3600,
+        )
+        .expect("issue grant");
+        let s = s.expect("secret");
+        let grant_id = g.grant_id;
+
+        let (c, _dir) = adopted_consumer(&org_a, "grantrevwake").await;
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&s))
+            .expect("install grant");
+        c.ingest_scoped_announcement_for_test(&granted_envelope(&p, &org_b, &g, &s, "svc-a", exp));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity.clone()],
+            "the record resolves before the grant is revoked",
+        );
+
+        let mut changes = c.subscribe_private_discovery_changes();
+        changes.borrow_and_update();
+        let before = c.private_discovery_generation();
+
+        // Org B withdraws the grant it issued.
+        let bundle = OrgGrantRevocationBundle::try_issue(&org_b, [RevokedGrant::capability(&g)])
+            .expect("issue grant revocation");
+        c.org_revocation_store()
+            .expect("installed")
+            .apply_grant_revocations(&bundle)
+            .expect("apply grant revocation");
+
+        assert!(
+            c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
+            "a revoked grant no longer discovers its provider",
         );
         assert!(
             c.private_discovery_generation() > before,
@@ -65135,6 +66464,173 @@ mod membership_failure_tests {
         );
     }
 
+    fn unsubscribe_bytes(channel: &ChannelName, nonce: u64) -> Vec<u8> {
+        membership::encode(&MembershipMsg::Unsubscribe {
+            channel: channel.clone(),
+            nonce,
+        })
+    }
+
+    /// CHAN-04: a delayed copy of an already-applied membership request
+    /// cannot undo a LATER applied one, in either direction.
+    ///
+    /// The reordering is modeled deterministically by delivering the
+    /// datagrams in the order the network would have: the first
+    /// `Subscribe` copy was delayed past its own retransmit (which was
+    /// applied and acked) and past the `Unsubscribe` that followed it.
+    /// Pre-fix the late copy re-ran the accept path and re-rostered a
+    /// member who had just been acknowledged as removed; the converse —
+    /// a late `Unsubscribe` copy — removed a newer subscription.
+    ///
+    /// Each late copy is still ACKED, so a sender that never saw the
+    /// first ack gets an answer. A retransmit of the CURRENT operation
+    /// is still re-decided in full (the accepted-retry contract above),
+    /// and a fresh request after all of it applies normally.
+    #[tokio::test]
+    async fn a_delayed_superseded_membership_copy_does_not_undo_a_later_operation() {
+        const PEER: u64 = 0xC4A4;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        install_resolvable_peer(&ctx, PEER);
+        let channel = ChannelName::new("open/plain").unwrap();
+        let id = ChannelId::new(channel.clone());
+
+        // Subscribe S1 (its retransmit lands; the first copy is in flight).
+        let s1 = subscribe_bytes(&channel, 0x5151);
+        MeshNode::handle_membership_message(&s1, PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &id), "S1 applies");
+
+        // Unsubscribe U applied and acked.
+        let u = unsubscribe_bytes(&channel, 0x0B0B);
+        MeshNode::handle_membership_message(&u, PEER, &ctx);
+        assert!(!ctx.roster.is_subscribed(PEER, &id), "U applies");
+
+        // The delayed first copy of S1 finally arrives.
+        MeshNode::handle_membership_message(&s1, PEER, &ctx);
+        assert!(
+            !ctx.roster.is_subscribed(PEER, &id),
+            "a delayed copy of a superseded Subscribe must not re-add the member"
+        );
+        assert!(
+            !ctx.auth_guard
+                .is_authorized_full(subscriber_principal(PEER), &channel),
+            "nor re-open the AuthGuard fast path"
+        );
+
+        // Converse: a fresh Subscribe S2 applies, then a delayed copy
+        // of U arrives.
+        let s2 = subscribe_bytes(&channel, 0x5252);
+        MeshNode::handle_membership_message(&s2, PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &id), "S2 applies");
+        MeshNode::handle_membership_message(&u, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "a delayed copy of a superseded Unsubscribe must not remove the newer subscription"
+        );
+
+        // A retransmit of the CURRENT operation is still re-decided:
+        // after an eviction it re-runs the accept path.
+        ctx.roster.remove(&id, PEER);
+        MeshNode::handle_membership_message(&s2, PEER, &ctx);
+        assert!(
+            ctx.roster.is_subscribed(PEER, &id),
+            "a retransmit of the current Subscribe must still re-run the accept path"
+        );
+
+        // And a fresh Unsubscribe still applies.
+        MeshNode::handle_membership_message(&unsubscribe_bytes(&channel, 0x0C0C), PEER, &ctx);
+        assert!(!ctx.roster.is_subscribed(PEER, &id), "a fresh U applies");
+    }
+
+    /// The fence is per membership: a request on one channel never
+    /// fences the same peer's requests on another, and fencing one
+    /// peer never fences another peer's identical nonce.
+    #[tokio::test]
+    async fn the_membership_fence_is_scoped_to_peer_and_channel() {
+        const PEER: u64 = 0xC4A5;
+        const OTHER: u64 = 0xC4A6;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        install_resolvable_peer(&ctx, PEER);
+        install_resolvable_peer(&ctx, OTHER);
+        let a = ChannelName::new("open/a").unwrap();
+        let b = ChannelName::new("open/b").unwrap();
+
+        MeshNode::handle_membership_message(&subscribe_bytes(&a, 1), PEER, &ctx);
+        MeshNode::handle_membership_message(&unsubscribe_bytes(&a, 2), PEER, &ctx);
+        // Nonce 1 is retired for (PEER, a) only.
+        MeshNode::handle_membership_message(&subscribe_bytes(&b, 1), PEER, &ctx);
+        assert!(ctx.roster.is_subscribed(PEER, &ChannelId::new(b)));
+        MeshNode::handle_membership_message(&subscribe_bytes(&a, 1), OTHER, &ctx);
+        assert!(ctx.roster.is_subscribed(OTHER, &ChannelId::new(a.clone())));
+        assert!(!ctx.roster.is_subscribed(PEER, &ChannelId::new(a)));
+    }
+
+    /// The fence map is bounded like the rejection cache: a peer
+    /// cycling through fresh channels cannot grow it past its cap.
+    #[tokio::test]
+    async fn the_membership_fence_is_bounded() {
+        const PEER: u64 = 0xC4A7;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+        for i in 0..(MEMBERSHIP_FENCE_MAX as u64 + 64) {
+            let applied = MeshNode::fenced_membership_op(PEER, i, i, &ctx, || (true, ()));
+            assert!(applied.is_some());
+        }
+        assert!(
+            ctx.membership_fence.len() <= MEMBERSHIP_FENCE_MAX,
+            "fence grew past its cap: {}",
+            ctx.membership_fence.len()
+        );
+    }
+
+    /// CHAN-04 past the cap: a steady-state subscription (its `latest`
+    /// applied, nothing retired yet) keeps its fence while newcomers push
+    /// the map over the cap. Pruning it there opened a fresh entry on the
+    /// next Unsubscribe that never learned the Subscribe's nonce, so a
+    /// delayed copy of that Subscribe re-added a member who had left.
+    #[tokio::test]
+    async fn a_steady_membership_keeps_its_fence_past_the_cap() {
+        const PEER: u64 = 0xC4A8;
+        const OTHERS: u64 = 0xC4A9;
+        const CHANNEL: ChannelHash = 0xFFFF_0001;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+            .await
+            .expect("MeshNode::new");
+        let ctx = node.dispatch_ctx();
+
+        // The subscription applies; nothing is retired for it yet.
+        assert!(MeshNode::fenced_membership_op(PEER, CHANNEL, 0x51, &ctx, || (true, ())).is_some());
+        // Newcomers fill the fence past its cap, each triggering a prune.
+        for i in 0..(MEMBERSHIP_FENCE_MAX as ChannelHash + 64) {
+            MeshNode::fenced_membership_op(OTHERS, i, i, &ctx, || (true, ()));
+        }
+        // The Unsubscribe applies on the same membership...
+        assert!(MeshNode::fenced_membership_op(PEER, CHANNEL, 0x0B, &ctx, || (true, ())).is_some());
+        // ...so the delayed Subscribe copy is a superseded request.
+        assert!(
+            MeshNode::fenced_membership_op(PEER, CHANNEL, 0x51, &ctx, || -> (bool, ()) {
+                panic!("a superseded Subscribe copy must not be re-applied")
+            })
+            .is_none(),
+        );
+        assert!(ctx.membership_fence.len() <= MEMBERSHIP_FENCE_MAX);
+    }
+
     /// **#8's gate contract, pinned.** A membership message from a
     /// sender with NO peer entry is refused at §12 gate 3's
     /// fail-closed arm — the documented eviction race — AND counted
@@ -67148,5 +68644,59 @@ impl Drop for BootstrapOfferTakeGuard<'_> {
             self.node
                 .release_bootstrap_offer_take(admitted, self.budget_key, self.dialog);
         }
+    }
+}
+
+/// CPOL-01: the sweep re-asks the current policy even on a channel with
+/// no token gate and a node with no token cache — the configuration it
+/// used to return early on.
+#[cfg(test)]
+mod cpol01_sweep_tests {
+    use super::*;
+    use crate::adapter::net::channel::{ChannelConfig, OriginBinding};
+    use crate::adapter::net::identity::EntityKeypair;
+
+    #[test]
+    fn the_sweep_withdraws_a_subscription_a_replaced_binding_refuses() {
+        let owner = EntityKeypair::generate().entity_id().clone();
+        let other = EntityKeypair::generate().entity_id().clone();
+        let name = ChannelName::new(&format!("svc.replies.{:016x}", owner.origin_hash())).unwrap();
+        let channel = ChannelId::new(name.clone());
+        let (owner_node, other_node) = (1u64, 2u64);
+
+        let roster = SubscriberRoster::new();
+        let guard = AuthGuard::new();
+        let peers = DashMap::new();
+        peers.insert(owner_node, owner);
+        peers.insert(other_node, other);
+        // Both admitted while the family was open.
+        for node in [owner_node, other_node] {
+            roster.add(channel.clone(), node);
+            guard.allow_channel(subscriber_principal(node), &name);
+        }
+        let configs = Arc::new(ChannelConfigRegistry::new());
+        let sentinel = ChannelId::new(ChannelName::new("svc.replies.prefix").unwrap());
+        configs.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(sentinel)
+                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16),
+        );
+
+        sweep_expired_subscribers(
+            &roster,
+            &guard,
+            None,
+            &peers,
+            Some(&configs),
+            &DashMap::new(),
+        );
+
+        assert!(!roster.is_subscribed(other_node, &channel));
+        assert!(!guard.is_authorized_full(subscriber_principal(other_node), &name));
+        assert!(
+            roster.is_subscribed(owner_node, &channel),
+            "the binding admits the owner — it stays"
+        );
+        assert!(guard.is_authorized_full(subscriber_principal(owner_node), &name));
     }
 }

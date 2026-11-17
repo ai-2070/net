@@ -16,6 +16,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,63 @@ func newBlobAdapter(t *testing.T, persistentDir, id string, opts *MeshBlobAdapte
 		t.Fatalf("NewMeshBlobAdapter: %v", err)
 	}
 	return r, a
+}
+
+// GBLOB-01: the legacy constructor passed a bare `redex.handle` to C, so
+// when the call was the caller's last use of `redex` the GC could run the
+// Redex finalizer (Free) before native construction cloned the inner Arc,
+// and construction failed with ErrBlob despite a live argument. Every
+// iteration here makes the constructor the Redex's last use while another
+// goroutine forces collections. With the read lock held across the call,
+// no iteration can fail.
+func TestBlobAdapterLegacyConstructorKeepsItsRedexLive(t *testing.T) {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				runtime.GC()
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+
+	for i := 0; i < 200; i++ {
+		a, err := NewMeshBlobAdapter(NewRedex(""), "go-blob-last-use-"+strconv.Itoa(i), nil)
+		if err != nil {
+			t.Fatalf("iteration %d: constructor failed with a live Redex argument: %v", i, err)
+		}
+		_ = a.Close()
+	}
+}
+
+// The constructor's early "already freed?" check read `redex.handle` without
+// the Redex lock while `Free` writes it under that lock: a data race the
+// -race run reports. Racing the two, the constructor must either succeed or
+// report the freed Redex as ErrBlob, and the race detector must stay quiet.
+func TestBlobAdapterConstructorRacesRedexFree(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		redex := NewRedex("")
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			redex.Free()
+		}()
+		a, err := NewMeshBlobAdapter(redex, "go-blob-free-race-"+strconv.Itoa(i), nil)
+		wg.Wait()
+		if err != nil {
+			if !errors.Is(err, ErrBlob) {
+				t.Fatalf("iteration %d: a freed Redex must be ErrBlob, got %v", i, err)
+			}
+			continue
+		}
+		_ = a.Close()
+	}
 }
 
 // ---------------------------------------------------------------------------

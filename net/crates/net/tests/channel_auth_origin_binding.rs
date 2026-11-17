@@ -17,10 +17,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::{
-    ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, EntityKeypair, MeshNode,
-    MeshNodeConfig, OriginBinding, SocketBufferConfig,
+    ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, EntityKeypair,
+    MeshNode, MeshNodeConfig, OnFailure, OriginBinding, PublishConfig, Reliability,
+    SocketBufferConfig,
 };
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -82,6 +84,14 @@ fn register_bound_prefix(node: &Node) {
     );
 }
 
+/// The same family with no binding at all — the pre-H3 shape an
+/// operator may later replace with [`register_bound_prefix`].
+fn register_open_prefix(node: &Node) {
+    let sentinel = ChannelName::new("svc.replies.prefix").unwrap();
+    node.registry
+        .insert_prefix(PREFIX, ChannelConfig::new(ChannelId::new(sentinel)));
+}
+
 /// `initiator` dials `responder`. Only the initiator pushes a capability
 /// announcement, so only the initiator ends up pinned on the responder.
 async fn handshake(initiator: &Arc<MeshNode>, responder: &Arc<MeshNode>) {
@@ -115,10 +125,16 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F) -> bool {
 /// Both peers handshake to `publisher` and announce, so `publisher`
 /// pins both of their entities.
 async fn pinned_pair() -> (Node, Node, Node) {
+    pinned_pair_registering(register_bound_prefix).await
+}
+
+/// [`pinned_pair`] with the publisher's reply family installed by
+/// `register`.
+async fn pinned_pair_registering(register: fn(&Node)) -> (Node, Node, Node) {
     let publisher = build_node().await;
     let alice = build_node().await;
     let mallory = build_node().await;
-    register_bound_prefix(&publisher);
+    register(&publisher);
 
     handshake(&alice.mesh, &publisher.mesh).await;
     handshake(&mallory.mesh, &publisher.mesh).await;
@@ -237,4 +253,54 @@ async fn malformed_suffix_is_rejected() {
             "suffix {suffix:?} is not this peer's origin and must be rejected"
         );
     }
+}
+
+/// CPOL-01: binding a family that was open withdraws the subscriptions
+/// the binding refuses. Mallory subscribed to Alice's reply channel while
+/// the prefix was open; the operator then re-registers the prefix with
+/// the origin binding (the documented replacement). Pre-fix the old
+/// AuthGuard entry stood and the open channel's publish branch admitted
+/// it without reading the binding, so roster fan-out still reached her.
+#[tokio::test]
+async fn binding_an_open_prefix_withdraws_another_peers_subscription() {
+    let (publisher, alice, mallory) = pinned_pair_registering(register_open_prefix).await;
+    let victim_channel = alice.own_reply_channel();
+    for subscriber in [&alice, &mallory] {
+        subscriber
+            .mesh
+            .subscribe_channel(publisher.mesh.node_id(), victim_channel.clone())
+            .await
+            .expect("an open family admits anyone");
+    }
+
+    register_bound_prefix(&publisher);
+    let report = publisher
+        .mesh
+        .publish(
+            &ChannelPublisher::new(
+                victim_channel.clone(),
+                PublishConfig {
+                    reliability: Reliability::FireAndForget,
+                    on_failure: OnFailure::BestEffort,
+                    max_inflight: 16,
+                },
+            ),
+            Bytes::from_static(b"alice's reply"),
+        )
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.attempted, 1,
+        "only the peer whose origin the channel names may still receive it"
+    );
+    let roster = publisher.mesh.roster();
+    let channel = ChannelId::new(victim_channel);
+    assert!(
+        !roster.is_subscribed(mallory.mesh.node_id(), &channel),
+        "the subscription the binding refuses must leave the roster"
+    );
+    assert!(
+        roster.is_subscribed(alice.mesh.node_id(), &channel),
+        "the owner's own subscription is what the binding admits — it stays"
+    );
 }
