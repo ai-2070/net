@@ -426,7 +426,7 @@ export function GamesHero() {
               style={{ animationDelay: "0.1s" }}
             >
               your game.
-            </span>
+            </span>{" "}
             <span
               className="field-rise block text-accent"
               style={{ animationDelay: "0.24s" }}

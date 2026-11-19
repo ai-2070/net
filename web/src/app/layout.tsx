@@ -52,7 +52,11 @@ export const metadata: Metadata = {
   metadataBase: new URL(siteUrl()),
   title: "NET — Network Event Transport. A latency-first encrypted mesh.",
   description:
-    "NET is a latency-first encrypted mesh runtime. Every device is a first-class node on a flat, encrypted topology. Nanosecond scheduling, zero-copy forwarding, capability-based routing. ~2.53 MB deployed binary.",
+    "NET is a latency-first encrypted mesh where every device is an equal node. Nanosecond scheduling, zero-copy forwarding, capability-based routing. Open source.",
+  // Defaults for pages without their own; no url here, so a page that
+  // forgets its own never claims to be the homepage.
+  openGraph: { type: "website", siteName: "NET", locale: "en_US" },
+  twitter: { card: "summary_large_image" },
 };
 
 export default async function RootLayout({

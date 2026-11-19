@@ -8,7 +8,7 @@ import { getClientDocTree, getDocsVersion } from "@/lib/docs";
 import { PageContainer } from "@/components/PageContainer";
 
 export const metadata = {
-  title: "Docs · Net",
+  title: "Docs · NET",
 };
 
 export default function DocsLayout({

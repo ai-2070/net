@@ -22,6 +22,10 @@ const MOVED: Record<string, string> = {
     "/docs/worldview/how-net-compares#zenoh-and-net",
 };
 
+// The agent dashboard was called Blacksite until it launched as Athena
+// Agents; its page moved with the name.
+MOVED["/blacksite"] = "/athena-agents";
+
 const nextConfig: NextConfig = {
   async redirects() {
     return Object.entries(MOVED).map(([source, destination]) => ({
