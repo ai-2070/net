@@ -59,7 +59,7 @@ export function StationMap({ onFeed }: { onFeed?: (e: FeedEvent) => void }) {
   return (
     <>
       <Image
-        src="/blacksite/hero.webp"
+        src="/athena-agents/hero.webp"
         alt=""
         fill
         priority

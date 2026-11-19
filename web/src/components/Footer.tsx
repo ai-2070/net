@@ -1,10 +1,10 @@
 import { FooterColumn } from "./FooterColumn";
 import globals from "@/lib/globals";
 import {
-  BLACKSITE_DOWNLOAD_URL,
-  BLACKSITE_GUIDE_URL,
-  BLACKSITE_REPO_URL,
-} from "@/components/blacksite/links";
+  ATHENA_DOWNLOAD_URL,
+  ATHENA_GUIDE_URL,
+  ATHENA_REPO_URL,
+} from "@/components/athena/links";
 
 const FOOTER_SPEC: ReadonlyArray<{
   href: string;
@@ -91,7 +91,7 @@ type FooterLink = { href: string; label: string; class?: string };
 const FOOTER_EXPLORE: ReadonlyArray<FooterLink> = [
   { href: "/", label: "Net" },
   { href: "/games", label: "Games" },
-  { href: "/blacksite", label: "Blacksite" },
+  { href: "/athena-agents", label: "Athena Agents" },
   { href: "/docs", label: "Docs" },
   {
     href: `mailto:${globals.email}`,
@@ -123,28 +123,26 @@ const GAMES_BUILD: ReadonlyArray<FooterLink> = [
   { href: "https://github.com/ai-2070/net", label: "Net // GitHub" },
 ];
 
-const BLACKSITE_PAGE: ReadonlyArray<FooterLink> = [
-  { href: "/blacksite#station", label: "The Station" },
-  { href: "/blacksite#brain", label: "The Brain" },
-  { href: "/blacksite#library", label: "Agent library" },
-  { href: "/blacksite#models", label: "Models and effort" },
-  { href: "/blacksite#chats", label: "Team chats" },
-  { href: "/blacksite#programs", label: "Programs and MCP" },
-  { href: "/blacksite#review", label: "Approvals" },
-  { href: "/blacksite#local", label: "Runs locally" },
+const ATHENA_PAGE: ReadonlyArray<FooterLink> = [
+  { href: "/athena-agents#station", label: "The Station" },
+  { href: "/athena-agents#brain", label: "The Brain" },
+  { href: "/athena-agents#library", label: "Agent library" },
+  { href: "/athena-agents#models", label: "Models and effort" },
+  { href: "/athena-agents#chats", label: "Team chats" },
+  { href: "/athena-agents#work", label: "Tasks and artifacts" },
+  { href: "/athena-agents#review", label: "Approvals" },
+  { href: "/athena-agents#learn", label: "Memory and skills" },
+  { href: "/athena-agents#programs", label: "Programs and MCP" },
+  { href: "/athena-agents#local", label: "Runs locally" },
 ];
 
-const BLACKSITE_GET: ReadonlyArray<FooterLink> = [
-  { href: BLACKSITE_DOWNLOAD_URL, label: "Download" },
-  { href: BLACKSITE_GUIDE_URL, label: "User guide" },
-  { href: BLACKSITE_REPO_URL, label: "Source // GitHub" },
-  {
-    href: "https://github.com/msitarzewski/agency-agents",
-    label: "Agency agents // GitHub",
-  },
+const ATHENA_GET: ReadonlyArray<FooterLink> = [
+  { href: ATHENA_DOWNLOAD_URL, label: "Download" },
+  { href: ATHENA_GUIDE_URL, label: "User guide" },
+  { href: ATHENA_REPO_URL, label: "Source // GitHub" },
 ];
 
-export type FooterPage = "net" | "games" | "blacksite";
+export type FooterPage = "net" | "games" | "athena";
 
 // What the footer says on each landing page: its name and line, its own
 // columns (Explore is added to all of them) and the bottom strip.
@@ -179,15 +177,15 @@ const FOOTERS: Record<
     mark: "NET // PROTOCOL.0x4E45·54",
     status: ["NET status:", "ONLINE"],
   },
-  blacksite: {
-    name: "blacksite",
-    line: "Run AI agents and teams from one local workspace. No account, runs on your computer. Free and open source.",
+  athena: {
+    name: "athena",
+    line: "A home for your AI agents. Build teams, give each agent a job, a model and its tools, and watch them work. Runs on your computer. Free and open source.",
     columns: [
-      { title: "Blacksite", items: BLACKSITE_PAGE },
-      { title: "Get it", items: BLACKSITE_GET },
+      { title: "Athena Agents", items: ATHENA_PAGE },
+      { title: "Get it", items: ATHENA_GET },
     ],
-    mark: "BLACKSITE",
-    status: ["Blacksite 0.1:", "DESKTOP APP"],
+    mark: "ATHENA AGENTS",
+    status: ["Athena Agents 1.0:", "DESKTOP APP"],
   },
 };
 

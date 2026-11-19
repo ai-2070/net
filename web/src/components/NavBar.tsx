@@ -5,14 +5,14 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { ArrowDown } from "@phosphor-icons/react";
 import globals from "@/lib/globals";
-import { BLACKSITE_DOWNLOAD_URL } from "@/components/blacksite/links";
+import { ATHENA_DOWNLOAD_URL } from "@/components/athena/links";
 
 type NavLink = { href: string; label: string };
 
 // Links every page shows on the right: the other products and the docs.
 const SITE_LINKS: ReadonlyArray<NavLink> = [
   { href: "/games", label: "GAMES" },
-  { href: "/blacksite", label: "BLACKSITE" },
+  { href: "/athena-agents", label: "ATHENA" },
   { href: "/docs", label: "DOCS" },
 ];
 
@@ -48,18 +48,19 @@ const PAGE_NAVS: Record<
     ],
     cta: { href: "/docs/sdk/browser/quickstart", label: "INSTALL" },
   },
-  "/blacksite": {
+  "/athena-agents": {
     sections: [
-      { href: "/blacksite#hero", label: "HOME" },
-      { href: "/blacksite#station", label: "STATION" },
-      { href: "/blacksite#brain", label: "BRAIN" },
-      { href: "/blacksite#library", label: "LIBRARY" },
-      { href: "/blacksite#models", label: "MODELS" },
-      { href: "/blacksite#chats", label: "CHATS" },
-      { href: "/blacksite#programs", label: "PROGRAMS" },
-      { href: "/blacksite#review", label: "REVIEW" },
+      { href: "/athena-agents#hero", label: "HOME" },
+      { href: "/athena-agents#station", label: "STATION" },
+      { href: "/athena-agents#brain", label: "BRAIN" },
+      { href: "/athena-agents#library", label: "LIBRARY" },
+      { href: "/athena-agents#models", label: "MODELS" },
+      { href: "/athena-agents#chats", label: "CHATS" },
+      { href: "/athena-agents#work", label: "TASKS" },
+      { href: "/athena-agents#review", label: "REVIEW" },
+      { href: "/athena-agents#programs", label: "PROGRAMS" },
     ],
-    cta: { href: BLACKSITE_DOWNLOAD_URL, label: "DOWNLOAD" },
+    cta: { href: ATHENA_DOWNLOAD_URL, label: "DOWNLOAD" },
   },
 };
 

@@ -127,8 +127,11 @@ export function NotFoundHero() {
                 Games
               </Link>
               <span className="text-ink-faint"> · </span>
-              <Link href="/blacksite" className="text-ink hover:text-accent">
-                Blacksite
+              <Link
+                href="/athena-agents"
+                className="text-ink hover:text-accent"
+              >
+                Athena Agents
               </Link>
               <span className="text-ink-faint"> · </span>
               <Link

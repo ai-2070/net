@@ -3,7 +3,7 @@
 import { useState } from "react";
 
 // A working copy of the per-agent model and effort pickers. The models,
-// their notes and each engine's effort range are Blacksite's own
+// their notes and each engine's effort range are Athena Agents' own
 // (web/models.ts, shared/effort.ts); switching to a model whose engine
 // lacks the chosen level moves to the nearest one, as the app does.
 
@@ -91,28 +91,28 @@ const MODELS: ReadonlyArray<Model> = [
     id: "deepseek",
     name: "DeepSeek",
     engine: "openrouter",
-    via: "OpenRouter",
+    via: "Eve · OpenRouter",
     note: "priced per M tokens",
   },
   {
     id: "gemini",
     name: "Gemini",
     engine: "openrouter",
-    via: "OpenRouter",
+    via: "Eve · OpenRouter",
     note: "priced per M tokens",
   },
   {
     id: "llama",
     name: "Llama",
     engine: "openrouter",
-    via: "OpenRouter",
+    via: "Eve · OpenRouter",
     note: "priced per M tokens",
   },
   {
     id: "ollama",
     name: "A local model",
     engine: "local",
-    via: "Ollama",
+    via: "Eve · Ollama",
     note: "runs on your own PC",
   },
 ];

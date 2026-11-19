@@ -61,9 +61,9 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.9,
     },
     {
-      url: `${globals.site.href}/blacksite`,
+      url: `${globals.site.href}/athena-agents`,
       lastModified: fileLastModified(
-        resolve(APP_ROOT, "blacksite", "page.tsx"),
+        resolve(APP_ROOT, "athena-agents", "page.tsx"),
         now,
       ),
       changeFrequency: "weekly",

@@ -1,6 +1,6 @@
-// Logos for the hero's made-up Station, copied from Blacksite's web/icons.ts:
+// Logos for the hero's made-up Station, copied from Athena Agents' web/icons.ts:
 // brand logos from Simple Icons (CC0), the terminal icon from Lucide (ISC).
-// ComfyUI has none there; its mark is public/blacksite/comfyui.png, cut from
+// ComfyUI has none there; its mark is public/athena-agents/comfyui.png, cut from
 // the ComfyUI Desktop app icon (a Comfy Org trademark).
 
 export interface BrandLogo {

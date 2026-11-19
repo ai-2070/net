@@ -845,8 +845,9 @@
   }
 }
 
-/* blacksite page: the made-up Station in the hero (stationSim.ts). Ported
-   from Blacksite's own station.css, so the labels look like the dashboard. */
+/* athena-agents page: the made-up Station in the hero (stationSim.ts).
+   Ported from the app's own station.css, so the labels look like the
+   dashboard. */
 .bs-station {
   position: absolute;
   inset: 0;

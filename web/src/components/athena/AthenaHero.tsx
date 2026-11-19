@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useState } from "react";
-import { BLACKSITE_DOWNLOAD_URL, BLACKSITE_REPO_URL } from "./links";
+import { ATHENA_DOWNLOAD_URL, ATHENA_REPO_URL } from "./links";
 import { StationMap } from "./StationMap";
 import type { FeedEvent } from "./stationSim";
 
@@ -39,7 +39,7 @@ function LiveFeed({ rows }: { rows: ReadonlyArray<FeedEvent> }) {
   );
 }
 
-export function BlacksiteHero() {
+export function AthenaHero() {
   const [feed, setFeed] = useState<ReadonlyArray<FeedEvent>>(FIRST_FEED);
   const onFeed = useCallback(
     (e: FeedEvent) => setFeed((f) => [e, ...f].slice(0, 4)),
@@ -86,7 +86,7 @@ export function BlacksiteHero() {
           >
             <span className="text-bg bg-accent px-2 py-1 font-bold">NEW</span>
             <span className="text-accent border border-accent-dim px-2 py-1">
-              BLACKSITE 0.1 · DESKTOP APP
+              ATHENA AGENTS 1.0 · DESKTOP APP
             </span>
           </div>
 
@@ -110,22 +110,23 @@ export function BlacksiteHero() {
 
           <div className="field-fade" style={{ animationDelay: "0.6s" }}>
             <p className="text-[20px] md:text-[22px] text-ink mt-9 max-w-[30em] leading-[1.45] font-light">
-              Run AI agents and teams from one local workspace. Give each agent
-              a role, a model and the tools it needs, and watch them work on a
-              live 3D map.
+              A home for your AI agents. Build teams, give each agent a job, a
+              model and the tools it needs, and watch them work together on a
+              live map.
             </p>
 
             <p className="text-[17px] text-ink-dim mt-6 max-w-[36em] leading-[1.6]">
               No account and no login: it runs on your computer. Works with
-              Claude Code, Codex, local models and MCP. Free and open source.
+              Claude Code, Codex, opencode, local models and MCP. Free and open
+              source.
             </p>
 
             <div className="mt-9 flex gap-4 flex-wrap items-center">
-              <a href={BLACKSITE_DOWNLOAD_URL} className="btn-field">
+              <a href={ATHENA_DOWNLOAD_URL} className="btn-field">
                 ↓ Download
               </a>
               <a
-                href={BLACKSITE_REPO_URL}
+                href={ATHENA_REPO_URL}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn-ghost-field"

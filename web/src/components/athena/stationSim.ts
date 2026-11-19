@@ -1,5 +1,5 @@
-// A made-up Blacksite Station for the landing page hero. The scene is ported
-// from the dashboard's own map (blacksite web/views/station.ts): the Brain in
+// A made-up Athena Agents Station for the landing page hero. The scene is ported
+// from the dashboard's own map (athena-agents web/views/station.ts): the Brain in
 // the middle, team pods with desks, monitors drawn on canvases, light running
 // between them, and dashed wires from the connected programs at the top. No
 // server: a small scheduler below invents the work.
@@ -49,7 +49,7 @@ const TOOLS: ReadonlyArray<ToolDef> = [
     id: "comfyui",
     label: "ComfyUI",
     // the mark from the ComfyUI Desktop app's own icon, on a clear background
-    logo: "img:/blacksite/comfyui.png",
+    logo: "img:/athena-agents/comfyui.png",
     color: "#f2ff59",
     acts: [
       ["rendering textures", "padded cloth, weathered"],
