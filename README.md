@@ -129,6 +129,13 @@ net-mesh invite create                         # prints a `netmesh-join_` token 
 net-mesh join <TOKEN> --yes && net-mesh up     # device: use the link, then run its own node
 ```
 
+## Games
+
+**[NET for games](https://ai2070.net/games)** — multiplayer for any game engine, plug and play for
+Three.js. Players connect directly, with no game server to run.
+[Net Shooter](https://github.com/ai-2070/net-fps) is a small, open-source three.js FPS with NET
+built in. Start with the [browser quickstart](https://ai2070.net/docs/sdk/browser/quickstart).
+
 ## What it enables
 
 Capabilities, authority, and state on one substrate change what you can build. Each point leads
