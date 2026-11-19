@@ -1,6 +1,6 @@
 //! Diagnostic — concurrent large-file transfer at increasing fan-out.
 //!
-//! The flow-control window is per-stream (5 MiB for transfers), so N
+//! The flow-control window is per-stream (~256 KB for transfers), so N
 //! concurrent large transfers put up to `N × window` bytes in flight
 //! against a single receive loop + kernel recv buffer. This sweep finds
 //! whether (and at what fan-out) concurrent 4 MiB transfers degrade or

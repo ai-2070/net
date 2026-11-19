@@ -87,6 +87,22 @@ pub enum EngineError {
          {expected} lowercase hex characters, or absent for a capability-level quote"
     )]
     MalformedInputHash { expected: usize },
+    /// A quote was asked for on terms this provider never published.
+    ///
+    /// The template a quote request carries is the *caller's* choice; only
+    /// the offers the provider published for the tool (see
+    /// [`PaymentEngine::publish_offers`]) are authority for what it signs.
+    /// Refused when the tool has no published offer at all (fail closed: a
+    /// priced capability with no registered terms quotes nothing), and when
+    /// the template is not byte-identical to one of its published
+    /// `accepts[]` entries — a cheaper amount, a foreign `payTo`, another
+    /// asset, scheme or network.
+    #[error("quote refused: {0}")]
+    UnpublishedOffer(String),
+    /// Pricing terms offered for publication cannot become quote
+    /// authority on this engine (undecodable, or naming another provider).
+    #[error("pricing terms cannot be published: {0}")]
+    InvalidOffer(String),
     #[error("engine state inconsistent: {0}")]
     State(String),
     /// The billing log could not record an emitted event. Loud and
@@ -518,12 +534,7 @@ impl RedemptionTombstone {
                 return Err(RedeemDenialReason::BindingRejected);
             }
         }
-        let bound_tool = self
-            .capability
-            .split_once('/')
-            .map(|(_, tool)| tool)
-            .unwrap_or(self.capability.as_str());
-        if bound_tool != tool_id {
+        if bound_tool_of(&self.capability) != tool_id {
             return Err(RedeemDenialReason::WrongToolBinding {
                 capability: self.capability.clone(),
                 tool_id: tool_id.to_string(),
@@ -776,6 +787,27 @@ pub struct PaymentEngine {
     /// refuses a redemption that presents no invocation binding.
     /// See [`with_require_invocation_binding`](Self::with_require_invocation_binding).
     require_invocation_binding: bool,
+    /// The provider-published offers, by bound tool id (the capability's
+    /// tool segment — exactly what the redemption gates compare): each
+    /// entry is the preserved bytes of one published `accepts[]`
+    /// template. The only authority [`Self::issue_offered_quote`] signs
+    /// against. In memory by design: it is derived from what this process
+    /// publishes, and re-published on every start.
+    offers: parking_lot::RwLock<BTreeMap<String, Vec<Vec<u8>>>>,
+}
+
+/// The tool a capability binds: everything after the first `/` (tool ids
+/// may themselves contain `/`), or the whole string when there is none.
+///
+/// The one rule shared by the redemption gates' tool-binding check and the
+/// offer book's key, so a quote is priced by exactly the published offer of
+/// the tool it can later redeem — the provider segment is routing, and is
+/// spelled several ways (decimal, `0x`-hex), so it can key neither.
+pub fn bound_tool_of(capability: &str) -> &str {
+    capability
+        .split_once('/')
+        .map(|(_, tool)| tool)
+        .unwrap_or(capability)
 }
 
 /// Default retention for terminal quote records: 6 hours past authoritative
@@ -884,6 +916,7 @@ impl PaymentEngine {
             terminal_record_retention_ns: Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS),
             billing_log: None,
             require_invocation_binding: true,
+            offers: parking_lot::RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -1008,6 +1041,14 @@ impl PaymentEngine {
     /// gate is what keeps a bound quote and a capability-level quote from
     /// ever colliding; the transcript itself cannot be domain-separated
     /// without moving every unbound quote id ever issued.
+    ///
+    /// **`requirements` is signed as given** — this is the provider's own
+    /// issuance primitive, and the price, `payTo`, asset and network in it
+    /// are taken as the provider's decision. Never pass it a template that
+    /// came from a caller: a quote request's template is the requester's
+    /// choice, and signing it lets them name their own price and recipient.
+    /// Caller-facing issuance goes through [`Self::issue_offered_quote`],
+    /// which only signs a template the provider published.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_quote(
         &self,
@@ -1044,6 +1085,129 @@ impl PaymentEngine {
         );
         quote.sign_with(&self.provider)?;
         Ok(quote)
+    }
+
+    /// Publish `pricing_terms` (canonical `net.pricing.terms@1` JSON) as
+    /// the quote authority for `tool_id`: from now on
+    /// [`Self::issue_offered_quote`] signs a quote for that tool only on
+    /// one of these `accepts[]` templates, byte for byte.
+    ///
+    /// `tool_id` is the id the redemption gate will be asked to admit
+    /// (`net.a2a.task/{service}` for a paid A2A service) — the tool
+    /// segment of every capability a caller can quote it under (see
+    /// [`bound_tool_of`]). It is taken from the serving path rather than
+    /// from `terms.capability`, which is display metadata the provider
+    /// wrote by hand.
+    ///
+    /// **Replaces** whatever was published for the tool before, so a
+    /// re-publication at a new price withdraws the old one. Refused when
+    /// the terms do not decode, name a provider other than this engine, or
+    /// could never produce a quote here — terms this engine cannot sign
+    /// quotes for are not its to publish:
+    ///
+    /// - authored under a different asset-registry revision than the one
+    ///   this engine quotes under (a caller would pay under a registry the
+    ///   provider never announced);
+    /// - an `accepts[]` entry the registry refuses (an unsupported network
+    ///   or asset), which [`Self::issue_quote`] would refuse at every
+    ///   request — a priced tool that can never be bought.
+    pub fn publish_offers(&self, tool_id: &str, pricing_terms: &[u8]) -> Result<(), EngineError> {
+        let terms = crate::core::terms::PricingTerms::from_json_bytes(pricing_terms)
+            .map_err(|e| EngineError::InvalidOffer(e.to_string()))?;
+        if terms.provider != *self.provider.entity_id() {
+            return Err(EngineError::InvalidOffer(format!(
+                "terms for `{tool_id}` name provider {} but this engine signs as {}",
+                terms.provider,
+                self.provider.entity_id()
+            )));
+        }
+        if terms.asset_registry != self.registry_ref {
+            return Err(EngineError::InvalidOffer(format!(
+                "terms for `{tool_id}` were authored under a different asset registry \
+                 than this engine quotes under"
+            )));
+        }
+        for requirements in &terms.accepts {
+            self.registry
+                .check_requirements(requirements.view())
+                .map_err(|e| {
+                    EngineError::InvalidOffer(format!(
+                        "terms for `{tool_id}` offer requirements this engine cannot quote: {e}"
+                    ))
+                })?;
+        }
+        let accepts = terms.accepts.iter().map(|t| t.bytes().to_vec()).collect();
+        self.offers.write().insert(tool_id.to_string(), accepts);
+        Ok(())
+    }
+
+    /// [`Self::publish_offers`] keyed by the terms' own `capability`
+    /// (its tool segment) — for a provider whose terms name the tool they
+    /// price exactly as its callers will quote it. Returns the tool id the
+    /// offers were published under.
+    pub fn publish_pricing_terms(&self, pricing_terms: &[u8]) -> Result<String, EngineError> {
+        let terms = crate::core::terms::PricingTerms::from_json_bytes(pricing_terms)
+            .map_err(|e| EngineError::InvalidOffer(e.to_string()))?;
+        let tool_id = bound_tool_of(&terms.capability).to_string();
+        self.publish_offers(&tool_id, pricing_terms)?;
+        Ok(tool_id)
+    }
+
+    /// Withdraw every offer published for `tool_id`: later quote requests
+    /// for it are refused. Quotes already signed are unaffected (a signed
+    /// quote is a commitment for its validity window).
+    pub fn withdraw_offers(&self, tool_id: &str) {
+        self.offers.write().remove(tool_id);
+    }
+
+    /// Issue a quote on a **caller-supplied** template — the issuance path
+    /// every quote request (the `net.payments.quote.v1` service, an
+    /// in-process [`crate::flow::InProcessProvider`]) goes through.
+    ///
+    /// The provider's published terms are the authority, not the request:
+    /// the template must be byte-identical to one `accepts[]` entry
+    /// published for the capability's tool ([`Self::publish_offers`]), so
+    /// amount, `payTo`, asset, scheme, network and timeout are all the
+    /// provider's. Anything else — and any tool with nothing published —
+    /// is [`EngineError::UnpublishedOffer`], before admission or signing.
+    /// Then exactly [`Self::issue_quote`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_offered_quote(
+        &self,
+        caller: EntityId,
+        capability: &str,
+        requirements: X402Carry<PaymentRequirements>,
+        input_hash: Option<&str>,
+        now_ns: u64,
+        ttl_ns: u64,
+    ) -> Result<PaymentQuote, EngineError> {
+        let tool_id = bound_tool_of(capability);
+        // The offer book's read guard is held through signing: released
+        // after the check, a concurrent withdrawal or repricing could leave
+        // the template unpublished by the time the quote is signed. A
+        // publish or withdraw waits for in-flight issuance instead.
+        let offers = self.offers.read();
+        {
+            let Some(published) = offers.get(tool_id) else {
+                return Err(EngineError::UnpublishedOffer(format!(
+                    "no pricing terms are published for `{tool_id}` — this provider \
+                     quotes only the terms it announced"
+                )));
+            };
+            if !published
+                .iter()
+                .any(|b| b.as_slice() == requirements.bytes())
+            {
+                return Err(EngineError::UnpublishedOffer(format!(
+                    "the requested payment requirements are not among the terms \
+                     published for `{tool_id}` — a quote restates the provider's own \
+                     price and recipient, never the requester's"
+                )));
+            }
+        }
+        let quote = self.issue_quote(caller, capability, requirements, input_hash, now_ns, ttl_ns);
+        drop(offers);
+        quote
     }
 
     /// Accept a payment against a quote: the full settle path, or the
@@ -2587,12 +2751,7 @@ impl PaymentEngine {
         // The capability binds `provider/tool`; the tool segment is
         // everything after the first `/` (tool ids may themselves
         // contain `/`).
-        let bound_tool = rec
-            .capability
-            .split_once('/')
-            .map(|(_, tool)| tool)
-            .unwrap_or(rec.capability.as_str());
-        if bound_tool != tool_id {
+        if bound_tool_of(&rec.capability) != tool_id {
             return Err(RedeemDenialReason::WrongToolBinding {
                 capability: rec.capability.clone(),
                 tool_id: tool_id.to_string(),
@@ -2967,6 +3126,235 @@ mod input_binding_tests {
             unbound.quote_id, bound.quote_id,
             "a bound and an unbound quote must never be one envelope"
         );
+    }
+}
+
+/// PAY-01: the offer book is the only authority caller-facing issuance
+/// ([`PaymentEngine::issue_offered_quote`]) signs against.
+#[cfg(test)]
+mod offer_book_tests {
+    use super::*;
+    use crate::core::registry::default_mock_registry;
+    use crate::core::terms::PricingTerms;
+    use crate::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
+
+    const NOW: u64 = 1_000_000_000_000_000;
+    const TTL: u64 = 60_000_000_000;
+    const TOOL: &str = "tool";
+
+    fn template(amount: &str, pay_to: &str) -> X402Carry<PaymentRequirements> {
+        X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: MOCK_NETWORK.into(),
+            amount: amount.into(),
+            asset: "musd".into(),
+            pay_to: pay_to.into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author requirements")
+    }
+
+    fn published() -> X402Carry<PaymentRequirements> {
+        template("2500", "provider-settle-addr")
+    }
+
+    fn engine() -> (PaymentEngine, tempfile::TempDir) {
+        let keys = Arc::new(EntityKeypair::generate());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = PaymentEngine::new(
+            keys.clone(),
+            Arc::new(MockFacilitator::new()),
+            Arc::new(AdmitAll),
+            default_mock_registry(keys.entity_id().clone()),
+            dir.path().join("engine.json"),
+        )
+        .expect("engine");
+        (engine, dir)
+    }
+
+    fn terms_for(
+        engine: &PaymentEngine,
+        provider: EntityId,
+        accepts: Vec<X402Carry<PaymentRequirements>>,
+    ) -> Vec<u8> {
+        let terms = PricingTerms::new(
+            provider,
+            format!("prov/{TOOL}"),
+            accepts,
+            engine.registry_ref.clone(),
+        );
+        crate::core::canonical::canonical_bytes(&terms).expect("canonicalize")
+    }
+
+    fn offered(
+        engine: &PaymentEngine,
+        capability: &str,
+        requirements: X402Carry<PaymentRequirements>,
+    ) -> Result<PaymentQuote, EngineError> {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        engine.issue_offered_quote(caller, capability, requirements, None, NOW, TTL)
+    }
+
+    #[test]
+    fn a_tool_with_nothing_published_quotes_nothing() {
+        let (engine, _dir) = engine();
+        assert!(matches!(
+            offered(&engine, "prov/tool", published()),
+            Err(EngineError::UnpublishedOffer(_))
+        ));
+    }
+
+    #[test]
+    fn only_a_published_template_is_signed() {
+        let (engine, _dir) = engine();
+        let terms = terms_for(
+            &engine,
+            engine.provider.entity_id().clone(),
+            vec![published()],
+        );
+        engine.publish_offers(TOOL, &terms).expect("publish");
+
+        for (name, substitute) in [
+            ("cheaper", template("1", "provider-settle-addr")),
+            ("own recipient", template("2500", "attacker-addr")),
+            ("both", template("1", "attacker-addr")),
+        ] {
+            assert!(
+                matches!(
+                    offered(&engine, "prov/tool", substitute),
+                    Err(EngineError::UnpublishedOffer(_))
+                ),
+                "a {name} template must not be signed"
+            );
+        }
+
+        // The provider segment is routing (decimal or hex): the offer is
+        // keyed by the bound tool, exactly what the redemption gate admits.
+        for capability in ["prov/tool", "0x2a/tool"] {
+            let quote = offered(&engine, capability, published()).expect("published terms quote");
+            assert_eq!(quote.requirements.bytes(), published().bytes());
+        }
+        // A different tool is not priced by this tool's offer.
+        assert!(matches!(
+            offered(&engine, "prov/other", published()),
+            Err(EngineError::UnpublishedOffer(_))
+        ));
+    }
+
+    #[test]
+    fn republication_replaces_and_withdrawal_removes() {
+        let (engine, _dir) = engine();
+        let provider = engine.provider.entity_id().clone();
+        engine
+            .publish_offers(
+                TOOL,
+                &terms_for(&engine, provider.clone(), vec![published()]),
+            )
+            .expect("publish");
+        let repriced = template("5000", "provider-settle-addr");
+        engine
+            .publish_offers(TOOL, &terms_for(&engine, provider, vec![repriced.clone()]))
+            .expect("republish");
+        assert!(
+            matches!(
+                offered(&engine, "prov/tool", published()),
+                Err(EngineError::UnpublishedOffer(_))
+            ),
+            "the withdrawn old price must not keep quoting"
+        );
+        offered(&engine, "prov/tool", repriced.clone()).expect("the new price quotes");
+
+        engine.withdraw_offers(TOOL);
+        assert!(matches!(
+            offered(&engine, "prov/tool", repriced),
+            Err(EngineError::UnpublishedOffer(_))
+        ));
+    }
+
+    #[test]
+    fn terms_this_engine_cannot_sign_for_are_not_publishable() {
+        let (engine, _dir) = engine();
+        let foreign = terms_for(
+            &engine,
+            EntityKeypair::generate().entity_id().clone(),
+            vec![published()],
+        );
+        assert!(matches!(
+            engine.publish_offers(TOOL, &foreign),
+            Err(EngineError::InvalidOffer(_))
+        ));
+        assert!(matches!(
+            engine.publish_offers(TOOL, br#"{"object":"net.pricing.terms@1"}"#),
+            Err(EngineError::InvalidOffer(_))
+        ));
+        // Nothing was published by either refusal.
+        assert!(matches!(
+            offered(&engine, "prov/tool", published()),
+            Err(EngineError::UnpublishedOffer(_))
+        ));
+    }
+
+    /// Terms that could never produce a quote here are refused at
+    /// publication, not at every request: authored under another asset
+    /// registry revision (a caller would pay under a registry this provider
+    /// never announced), or offering requirements the registry refuses (a
+    /// priced tool nobody can buy).
+    ///
+    /// Red: `publish_offers` accepted both, and only `issue_quote` refused
+    /// the second — after the tool was already announced as purchasable.
+    #[test]
+    fn terms_this_engine_could_never_quote_are_not_publishable() {
+        let (engine, _dir) = engine();
+        let provider = engine.provider.entity_id().clone();
+
+        let mut other_registry = engine.registry_ref.clone();
+        other_registry.hash = "00".repeat(32);
+        let foreign_registry = crate::core::canonical::canonical_bytes(&PricingTerms::new(
+            provider.clone(),
+            format!("prov/{TOOL}"),
+            vec![published()],
+            other_registry,
+        ))
+        .expect("canonicalize");
+        assert!(matches!(
+            engine.publish_offers(TOOL, &foreign_registry),
+            Err(EngineError::InvalidOffer(_))
+        ));
+
+        let unsupported = X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: "eip155:999999999".into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author requirements");
+        let unquotable = terms_for(&engine, provider, vec![published(), unsupported]);
+        assert!(matches!(
+            engine.publish_offers(TOOL, &unquotable),
+            Err(EngineError::InvalidOffer(_))
+        ));
+
+        // Neither refusal published anything.
+        assert!(matches!(
+            offered(&engine, "prov/tool", published()),
+            Err(EngineError::UnpublishedOffer(_))
+        ));
+    }
+
+    #[test]
+    fn terms_keyed_by_their_own_capability_publish_under_its_tool() {
+        let (engine, _dir) = engine();
+        let terms = terms_for(
+            &engine,
+            engine.provider.entity_id().clone(),
+            vec![published()],
+        );
+        assert_eq!(engine.publish_pricing_terms(&terms).expect("publish"), TOOL);
+        offered(&engine, "prov/tool", published()).expect("published terms quote");
     }
 }
 

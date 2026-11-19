@@ -41,6 +41,7 @@ ROWS = [
     ("describe_a2a", (9,), "describe_a2a", (9,)),
     ("task_status", (9, "t"), "task_status", (9, "t")),
     ("cancel_task", (9, "t"), "cancel_task", (9, "t")),
+    ("ensure_attached", ("rv",), "ensure_attached", ("rv",)),
     ("rendezvous_string", (), "rendezvous_string", ()),
     ("join", ("dev", "inv", "n", ["t"]), "join", ("dev", "inv", "n", ["t"])),
     ("renew", ("enr",), "renew", ("enr",)),

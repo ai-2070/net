@@ -117,7 +117,7 @@ impl World {
             .expect("engine")
             .with_billing_log(provider_log.clone()),
         );
-        let in_process = Arc::new(InProcessProvider::new(engine, clock.clone()));
+        let in_process = Arc::new(InProcessProvider::new(engine.clone(), clock.clone()));
         let serving = serve_payments(&provider_mesh, in_process).expect("serve payments");
 
         // The capability id the mesh channel routes by: `<node_id>/<tool>`.
@@ -142,6 +142,13 @@ impl World {
         );
         let terms_json =
             String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
+        // What a serving path does as it announces the price: the announced
+        // terms become the engine's quote authority for the tool. Without it
+        // the quote wire refuses every request (PAY-01: a provider quotes
+        // only the terms it published, never the requester's template).
+        engine
+            .publish_offers("fixture-tool", terms_json.as_bytes())
+            .expect("publish the announced terms as quote authority");
 
         Self {
             provider_node: provider_mesh.inner().node_id(),
@@ -190,12 +197,23 @@ impl World {
         caller: &EntityKeypair,
         nonce: &str,
     ) -> net_payments::core::quote_request::QuoteRequest {
+        self.quote_request_for(caller, nonce, &self.template)
+    }
+
+    /// [`Self::quote_request`] over a caller-chosen `template` — the one
+    /// field PAY-01's tests vary.
+    fn quote_request_for(
+        &self,
+        caller: &EntityKeypair,
+        nonce: &str,
+        template: &X402Carry<PaymentRequirements>,
+    ) -> net_payments::core::quote_request::QuoteRequest {
         use net_payments::core::quote_request::QuoteRequest;
         let mut request = QuoteRequest::new(
             self.provider_id.clone(),
             caller.entity_id().clone(),
             &self.capability,
-            self.template.bytes(),
+            template.bytes(),
             self.clock.now_ns(),
             30_000_000_000,
             nonce,
@@ -216,6 +234,15 @@ impl World {
         &self,
         request: &net_payments::core::quote_request::QuoteRequest,
     ) -> Result<(), String> {
+        self.request_quote_for(request, &self.template).await
+    }
+
+    /// [`Self::request_quote`] carrying a caller-chosen `template`.
+    async fn request_quote_for(
+        &self,
+        request: &net_payments::core::quote_request::QuoteRequest,
+        template: &X402Carry<PaymentRequirements>,
+    ) -> Result<(), String> {
         use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine as _;
         let bytes = canonical_bytes(request).expect("canonical");
@@ -226,7 +253,7 @@ impl World {
                 "net.payments.quote.v1",
                 &QuoteWire {
                     request_b64: BASE64.encode(bytes),
-                    template_b64: BASE64.encode(self.template.bytes()),
+                    template_b64: BASE64.encode(template.bytes()),
                 },
                 Default::default(),
             )
@@ -439,4 +466,55 @@ async fn a_request_for_another_provider_is_refused() {
     // above is the bind and not the wire.
     let addressed = w.quote_request(&caller, "right-destination");
     assert!(w.request_quote(&addressed).await.is_ok());
+}
+
+/// PAY-01: a quote request names the capability, not the price. A
+/// signed, admitted caller that asks for the paid tool on a cheaper
+/// amount, on its own `payTo`, or on both is refused over the real wire —
+/// the provider signs only the `accepts[]` terms it published for the
+/// tool. Before the fix the service signed whatever template arrived, so
+/// a caller could settle its own price to its own address and redeem the
+/// published tool with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quote_request_cannot_choose_its_own_price_or_recipient() {
+    let w = World::start().await;
+    let caller = EntityKeypair::generate();
+    let published: PaymentRequirements =
+        serde_json::from_slice(w.template.bytes()).expect("published template");
+
+    let substitute = |amount: &str, pay_to: &str| {
+        X402Carry::author(&PaymentRequirements {
+            amount: amount.into(),
+            pay_to: pay_to.into(),
+            ..published.clone()
+        })
+        .expect("author")
+    };
+    let cases = [
+        ("cheaper", substitute("1", &published.pay_to)),
+        (
+            "own recipient",
+            substitute(&published.amount, "attacker-settle-addr"),
+        ),
+        (
+            "cheaper, own recipient",
+            substitute("1", "attacker-settle-addr"),
+        ),
+    ];
+    for (i, (name, template)) in cases.iter().enumerate() {
+        let request = w.quote_request_for(&caller, &format!("substitute-{i}"), template);
+        let refusal = w
+            .request_quote_for(&request, template)
+            .await
+            .expect_err(&format!("a {name} template must not be signed"));
+        assert!(
+            refusal.contains("not among the terms published"),
+            "the refusal must be the published-offer check ({name}): {refusal}"
+        );
+    }
+
+    // Same caller, same capability, the published template: quoted. The
+    // refusals above are the price check, not the wire.
+    let honest = w.quote_request(&caller, "published-terms");
+    assert!(w.request_quote(&honest).await.is_ok());
 }

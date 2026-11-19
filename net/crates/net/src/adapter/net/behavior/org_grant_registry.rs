@@ -43,6 +43,8 @@ use std::sync::Arc;
 
 use super::org::OrgId;
 use super::org_grant::{OrgAudienceSecret, OrgCapabilityGrant};
+use super::org_grant_revocation::RevokedGrantKind;
+use super::org_revocation::OrgRevocationState;
 use super::org_routing_registry::GrantMovementFence;
 use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
 
@@ -664,18 +666,30 @@ pub(crate) fn validate_provider_record(
 /// were already signature-verified at installation. An inactive record is simply
 /// omitted for this emission; the snapshot stays installed for when it becomes
 /// active.
+///
+/// ORG-02: a grant its issuer has REVOKED (`floors` holds its capability-grant
+/// revocation) is inactive too. Revocation withdraws DISCOVER exactly as it
+/// withdraws INVOKE: a provider must stop sealing new private-discovery
+/// updates to the former grantee the moment the revocation is applied, not at
+/// the grant's expiry or at an explicit registry removal.
 pub(crate) fn grant_active_for_emission(
     grant: &OrgCapabilityGrant,
     provider_entity: &EntityId,
     provider_owner_org: &OrgId,
     now_secs: u64,
     skew_secs: u64,
+    floors: &OrgRevocationState,
 ) -> bool {
     grant.is_valid_at_with_skew(now_secs, skew_secs).is_ok()
         && &grant.issuer_org == provider_owner_org
         && grant
             .target_scope
             .covers(provider_entity, Some(provider_owner_org))
+        && !floors.is_grant_revoked(
+            &grant.issuer_org,
+            RevokedGrantKind::Capability,
+            &grant.grant_id,
+        )
 }
 
 /// Validate a CONSUMER-side record (Kyra OA3-4b2 slice 2): the common invariants
@@ -973,6 +987,7 @@ mod tests {
         };
         let now = 10_000u64;
         let skew = 0u64;
+        let none = OrgRevocationState::empty();
 
         // Inside the validity window → active (an envelope would be built).
         assert!(grant_active_for_emission(
@@ -980,7 +995,8 @@ mod tests {
             &provider,
             &owner,
             now,
-            skew
+            skew,
+            &none
         ));
         // Evaluated BEFORE not_before → inactive (no envelope).
         assert!(!grant_active_for_emission(
@@ -988,7 +1004,8 @@ mod tests {
             &provider,
             &owner,
             now,
-            skew
+            skew,
+            &none
         ));
         // Evaluated AT/AFTER not_after → inactive (no envelope).
         assert!(!grant_active_for_emission(
@@ -996,7 +1013,8 @@ mod tests {
             &provider,
             &owner,
             now,
-            skew
+            skew,
+            &none
         ));
         // Issuer org that is not this provider's owner → inactive.
         assert!(!grant_active_for_emission(
@@ -1004,7 +1022,8 @@ mod tests {
             &provider,
             &org_a().org_id(),
             now,
-            skew
+            skew,
+            &none
         ));
         // Target scope that does not cover this provider → inactive.
         let other = EntityKeypair::from_bytes([0x44u8; 32]).entity_id().clone();
@@ -1013,7 +1032,34 @@ mod tests {
             &provider,
             &owner,
             now,
-            skew
+            skew,
+            &none
+        ));
+        // ORG-02: a grant its issuer REVOKED → inactive, even inside its window
+        // and with issuer + target intact. Revocation withdraws DISCOVER.
+        let active = mk(now - 100, now + 100, exact.clone());
+        let mut revoked = OrgRevocationState::empty();
+        let bundle = crate::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle::issue_at(
+            &issuer,
+            [crate::adapter::net::behavior::org_grant_revocation::RevokedGrant::capability(&active)],
+            now,
+        )
+        .expect("revocation bundle");
+        assert_eq!(revoked.merge_grant_revocations(&bundle, now), 1);
+        assert!(!grant_active_for_emission(
+            &active, &provider, &owner, now, skew, &revoked
+        ));
+        // A revocation by ANOTHER org cannot withdraw this issuer's grant.
+        let mut foreign = OrgRevocationState::empty();
+        let foreign_bundle = crate::adapter::net::behavior::org_grant_revocation::OrgGrantRevocationBundle::issue_at(
+            &org_a(),
+            [crate::adapter::net::behavior::org_grant_revocation::RevokedGrant::capability(&active)],
+            now,
+        )
+        .expect("foreign bundle");
+        foreign.merge_grant_revocations(&foreign_bundle, now);
+        assert!(grant_active_for_emission(
+            &active, &provider, &owner, now, skew, &foreign
         ));
     }
 

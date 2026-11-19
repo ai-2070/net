@@ -25,25 +25,40 @@
 use std::process::Command;
 
 /// Locate the `natsim_node` example for the ACTIVE build profile.
-/// This test binary lives at `<target>/<profile>/deps/<name>-<hash>`,
-/// so the example sits two directories up at
-/// `<target>/<profile>/examples/natsim_node` — correct under
-/// `--release`, custom `--profile` names, and `CARGO_TARGET_DIR`
-/// alike. (Cubic round 6: a hardcoded `target/debug/` path made the
-/// no-root guard tests silently skip in release builds; note that
-/// `PROFILE` is a build-script-only env var and is NOT available at
-/// test runtime, hence the current_exe derivation.) The
-/// `NATSIM_NODE_BIN` override mirrors `run_scenario.sh`.
+/// The example is uplifted to `<target>/<profile>/examples/natsim_node`
+/// — correct under `--release`, custom `--profile` names, and
+/// `CARGO_TARGET_DIR` alike. (Cubic round 6: a hardcoded
+/// `target/debug/` path made the no-root guard tests silently skip in
+/// release builds; note that `PROFILE` is a build-script-only env var
+/// and is NOT available at test runtime, hence the current_exe
+/// derivation.) The `NATSIM_NODE_BIN` override mirrors
+/// `run_scenario.sh`.
+///
+/// `<profile>/` is found by walking up from the test binary to its
+/// nearest `deps/` or `build/` ancestor rather than by a fixed number
+/// of `pop()`s, because the binary's depth differs by cargo layout:
+/// `<profile>/deps/<name>-<hash>` under the old layout, and
+/// `<profile>/build/<package>/<hash>/out/<name>-<hash>` under the
+/// build-dir layout cargo 1.100 made the default. Two fixed pops
+/// landed in `build/<package>/<hash>/`, so every scenario row failed
+/// with "helper not built" and the no-root guards silently skipped.
 fn natsim_node_bin() -> std::path::PathBuf {
     if let Ok(explicit) = std::env::var("NATSIM_NODE_BIN") {
         return explicit.into();
     }
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop(); // strip the test-binary filename → deps/
-    p.pop(); // strip deps/ → <profile>/
-    p.push("examples");
-    p.push("natsim_node");
-    p
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .ancestors()
+        .skip(1)
+        .find(|dir| {
+            matches!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("deps" | "build")
+            )
+        })
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| panic!("no deps/ or build/ ancestor of {}", exe.display()));
+    profile_dir.join("examples").join("natsim_node")
 }
 
 /// A completed scenario: the initiator's outcome JSON plus the state

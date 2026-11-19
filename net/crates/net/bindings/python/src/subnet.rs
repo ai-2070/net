@@ -375,5 +375,8 @@ pub fn serve_subnet_exported(
         .map_err(|e| subnet_py_err(format!("subnet-exported serve registration failed: {e}")))?
     };
 
-    Ok(crate::org_serve::PyOrgServeHandle::from_handle(handle))
+    Ok(crate::org_serve::PyOrgServeHandle::from_handle(
+        &mesh.node_arc_clone()?,
+        handle,
+    ))
 }

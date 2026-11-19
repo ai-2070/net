@@ -172,6 +172,10 @@ impl Mesh {
         F: Fn(JoinRequest) -> Fut + Clone + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
+        // ANCHOR-03: a grant promotes only the session of the device
+        // it names.
+        #[cfg(feature = "webrtc")]
+        self.node().set_enrollment_subject_binding(true);
         // R6: the outcome bytes travel RAW. A JSON-encoded
         // `Vec<u8>` is a JSON array of numbers, and the core's
         // promotion gate reads the body's own `NMO1` prefix — so a
@@ -204,6 +208,10 @@ impl Mesh {
         grant_ttl: Duration,
         max_depth: u8,
     ) -> Result<ServeHandle, ServeError> {
+        // ANCHOR-03: a grant promotes only the session of the device
+        // it names.
+        #[cfg(feature = "webrtc")]
+        self.node().set_enrollment_subject_binding(true);
         // R6: raw bodies, same reason as `serve_enrollment`.
         self.serve_rpc_raw_bytes(ENROLLMENT_SERVICE, move |req: Vec<u8>| {
             let operator = operator.clone();
@@ -246,13 +254,16 @@ impl Mesh {
         let device = self.identity().cloned().ok_or(JoinFlowError::NoIdentity)?;
         let rv = Rendezvous::decode(rendezvous)
             .ok_or_else(|| JoinFlowError::Transport("malformed rendezvous locator".into()))?;
-        // Best-effort attach: a fresh device (renewing after a restart) needs
-        // the handshake, but a device renewing right after joining is already
-        // connected — its `connect_via` would fail as "already connected", which
-        // is fine since `call` routes by node id. A genuine unreachability
-        // surfaces as the `call` error below.
-        let _ = self
-            .connect_via(&rv.addr, &rv.noise_pubkey, rv.node_id)
+        // Attach first, unless the session is already live (a device
+        // renewing right after `join`). After a restart on either side
+        // this re-dials through the operator's busy-gate window rather
+        // than giving up after one `connect_via`. Still best-effort: a
+        // genuine unreachability surfaces as the `call` error below,
+        // which then also names the handshake failure — the part that
+        // tells "the operator is off" apart from "its rendezvous key no
+        // longer matches (re-pair)".
+        let attach = self
+            .ensure_attached_via(&rv.addr, &rv.noise_pubkey, rv.node_id)
             .await;
         let request = RenewalRequest::create(&device, current_chain);
         // R6: raw both ways. The outcome is already a serialized
@@ -262,7 +273,15 @@ impl Mesh {
             .call_raw_bytes(rv.node_id, RENEWAL_SERVICE, request.to_bytes())
             .await
             // `SdkError::Rpc` already reads "call: …".
-            .map_err(|e| JoinFlowError::Transport(e.to_string()))?;
+            .map_err(|e| match &attach {
+                Ok(()) => JoinFlowError::Transport(e.to_string()),
+                Err(handshake) => JoinFlowError::Transport(format!(
+                    "{e}; the handshake to the rendezvous at {} also failed ({handshake}) — \
+                     the operator is unreachable, or its Noise key no longer matches the \
+                     saved rendezvous and the device must re-pair",
+                    rv.addr
+                )),
+            })?;
         // The renewed grant must anchor at the same root and bind to this
         // device — the same rogue-operator defense as `join`.
         let root = current_chain.root();

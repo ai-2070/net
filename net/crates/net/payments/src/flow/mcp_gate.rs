@@ -83,4 +83,16 @@ impl PaymentAdmission for EnginePaymentAdmission {
         // (`mesh::EngineToolPaymentGate`) — see `flow::redeem_via_engine`.
         super::redeem_via_engine(&self.engine, tool_id, quote_id, binding).await
     }
+
+    /// The publication's announced terms become the engine's quote
+    /// authority for the tool (see [`PaymentEngine::publish_offers`]).
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        self.engine
+            .publish_offers(tool_id, pricing_terms.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.engine.withdraw_offers(tool_id);
+    }
 }

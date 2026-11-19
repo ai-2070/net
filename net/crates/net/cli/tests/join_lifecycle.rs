@@ -94,11 +94,15 @@ impl Fx {
     }
 
     fn up(&self, extra: &[&str]) -> Up {
-        // `--bind 127.0.0.1:0` lets the OS pick the UDP port, and the
-        // enrollment listener then binds TCP on the SAME number (a token
-        // names one port for both). Another process may hold that TCP
-        // port — tests run in parallel — so that one refusal is retried
-        // with a fresh port; every other failure fails the test.
+        // With `--enroll --bind 127.0.0.1:0`, `up` picks a port free for
+        // both UDP and TCP (a token names one port for both) and PERSISTS
+        // it in the state dir before binding. Tests run in parallel, so
+        // another process can take that port in between. Retrying with the
+        // same state dir would reuse the persisted port, so a retry first
+        // removes the state — only when this call created it, so a state
+        // that existed before (a restart) is never wiped. Every other
+        // failure fails the test.
+        let fresh_state = !self.state().exists();
         for attempt in 1..=3 {
             let mut child = self
                 .base()
@@ -117,7 +121,12 @@ impl Fx {
                     assert_eq!(ready["event"], "ready", "{ready}");
                     return Up { child, ready };
                 }
-                Err(stderr) if attempt < 3 && stderr.contains("Address already in use") => continue,
+                Err(stderr)
+                    if attempt < 3 && fresh_state && stderr.contains("Address already in use") =>
+                {
+                    std::fs::remove_dir_all(self.state()).unwrap();
+                    continue;
+                }
                 Err(stderr) => panic!("no row from up; stderr: {stderr}"),
             }
         }

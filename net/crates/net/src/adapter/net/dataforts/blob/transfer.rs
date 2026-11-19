@@ -173,6 +173,21 @@ pub enum TransferHeader {
 
 type DoneTx = tokio::sync::oneshot::Sender<Result<Bytes, BlobError>>;
 
+/// What a pending fetch fails with when the holder gave up sending
+/// ([`BlobTransferEngine::on_reset`]). Matched by [`is_holder_gave_up`]
+/// only; keep the two together.
+const HOLDER_GAVE_UP: &str = "transfer: holder reset the stream (it gave up sending)";
+
+/// Whether a fetch failed because the holder gave up mid-chunk (its
+/// reliable layer exhausted retransmits, or it abandoned the stream under
+/// backpressure). That is the one transient fetch failure: the holder has
+/// the chunk and was sending it, so asking again can succeed. A
+/// `NotFound`, an idle timeout or a hash mismatch will not change on a
+/// retry.
+pub(crate) fn is_holder_gave_up(e: &BlobError) -> bool {
+    matches!(e, BlobError::Backend(msg) if msg == HOLDER_GAVE_UP)
+}
+
 /// Outcome of folding one reassembly event. Hoisted to module scope so
 /// both `on_data` (drives the loop) and `process_event` (folds one
 /// event) share it without re-acquiring the DashMap guard across a
@@ -207,6 +222,11 @@ struct PendingInbound {
     reorder: BTreeMap<u64, Vec<Bytes>>,
     /// Taken and fired once on completion (success / NotFound / error).
     done: Option<DoneTx>,
+    /// When this transfer last made progress: registration, then every
+    /// packet that arrives for it. The requester times a fetch out on
+    /// silence (`idle_for`), not on total duration, so a slow but moving
+    /// chunk is never cut off and a dead one fails promptly.
+    last_progress: std::time::Instant,
 }
 
 impl PendingInbound {
@@ -283,8 +303,17 @@ impl BlobTransferEngine {
                 next_seq: 0,
                 reorder: BTreeMap::new(),
                 done: Some(done),
+                last_progress: std::time::Instant::now(),
             },
         );
+    }
+
+    /// How long the pending transfer on `stream_id` has gone without a
+    /// packet. `None` once it has settled (or was never registered).
+    pub fn idle_for(&self, stream_id: u64) -> Option<std::time::Duration> {
+        self.pending
+            .get(&stream_id)
+            .map(|p| p.last_progress.elapsed())
     }
 
     /// Drop a pending transfer (timeout / give-up). Idempotent. Closes the
@@ -335,18 +364,14 @@ impl BlobTransferEngine {
         self.remove_and_close(stream_id)
     }
 
-    /// The holder's reliable layer gave up retransmitting this transfer
-    /// stream (STREAM_RETRANSMIT H-3 reset). Fail the pending read now
-    /// with a distinct error so the caller can fail over to another
-    /// holder immediately instead of waiting for the 30 s timeout.
-    /// No-op if the transfer already settled.
+    /// The holder gave up sending on this transfer stream — its reliable
+    /// layer exhausted retransmits (STREAM_RETRANSMIT H-3), or it stopped
+    /// mid-chunk on purpose (`MeshNode::abandon_stream_send`). Fail the
+    /// pending read now with a distinct error so the caller can retry or
+    /// fail over at once instead of waiting out the idle limit. No-op if
+    /// the transfer already settled.
     pub fn on_reset(&self, stream_id: u64) {
-        self.finish(
-            stream_id,
-            Err(BlobError::Backend(
-                "transfer: holder reset stream (retransmit exhausted)".into(),
-            )),
-        );
+        self.finish(stream_id, Err(BlobError::Backend(HOLDER_GAVE_UP.into())));
     }
 
     /// Serving side: a `TransferControl::Request` arrived on `stream_id`
@@ -412,6 +437,9 @@ impl BlobTransferEngine {
                 Some(e) => e,
                 None => return, // already completed / cancelled
             };
+            // Any packet for a live transfer is progress — duplicates and
+            // out-of-order ones included: the holder is still sending.
+            entry.last_progress = std::time::Instant::now();
             // Dedup + bound: ignore already-consumed sequences, duplicate
             // buffered ones, and anything beyond the reorder horizon.
             if seq < entry.next_seq
@@ -586,13 +614,14 @@ async fn serve_chunk(
                 .await
                 .is_ok()
             {
-                // One reliable event per ~8 KiB frame. Because
-                // `TRANSFER_STREAM_WINDOW_BYTES` covers a whole chunk's
-                // on-wire size, the per-event credit never runs dry
-                // mid-chunk, so these sends don't stall into
-                // `send_with_retry`'s backoff (the 64 KiB default window
-                // exhausted every ~8 frames and each stall paid ≥5 ms
-                // even though the receiver's grant lands in <1 ms).
+                // One reliable event per ~8 KiB frame.
+                // `TRANSFER_STREAM_WINDOW_BYTES` (~256 KB) is a sixteenth
+                // of a 4 MiB chunk, so the per-event credit does run dry
+                // mid-chunk and a send waits in `send_with_retry` until
+                // the receiver's grant lands. One chunk stream is
+                // therefore paced by that window; a large file gets its
+                // throughput from several chunk streams at once
+                // (`dataforts::dir::MAX_CHUNKS_IN_FLIGHT_PER_FILE`).
                 // Per-event (not batched) keeps each `send_with_retry`
                 // independently safe: a one-packet call can't partially
                 // commit and then resend a duplicate under a fresh
@@ -614,10 +643,16 @@ async fn serve_chunk(
                         .await
                         .is_err()
                     {
+                        // Giving up mid-chunk: tell the requester, so it
+                        // retries now instead of waiting out its idle
+                        // limit on bytes that will never come.
+                        mesh.abandon_stream_send(requester, stream_id);
                         break;
                     }
                     offset = end;
                 }
+            } else {
+                mesh.abandon_stream_send(requester, stream_id);
             }
         }
         Err(_) => {
@@ -738,5 +773,52 @@ mod tests {
         assert!(engine.cancel_pending_reporting(sid));
         assert!(!engine.cancel_pending_reporting(sid));
         assert!(engine.list_pending().is_empty());
+    }
+
+    /// AIB-6 (CODE_REVIEW_2026_10_28): the directory fetch retries a
+    /// chunk only when the holder gave up mid-send. The error `on_reset`
+    /// fails a pending fetch with must be the one `is_holder_gave_up`
+    /// recognises, and the non-transient failures must not be.
+    #[tokio::test]
+    async fn only_a_holder_reset_counts_as_gave_up() {
+        use crate::adapter::net::identity::EntityKeypair;
+        use crate::adapter::net::redex::Redex;
+        use crate::adapter::net::MeshNodeConfig;
+
+        let addr = "127.0.0.1:0".parse().expect("addr");
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x18u8; 32]),
+            )
+            .await
+            .expect("node"),
+        );
+        let adapter = Arc::new(MeshBlobAdapter::new("t", Arc::new(Redex::new())));
+        let engine = BlobTransferEngine::new(&node, adapter);
+
+        let sid = transfer_stream_id(7);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(sid, 7, [0xCDu8; 32], tx);
+        engine.on_reset(sid);
+        let err = rx
+            .await
+            .expect("settled")
+            .expect_err("a reset fails the fetch");
+        assert!(is_holder_gave_up(&err), "reset error not recognised: {err}");
+
+        assert!(!is_holder_gave_up(&BlobError::NotFound(
+            "transfer: holder NotFound".into()
+        )));
+        assert!(!is_holder_gave_up(&BlobError::NotFound(
+            "blob transfer: no data for 15s fetching mesh://00".into()
+        )));
+        assert!(!is_holder_gave_up(&BlobError::HashMismatch {
+            expected: [0; 32],
+            actual: [1; 32],
+        }));
+        assert!(!is_holder_gave_up(&BlobError::Backend(
+            "blob transfer: send request failed: x".into()
+        )));
     }
 }

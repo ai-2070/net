@@ -1396,7 +1396,7 @@ fn build_leaf(root: &Path) -> Result<PathBuf, String> {
         .arg(&wasm)
         .status()
         .map_err(|e| {
-            format!("wasm-bindgen: {e} (install with `cargo install wasm-bindgen-cli --version 0.2.129`)")
+            format!("wasm-bindgen: {e} (install with `cargo install wasm-bindgen-cli --version 0.2.130`)")
         })?;
     if !status.success() {
         return Err("wasm-bindgen failed (CLI/crate version mismatch?)".into());
@@ -3842,11 +3842,18 @@ async fn run(
                 .await;
             let sent_bytes = control.sent_bytes.unwrap_or(0) + over.sent_bytes.unwrap_or(0);
             let sent_frames = control.sent_frames.unwrap_or(0) + over.sent_frames.unwrap_or(0);
-            let closed = wait_for(
-                || anchor.peer_session_id(node_id) != session,
+            // The breach path removes the peer entry and THEN counts the
+            // reclaim, so the counter can lag the removal. Wait for both,
+            // then read each on its own so a failure still says which.
+            let _ = wait_for(
+                || {
+                    anchor.peer_session_id(node_id) != session
+                        && anchor.rtc_stats().admission_reclaimed() > reclaimed_before
+                },
                 Duration::from_secs(20),
             )
             .await;
+            let closed = anchor.peer_session_id(node_id) != session;
             let reclaimed = anchor.rtc_stats().admission_reclaimed() > reclaimed_before;
             // The transport teardown, observed at the far end: the
             // page never closes this session itself, so its

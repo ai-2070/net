@@ -39,6 +39,7 @@ const FORWARDED_KEYS: (keyof MeshNodeConfig)[] = [
     'subnet',
     'subnetPolicy',
     'identitySeed',
+    'noiseStaticKey',
     'subnetAuthorities',
     'subnetAttachment',
     'subnetControlChannel',

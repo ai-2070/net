@@ -24,6 +24,13 @@ const NOISE_PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Domain-separated Noise prologue binding `(src_node_id, dest_node_id)`
 /// into the handshake transcript.
 ///
+/// The mesh passes each id's 32-bit ROUTING projection, not the full
+/// node id: `(node_id as u32) as u64`, the low 32 bits zero-extended.
+/// The routing header carries only 32-bit ids, so that is what both ends
+/// (and any relay) can see; the full id travels inside the
+/// AEAD-protected msg1 payload. A peer implementing the handshake must
+/// apply the same projection or its transcript will not match.
+///
 /// Both direct and relayed handshakes use this construction. A relay
 /// that rewrites either node id in the outer addressing (routing header
 /// for routed handshakes, or the caller's own `peer_node_id` argument
@@ -31,13 +38,27 @@ const NOISE_PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
 /// fails the Noise MAC check on msg1 — the handshake is rejected
 /// end-to-end before any session keys are bound to an attacker-chosen
 /// identity.
+///
+/// The 16-byte tag is the handshake **version**. `v2` marks the
+/// session-key derivation from the Noise Split outputs (NHS-01): a v1
+/// peer derives different keys, so the tag changed with it and a mixed
+/// v1/v2 pair fails loudly at msg1 instead of establishing a session
+/// on which every packet fails AEAD.
 pub fn handshake_prologue(src_node_id: u64, dest_node_id: u64) -> [u8; 32] {
     let mut buf = [0u8; 32];
-    buf[0..16].copy_from_slice(b"net-handshake-v1");
+    buf[0..16].copy_from_slice(HANDSHAKE_VERSION_TAG);
     buf[16..24].copy_from_slice(&src_node_id.to_le_bytes());
     buf[24..32].copy_from_slice(&dest_node_id.to_le_bytes());
     buf
 }
+
+/// The handshake version tag: the first 16 bytes of every
+/// [`handshake_prologue`], and the WHOLE prologue of a handshake that binds
+/// no node ids — [`NoiseHandshake::initiator`] / [`NoiseHandshake::responder`]
+/// (the point-to-point adapter). Every handshake path therefore carries it,
+/// so a peer on another session-key derivation fails at msg1 instead of
+/// completing a handshake whose session it cannot decrypt (NHS-01).
+pub const HANDSHAKE_VERSION_TAG: &[u8; 16] = b"net-handshake-v2";
 
 /// Error type for cryptographic operations
 #[derive(Debug, Clone)]
@@ -90,8 +111,9 @@ pub struct SessionKeys {
     /// Key authenticating route-hop envelopes this node SENDS on this
     /// edge (SUBNET_AUTH_PLAN.md D6).
     ///
-    /// Derived from the same handshake hash as the packet keys but
-    /// under distinct labels, so route-hop authentication and packet
+    /// Derived from the same Noise Split output as the packet key of
+    /// this direction but under a distinct label, so route-hop
+    /// authentication and packet
     /// AEAD never share key material or nonce/sequence space. A relay
     /// authenticates its adjacent hop with these while the inner
     /// end-to-end packet stays sealed under the packet keys it cannot
@@ -187,11 +209,15 @@ pub struct NoiseHandshake {
 }
 
 impl NoiseHandshake {
-    /// Create initiator handshake state with an empty prologue.
+    /// Create initiator handshake state whose prologue is the version tag
+    /// alone ([`HANDSHAKE_VERSION_TAG`]): for a handshake that binds no
+    /// node ids. It used to be EMPTY, so a peer on the earlier hash-only
+    /// key derivation completed this handshake and then failed every
+    /// packet; with the tag it fails at msg1.
     ///
     /// The initiator knows the responder's static public key.
     pub fn initiator(psk: &[u8; 32], responder_static: &[u8; 32]) -> Result<Self, CryptoError> {
-        Self::initiator_with_prologue(psk, responder_static, &[])
+        Self::initiator_with_prologue(psk, responder_static, HANDSHAKE_VERSION_TAG)
     }
 
     /// Create initiator handshake state with a caller-supplied prologue.
@@ -228,11 +254,12 @@ impl NoiseHandshake {
         })
     }
 
-    /// Create responder handshake state with an empty prologue.
+    /// Create responder handshake state whose prologue is the version tag
+    /// alone — the counterpart of [`Self::initiator`].
     ///
     /// The responder uses its static keypair for authentication.
     pub fn responder(psk: &[u8; 32], static_keypair: &StaticKeypair) -> Result<Self, CryptoError> {
-        Self::responder_with_prologue(psk, static_keypair, &[])
+        Self::responder_with_prologue(psk, static_keypair, HANDSHAKE_VERSION_TAG)
     }
 
     /// Create responder handshake state with a caller-supplied prologue.
@@ -355,10 +382,11 @@ impl NoiseHandshake {
         }
 
         let is_initiator = self.is_initiator;
+        let mut state = self.state;
 
         // Get the handshake hash before transitioning (HandshakeState has this method)
         let handshake_hash: [u8; 32] = {
-            let hash_slice = self.state.get_handshake_hash();
+            let hash_slice = state.get_handshake_hash();
             let mut arr = [0u8; 32];
             let len = hash_slice.len().min(32);
             arr[..len].copy_from_slice(&hash_slice[..len]);
@@ -373,14 +401,21 @@ impl NoiseHandshake {
         // `None` (shouldn't happen post-handshake but `get_remote_static`
         // is nominally fallible).
         let mut remote_static_pub = [0u8; 32];
-        if let Some(rs) = self.state.get_remote_static() {
+        if let Some(rs) = state.get_remote_static() {
             let len = rs.len().min(32);
             remote_static_pub[..len].copy_from_slice(&rs[..len]);
         }
 
+        // Noise Split(): the two cipher keys HKDF'd from the final
+        // chaining key `ck`, which every DH of the handshake (`es`,
+        // `ee`) was mixed into. This — not the handshake hash — is the
+        // secret every session key is expanded from (NHS-01). First
+        // output keys initiator→responder, second responder→initiator
+        // (Noise §5.2), identically on both sides.
+        let (split_i2r, split_r2i) = state.dangerously_get_raw_split();
+
         // Transition to transport mode (we don't need the transport state since we're using stateless encryption)
-        let _transport = self
-            .state
+        let _transport = state
             .into_transport_mode()
             .map_err(|e| CryptoError::Handshake(format!("transport mode failed: {}", e)))?;
 
@@ -391,39 +426,12 @@ impl NoiseHandshake {
         )]
         let session_id = u64::from_le_bytes(handshake_hash[0..8].try_into().unwrap());
 
-        // Use HKDF to derive tx and rx keys from handshake hash
-        // For NKpsk0, initiator sends first, so:
-        // - Initiator: tx_key from first half, rx_key from second half
-        // - Responder: rx_key from first half, tx_key from second half
-        let mut tx_key = [0u8; 32];
-        let mut rx_key = [0u8; 32];
-
-        // Simple key derivation from handshake hash
-        // In production, use proper HKDF
-        if is_initiator {
-            derive_key(&handshake_hash, b"initiator-tx", &mut tx_key);
-            derive_key(&handshake_hash, b"initiator-rx", &mut rx_key);
-        } else {
-            derive_key(&handshake_hash, b"initiator-rx", &mut tx_key);
-            derive_key(&handshake_hash, b"initiator-tx", &mut rx_key);
-        }
-
-        // Route-hop authentication keys, derived here because this is
-        // the last point the handshake hash exists — `into_transport_mode`
-        // above already consumed the state. Distinct labels from the
-        // packet keys: a route-hop MAC must never be forgeable from
-        // packet key material, and the two have independent sequence
-        // spaces. Directional, so a captured envelope cannot be
-        // reflected back along the edge it came from.
-        let mut route_hop_tx_key = [0u8; 32];
-        let mut route_hop_rx_key = [0u8; 32];
-        if is_initiator {
-            derive_key(&handshake_hash, b"route-hop-tx-v1", &mut route_hop_tx_key);
-            derive_key(&handshake_hash, b"route-hop-rx-v1", &mut route_hop_rx_key);
-        } else {
-            derive_key(&handshake_hash, b"route-hop-rx-v1", &mut route_hop_tx_key);
-            derive_key(&handshake_hash, b"route-hop-tx-v1", &mut route_hop_rx_key);
-        }
+        let DirectionalKeys {
+            tx_key,
+            rx_key,
+            route_hop_tx_key,
+            route_hop_rx_key,
+        } = DirectionalKeys::derive(&split_i2r, &split_r2i, &handshake_hash, is_initiator);
 
         Ok((
             SessionKeys {
@@ -451,6 +459,80 @@ impl NoiseHandshake {
     pub fn into_session_keys(self) -> Result<SessionKeys, CryptoError> {
         self.into_session_keys_with_binding()
             .map(|(keys, _binding)| keys)
+    }
+}
+
+/// Labels for the four per-session keys. Each names its direction
+/// (initiator→responder / responder→initiator), not a role, so both
+/// endpoints select the same label for the same key. `-v2`: the
+/// derivation input changed from the handshake hash to the Noise Split
+/// outputs (NHS-01); a v1 key can never collide with a v2 key.
+const LABEL_PACKET_I2R: &[u8] = b"net-packet-i2r-v2";
+const LABEL_PACKET_R2I: &[u8] = b"net-packet-r2i-v2";
+const LABEL_ROUTE_HOP_I2R: &[u8] = b"net-route-hop-i2r-v2";
+const LABEL_ROUTE_HOP_R2I: &[u8] = b"net-route-hop-r2i-v2";
+
+/// The four directional keys of one session, as this endpoint uses
+/// them.
+struct DirectionalKeys {
+    tx_key: [u8; 32],
+    rx_key: [u8; 32],
+    route_hop_tx_key: [u8; 32],
+    route_hop_rx_key: [u8; 32],
+}
+
+impl DirectionalKeys {
+    /// Expand the Noise Split outputs into packet and route-hop keys.
+    ///
+    /// The **key material** is the Split output of the matching
+    /// direction — secret, derived from the handshake's DH results
+    /// through the chaining key, so an observer holding the PSK and
+    /// every public handshake byte still cannot compute it, and a
+    /// later PSK disclosure does not expose recorded sessions.
+    ///
+    /// The handshake hash enters only as **channel binding** in the
+    /// KDF info, after the label. It is public transcript material:
+    /// a PSK-holding observer can recompute it from the wire (NHS-01),
+    /// which is why it must never be the sole input.
+    ///
+    /// Packet and route-hop keys of the same direction share a Split
+    /// output but not a label, so neither is derivable from the other
+    /// (keyed BLAKE2s is a PRF); route-hop MACs and packet AEAD keep
+    /// independent key and sequence spaces, and every key is
+    /// directional so a captured frame cannot be reflected.
+    fn derive(
+        split_i2r: &[u8; 32],
+        split_r2i: &[u8; 32],
+        handshake_hash: &[u8; 32],
+        is_initiator: bool,
+    ) -> Self {
+        let expand = |ikm: &[u8; 32], label: &[u8]| {
+            let mut info = Vec::with_capacity(label.len() + handshake_hash.len());
+            info.extend_from_slice(label);
+            info.extend_from_slice(handshake_hash);
+            let mut out = [0u8; 32];
+            derive_key(ikm, &info, &mut out);
+            out
+        };
+        let packet_i2r = expand(split_i2r, LABEL_PACKET_I2R);
+        let packet_r2i = expand(split_r2i, LABEL_PACKET_R2I);
+        let hop_i2r = expand(split_i2r, LABEL_ROUTE_HOP_I2R);
+        let hop_r2i = expand(split_r2i, LABEL_ROUTE_HOP_R2I);
+        if is_initiator {
+            Self {
+                tx_key: packet_i2r,
+                rx_key: packet_r2i,
+                route_hop_tx_key: hop_i2r,
+                route_hop_rx_key: hop_r2i,
+            }
+        } else {
+            Self {
+                tx_key: packet_r2i,
+                rx_key: packet_i2r,
+                route_hop_tx_key: hop_r2i,
+                route_hop_rx_key: hop_i2r,
+            }
+        }
     }
 }
 
@@ -2030,38 +2112,271 @@ mod tests {
 
     /// Route-hop keys must agree across the edge, be directional, and
     /// share nothing with the packet AEAD keys (SUBNET_AUTH_PLAN.md
-    /// D6). Derived from the same handshake hash under distinct
-    /// labels, so this reproduces both sides' derivation from one
-    /// hash rather than running a full handshake.
+    /// D6). Exercises the derivation directly on fixed Split outputs,
+    /// so both sides' selection is checked without a handshake.
     #[test]
     fn route_hop_keys_agree_across_peers_and_differ_from_packet_keys() {
+        let split_i2r = [0x11u8; 32];
+        let split_r2i = [0x22u8; 32];
         let hash = [0x5Au8; 32];
-        let derive = |label: &[u8]| {
-            let mut k = [0u8; 32];
-            derive_key(&hash, label, &mut k);
-            k
-        };
+        let init = DirectionalKeys::derive(&split_i2r, &split_r2i, &hash, true);
+        let resp = DirectionalKeys::derive(&split_i2r, &split_r2i, &hash, false);
 
         // Initiator's tx is the responder's rx, and vice versa.
-        let init_tx = derive(b"route-hop-tx-v1");
-        let init_rx = derive(b"route-hop-rx-v1");
-        let resp_tx = derive(b"route-hop-rx-v1");
-        let resp_rx = derive(b"route-hop-tx-v1");
-        assert_eq!(init_tx, resp_rx, "initiator tx must verify as responder rx");
-        assert_eq!(resp_tx, init_rx, "responder tx must verify as initiator rx");
+        assert_eq!(
+            init.route_hop_tx_key, resp.route_hop_rx_key,
+            "initiator tx must verify as responder rx"
+        );
+        assert_eq!(
+            resp.route_hop_tx_key, init.route_hop_rx_key,
+            "responder tx must verify as initiator rx"
+        );
+        assert_eq!(init.tx_key, resp.rx_key);
+        assert_eq!(init.rx_key, resp.tx_key);
 
         // Directional: a captured envelope cannot be reflected back.
-        assert_ne!(init_tx, init_rx, "route-hop keys must be directional");
+        assert_ne!(
+            init.route_hop_tx_key, init.route_hop_rx_key,
+            "route-hop keys must be directional"
+        );
+        assert_ne!(init.tx_key, init.rx_key, "packet keys must be directional");
 
         // Disjoint from the packet AEAD keys derived from the same
-        // hash — a route-hop MAC must not be forgeable from packet
-        // key material, and vice versa.
-        let packet_tx = derive(b"initiator-tx");
-        let packet_rx = derive(b"initiator-rx");
-        for hop in [init_tx, init_rx] {
-            assert_ne!(hop, packet_tx);
-            assert_ne!(hop, packet_rx);
+        // Split output — a route-hop MAC must not be forgeable from
+        // packet key material, and vice versa.
+        for hop in [init.route_hop_tx_key, init.route_hop_rx_key] {
+            assert_ne!(hop, init.tx_key);
+            assert_ne!(hop, init.rx_key);
         }
+
+        // The handshake hash is bound in: same Split, different
+        // transcript, different keys.
+        let other = DirectionalKeys::derive(&split_i2r, &split_r2i, &[0x5Bu8; 32], true);
+        assert_ne!(other.tx_key, init.tx_key);
+        assert_ne!(other.route_hop_tx_key, init.route_hop_tx_key);
+    }
+
+    // ---- NHS-01: a PSK-holding observer of the public handshake ----
+    //
+    // NKpsk0's handshake hash `h` absorbs only public inputs plus a
+    // PSK-derived value: the protocol name, the prologue, the
+    // responder's static public key, MixKeyAndHash(psk)'s temp_h (from
+    // the public initial `ck` and the PSK), both ephemeral public keys
+    // and both handshake ciphertexts. The DH results feed only the
+    // chaining key. So anyone holding the PSK who watched msg1/msg2 can
+    // recompute `h` — the helpers below do exactly that, from
+    // `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s` per the Noise spec.
+
+    fn nhs01_blake2s(parts: &[&[u8]]) -> [u8; 32] {
+        use blake2::{Blake2s256, Digest};
+        let mut h = Blake2s256::new();
+        for p in parts {
+            Digest::update(&mut h, p);
+        }
+        h.finalize().into()
+    }
+
+    /// HMAC-BLAKE2s (RFC 2104, block length 64), as Noise's HKDF uses.
+    fn nhs01_hmac(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            k[..32].copy_from_slice(&nhs01_blake2s(&[key]));
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+        let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+        let mut inner_parts: Vec<&[u8]> = vec![&ipad];
+        inner_parts.extend_from_slice(data);
+        let inner = nhs01_blake2s(&inner_parts);
+        nhs01_blake2s(&[&opad, &inner])
+    }
+
+    /// Noise HKDF with three outputs.
+    fn nhs01_hkdf3(ck: &[u8; 32], ikm: &[u8]) -> [[u8; 32]; 3] {
+        let temp = nhs01_hmac(ck, &[ikm]);
+        let o1 = nhs01_hmac(&temp, &[&[0x01]]);
+        let o2 = nhs01_hmac(&temp, &[&o1, &[0x02]]);
+        let o3 = nhs01_hmac(&temp, &[&o2, &[0x03]]);
+        [o1, o2, o3]
+    }
+
+    /// Recompute the final handshake hash from what a PSK-holding
+    /// observer has: the PSK, the prologue, the responder's static
+    /// PUBLIC key and the two handshake messages off the wire.
+    fn nhs01_observer_hash(
+        psk: &[u8; 32],
+        prologue: &[u8],
+        responder_static_pub: &[u8; 32],
+        msg1: &[u8],
+        msg2: &[u8],
+    ) -> [u8; 32] {
+        let name = b"Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
+        assert!(name.len() > 32, "name longer than HASHLEN is hashed");
+        let h0 = nhs01_blake2s(&[name]);
+        let ck0 = h0;
+        let mut h = nhs01_blake2s(&[&h0, prologue]);
+        h = nhs01_blake2s(&[&h, responder_static_pub]); // <- s
+        let [_ck, temp_h, _k] = nhs01_hkdf3(&ck0, psk); // psk
+        h = nhs01_blake2s(&[&h, &temp_h]);
+        h = nhs01_blake2s(&[&h, &msg1[..32]]); // e
+        h = nhs01_blake2s(&[&h, &msg1[32..]]); // EncryptAndHash(payload)
+        h = nhs01_blake2s(&[&h, &msg2[..32]]); // e
+        nhs01_blake2s(&[&h, &msg2[32..]]) // EncryptAndHash(payload)
+    }
+
+    /// NHS-01 regression. The observer CAN reproduce the handshake
+    /// hash (asserted, so the premise is witnessed rather than
+    /// assumed); the session keys must nonetheless be out of its
+    /// reach. Before the fix every key was `derive_key(h, label)`, so
+    /// the `initiator-tx` / `route-hop-tx-v1` comparisons below were
+    /// equalities and this test failed.
+    #[test]
+    fn nhs01_session_keys_are_not_a_function_of_the_public_handshake_hash() {
+        let psk = [0x42u8; 32];
+        let responder_keypair = StaticKeypair::generate();
+        let prologue = handshake_prologue(7, 9);
+        let mut initiator =
+            NoiseHandshake::initiator_with_prologue(&psk, &responder_keypair.public, &prologue)
+                .unwrap();
+        let mut responder =
+            NoiseHandshake::responder_with_prologue(&psk, &responder_keypair, &prologue).unwrap();
+        let msg1 = initiator.write_message(b"").unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(b"").unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let observed =
+            nhs01_observer_hash(&psk, &prologue, &responder_keypair.public, &msg1, &msg2);
+        assert_eq!(
+            observed,
+            initiator.handshake_hash().unwrap(),
+            "premise: a PSK holder recomputes h from public handshake bytes"
+        );
+
+        let (init_keys, init_binding) = initiator.into_session_keys_with_binding().unwrap();
+        let (resp_keys, resp_binding) = responder.into_session_keys_with_binding().unwrap();
+        assert_eq!(init_binding, observed);
+        assert_eq!(resp_binding, observed);
+
+        // Both endpoints agree, directionally.
+        assert_eq!(init_keys.tx_key, resp_keys.rx_key);
+        assert_eq!(init_keys.rx_key, resp_keys.tx_key);
+        assert_eq!(init_keys.route_hop_tx_key, resp_keys.route_hop_rx_key);
+        assert_eq!(init_keys.route_hop_rx_key, resp_keys.route_hop_tx_key);
+
+        // No key is the hash-only derivation the observer can run,
+        // under the pre-fix labels or the current ones.
+        let keys = [
+            init_keys.tx_key,
+            init_keys.rx_key,
+            init_keys.route_hop_tx_key,
+            init_keys.route_hop_rx_key,
+        ];
+        for label in [
+            &b"initiator-tx"[..],
+            b"initiator-rx",
+            b"route-hop-tx-v1",
+            b"route-hop-rx-v1",
+            LABEL_PACKET_I2R,
+            LABEL_PACKET_R2I,
+            LABEL_ROUTE_HOP_I2R,
+            LABEL_ROUTE_HOP_R2I,
+        ] {
+            let mut from_hash = [0u8; 32];
+            derive_key(&observed, label, &mut from_hash);
+            let mut info = label.to_vec();
+            info.extend_from_slice(&observed);
+            let mut from_hash_bound = [0u8; 32];
+            derive_key(&observed, &info, &mut from_hash_bound);
+            for key in keys {
+                assert_ne!(key, from_hash, "a session key is derivable from h alone");
+                assert_ne!(
+                    key, from_hash_bound,
+                    "a session key is derivable from h alone"
+                );
+                assert_ne!(key, observed, "a session key equals h");
+            }
+        }
+
+        // The packet keys actually carry traffic across the edge.
+        let tx = PacketCipher::new(&init_keys.tx_key, init_keys.session_id);
+        let rx = PacketCipher::new(&resp_keys.rx_key, resp_keys.session_id);
+        let (ct, counter) = tx.encrypt(b"aad", b"payload").unwrap();
+        assert_eq!(rx.decrypt(counter, b"aad", &ct).unwrap(), b"payload");
+    }
+
+    /// Same PSK, same responder, same prologue: two establishments
+    /// never share a key (fresh ephemerals reach the Split through
+    /// `ee`/`es`), and a v1 prologue peer cannot complete a handshake
+    /// with a v2 one — the tag bump makes the NHS-01 key change fail
+    /// loudly at msg1.
+    #[test]
+    fn nhs01_the_default_constructors_are_versioned_too() {
+        // The point-to-point adapter builds its handshakes with the default
+        // constructors. They carry the version tag, so an unversioned
+        // (empty-prologue, pre-v2) peer is refused at msg1 rather than
+        // completing a handshake whose session it cannot decrypt.
+        // Red: with an empty default prologue this msg1 authenticated.
+        let psk = [0x42u8; 32];
+        let responder_keypair = StaticKeypair::generate();
+        let mut legacy =
+            NoiseHandshake::initiator_with_prologue(&psk, &responder_keypair.public, &[]).unwrap();
+        let mut current = NoiseHandshake::responder(&psk, &responder_keypair).unwrap();
+        let m1 = legacy.write_message(b"").unwrap();
+        assert!(
+            current.read_message(&m1).is_err(),
+            "an unversioned msg1 must not authenticate to a default responder"
+        );
+
+        // Two default-constructed ends still agree with each other.
+        let mut i = NoiseHandshake::initiator(&psk, &responder_keypair.public).unwrap();
+        let mut r = NoiseHandshake::responder(&psk, &responder_keypair).unwrap();
+        let m1 = i.write_message(b"").unwrap();
+        r.read_message(&m1).unwrap();
+        let m2 = r.write_message(b"").unwrap();
+        i.read_message(&m2).unwrap();
+        assert_eq!(
+            i.into_session_keys().unwrap().tx_key,
+            r.into_session_keys().unwrap().rx_key
+        );
+    }
+
+    #[test]
+    fn nhs01_fresh_keys_per_handshake_and_v1_prologue_is_refused() {
+        let psk = [0x42u8; 32];
+        let responder_keypair = StaticKeypair::generate();
+        let prologue = handshake_prologue(1, 2);
+        let run = || {
+            let mut i =
+                NoiseHandshake::initiator_with_prologue(&psk, &responder_keypair.public, &prologue)
+                    .unwrap();
+            let mut r =
+                NoiseHandshake::responder_with_prologue(&psk, &responder_keypair, &prologue)
+                    .unwrap();
+            let m1 = i.write_message(b"").unwrap();
+            r.read_message(&m1).unwrap();
+            let m2 = r.write_message(b"").unwrap();
+            i.read_message(&m2).unwrap();
+            i.into_session_keys().unwrap()
+        };
+        let a = run();
+        let b = run();
+        assert_ne!(a.tx_key, b.tx_key);
+        assert_ne!(a.route_hop_tx_key, b.route_hop_tx_key);
+
+        assert_eq!(&prologue[..16], b"net-handshake-v2");
+        let mut v1 = prologue;
+        v1[..16].copy_from_slice(b"net-handshake-v1");
+        let mut old =
+            NoiseHandshake::initiator_with_prologue(&psk, &responder_keypair.public, &v1).unwrap();
+        let mut new =
+            NoiseHandshake::responder_with_prologue(&psk, &responder_keypair, &prologue).unwrap();
+        let m1 = old.write_message(b"").unwrap();
+        assert!(
+            new.read_message(&m1).is_err(),
+            "a v1-prologue msg1 must not authenticate to a v2 responder"
+        );
     }
 
     #[test]

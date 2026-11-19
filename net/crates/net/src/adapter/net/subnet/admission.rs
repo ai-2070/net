@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use super::auth::{ExpectedBinding, VerifiedSubnetContext};
+use super::auth::{ExpectedBinding, SubnetAuthError, SubnetFloorRegistry, VerifiedSubnetContext};
 use crate::adapter::net::identity::EntityId;
 
 /// How long an unconsumed challenge stays valid. Short: the subject
@@ -205,6 +205,67 @@ impl SubnetContextStore {
     /// Drop the context for a peer (failure, eviction, withdrawal).
     pub fn forget_peer(&self, node_id: u64) {
         self.by_peer.remove(&node_id);
+    }
+
+    /// Drop `node_id`'s context only if it is still exactly `ctx` — the
+    /// admission fence's rollback, which must never remove a newer
+    /// context a concurrent admission installed. Returns whether one was
+    /// dropped.
+    pub fn forget_if_same(&self, node_id: u64, ctx: &VerifiedSubnetContext) -> bool {
+        self.by_peer
+            .remove_if(&node_id, |_, held| held == ctx)
+            .is_some()
+    }
+
+    /// The SUBNET-01 publication fence, run on a context the caller has
+    /// JUST installed for `node_id`: re-read every revocation input
+    /// verification consulted, and roll the install back (only if it is
+    /// still exactly `ctx`) when any of them moved.
+    ///
+    /// Each revocation kind raises its registry state BEFORE it scans
+    /// this store for contexts to drop. So for any revocation racing an
+    /// admission, either its scan runs after the install (and drops the
+    /// context itself), or its raise is visible to the re-read here.
+    /// Subtree floors and topology moves are caught through their
+    /// epochs. A subject floor advances no epoch, so it is re-read
+    /// directly — exactly as [`verify_admission`] judged it (the leaf's
+    /// generation, and whether it was delegated: `one_hop`), never
+    /// conservatively, or a subject re-credentialed above its floor could
+    /// never be admitted.
+    ///
+    /// [`verify_admission`]: super::auth::verify_admission
+    pub fn fence_installed(
+        &self,
+        node_id: u64,
+        ctx: &VerifiedSubnetContext,
+        current_topology_epoch: u32,
+        floors: &SubnetFloorRegistry,
+        one_hop: bool,
+    ) -> Result<(), SubnetAuthError> {
+        let refusal = if ctx.topology_epoch != current_topology_epoch {
+            Some(SubnetAuthError::WrongTopologyEpoch)
+        } else if ctx.subnet_auth_epoch != floors.auth_epoch(&ctx.authority)
+            || floors.subject_refuses(
+                &ctx.authority,
+                ctx.topology_epoch,
+                &ctx.subject,
+                ctx.attachment,
+                ctx.rights,
+                ctx.generation,
+                one_hop,
+            )
+        {
+            Some(SubnetAuthError::Revoked)
+        } else {
+            None
+        };
+        match refusal {
+            Some(e) => {
+                self.forget_if_same(node_id, ctx);
+                Err(e)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Drop `node_id`'s context only if it is the admission at exactly

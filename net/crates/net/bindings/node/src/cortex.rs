@@ -1334,7 +1334,7 @@ impl TasksAdapter {
     pub async fn open_from_snapshot(
         redex: &Redex,
         origin_hash: BigInt,
-        state_bytes: Buffer,
+        #[napi(ts_arg_type = "Buffer")] state_bytes: crate::common::JsBytes,
         last_seq: Option<BigInt>,
         persistent: Option<bool>,
     ) -> Result<Self> {
@@ -1872,7 +1872,7 @@ impl MemoriesAdapter {
     pub async fn open_from_snapshot(
         redex: &Redex,
         origin_hash: BigInt,
-        state_bytes: Buffer,
+        #[napi(ts_arg_type = "Buffer")] state_bytes: crate::common::JsBytes,
         last_seq: Option<BigInt>,
         persistent: Option<bool>,
     ) -> Result<Self> {
@@ -2498,7 +2498,7 @@ impl WorkflowAdapter {
     pub async fn open_from_snapshot(
         redex: &Redex,
         origin_hash: BigInt,
-        state_bytes: Buffer,
+        #[napi(ts_arg_type = "Buffer")] state_bytes: crate::common::JsBytes,
         last_seq: Option<BigInt>,
         persistent: Option<bool>,
     ) -> Result<Self> {

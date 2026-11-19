@@ -499,7 +499,11 @@ pub fn blob_adapter_ids() -> Vec<String> {
 /// BlobRef bytes — drop these straight into `RedexFile.append` or
 /// `Mesh.publish` as the event payload.
 #[napi]
-pub async fn blob_publish(adapter_id: String, uri: String, data: Buffer) -> Result<Buffer> {
+pub async fn blob_publish(
+    adapter_id: String,
+    uri: String,
+    #[napi(ts_arg_type = "Buffer")] data: crate::common::JsBytes,
+) -> Result<Buffer> {
     let adapter = global_blob_adapter_registry()
         .get(&adapter_id)
         .ok_or_else(|| {
@@ -519,7 +523,10 @@ pub async fn blob_publish(adapter_id: String, uri: String, data: Buffer) -> Resu
 /// registered under `adapterId`, fetch + verify, and return the
 /// resolved bytes.
 #[napi]
-pub async fn blob_resolve(adapter_id: String, payload: Buffer) -> Result<Buffer> {
+pub async fn blob_resolve(
+    adapter_id: String,
+    #[napi(ts_arg_type = "Buffer")] payload: crate::common::JsBytes,
+) -> Result<Buffer> {
     let adapter = global_blob_adapter_registry()
         .get(&adapter_id)
         .ok_or_else(|| {
@@ -573,9 +580,20 @@ pub struct JsBlobFetchRangeArgs {
 }
 
 type StoreTsfn = ThreadsafeFunction<JsBlobStoreArgs, (), JsBlobStoreArgs, napi::Status, false>;
-type FetchTsfn = ThreadsafeFunction<JsBlobFetchArgs, Buffer, JsBlobFetchArgs, napi::Status, false>;
-type FetchRangeTsfn =
-    ThreadsafeFunction<JsBlobFetchRangeArgs, Buffer, JsBlobFetchRangeArgs, napi::Status, false>;
+type FetchTsfn = ThreadsafeFunction<
+    JsBlobFetchArgs,
+    crate::common::JsBytes,
+    JsBlobFetchArgs,
+    napi::Status,
+    false,
+>;
+type FetchRangeTsfn = ThreadsafeFunction<
+    JsBlobFetchRangeArgs,
+    crate::common::JsBytes,
+    JsBlobFetchRangeArgs,
+    napi::Status,
+    false,
+>;
 type ExistsTsfn = ThreadsafeFunction<JsBlobFetchArgs, bool, JsBlobFetchArgs, napi::Status, false>;
 
 /// `BlobAdapter` impl that bridges to JS-side functions via four
@@ -719,7 +737,7 @@ impl BlobAdapter for NodeBlobAdapter {
     ) -> std::result::Result<bytes::Bytes, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchArgs { uri, hash, size };
-        let buf = await_tsfn::<Buffer, _>(self.timeout, "fetch", |cb| {
+        let buf = await_tsfn::<crate::common::JsBytes, _>(self.timeout, "fetch", |cb| {
             self.fetch.call_with_return_value(
                 args,
                 ThreadsafeFunctionCallMode::NonBlocking,
@@ -730,12 +748,13 @@ impl BlobAdapter for NodeBlobAdapter {
             )
         })
         .await?;
-        // napi Buffer's backing storage isn't shareable with `Bytes`
-        // safely, so we materialize via `to_vec` then wrap. The FFI
-        // boundary keeps the copy that dataforts perf #184 lifted
-        // from the internal mesh paths — see the comment on
-        // `ffi::blob::fetch`.
-        Ok(bytes::Bytes::from(buf.to_vec()))
+        // The adapter's returned Buffer was copied into Rust-owned
+        // memory as napi converted it, on the JS thread (`JsBytes`):
+        // copying it here, on a tokio worker, read JS memory the
+        // adapter could still be rewriting. The FFI boundary keeps the
+        // one copy that dataforts perf #184 lifted from the internal
+        // mesh paths — see the comment on `ffi::blob::fetch`.
+        Ok(buf.into_bytes())
     }
 
     async fn fetch_range(
@@ -751,7 +770,7 @@ impl BlobAdapter for NodeBlobAdapter {
             start: BigInt::from(range.start),
             end: BigInt::from(range.end),
         };
-        let buf = await_tsfn::<Buffer, _>(self.timeout, "fetch_range", |cb| {
+        let buf = await_tsfn::<crate::common::JsBytes, _>(self.timeout, "fetch_range", |cb| {
             self.fetch_range.call_with_return_value(
                 args,
                 ThreadsafeFunctionCallMode::NonBlocking,
@@ -762,7 +781,7 @@ impl BlobAdapter for NodeBlobAdapter {
             )
         })
         .await?;
-        Ok(bytes::Bytes::from(buf.to_vec()))
+        Ok(buf.into_bytes())
     }
 
     async fn exists(&self, blob_ref: &InnerBlobRef) -> std::result::Result<bool, InnerBlobError> {
@@ -800,8 +819,16 @@ impl BlobAdapter for NodeBlobAdapter {
 pub fn register_blob_adapter(
     id: String,
     store_fn: Function<'static, JsBlobStoreArgs, ()>,
-    fetch_fn: Function<'static, JsBlobFetchArgs, Buffer>,
-    fetch_range_fn: Function<'static, JsBlobFetchRangeArgs, Buffer>,
+    #[napi(ts_arg_type = "(arg: JsBlobFetchArgs) => Buffer")] fetch_fn: Function<
+        'static,
+        JsBlobFetchArgs,
+        crate::common::JsBytes,
+    >,
+    #[napi(ts_arg_type = "(arg: JsBlobFetchRangeArgs) => Buffer")] fetch_range_fn: Function<
+        'static,
+        JsBlobFetchRangeArgs,
+        crate::common::JsBytes,
+    >,
     exists_fn: Function<'static, JsBlobFetchArgs, bool>,
     timeout_ms: Option<u32>,
 ) -> Result<()> {
@@ -830,11 +857,16 @@ pub fn register_blob_adapter(
 
 type StoreAsyncTsfn =
     ThreadsafeFunction<JsBlobStoreArgs, Promise<()>, JsBlobStoreArgs, napi::Status, false>;
-type FetchAsyncTsfn =
-    ThreadsafeFunction<JsBlobFetchArgs, Promise<Buffer>, JsBlobFetchArgs, napi::Status, false>;
+type FetchAsyncTsfn = ThreadsafeFunction<
+    JsBlobFetchArgs,
+    Promise<crate::common::JsBytes>,
+    JsBlobFetchArgs,
+    napi::Status,
+    false,
+>;
 type FetchRangeAsyncTsfn = ThreadsafeFunction<
     JsBlobFetchRangeArgs,
-    Promise<Buffer>,
+    Promise<crate::common::JsBytes>,
     JsBlobFetchRangeArgs,
     napi::Status,
     false,
@@ -997,7 +1029,7 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
     ) -> std::result::Result<bytes::Bytes, InnerBlobError> {
         let (uri, hash, size) = js_blob_ref_parts(blob_ref);
         let args = JsBlobFetchArgs { uri, hash, size };
-        let buf = await_tsfn_promise::<Buffer, _>(self.timeout, "fetch", |cb| {
+        let buf = await_tsfn_promise::<crate::common::JsBytes, _>(self.timeout, "fetch", |cb| {
             self.fetch.call_with_return_value(
                 args,
                 ThreadsafeFunctionCallMode::NonBlocking,
@@ -1008,7 +1040,7 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
             )
         })
         .await?;
-        Ok(bytes::Bytes::from(buf.to_vec()))
+        Ok(buf.into_bytes())
     }
 
     async fn fetch_range(
@@ -1024,18 +1056,19 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
             start: BigInt::from(range.start),
             end: BigInt::from(range.end),
         };
-        let buf = await_tsfn_promise::<Buffer, _>(self.timeout, "fetch_range", |cb| {
-            self.fetch_range.call_with_return_value(
-                args,
-                ThreadsafeFunctionCallMode::NonBlocking,
-                move |ret, _env| {
-                    cb(ret);
-                    Ok(())
-                },
-            )
-        })
-        .await?;
-        Ok(bytes::Bytes::from(buf.to_vec()))
+        let buf =
+            await_tsfn_promise::<crate::common::JsBytes, _>(self.timeout, "fetch_range", |cb| {
+                self.fetch_range.call_with_return_value(
+                    args,
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                    move |ret, _env| {
+                        cb(ret);
+                        Ok(())
+                    },
+                )
+            })
+            .await?;
+        Ok(buf.into_bytes())
     }
 
     async fn exists(&self, blob_ref: &InnerBlobRef) -> std::result::Result<bool, InnerBlobError> {
@@ -1075,8 +1108,13 @@ impl BlobAdapter for NodeAsyncBlobAdapter {
 pub fn register_async_blob_adapter(
     id: String,
     store_fn: Function<'static, JsBlobStoreArgs, Promise<()>>,
-    fetch_fn: Function<'static, JsBlobFetchArgs, Promise<Buffer>>,
-    fetch_range_fn: Function<'static, JsBlobFetchRangeArgs, Promise<Buffer>>,
+    #[napi(ts_arg_type = "(arg: JsBlobFetchArgs) => Promise<Buffer>")] fetch_fn: Function<
+        'static,
+        JsBlobFetchArgs,
+        Promise<crate::common::JsBytes>,
+    >,
+    #[napi(ts_arg_type = "(arg: JsBlobFetchRangeArgs) => Promise<Buffer>")]
+    fetch_range_fn: Function<'static, JsBlobFetchRangeArgs, Promise<crate::common::JsBytes>>,
     exists_fn: Function<'static, JsBlobFetchArgs, Promise<bool>>,
     timeout_ms: Option<u32>,
 ) -> Result<()> {
@@ -1322,10 +1360,14 @@ impl MeshBlobAdapter {
     /// before persisting; mismatches throw `"blob: ..."`.
     /// Idempotent on identical bytes.
     #[napi]
-    pub async fn store(&self, blob_ref: &BlobRef, data: Buffer) -> Result<()> {
+    pub async fn store(
+        &self,
+        blob_ref: &BlobRef,
+        #[napi(ts_arg_type = "Buffer")] data: crate::common::JsBytes,
+    ) -> Result<()> {
         let adapter = self.inner.clone();
         let blob = blob_ref.inner.clone();
-        let data_owned: Vec<u8> = data.to_vec();
+        let data_owned: Vec<u8> = data.into_vec();
         adapter
             .store(&blob, &data_owned)
             .await
@@ -1397,7 +1439,7 @@ impl MeshBlobAdapter {
     #[napi]
     pub async fn store_stream_tree_from_bytes(
         &self,
-        data: Buffer,
+        #[napi(ts_arg_type = "Buffer")] data: crate::common::JsBytes,
         encoding: Option<&Encoding>,
     ) -> Result<BlobRef> {
         use bytes::Bytes;
@@ -1415,7 +1457,7 @@ impl MeshBlobAdapter {
             _ => InnerEncoding::Replicated,
         };
         let adapter = self.inner.clone();
-        let owned: Vec<u8> = data.to_vec();
+        let owned: Vec<u8> = data.into_vec();
         let s = stream::once(async move { Ok::<_, InnerBlobError>(Bytes::from(owned)) });
         let blob = adapter
             .store_stream_tree(Box::pin(s), enc, ChunkingStrategy::default())

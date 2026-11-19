@@ -910,6 +910,7 @@ class NetMesh:
         subnet_attachment: Optional[list] = None,
         subnet_control_channel: Optional[str] = None,
         subnet_exports: Optional[list] = None,
+        noise_static_key: Optional[bytes] = None,
     ) -> None:
         """Construct a new mesh node.
 
@@ -1005,6 +1006,13 @@ class NetMesh:
         its worker thread until it returns, and its late answer is ignored.
         Use a coroutine function for an approver that prompts a human — it
         is cancelled at the timeout. ``approve_timeout_ms`` must be >= 1."""
+        ...
+    def ensure_attached(self, rendezvous: str) -> None:
+        """Make sure there is a working session to the node ``rendezvous``
+        names (``addr|noise_pubkey|node_id``), re-dialing only when needed —
+        call it when a paired machine may have restarted. After a restart the
+        far side can take up to three heartbeat intervals to accept; ``renew``
+        already does this. (Requires the ``delegation`` feature.)"""
         ...
     def renew(self, enrollment: "DeviceEnrollment") -> DelegationChain:
         """Device-side renewal: refresh the grant carried by ``enrollment`` over
@@ -2055,9 +2063,10 @@ class OperatorEnrollment:
     def root_fingerprint(self) -> str: ...
 
 class EnrollmentServeHandle:
-    """Keeps a served enrollment service alive (returned by
-    ``NetMesh.serve_enrollment_auto``). Dropping it or calling :meth:`stop`
-    unregisters the service."""
+    """A served enrollment service (returned by
+    ``NetMesh.serve_enrollment_auto``). The mesh owns the service: it stays
+    up until :meth:`stop` or the mesh's ``shutdown()``, even if this handle
+    is dropped."""
 
     def stop(self) -> None:
         """Stop serving enrollment (unregister the service)."""
@@ -2090,9 +2099,10 @@ class LocalPublicationHandle:
         ...
 
 class A2aServeHandle:
-    """Keeps the served agent-to-agent task services alive (returned by
-    ``NetMesh.serve_a2a`` or ``PaymentProvider.serve_a2a_configured``).
-    Dropping it or calling :meth:`stop` unregisters them."""
+    """The served agent-to-agent task services (returned by
+    ``NetMesh.serve_a2a`` or ``PaymentProvider.serve_a2a_configured``). The
+    mesh owns them: they stay up until :meth:`stop` or the mesh's
+    ``shutdown()``, even if this handle is dropped."""
 
     def stop(self) -> None:
         """Stop accepting A2A tasks (unregister the services)."""
@@ -3587,11 +3597,21 @@ class ResponseSinkSend:
     handlers."""
 
     def send(self, body: bytes) -> bool:
-        """Emit one chunk; ``True`` on success, ``False`` once the sink has
-        been torn down. Non-blocking by design — it is a ``try_send`` into a
-        bounded queue feeding the response pump, so chunks are dropped when
-        the pump stalls on credit. Pace emits to the REQUEST_GRANT cadence
-        rather than burst-pushing."""
+        """Emit one chunk without waiting; ``True`` if it was queued,
+        ``False`` if it was dropped (the bounded queue feeding the response
+        pump is full, or the call is gone). Use :meth:`send_wait` when every
+        chunk must arrive."""
+        ...
+
+    def send_wait(self, body: bytes) -> bool:
+        """Emit one chunk, waiting for queue room instead of dropping it;
+        ``True`` once queued, ``False`` if the call is gone. Blocks the
+        calling thread (GIL released) — for regular ``def`` handlers."""
+        ...
+
+    def asend_wait(self, body: bytes) -> Awaitable[bool]:
+        """:meth:`send_wait` for ``async def`` handlers: an awaitable that
+        resolves ``True`` once queued, ``False`` if the call is gone."""
         ...
 
 class RpcCallEvent:
@@ -3916,6 +3936,11 @@ class ServeHandle:
     Returned by ``MeshRpc.serve`` / ``AsyncMeshRpc.serve``. In-flight handlers
     continue to completion on ``close()``, but no new request is dispatched;
     ``close`` is idempotent, and leaving the ``with`` block closes for you.
+
+    The mesh owns the service: dropping this handle (``del``, refcount 0)
+    does NOT unregister it. Serving the same name again without ``close()``
+    raises ``RpcError`` (the name is still being served); the mesh's
+    ``shutdown()`` closes every service it holds.
     """
 
     def close(self) -> None: ...
@@ -5576,7 +5601,9 @@ class AsyncOrgClient:
     def __exit__(self, *exc: object) -> bool: ...
 
 class OrgServeHandle:
-    """Handle for a served organization service. ``close()`` unregisters."""
+    """Handle for a served organization service. ``close()`` unregisters;
+    dropping the handle does not (the mesh owns the service until
+    ``close()`` or its ``shutdown()``)."""
 
     @property
     def is_closed(self) -> bool: ...

@@ -35,15 +35,23 @@ fn now() -> u64 {
 struct Bundles {
     issued: AtomicUsize,
     refuse_recovery: AtomicBool,
+    /// ENR-03: model a bundle preparation slow enough (still inside the
+    /// session deadline) to cross the invitation's expiry.
+    prepare_past_expiry: AtomicBool,
 }
 
 impl BundleIssuer for Bundles {
     fn issue(
         &self,
-        _invite: &MembershipInvite,
+        invite: &MembershipInvite,
         intent: &RedemptionIntent,
     ) -> Result<Vec<u8>, Refusal> {
         self.issued.fetch_add(1, Ordering::SeqCst);
+        if self.prepare_past_expiry.load(Ordering::SeqCst) {
+            while now() < invite.policy().expires_at() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         let mut b = b"BUNDLE:".to_vec();
         b.extend_from_slice(intent.subject().as_bytes());
         Ok(b)
@@ -129,6 +137,16 @@ fn sign_by(
     mode: ApprovalMode,
     key: EnrollmentKey,
 ) -> MembershipInvite {
+    sign_by_ttl(issuer, port, mode, key, Duration::from_secs(3600))
+}
+
+fn sign_by_ttl(
+    issuer: &Identity,
+    port: u16,
+    mode: ApprovalMode,
+    key: EnrollmentKey,
+    ttl: Duration,
+) -> MembershipInvite {
     MembershipInvite::sign(
         issuer,
         InviteSpec {
@@ -142,7 +160,7 @@ fn sign_by(
             channel: None,
             relations: vec![Relation::Mesh],
             intended_subject: None,
-            policy: InvitationPolicy::with_options(now(), Duration::from_secs(3600), mode).unwrap(),
+            policy: InvitationPolicy::with_options(now(), ttl, mode).unwrap(),
         },
     )
     .unwrap()
@@ -344,6 +362,103 @@ async fn revocation_blocks_issue_and_current_authority_blocks_recovery() {
         matches!(err, RedeemError::Refused(Refusal::Revoked)),
         "{err:?}"
     );
+}
+
+/// ENR-03: the claim lands inside the invitation's window, but the bundle
+/// preparation that follows (here: until the wall clock reaches expiry, well
+/// inside the session deadline) crosses it. The final issuance must be judged
+/// at the time it is committed, not at the time sampled before the claim:
+/// pre-fix the ledger accepted the stale timestamp and an unissued invitation
+/// first issued after its window. Nothing is delivered or recorded, and a
+/// retry is refused as expired too.
+#[tokio::test]
+async fn bundle_preparation_that_crosses_expiry_does_not_first_issue() {
+    let fx = Fixture::start(ServiceConfig::default()).await;
+    fx.bundles.prepare_past_expiry.store(true, Ordering::SeqCst);
+    let invite = sign_by_ttl(
+        &fx.issuer,
+        fx.service.local_addr().port(),
+        ApprovalMode::Preauthorized,
+        fx.service.enrollment_key(),
+        // Long enough that a slow runner still claims inside the window
+        // (whole-second expiry), short enough that waiting it out stays
+        // inside the 10 s redemption deadline.
+        Duration::from_secs(5),
+    );
+    fx.service
+        .ledger()
+        .lock()
+        .offer(invite.offer_spec(), now())
+        .unwrap();
+    let device = Identity::generate();
+
+    let err = join(&invite, &device).await.unwrap_err();
+    assert!(
+        matches!(err, RedeemError::Refused(Refusal::Expired)),
+        "a bundle prepared past expiry must not first issue: {err:?}"
+    );
+    assert_eq!(fx.bundles.issued.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(fx.state(&invite), OfferState::Ready { .. }),
+        "claimed but never issued: {:?}",
+        fx.state(&invite)
+    );
+
+    fx.bundles
+        .prepare_past_expiry
+        .store(false, Ordering::SeqCst);
+    let err = join(&invite, &device).await.unwrap_err();
+    assert!(
+        matches!(err, RedeemError::Refused(Refusal::Expired)),
+        "{err:?}"
+    );
+    assert_eq!(fx.bundles.issued.load(Ordering::SeqCst), 1);
+}
+
+/// ENR-03 counterpart: an issuance COMMITTED inside the window stays
+/// recoverable by its own device after the invitation expires.
+#[tokio::test]
+async fn a_committed_issuance_is_still_recovered_after_expiry() {
+    let fx = Fixture::start(ServiceConfig::default()).await;
+    let invite = sign_by_ttl(
+        &fx.issuer,
+        fx.service.local_addr().port(),
+        ApprovalMode::Preauthorized,
+        fx.service.enrollment_key(),
+        // Long enough that a slow runner still claims inside the window
+        // (whole-second expiry), short enough that waiting it out stays
+        // inside the 10 s redemption deadline.
+        Duration::from_secs(5),
+    );
+    fx.service
+        .ledger()
+        .lock()
+        .offer(invite.offer_spec(), now())
+        .unwrap();
+    let device = Identity::generate();
+    let first = join(&invite, &device).await.unwrap();
+    let RedeemOutcome::Issued {
+        receipt_id,
+        recovered: false,
+        bundle,
+    } = first
+    else {
+        panic!("expected first issuance, got {first:?}");
+    };
+
+    while now() < invite.policy().expires_at() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let again = join(&invite, &device).await.unwrap();
+    assert_eq!(
+        again,
+        RedeemOutcome::Issued {
+            receipt_id,
+            recovered: true,
+            bundle
+        }
+    );
+    assert_eq!(fx.bundles.issued.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -166,13 +166,17 @@ impl OrgClient {
     /// signed proof is bound to one call id, so any second attempt must be a
     /// fresh call the application makes deliberately.
     #[napi]
-    pub async fn call_bytes(&self, service: String, request: Buffer) -> Result<Buffer> {
+    pub async fn call_bytes(
+        &self,
+        service: String,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
+    ) -> Result<Buffer> {
         // Snapshot first: if `close()` lands after this line, the clone keeps
         // the lease and node reference alive until the call completes.
         let client = self.inner.load_full().ok_or_else(|| {
             Error::from_reason("org:credentials:closed: this OrgClient has been closed")
         })?;
-        let body = bytes::Bytes::from(request.to_vec());
+        let body = request.into_bytes();
         let reply = client.call_bytes(&service, body).await.map_err(org_error)?;
         Ok(Buffer::from(reply.to_vec()))
     }
@@ -188,11 +192,15 @@ impl OrgClient {
     /// `callSubnet`: the caller names no subnet, joins no subnet, and
     /// receives no subnet context.
     #[napi]
-    pub async fn call_exported_bytes(&self, service: String, request: Buffer) -> Result<Buffer> {
+    pub async fn call_exported_bytes(
+        &self,
+        service: String,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
+    ) -> Result<Buffer> {
         let client = self.inner.load_full().ok_or_else(|| {
             Error::from_reason("org:credentials:closed: this OrgClient has been closed")
         })?;
-        let body = bytes::Bytes::from(request.to_vec());
+        let body = request.into_bytes();
         let reply = client
             .call_exported_bytes(&service, body)
             .await
@@ -222,7 +230,7 @@ impl OrgClient {
     pub async fn call_streaming_bytes(
         &self,
         service: String,
-        request: Buffer,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
         deadline_ms: Option<u32>,
         cancel_token: Option<BigInt>,
     ) -> Result<crate::mesh_rpc::RpcStream> {
@@ -233,7 +241,7 @@ impl OrgClient {
             Some(t) => crate::common::bigint_u64(t)?,
             None => 0,
         };
-        let body = bytes::Bytes::from(request.to_vec());
+        let body = request.into_bytes();
         let inner = client
             .call_streaming_bytes_deadline(
                 &service,
@@ -528,10 +536,12 @@ const ORG_HANDLER_ERROR: u16 = 0x8001;
 pub(crate) type OrgHandlerTsfn =
     ThreadsafeFunction<OrgRequest, Promise<Buffer>, OrgRequest, Status, false>;
 
-/// Handle for a served organization service. `close()` unregisters.
+/// Handle for a served organization service. `close()` unregisters; the
+/// service is node-owned, so it stays up until then (or the mesh's
+/// `shutdown()`) even if this handle is not kept referenced.
 #[napi]
 pub struct OrgServeHandle {
-    inner: parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>,
+    inner: Arc<parking_lot::Mutex<Option<net_sdk::mesh_rpc::ServeHandle>>>,
     /// The runtime the registration ran on, carried forward — exactly the
     /// role `mesh_rpc::ServeHandle`'s `runtime` field plays (`mesh_rpc.rs`
     /// "ServeHandle"): `close()` runs on the JS thread with no reactor in
@@ -540,15 +550,26 @@ pub struct OrgServeHandle {
     /// belongs to. Every org-surface serve registers on
     /// [`org_serve_runtime`], so that is the runtime captured here.
     runtime: tokio::runtime::Handle,
+    /// The node's hold on the service (`keepalive`): it lives until
+    /// `close()` or the mesh's `shutdown()`, not until V8 finalizes this
+    /// wrapper.
+    registration: crate::keepalive::Registration,
 }
 
 impl OrgServeHandle {
     /// Wrap a registered serve handle — shared with the subnet-exported
-    /// serve, which returns the same RAII shape.
-    pub(crate) fn from_handle(handle: net_sdk::mesh_rpc::ServeHandle) -> Self {
+    /// serve, which returns the same shape.
+    pub(crate) fn from_handle(
+        node: &Arc<net::adapter::net::MeshNode>,
+        handle: net_sdk::mesh_rpc::ServeHandle,
+    ) -> Self {
+        let inner = Arc::new(parking_lot::Mutex::new(Some(handle)));
+        let runtime = org_serve_runtime().handle().clone();
+        let registration = crate::keepalive::hold(node, &inner, Some(runtime.clone()));
         OrgServeHandle {
-            inner: parking_lot::Mutex::new(Some(handle)),
-            runtime: org_serve_runtime().handle().clone(),
+            inner,
+            runtime,
+            registration,
         }
     }
 }
@@ -563,7 +584,9 @@ impl OrgServeHandle {
         // Enter the registration's runtime before dropping the inner
         // handle — mirror of `mesh_rpc::ServeHandle::close`.
         let _enter = self.runtime.enter();
-        let _ = self.inner.lock().take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 }
 
@@ -631,7 +654,7 @@ pub fn serve_org(
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
 
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
 
 /// A dedicated multi-thread runtime for the sync `serve_org` registration so the
@@ -926,7 +949,7 @@ async fn dispatch_streaming_to_js(
     sink: ::net::adapter::net::cortex::RpcResponseSink,
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
-    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(Arc::new(sink))));
     // NODE-3 — the release owner for the forced-drop path (see the
     // handler-drop contract above).
     let _release = crate::mesh_rpc::JsHandleRelease::sink(sink_slot.clone());
@@ -1083,7 +1106,7 @@ async fn dispatch_duplex_to_js(
     sink: ::net::adapter::net::cortex::RpcResponseSink,
     timeout: Duration,
 ) -> std::result::Result<(), net_sdk::org::OrgHandlerError> {
-    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(sink)));
+    let sink_slot = Arc::new(parking_lot::Mutex::new(Some(Arc::new(sink))));
     let arg = OrgDuplexHandlerArgs {
         caller: org_caller_js(&caller),
         stream: org_request_stream(requests),
@@ -1217,7 +1240,7 @@ pub fn serve_org_streaming(
         )
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
 
 /// Serve a protected, privately-discoverable service with a STREAM OF
@@ -1268,7 +1291,7 @@ pub fn serve_org_client_stream(
         )
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }
 
 /// Serve a protected, privately-discoverable DUPLEX service (§4.4's
@@ -1319,5 +1342,5 @@ pub fn serve_org_duplex(
         )
         .map_err(|e| Error::from_reason(format!("org serve registration failed: {e}")))?
     };
-    Ok(OrgServeHandle::from_handle(handle))
+    Ok(OrgServeHandle::from_handle(&mesh.node_arc_clone()?, handle))
 }

@@ -1064,6 +1064,10 @@ impl A2aServiceConfig {
 /// handle can come from. It is also the only way to observe the
 /// in-memory store an all-free catalog runs on.
 pub struct A2aServing {
+    /// The paid services' offers published as quote authority, withdrawn
+    /// on drop. Declared first so they are withdrawn before the handlers
+    /// below are released (see `tool_payment::OfferWithdrawal`).
+    _offers: Option<crate::tool_payment::OfferWithdrawal>,
     /// The five registrations: submit, status, cancel, prepare,
     /// describe.
     pub handles: Vec<ServeHandle>,
@@ -2535,6 +2539,24 @@ impl Mesh {
                     .to_string(),
             ));
         }
+        // Every announced price becomes the gate's quote authority — once
+        // this serving owns the A2A services (below), never before: a
+        // second serve on the node would otherwise replace the running
+        // catalog's terms and then fail to register. Collected here, while
+        // the catalog is still borrowable.
+        let paid_offers: Vec<(String, String, String)> = config
+            .services
+            .iter()
+            .filter_map(|(id, policy)| match policy {
+                A2aServicePolicy::Paid(offer) => policy
+                    .offer()
+                    .pricing_terms
+                    .clone()
+                    .map(|terms| (id.clone(), tool_id_of(&offer.service_id), terms)),
+                A2aServicePolicy::Free(_) => None,
+            })
+            .collect();
+        let offer_gate = config.payment.clone();
 
         let A2aServiceConfig {
             services,
@@ -2636,7 +2658,34 @@ impl Mesh {
             )?,
         ];
 
+        // The provider signs quotes only on the terms its catalog
+        // publishes, never on a requester's template. Published now that
+        // the handlers are ours; a refusal unwinds everything (the guard
+        // withdraws what was published, the handles unregister), and the
+        // guard withdraws them all when this serving is released, so quote
+        // authority never outlives the services it prices.
+        let offers = match offer_gate {
+            Some(gate) => {
+                let mut offers = {
+                    let gate = Arc::clone(&gate);
+                    crate::tool_payment::OfferWithdrawal::new(move |id| gate.withdraw_offer(id))
+                };
+                for (id, tool_id, terms) in paid_offers {
+                    if let Err(reason) = gate.publish_offer(&tool_id, &terms) {
+                        return Err(ServeError::A2aPaidMisconfigured(format!(
+                            "service {id:?}: the admission gate refused its pricing terms: \
+                             {reason}"
+                        )));
+                    }
+                    offers.published(tool_id);
+                }
+                Some(offers)
+            }
+            None => None,
+        };
+
         Ok(A2aServing {
+            _offers: offers,
             handles,
             store,
             _owner: owner,

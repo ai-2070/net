@@ -23,6 +23,7 @@ fn descriptor(seq: u64) -> Arc<RetransmitDescriptor> {
         events: vec![Bytes::from_static(b"payload")],
         flags: PacketFlags::RELIABLE,
         fragment: None,
+        header: None,
     })
 }
 

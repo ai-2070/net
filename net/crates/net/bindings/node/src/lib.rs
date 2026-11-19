@@ -90,6 +90,13 @@ mod transport;
 // cortex / netdb feature unit.
 #[cfg(feature = "net")]
 mod identity;
+// Node-owned serve registrations: a serve handle's GC no longer stops
+// the service (APP_INTEGRATION_BLOCKERS_PLAN.md Phase 4). `shutdown`
+// always releases; only the serve surfaces (nRPC, enrollment, org, A2A)
+// hold, so a `net`-only build uses part of the module.
+#[cfg(feature = "net")]
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
+mod keepalive;
 #[cfg(feature = "cortex")]
 mod mesh_rpc;
 // MeshDB query layer (Node SDK slice 1: factory AST + in-memory
@@ -178,7 +185,7 @@ use net::config::RedisAdapterConfig;
 use net::config::JetStreamAdapterConfig;
 
 #[cfg(feature = "net")]
-use net::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
+use net::adapter::net::{NetAdapterConfig, NoiseStaticKey, ReliabilityConfig, StaticKeypair};
 
 /// Redis adapter configuration.
 #[napi(object)]
@@ -1354,7 +1361,18 @@ mod mesh_bindings {
         /// keypair (and therefore its `entity_id` + stable
         /// `node_id`) from these bytes instead of generating
         /// ephemeral ones. Treat as secret material.
+        ///
+        /// A seeded node also derives its Noise static key (its
+        /// `publicKey()`, the key in its rendezvous string) from this
+        /// seed unless `noiseStaticKey` is set, so peers that paired
+        /// with it can still reach it after a restart.
         pub identity_seed: Option<Buffer>,
+        /// 32-byte Noise (X25519) static private key — any 32 random
+        /// bytes, stored by the caller. Keeps `publicKey()` stable
+        /// across restarts independently of the identity. Leave unset
+        /// to derive it from `identitySeed` (or, with no seed, to get a
+        /// fresh key per process). Treat as secret material.
+        pub noise_static_key: Option<Buffer>,
         /// Pin this mesh's publicly-advertised reflex to the
         /// supplied external `"ip:port"`. Classification is
         /// skipped; the node starts in `nat:open` and advertises
@@ -1889,6 +1907,21 @@ mod mesh_bindings {
                 None => EntityKeypair::generate(),
             };
 
+            // Noise static key: an explicit one wins. Without it,
+            // `MeshNode::new` derives one from a seeded (configured)
+            // identity, so the node's rendezvous address survives a
+            // restart, and otherwise generates a fresh key.
+            if let Some(key) = options.noise_static_key {
+                let bytes: &[u8] = key.as_ref();
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                    Error::from_reason(format!(
+                        "noise_static_key must be 32 bytes, got {}",
+                        bytes.len()
+                    ))
+                })?;
+                config = config.with_static_key(NoiseStaticKey::from_private(arr));
+            }
+
             let mut node = MeshNode::new(identity, config)
                 .await
                 .map_err(|e| Error::from_reason(format!("MeshNode creation failed: {}", e)))?;
@@ -2037,7 +2070,11 @@ mod mesh_bindings {
 
         /// Send raw bytes to a direct peer.
         #[napi]
-        pub async fn push_to(&self, peer_addr: String, data: Buffer) -> Result<bool> {
+        pub async fn push_to(
+            &self,
+            peer_addr: String,
+            #[napi(ts_arg_type = "Buffer")] data: crate::common::JsBytes,
+        ) -> Result<bool> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let addr: std::net::SocketAddr = peer_addr
@@ -2046,11 +2083,7 @@ mod mesh_bindings {
 
             let batch = net::event::Batch {
                 shard_id: 0,
-                events: vec![net::event::InternalEvent::new(
-                    bytes::Bytes::copy_from_slice(data.as_ref()),
-                    0,
-                    0,
-                )],
+                events: vec![net::event::InternalEvent::new(data.into_bytes(), 0, 0)],
                 sequence_start: 0,
                 process_nonce: net::event::batch_process_nonce(),
             };
@@ -2330,13 +2363,14 @@ mod mesh_bindings {
         /// discover it by being refused. Nothing in the batch is
         /// sent; the check runs before the peer is resolved.
         #[napi]
-        pub async fn send_on_stream(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
+        pub async fn send_on_stream(
+            &self,
+            stream: &NetStream,
+            #[napi(ts_arg_type = "Array<Buffer>")] events: Vec<crate::common::JsBytes>,
+        ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let payloads: Vec<bytes::Bytes> = events
-                .into_iter()
-                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
-                .collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(|b| b.into_bytes()).collect();
             node.send_on_stream(&stream.core, &payloads)
                 .await
                 .map_err(stream_error_to_napi)
@@ -2351,15 +2385,12 @@ mod mesh_bindings {
         pub async fn send_with_retry(
             &self,
             stream: &NetStream,
-            events: Vec<Buffer>,
+            #[napi(ts_arg_type = "Array<Buffer>")] events: Vec<crate::common::JsBytes>,
             max_retries: u32,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let payloads: Vec<bytes::Bytes> = events
-                .into_iter()
-                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
-                .collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(|b| b.into_bytes()).collect();
             node.send_with_retry(&stream.core, &payloads, max_retries as usize)
                 .await
                 .map_err(stream_error_to_napi)
@@ -2375,13 +2406,14 @@ mod mesh_bindings {
         /// is absorbed; an oversize-event rejection propagates at
         /// once.
         #[napi]
-        pub async fn send_blocking(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
+        pub async fn send_blocking(
+            &self,
+            stream: &NetStream,
+            #[napi(ts_arg_type = "Array<Buffer>")] events: Vec<crate::common::JsBytes>,
+        ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let payloads: Vec<bytes::Bytes> = events
-                .into_iter()
-                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
-                .collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(|b| b.into_bytes()).collect();
             node.send_blocking(&stream.core, &payloads)
                 .await
                 .map_err(stream_error_to_napi)
@@ -2460,7 +2492,9 @@ mod mesh_bindings {
             &self,
             publisher_node_id: BigInt,
             channel: String,
-            token: Option<Buffer>,
+            #[napi(ts_arg_type = "Buffer | undefined | null")] token: Option<
+                crate::common::JsBytes,
+            >,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
@@ -2517,7 +2551,7 @@ mod mesh_bindings {
         pub async fn publish(
             &self,
             channel: String,
-            payload: Buffer,
+            #[napi(ts_arg_type = "Buffer")] payload: crate::common::JsBytes,
             config: Option<PublishConfigJs>,
         ) -> Result<PublishReportJs> {
             let guard = self.load_node()?;
@@ -2526,7 +2560,7 @@ mod mesh_bindings {
                 .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
             let pub_cfg = config.unwrap_or_default().into_core()?;
             let publisher = net::adapter::net::ChannelPublisher::new(name, pub_cfg);
-            let payload_bytes = bytes::Bytes::copy_from_slice(payload.as_ref());
+            let payload_bytes = payload.into_bytes();
             let report = node
                 .publish(&publisher, payload_bytes)
                 .await
@@ -2737,6 +2771,14 @@ mod mesh_bindings {
             // serve-task teardown ticks in the race path.
             const DRAIN_ATTEMPTS: u32 = 50;
             const DRAIN_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+            // Stop every service registered on this node first. They are
+            // node-owned (a dropped JS handle no longer stops one), and each
+            // holds a node reference that would otherwise fail the
+            // sole-ownership wait below.
+            if let Some(node) = self.node.load_full() {
+                crate::keepalive::release_all(&node);
+            }
 
             let mut node_arc = self
                 .node
@@ -3219,7 +3261,7 @@ mod mesh_bindings {
         pub async fn connect_direct(
             &self,
             peer_node_id: BigInt,
-            peer_public_key: Buffer,
+            #[napi(ts_arg_type = "Buffer")] peer_public_key: crate::common::JsBytes,
             coordinator: BigInt,
         ) -> Result<()> {
             let guard = self.load_node()?;
@@ -3258,7 +3300,7 @@ mod mesh_bindings {
         pub async fn connect_direct_auto(
             &self,
             peer_node_id: BigInt,
-            peer_public_key: Buffer,
+            #[napi(ts_arg_type = "Buffer")] peer_public_key: crate::common::JsBytes,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();

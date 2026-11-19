@@ -1944,7 +1944,7 @@ fn s3r_capturing_emitter() -> (
     let sink = captured.clone();
     let emit: RpcAsyncResponseEmitter = std::sync::Arc::new(move |_from, _origin, _call, resp| {
         sink.lock().push(resp);
-        Box::pin(async move {})
+        Box::pin(async move { true })
     });
     (emit, captured)
 }

@@ -359,14 +359,20 @@ fn flow_err(e: A2aFlowError) -> PyErr {
 
 /// Keeps the served A2A services alive (returned by `NetMesh.serve_a2a` or
 /// `PaymentProvider.serve_a2a_configured`).
-/// Dropping it or calling [`stop`](Self::stop) unregisters them.
+/// The services are owned by the node: they stay up until
+/// [`stop`](Self::stop) or the mesh's `shutdown()`, even if this handle
+/// is dropped.
 #[pyclass(name = "A2aServeHandle", module = "net._net")]
 pub struct PyA2aServeHandle {
     // The `Mesh` holds the channel registry the services registered against,
     // and the registrations themselves are whatever the serving path returned.
     // A lock, not `&mut self`: `stop()` raced any concurrent borrow into
     // "Already borrowed" (SDK audit 2026-10-11).
-    inner: parking_lot::Mutex<Option<(Mesh, Registered)>>,
+    inner: Arc<parking_lot::Mutex<Option<(Mesh, Registered)>>>,
+    /// The node's hold on the services (`keepalive`): they stay up until
+    /// `stop()` or the mesh's `shutdown()`, not until this handle's
+    /// refcount reaches zero.
+    registration: crate::keepalive::Registration,
 }
 
 /// What a serve call registered — held opaquely, because dropping it is the
@@ -402,8 +408,12 @@ impl Registered {
 impl PyA2aServeHandle {
     /// Wrap what a serving call registered.
     pub(crate) fn new(mesh: Mesh, registered: Registered) -> Self {
+        let node = Arc::clone(mesh.node());
+        let inner = Arc::new(parking_lot::Mutex::new(Some((mesh, registered))));
+        let registration = crate::keepalive::hold(&node, &inner, None);
         Self {
-            inner: parking_lot::Mutex::new(Some((mesh, registered))),
+            inner,
+            registration,
         }
     }
 }
@@ -415,6 +425,7 @@ impl PyA2aServeHandle {
         // Drop outside the lock: unregistering runs the services' drops.
         let taken = self.inner.lock().take();
         drop(taken);
+        self.registration.forget();
     }
 
     /// Whether the services are still registered.

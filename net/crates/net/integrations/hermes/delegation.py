@@ -69,56 +69,232 @@ def _machine_id_path() -> Optional["pathlib.Path"]:
     return None
 
 
+#: How long a starter that lost the race to publish the machine id waits for a
+#: file it found EMPTY to gain its value. A current writer never publishes an
+#: empty file (see :func:`_publish_machine_id`), so this only covers a writer
+#: on a filesystem without hard links, or an older plugin version mid-write.
+_MACHINE_ID_WAIT_SECONDS = 2.0
+
+
+#: Every machine id this plugin has ever generated is ``secrets.token_hex(16)``.
+_MACHINE_ID_LEN = 32
+
+#: How long after its last write a file that could still be a write in
+#: progress (see :func:`_may_be_partial`) is taken as final. A writer finishes
+#: in one write + fsync, so a file this old is not being written any more.
+_MACHINE_ID_SETTLE_SECONDS = 60.0
+
+
+def _may_be_partial(value: str) -> bool:
+    """Whether ``value`` could be a write in progress: empty, or a strict
+    lowercase-hex PREFIX of a generated id (the POSIX no-hard-link fallback
+    writes the name before its value). Anything else — a complete generated id,
+    an id an operator wrote by hand, uppercase hex, any other shape an older
+    plugin version accepted — is never a partial write of this plugin's, so it
+    is the committed id as it stands."""
+    return len(value) < _MACHINE_ID_LEN and all(c in "0123456789abcdef" for c in value)
+
+
+def _settled(idfile) -> bool:
+    """Whether ``idfile`` was last written long enough ago that no writer is
+    still filling it in."""
+    import time
+
+    try:
+        return time.time() - idfile.stat().st_mtime >= _MACHINE_ID_SETTLE_SECONDS
+    except OSError:
+        return False
+
+
+def _read_machine_id(idfile) -> str:
+    """The committed machine id in ``idfile``, or ``""`` when it is absent,
+    unreadable, empty, or possibly still being written.
+
+    A value that could be a partial write is adopted only once the file has
+    settled: then it is all that was ever persisted (its writer died before
+    completing it, so nobody used the full value), and every later start reads
+    the same. A FRESH prefix may be completed any moment, so it is not adopted.
+    """
+    try:
+        value = idfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not _may_be_partial(value):
+        return value
+    if value and _settled(idfile):
+        return value
+    return ""
+
+
+def _sync_dir(path) -> None:
+    """Best-effort durability barrier for a new directory entry: ``fsync`` the
+    directory on POSIX, so a power loss after a successful publish cannot drop
+    the ``machine-id`` name (a restart would then mint a new node identity).
+    There is no portable equivalent elsewhere; NTFS journals the entry."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+#: Windows ``os.rename`` refuses an existing target, so there it is an atomic
+#: create-with-contents; POSIX ``rename`` replaces. (A module constant so the
+#: POSIX fallback can be exercised on any host.)
+_RENAME_NEVER_REPLACES = os.name == "nt"
+
+
+def _publish_machine_id(idfile, value: str) -> bool:
+    """Publish ``value`` as the machine id **with its contents already in
+    place**: ``True`` if this call published it, ``False`` if another starter
+    already had.
+
+    The value is written + fsynced to a private temp file first, then linked
+    to the final name — ``os.link`` fails if the name exists, so creation stays
+    exclusive, and the name never exists without its complete value. (An
+    exclusive ``open(.., "x")`` + write, the previous scheme, made the NAME
+    exclusive but published an empty file first: a concurrent starter read it
+    empty and returned its own never-persisted id — HERMES-08.)
+    """
+    import secrets
+
+    tmp = idfile.with_name(f".{idfile.name}.{secrets.token_hex(8)}.tmp")
+    with open(tmp, "x", encoding="utf-8") as f:
+        f.write(value)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        try:
+            os.link(tmp, idfile)
+            _sync_dir(idfile.parent)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            # The filesystem has no hard links (FAT, some network/FUSE mounts).
+            if _RENAME_NEVER_REPLACES:
+                # Windows rename never replaces an existing target, so it is
+                # the same atomic create-with-contents.
+                try:
+                    os.rename(tmp, idfile)
+                    _sync_dir(idfile.parent)
+                    return True
+                except FileExistsError:
+                    return False
+            # POSIX without hard links has no no-replace rename in the stdlib:
+            # fall back to exclusive create + immediate write. The name can be
+            # briefly empty here; losers wait for the value instead of
+            # inventing their own (`_persistent_machine_id`).
+            try:
+                fd = os.open(idfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                return False
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(value)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                # This call created the name, so a failed write must not leave
+                # a partial id behind for later starts (they would also refuse
+                # it — `_read_machine_id` accepts only a complete id).
+                try:
+                    os.unlink(idfile)
+                except OSError:
+                    pass
+                raise
+            _sync_dir(idfile.parent)
+            return True
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _persistent_machine_id() -> str:
     """A unique, persistent per-machine id — generated once and stored so it
     survives restarts. Returns ``""`` if it can't be read or written (the caller
-    then warns and falls back to the hostname)."""
+    then warns and falls back to the hostname).
+
+    Concurrent first starts agree on ONE id: whoever publishes first wins and
+    every other starter returns the published value — never a value of its own
+    that is not on disk (that would give one namespace two live machine
+    identities, while every later start uses only the persisted one)."""
     import secrets
+    import time
 
     idfile = _machine_id_path()
     if idfile is None:
         return ""
-    try:
-        existing = idfile.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing
-    except OSError:
-        pass
+    existing = _read_machine_id(idfile)
+    if existing:
+        return existing
     try:
         idfile.parent.mkdir(parents=True, exist_ok=True)
         value = secrets.token_hex(16)
-        # Exclusive create so two racing starts on one machine agree on ONE id
-        # (whoever creates first wins; the loser reads it) rather than deriving
-        # two different machine identities.
-        try:
-            with open(idfile, "x", encoding="utf-8") as f:
-                f.write(value)
+        if _publish_machine_id(idfile, value):
             return value
-        except FileExistsError:
-            return (idfile.read_text(encoding="utf-8").strip()) or value
     except OSError:
         return ""
+    # Lost the race: adopt the winner's value. It is normally already complete;
+    # wait briefly only for a writer that cannot publish atomically.
+    deadline = time.monotonic() + _MACHINE_ID_WAIT_SECONDS
+    while True:
+        committed = _read_machine_id(idfile)
+        # A settled empty file has no writer left to wait for.
+        if committed or time.monotonic() >= deadline or _settled(idfile):
+            break
+        time.sleep(0.01)
+    if not committed:
+        logger.warning(
+            "net plugin: machine id file %s exists but holds no complete id; not "
+            "inventing an id that would not be persisted. Delete the file to "
+            "regenerate it.",
+            idfile,
+        )
+    return committed
 
 
 def _machine_label() -> str:
-    """A **unique, persistent** per-machine label for the delegation namespace.
+    """The delegation label of :func:`_machine_labels`."""
+    return _machine_labels()[0]
 
-    Machine + gateway identities are derived deterministically from this label
+
+def _machine_labels() -> "tuple[str, str]":
+    """``(delegation_label, transport_label)`` for this machine, from ONE read
+    of the machine id.
+
+    The delegation label must be **unique and persistent** per machine: machine
+    + gateway identities are derived deterministically from it
     (`derive_child_seed(root, f"machine:{label}")`), so two machines sharing a
     label produce identical `machine_id` / `gateway_id` from the same root —
     breaking per-machine revocation isolation and conflating audit trails.
-
     Order: explicit ``NET_MESH_MACHINE_ID`` → a persistent random per-machine id
     (host-prefixed for readability) → **hostname with a loud warning** (the only
     unstable path, and only when no id can be persisted).
+
+    The transport label (what the node's transport identity derives from) is
+    hostname-independent: the explicit ``NET_MESH_MACHINE_ID`` or the persistent
+    machine id alone. The delegation label keeps its readable host prefix. So
+    renaming the host does not rotate the node's mesh identity. Only the
+    hostname fallback (no id could be persisted) uses the hostname for both.
     """
     override = (os.environ.get("NET_MESH_MACHINE_ID") or "").strip()
     if override:
-        return override
+        return override, override
     host = _hostname()
     persistent = _persistent_machine_id()
     if persistent:
-        return f"{host}:{persistent}" if host != "unknown-host" else persistent
+        label = f"{host}:{persistent}" if host != "unknown-host" else persistent
+        return label, persistent
     logger.warning(
         "net plugin: could not establish a unique persistent machine id; "
         "delegation identities derive from the hostname (%s) and may COLLIDE "
@@ -126,7 +302,42 @@ def _machine_label() -> str:
         "NET_MESH_MACHINE_ID to a unique, stable value.",
         host,
     )
-    return host
+    return host, host
+
+
+#: Domain separation for :func:`transport_identity_seed` — keyed BLAKE2b, a
+#: different function and context than the SDK's blake3 child-seed KDF, so a
+#: node's transport key never coincides with its machine / gateway delegation
+#: keys derived from the same root.
+_TRANSPORT_SEED_PERSON = b"net-hermes-node"
+_TRANSPORT_SEED_CONTEXT = b"net-mesh hermes transport identity v1\x00"
+
+
+def transport_identity_seed(root_seed: bytes, machine_label: str) -> bytes:
+    """The 32-byte seed this machine's embedded mesh node runs as, derived from
+    the operator ``root_seed`` and the per-machine ``machine_label``.
+
+    The root is signing *authority* (delegation, device enrollment), not a
+    transport identity: a node built from the root seed itself has the root's
+    entity id and therefore its node id, so every machine under one root would
+    be the SAME mesh node — discovery and routing key providers by node id and
+    could not tell them apart (HERMES-02). Deriving per machine keeps each
+    node distinct, and stable across restarts as long as its label is (the
+    persistent machine id, or ``NET_MESH_MACHINE_ID``).
+
+    Keyed BLAKE2b is a PRF, so the result reveals nothing about the root. The
+    derived seed is held in Python only as long as the root seed already is
+    (both are passed to ``NetMesh`` as bytes), and it carries strictly less
+    authority: it can run this one node, not sign delegations.
+    """
+    import hashlib
+
+    if len(root_seed) != 32:
+        raise ValueError(f"root seed must be 32 bytes, got {len(root_seed)}")
+    h = hashlib.blake2b(key=root_seed, digest_size=32, person=_TRANSPORT_SEED_PERSON)
+    h.update(_TRANSPORT_SEED_CONTEXT)
+    h.update(machine_label.encode("utf-8"))
+    return h.digest()
 
 
 def _revocation_store_path() -> Optional[str]:

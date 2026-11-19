@@ -8,11 +8,12 @@ import { describe, expect, it } from 'vitest';
 
 import { createLocalMesh, type LocalNode } from '../../src/local.js';
 import { defineStore } from '../../src/store/definition.js';
-import { hostStore } from '../../src/store/host.js';
+import { hostStore, type TransportStream } from '../../src/store/host.js';
 import { cellKey, cellsAround, sameCells, stickyCells } from '../../src/store/interest.js';
 import { joinStore } from '../../src/store/join.js';
 import { hostPlayer } from '../../src/store/player.js';
-import type { Cancel } from '../../src/store/types.js';
+import { StoreError } from '../../src/store/errors.js';
+import type { AccessRequest, Cancel } from '../../src/store/types.js';
 import { decodeMessage, encodeMessage, MAX_INTEREST_KEYS, type Hex } from '../../src/store/wire.js';
 
 const MAX_EVENT_BYTES = 8104;
@@ -70,7 +71,7 @@ function grid(): World {
   return { ships, tick: 0 };
 }
 
-function serve() {
+function serve(authorize: (request: AccessRequest<Actions, Inputs>) => boolean = () => true) {
   const mesh = createLocalMesh();
   const host = hostStore<World, Actions, Inputs>({
     definition: world,
@@ -78,7 +79,7 @@ function serve() {
     initialState: grid(),
     maxEventBytes: MAX_EVENT_BYTES,
     schedule: never,
-    authorize: () => true,
+    authorize,
     actions: {
       move: (input, context) => {
         context.setState({ ships: { ...context.getState().ships, [input.id]: { x: input.x, z: input.z } } });
@@ -110,6 +111,24 @@ function frames(node: LocalNode): string[] {
     if (event.payload !== undefined) seen.push(new TextDecoder().decode(event.payload));
   });
   return seen;
+}
+
+/** `node`, recording every frame it sends into `sent`. */
+function recordingSends(node: LocalNode, sent: string[]): LocalNode {
+  return {
+    ...node,
+    openStream: options => {
+      const wrap = (stream: TransportStream): TransportStream => ({
+        ...stream,
+        send: payload => {
+          sent.push(new TextDecoder().decode(payload));
+          return stream.send(payload);
+        },
+      });
+      const stream = node.openStream(options);
+      return stream instanceof Promise ? stream.then(wrap) : wrap(stream);
+    },
+  };
 }
 
 async function settle(): Promise<void> {
@@ -221,6 +240,82 @@ describe('interest', () => {
     expect(() =>
       encodeMessage({ k: 'int', q: '1'.repeat(16) as Hex, h: '2'.repeat(32) as Hex, int: ['x'.repeat(65)] }),
     ).toThrow();
+  });
+
+  it('re-authorizes a widening: a read revoked with no commit since projects nothing (STORE-02)', async () => {
+    const readable = { value: true };
+    const keys: unknown[] = [];
+    const { mesh } = serve(request => {
+      if (request.type !== 'read') return true;
+      keys.push((request as { key?: unknown }).key);
+      return readable.value;
+    });
+    const node = mesh.node(NEAR);
+    const replica = join(node, []);
+    await replica.ready();
+    expect(Object.keys(replica.getState().ships)).toHaveLength(0);
+    const wire = frames(node);
+
+    // The policy revokes the peer; nothing commits, so no feed delta
+    // re-asks. The widening is a fresh read and must be refused.
+    readable.value = false;
+    const refused = await replica.setInterest(cellsAround(5, 5, { size: SIZE })).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await settle();
+    expect(refused).toBeInstanceOf(StoreError);
+    expect((refused as StoreError).code).toBe('forbidden');
+    expect(Object.keys(replica.getState().ships)).toHaveLength(0);
+    const kinds = wire.map(frame => JSON.parse(frame).k);
+    expect(kinds).not.toContain('delta');
+    expect(kinds).not.toContain('snap');
+    // Asked under the join's own key, like every other read.
+    expect(keys.length).toBeGreaterThanOrEqual(2);
+    expect(keys.every(key => key === 'player')).toBe(true);
+  });
+
+  it('a setInterest after a refused one lifts the fence instead of waiting forever', async () => {
+    // The refusal fenced the replica. Once the policy allows the read
+    // again, the caller's retry must reach the owner and install — it
+    // used to await a `ready()` no frame would ever settle.
+    const readable = { value: true };
+    const { mesh } = serve(request => request.type !== 'read' || readable.value);
+    const replica = join(mesh.node(NEAR), []);
+    await replica.ready();
+
+    // A refused TRANSITION fences the replica (an `int` refusal settles
+    // through its own correlation and leaves it unfenced).
+    readable.value = false;
+    const refused = await replica.setAudience(['crew']).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect((refused as StoreError).code).toBe('forbidden');
+    await settle();
+
+    readable.value = true;
+    const retried = await Promise.race([
+      replica.setInterest(cellsAround(5, 5, { size: SIZE })).then(() => 'installed'),
+      new Promise(resolve => setTimeout(() => resolve('stuck'), 2000)),
+    ]);
+    expect(retried).toBe('installed');
+    expect(Object.keys(replica.getState().ships).length).toBeGreaterThan(0);
+  });
+
+  it('a superseded pre-ready setInterest sends nothing, even when the sets join to the same string', async () => {
+    // Keys may contain NUL, so `['a', 'b']` and `['a\u0000b']` were equal
+    // to the old NUL-joined comparison: the superseded call thought it
+    // was current and sent its stale set too.
+    const { mesh } = serve();
+    const sent: string[] = [];
+    const replica = join(recordingSends(mesh.node(NEAR), sent));
+    const first = replica.setInterest(['a', 'b']);
+    const second = replica.setInterest(['a\u0000b']);
+    await Promise.all([first, second]);
+    await settle();
+    const ints = sent.map(frame => JSON.parse(frame)).filter(message => message.k === 'int');
+    expect(ints.map(message => message.int)).toEqual([['a\u0000b']]);
   });
 
   it("filters the host's own player too", async () => {

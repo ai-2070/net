@@ -43,10 +43,19 @@ pub fn default_revocation_store_path() -> Option<PathBuf> {
 
 /// Errors from the revocation store.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RevocationStoreError {
-    /// An I/O error touching the store or its lock.
+    /// An I/O error touching the store or its lock. Nothing was published:
+    /// the previous contents are still in place.
     #[error("revocation store I/O at {path}: {reason}")]
     Io { path: String, reason: String },
+    /// The update WAS published (renamed into place, visible to every
+    /// reader) but the durability barrier after it failed, so it may not
+    /// survive a crash. Unlike [`Self::Io`] it must not be treated as "nothing
+    /// happened": a caller that rolls back its own side effects on this error
+    /// would contradict what readers already see. Saving again is safe.
+    #[error("revocation store at {path} was saved, but not durably (the update may not survive a crash): {reason}")]
+    NotDurable { path: String, reason: String },
     /// The store file exists but couldn't be parsed — surfaced (not silently
     /// treated as empty) so a typo never quietly drops revocations.
     #[error("revocation store at {path} is corrupt: {reason}")]
@@ -279,41 +288,41 @@ impl RevocationStore {
             reason: format!("serialize revocation store: {e}"),
         })?;
 
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
+        // Exclusive, per-save-unique staging named after the FULL filename
+        // (owner-only on Unix), never `with_extension`: that collapsed e.g.
+        // `x.json` and `x.pins` onto one `x.tmp.<pid>` shared across
+        // independently-locked stores (PSTORE-03). See `crate::store_file`.
+        let (tmp, mut f) = crate::store_file::create_staging(path).map_err(io)?;
+        let written = {
             use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(&tmp).map_err(io)?;
-            f.write_all(&bytes).map_err(io)?;
-            f.flush().map_err(io)?;
-            f.sync_all().map_err(io)?;
+            f.write_all(&bytes)
+                .and_then(|()| f.flush())
+                .and_then(|()| f.sync_all())
+        };
+        drop(f);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
         }
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             io(e)
         })?;
 
-        // Durability (POSIX): `rename()` only updates the directory entry in
-        // memory; without fsyncing the parent directory a crash can revert to
-        // the old file, silently losing the just-persisted revocation (BUG #93,
-        // mirrors `redex/disk.rs`). Best-effort — a dir-fsync failure doesn't
-        // undo the completed rename, and Windows needs no directory fsync.
-        #[cfg(unix)]
-        {
-            let dir = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            if let Ok(dirf) = std::fs::File::open(dir) {
-                let _ = dirf.sync_all();
+        // Durability (CONSENT-02, as the pin store): the rename is reported
+        // committed only once it is on stable storage. POSIX `rename()`
+        // updates the directory entry in memory; a crash before the parent
+        // directory is fsynced can revert to the old file, silently undoing an
+        // update the caller was told succeeded. Elsewhere the renamed file
+        // itself is reopened and flushed. A failed barrier is an error: the
+        // new contents are in place but may not survive a crash, and saving
+        // again is safe.
+        crate::store_file::durability_barrier(path).map_err(|e| {
+            RevocationStoreError::NotDurable {
+                path: path.display().to_string(),
+                reason: e.to_string(),
             }
-        }
+        })?;
         Ok(())
     }
 }
@@ -357,6 +366,30 @@ fn decode_entity_hex(s: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A revocation whose durability barrier failed was still published:
+    /// the error says so (`NotDurable`, not `Io`), and every reader already
+    /// sees the floor.
+    #[test]
+    fn a_failed_barrier_is_reported_as_published_not_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.json");
+        let device = crate::Identity::generate();
+        {
+            let _fail = crate::store_file::fail_durability_barrier_for_test();
+            assert!(matches!(
+                RevocationStore::revoke_subject(&path, device.entity_id()),
+                Err(RevocationStoreError::NotDurable { .. })
+            ));
+        }
+        assert_eq!(
+            RevocationStore::load(&path)
+                .unwrap()
+                .floor(device.entity_id()),
+            REVOKED_SUBJECT_FLOOR,
+            "the floor is in place"
+        );
+    }
     use crate::Identity;
 
     #[test]

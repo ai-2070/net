@@ -297,6 +297,12 @@ pub fn answer_subnet_redeem(
 /// holds the certificates the operator signed at approval; a channel-only
 /// link needs a grant in `channels` covering its offer. The caller must
 /// additionally refuse a subject its own floors removed.
+///
+/// `now` is when the request arrived; it judges the request's freshness. The
+/// ledger claim and the final issuance are judged against the later of `now`
+/// and the wall clock read once the ledger lock is held and again after the
+/// credentials are prepared, so an invitation cannot first issue after its
+/// expiry because the caller's sample went stale while waiting.
 #[allow(clippy::too_many_arguments)]
 pub fn answer_standalone_redeem(
     request_bytes: &[u8],
@@ -341,6 +347,13 @@ pub fn answer_standalone_redeem(
     let claimant = intent.claimant();
     let id = invite.invitation_id();
     let mut ledger = ledger.lock();
+    // ENR-03: `now` was sampled by the caller when the request arrived — it
+    // still judges the request's freshness above — but this thread may then
+    // have waited for the ledger lock. The ledger transitions are judged
+    // against the clock as of now (never earlier than `now`), so neither the
+    // lock wait nor credential preparation below can stretch the
+    // invitation's first-issuance window.
+    let claim_now = now.max(super::now_unix());
     if ledger.issuer() != invite.issuer() {
         return Err(Refusal::Invalid);
     }
@@ -349,20 +362,17 @@ pub fn answer_standalone_redeem(
     }
     // What this link delivers, now: fresh subnet credentials, or the
     // certificate the operator approved for exactly this claim.
-    let deliver = || -> Result<SubnetRedeemReply, Refusal> {
+    let deliver = |at: u64| -> Result<SubnetRedeemReply, Refusal> {
         if let Some(offer) = invite.channel() {
-            let chain = channels
-                .iter()
-                .find(|issuer| issuer.covers(offer))
-                .ok_or(Refusal::Unavailable)?
-                .issue(&request.subject, offer.rights)
-                .map_err(|_| Refusal::Unavailable)?;
+            // CISS-01: skip covering grants that cannot issue now.
+            let chain = crate::channel_issuer::issue_covering(channels, offer, &request.subject)
+                .ok_or(Refusal::Unavailable)?;
             return Ok(SubnetRedeemReply::ChannelIssued(chain.to_bytes()));
         }
         if let Some(offer) = invite.subnet() {
             let issuer = subnet.ok_or(Refusal::Unavailable)?;
             return issuer
-                .issue(offer, &request.subject, now)
+                .issue(offer, &request.subject, at)
                 .map(|set| SubnetRedeemReply::Issued(Box::new(set)));
         }
         let offer = invite.org().ok_or(Refusal::Invalid)?;
@@ -381,20 +391,23 @@ pub fn answer_standalone_redeem(
         })
     };
     match ledger
-        .claim(&id, &claimant, now)
+        .claim(&id, &claimant, claim_now)
         .map_err(super::service::refusal)?
     {
         ClaimOutcome::PendingApproval => Ok(SubnetRedeemReply::PendingApproval),
         ClaimOutcome::Ready => {
-            let reply = deliver()?;
+            let reply = deliver(claim_now)?;
             let payload = match &reply {
                 SubnetRedeemReply::Issued(set) => set.to_bytes(),
                 SubnetRedeemReply::OrgIssued { cert, .. } => cert.to_bytes(),
                 SubnetRedeemReply::ChannelIssued(chain) => chain.clone(),
                 SubnetRedeemReply::PendingApproval => return Err(Refusal::Unavailable),
             };
+            // ENR-03: resample after the credentials were prepared — the
+            // final authorization is judged at the moment it is committed.
+            let issue_now = claim_now.max(super::now_unix());
             ledger
-                .issue(&id, &claimant, &payload, now)
+                .issue(&id, &claimant, &payload, issue_now)
                 .map_err(super::service::refusal)?;
             Ok(reply)
         }
@@ -407,7 +420,7 @@ pub fn answer_standalone_redeem(
         // exactly the chain committed at issuance (one link, one chain).
         ClaimOutcome::AlreadyIssued(_) if invite.channel().is_some() => {
             let recovered = ledger
-                .recover(&id, &claimant, now)
+                .recover(&id, &claimant, claim_now)
                 .map_err(super::service::refusal)?;
             net::adapter::net::identity::TokenChain::from_bytes(&recovered.payload)
                 .map(|_| SubnetRedeemReply::ChannelIssued(recovered.payload.clone()))
@@ -415,7 +428,7 @@ pub fn answer_standalone_redeem(
         }
         ClaimOutcome::AlreadyIssued(_) => {
             drop(ledger);
-            deliver()
+            deliver(claim_now)
         }
     }
 }

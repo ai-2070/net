@@ -168,6 +168,7 @@ class MeshNode:
         try_port_mapping: Optional[bool] = None,
         auto_direct_upgrade: Optional[bool] = None,
         permissive_channels: Optional[bool] = None,
+        noise_static_key: Optional[bytes] = None,
     ) -> None:
         """Construct a mesh node. Every keyword is forwarded unchanged to
         the native ``NetMesh`` constructor, which validates it.
@@ -187,6 +188,10 @@ class MeshNode:
           turns channel authorization off for **every** channel on this
           node: any peer may subscribe to any channel. Test-only; nRPC and
           the tool surface work with the strict default.
+        - ``noise_static_key``: a 32-byte Noise private key you store, to
+          keep ``public_key`` (and so this node's rendezvous address) stable
+          across restarts independently of the identity. Unset, a node
+          given ``identity_seed`` derives it from the seed — already stable.
 
         ``tests/test_sdk_mesh_ctor_parity.py`` (in the binding's test
         suite) fails if this signature drifts from the native one.
@@ -216,6 +221,7 @@ class MeshNode:
             subnet_attachment=subnet_attachment,
             subnet_control_channel=subnet_control_channel,
             subnet_exports=subnet_exports,
+            noise_static_key=noise_static_key,
         )
 
     def serve_subnet_exported(
@@ -658,6 +664,14 @@ class MeshNode:
         ``OperatorEnrollment.invite``."""
         return self._native.rendezvous_string()
 
+    def ensure_attached(self, rendezvous: str) -> None:
+        """Make sure there is a working session to the node ``rendezvous``
+        names, re-dialing it only when needed — call it when a paired
+        machine may have restarted, on either side. After a restart the far
+        side can take up to three heartbeat intervals to accept;
+        :meth:`renew` already does this."""
+        self._native.ensure_attached(rendezvous)
+
     def serve_enrollment_auto(
         self,
         operator: Any,
@@ -665,7 +679,9 @@ class MeshNode:
         max_depth: Optional[int] = None,
     ) -> Any:
         """Operator side: serve device enrollment (join + renew) on this
-        node; the invite is the authorization. Hold the returned handle."""
+        node; the invite is the authorization. The services stay up until
+        the returned handle's ``stop()`` or :meth:`shutdown`, whether or not
+        the handle is kept."""
         kwargs = _set_only(max_depth=max_depth)
         return self._native.serve_enrollment_auto(operator, grant_ttl_seconds, **kwargs)
 
@@ -680,7 +696,8 @@ class MeshNode:
         """Operator side, approver-gated: each valid join request is passed
         to ``approver(request)`` (sync or async) and admitted only on an
         explicit ``True``; a denial does not burn the invite. Safer than
-        :meth:`serve_enrollment_auto`. Hold the returned handle."""
+        :meth:`serve_enrollment_auto`. The service stays up until the
+        returned handle's ``stop()`` or :meth:`shutdown`."""
         kwargs = _set_only(max_depth=max_depth, approve_timeout_ms=approve_timeout_ms)
         return self._native.serve_enrollment(operator, approver, grant_ttl_seconds, **kwargs)
 

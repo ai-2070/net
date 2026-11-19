@@ -19,10 +19,21 @@ the plugin with only ``plugins.enabled: [net]`` and a few vars:
                                identity; when set, the node derives a
                                ``root -> machine -> gateway`` delegation chain
                                from it (Phase 3, see ``delegation.py``). Unset ⇒
-                               an un-delegated dev node.
-* ``NET_MESH_MACHINE_ID``    — stable per-machine label for the delegation
-                               namespace (default: hostname). Set it where the
-                               hostname isn't stable (containers).
+                               an un-delegated dev node. The root is authority
+                               only: the node does NOT run as it, but as a
+                               per-machine transport identity derived from it
+                               and the machine label
+                               (``delegation.transport_identity_seed``), so
+                               machines under one root are distinct mesh nodes.
+* ``NET_MESH_NODE_SEED``     — optional 32-byte hex seed the node runs as,
+                               overriding that derivation (e.g. to keep a
+                               node id other machines already pin). Must differ
+                               per machine.
+* ``NET_MESH_MACHINE_ID``    — stable, unique per-machine label for the
+                               delegation namespace and the node identity
+                               (default: a persistent random id stored next to
+                               the pin store). Set it where that file can't
+                               persist (containers).
 * ``NET_MESH_PIN_STORE``     — pin-store path; defaults to the machine-shared
                                file (``net_sdk.default_pin_store_path()``), the
                                same one ``net mcp pin`` uses.
@@ -81,7 +92,27 @@ def _config() -> dict:
         "peers": os.environ.get("NET_MESH_PEERS", "").strip(),
         "pin_store": (os.environ.get("NET_MESH_PIN_STORE") or "").strip() or None,
         "identity_seed": (os.environ.get("NET_MESH_IDENTITY_SEED") or "").strip() or None,
+        "node_seed": (os.environ.get("NET_MESH_NODE_SEED") or "").strip() or None,
     }
+
+
+def _parse_seed(raw: str, var: str) -> bytes:
+    """A 32-byte seed from 64 hex chars, or a ``RuntimeError`` naming ``var`` —
+    a bare ``ValueError`` would surface only as a generic "plugin unavailable"
+    (like the NET_MESH_PEERS guard, name the env var + format)."""
+    try:
+        seed = bytes.fromhex(raw)
+    except ValueError as e:
+        raise RuntimeError(
+            f"net plugin: {var} must be a 32-byte identity seed as 64 hex chars; "
+            f"got an unparseable value ({e})"
+        ) from e
+    if len(seed) != 32:
+        raise RuntimeError(
+            f"net plugin: {var} must be a 32-byte identity seed as 64 hex chars; "
+            f"got {len(seed)} bytes"
+        )
+    return seed
 
 
 def _build() -> Tuple[object, object, str, object]:
@@ -94,16 +125,36 @@ def _build() -> Tuple[object, object, str, object]:
     cfg = _config()
     seed = None
     if cfg["identity_seed"]:
-        try:
-            seed = bytes.fromhex(cfg["identity_seed"])
-        except ValueError as e:
-            # A malformed seed otherwise raises a bare `ValueError` that surfaces
-            # only as a generic "plugin unavailable" — name the env var + format
-            # so the misconfiguration is obvious (like the NET_MESH_PEERS guard).
+        seed = _parse_seed(cfg["identity_seed"], "NET_MESH_IDENTITY_SEED")
+    node_seed = None
+    if cfg["node_seed"]:
+        node_seed = _parse_seed(cfg["node_seed"], "NET_MESH_NODE_SEED")
+
+    # The root seed is operator AUTHORITY (it signs the delegation chain and
+    # device enrollments), never this node's transport identity: a mesh built
+    # from it takes the root's entity id — and so its node id — making every
+    # machine under one root the same mesh node (HERMES-02). One machine label
+    # is resolved here and shared by the node identity and the delegation, so
+    # the two always describe the same machine.
+    #
+    # The node's identity derives from the hostname-independent transport
+    # label (the persistent machine id or NET_MESH_MACHINE_ID), so renaming the
+    # host does not rotate it; the delegation keeps its host-prefixed label.
+    machine_label = None
+    transport_seed = node_seed
+    if seed is not None:
+        from .delegation import _machine_labels, transport_identity_seed
+
+        machine_label, transport_label = _machine_labels()
+        if transport_seed is None:
+            transport_seed = transport_identity_seed(seed, transport_label)
+        elif transport_seed == seed:
+            # Running the node AS the root makes every machine that does the
+            # same one mesh node (HERMES-02). A warning let it start anyway.
             raise RuntimeError(
-                "net plugin: NET_MESH_IDENTITY_SEED must be a 32-byte identity "
-                f"seed as 64 hex chars; got an unparseable value ({e})"
-            ) from e
+                "net plugin: NET_MESH_NODE_SEED must differ from "
+                "NET_MESH_IDENTITY_SEED; use a distinct per-machine node seed"
+            )
 
     # Phase 3 (Slice A): derive the `root -> machine -> gateway` delegation
     # chain from the root seed *before* touching the mesh, so an acquisition
@@ -117,7 +168,7 @@ def _build() -> Tuple[object, object, str, object]:
         try:
             from .delegation import GatewayDelegation
 
-            delegation = GatewayDelegation(seed)
+            delegation = GatewayDelegation(seed, machine_label=machine_label)
         except ImportError as e:
             logger.info(
                 "net plugin: delegation surface unavailable (%s); running un-delegated", e
@@ -129,7 +180,9 @@ def _build() -> Tuple[object, object, str, object]:
     # are dynamic per-caller-origin and can't be pre-registered. Capability
     # security is unaffected (owner-scope / consent / delegation gate at the
     # capability layer, not the channel layer).
-    mesh = NetMesh(cfg["bind_addr"], cfg["psk"], identity_seed=seed, permissive_channels=True)
+    mesh = NetMesh(
+        cfg["bind_addr"], cfg["psk"], identity_seed=transport_seed, permissive_channels=True
+    )
 
     if cfg["peers"]:
         try:

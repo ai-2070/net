@@ -431,7 +431,9 @@ pub unsafe extern "C" fn net_dir_manifest_read(
         Ok(Ok(b)) => b,
         Ok(Err(e)) => return blob_err_code(&e),
     };
-    let manifest: DirManifest = match postcard::from_bytes(&bytes) {
+    // The shared decoder, so inspection refuses exactly the schema
+    // versions `fetch_dir` refuses (GBLOB-02).
+    let manifest = match DirManifest::decode(&bytes) {
         Ok(m) => m,
         Err(_) => return NET_ERR_DIR_INVALID_MANIFEST,
     };

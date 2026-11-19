@@ -258,7 +258,14 @@ where
 /// registered for the lifetime of the `Mesh`; it's harmless when
 /// the registry is empty (returns `NotFound` for every request).
 #[cfg(feature = "cortex")]
+#[must_use = "dropping a ToolServeHandle unregisters the tool at once; \
+              bind it (`let _tool = ...`) for as long as the tool should be served"]
 pub struct ToolServeHandle {
+    /// A paid tool's published offer (`serve_tool_paid`), withdrawn on
+    /// drop. Declared first so it drops before `inner` releases the
+    /// handler: see `tool_payment::OfferWithdrawal`.
+    #[allow(dead_code)] // Held for Drop side effect.
+    offers: Option<crate::tool_payment::OfferWithdrawal>,
     /// Inner handle from `serve_rpc_typed`. Dropping it
     /// unregisters the nRPC handler.
     #[allow(dead_code)] // Held for Drop side effect.
@@ -377,6 +384,7 @@ impl Mesh {
         self.ensure_tool_watch_installed();
 
         Ok(ToolServeHandle {
+            offers: None,
             inner,
             registry,
             tool_id,
@@ -429,9 +437,9 @@ impl Mesh {
         Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
     {
         let tool_id = descriptor.tool_id.clone();
-        if descriptor.pricing_terms.is_none() {
+        let Some(terms) = descriptor.pricing_terms.clone() else {
             return Err(ServeError::MissingPricingTerms(tool_id));
-        }
+        };
         let registry = self.inner().tool_registry().clone();
 
         // Step 1: registry insert (atomic duplicate rejection,
@@ -440,6 +448,27 @@ impl Mesh {
         if !registry.try_insert(descriptor) {
             return Err(ServeError::AlreadyServing(tool_id));
         }
+
+        // Step 1b: the announced terms become the gate's quote authority:
+        // a provider signs quotes only on the price and recipient it
+        // publishes, never on a requester's template. A gate that cannot
+        // hold them cannot enforce this price. Published only once this
+        // registration owns the tool id — before it, a duplicate serve
+        // replaced the running tool's terms and then failed — and
+        // withdrawn on every rollback below and when the handle drops, so
+        // quote authority never outlives the handler.
+        if let Err(reason) = gate.publish_offer(&tool_id, &terms) {
+            registry.remove(&tool_id);
+            return Err(ServeError::CapabilityRefused(format!(
+                "paid tool `{tool_id}`: its payment gate refused the announced pricing \
+                 terms: {reason}"
+            )));
+        }
+        let mut offers = {
+            let gate = gate.clone();
+            crate::tool_payment::OfferWithdrawal::new(move |id| gate.withdraw_offer(id))
+        };
+        offers.published(tool_id.clone());
 
         // Step 2: the gated handler. Untyped registration — the payment
         // headers live on the RpcContext, which the typed path does not
@@ -457,6 +486,7 @@ impl Mesh {
         let inner = match self.serve_rpc(&tool_id, std::sync::Arc::new(paid)) {
             Ok(h) => h,
             Err(e) => {
+                drop(offers);
                 registry.remove(&tool_id);
                 return Err(e);
             }
@@ -468,6 +498,7 @@ impl Mesh {
         self.ensure_tool_watch_installed();
 
         Ok(ToolServeHandle {
+            offers: Some(offers),
             inner,
             registry,
             tool_id,
@@ -586,6 +617,7 @@ impl Mesh {
         self.ensure_tool_watch_installed();
 
         Ok(ToolServeHandle {
+            offers: None,
             inner,
             registry,
             tool_id,

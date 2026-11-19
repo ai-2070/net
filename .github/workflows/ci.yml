@@ -3148,6 +3148,10 @@ jobs:
       #     exact incarnation.
       #   - a_rejected_sdk_enrollment_leaves_the_session_provisional — the
       #     negative half; a refusal admits nothing.
+      #   - one_devices_join_body_promotes_only_that_devices_session —
+      #     ANCHOR-03: a game grant promotes only the session whose
+      #     participant it names; a replayed body on another session
+      #     is answered but promotes nothing.
       - name: SDK WebRTC enrollment
         if: ${{ !cancelled() }}
         run: |
@@ -3156,6 +3160,7 @@ jobs:
           REQUIRED="
             a_real_sdk_enrollment_promotes_the_exact_session
             a_rejected_sdk_enrollment_leaves_the_session_provisional
+            one_devices_join_body_promotes_only_that_devices_session
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features "$FEATURES" --test enrollment_over_rtc 2>&1) \
@@ -3167,7 +3172,7 @@ jobs:
                        -E "test(=$required)" 2>&1) \
               || { printf '%s\n' "$single"; echo "::error::$required did not run and pass as exactly one test"; exit 1; }
           done
-          echo "SDK RTC enrollment: both witnesses green"
+          echo "SDK RTC enrollment: all witnesses green"
 
       # === the bootstrap listener's witnesses ===================
       #
@@ -3236,6 +3241,9 @@ jobs:
             rtc_bootstrap_acme::tests::a_matching_common_name_cannot_override_a_wrong_san
             rtc_bootstrap_acme::tests::a_failed_publication_leaves_the_previous_pair_intact
             rtc_bootstrap_acme::tests::a_cached_pair_is_reused_only_when_it_qualifies
+            rtc_bootstrap_acme::tests::a_certificate_from_another_acme_directory_is_not_reused
+            rtc_bootstrap_acme::tests::a_fresh_cache_is_created_private_and_passes_its_check
+            rtc_bootstrap_acme::tests::a_cache_another_user_could_control_is_refused
           "
           out=$(cargo nextest run --color never --no-fail-fast --no-tests=fail \
                   --retries 0 --features rtc-bootstrap --lib 2>&1) \
@@ -3725,7 +3733,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -3901,7 +3909,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # `sdk-ts` resolves `@net-mesh/core` through a `file:` devDependency,
       # which carries no version — so a peerDependency range that excludes
@@ -4113,13 +4121,13 @@ jobs:
         run: python3 .github/scripts/check-python-wheel-features.py
 
       # Match `net/crates/net/rust-toolchain.toml` directly so the
-      # pinned 1.99.0 toolchain is installed up-front rather than
+      # pinned 1.100.0 toolchain is installed up-front rather than
       # auto-fetched mid-`maturin develop` by rustup (which has flaked
       # — partial download leaves `rustc` absent on the new toolchain).
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: clippy, rustfmt, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
@@ -4568,7 +4576,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -4732,7 +4740,7 @@ jobs:
           python3 .github/scripts/check-callback-buffer-ownership.py
 
       - name: Setup Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go/go.mod
 
@@ -5234,14 +5242,14 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go/go.mod
 
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       - name: Install Python
         uses: actions/setup-python@v7
@@ -5443,14 +5451,14 @@ jobs:
       # moved field offset, ...) and requires each to be reported.
       #
       # It also compares the headers, header by header, with the last
-      # release's (v0.45.1) and with the pinned fixtures in
+      # release's (v0.47.0) and with the pinned fixtures in
       # tests/c_abi/fixtures/. A removed or changed declaration fails unless
       # tests/c_abi/breaks.toml authorizes exactly that change. The checkout
       # is shallow and tagless, so the release tag is fetched first.
       - name: Guard — headers, exports and Rust definitions agree (C1 audit)
         if: runner.os == 'Linux'
         run: |
-          git fetch --no-tags --depth=1 origin +refs/tags/v0.45.1:refs/tags/v0.45.1
+          git fetch --no-tags --depth=1 origin +refs/tags/v0.47.0:refs/tags/v0.47.0
           "$PY" -m pip install --quiet pycparser
           "$PY" .github/scripts/check-c-abi.py --self-test
           "$PY" .github/scripts/check-c-abi.py --bundle "$PROD_BUNDLE"
@@ -6245,7 +6253,7 @@ jobs:
       - name: Install Node + TypeScript
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
       - name: Install tsc
         run: npm install -g typescript@6
 
@@ -6566,6 +6574,17 @@ jobs:
           cargo nextest run --features net --lib --no-tests=fail
           -E 'test(/^adapter::net::behavior::enrollment_storage::/)'
 
+      # The mesh UDP port is exclusive. On Windows that rests on
+      # `SO_EXCLUSIVEADDRUSE` (`#[cfg(windows)]` in `transport.rs`), which no
+      # ubuntu job compiles: without it a second process — or any socket
+      # asking for SO_REUSEADDR — bound the node's port without an error and
+      # split its traffic. Solo filter for the same reason as the step above.
+      - name: Exclusive mesh port unit test
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --features net --lib --no-tests=fail
+          -E 'test(=adapter::net::transport::tests::a_bound_mesh_port_cannot_be_shared)'
+
       # The CLI's Windows witnesses: the DACL warning on `--discover`, and the
       # case-variant no-clobber guard (NTFS is case-insensitive, so a
       # case-variant `--out` names the SAME file as the org key — the exact
@@ -6768,9 +6787,9 @@ jobs:
       # `targets:` on the toolchain action installs into the
       # **stable** installation, but every cargo command below runs
       # under `net/crates/net`, where `rust-toolchain.toml` pins
-      # 1.99.0 — a separate installation with its own target set. The
+      # 1.100.0 — a separate installation with its own target set. The
       # first candidate installed the target on stable and then asked
-      # 1.99.0 to build for it: `E0463: can't find crate for 'core'`.
+      # 1.100.0 to build for it: `E0463: can't find crate for 'core'`.
       # Install the toolchain the commands actually select, then add
       # the target FROM the pinned directory so rustup resolves the
       # same override file cargo does.
@@ -7050,7 +7069,7 @@ jobs:
             --floor rtc_classifier=2 \
             --floor rtc_admission_probes=11 \
             --floor rtc_signalling=14 \
-            --floor rtc_admission=26 \
+            --floor rtc_admission=28 \
             --floor rtc_anchor_registry=2 \
             --floor rtc_proxy_boundary=2 \
             --floor natsim_browser=49 \
@@ -7075,6 +7094,7 @@ jobs:
           rtc_dual_stack:the_ipv6_stun_endpoint_answers_on_its_own_socket
           rtc_admission:an_outcome_that_only_looks_admitted_promotes_nothing
           rtc_admission:a_claimant_is_not_promoted_by_another_peers_enrollment
+          rtc_admission:an_admitted_outcome_refused_at_the_tenant_cap_reaches_the_client_as_a_refusal
           rtc_repairs:scheduled_fire_and_forget_packets_reach_rtc_admission_and_the_peer
           rtc_repairs:the_scheduler_drain_counts_what_it_drops_under_pressure
           rtc_repairs:rtc_admission_pressure_is_retryable_backpressure_not_a_transport_error
@@ -7264,11 +7284,11 @@ jobs:
           workspaces: net/crates/net/leaf -> target
 
       # The bindgen CLI version must EQUAL the crate version the leaf
-      # pins (`wasm-bindgen = "=0.2.129"`).
-      - name: Install wasm-bindgen-cli 0.2.129
+      # pins (`wasm-bindgen = "=0.2.130"`).
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       # `wasm-bindgen-test-runner` drives a real browser over
       # WebDriver, and chromedriver refuses a Chrome whose major
@@ -7705,10 +7725,10 @@ jobs:
         with:
           shared-key: leaf-wasm
           workspaces: net/crates/net/leaf -> target
-      - name: Install wasm-bindgen-cli 0.2.129
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       # The size assertion is about the bundle a page downloads, so
       # the wasm has to be the real one, built here.
@@ -7721,7 +7741,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # `npm install`, not `npm ci`: the repo ignores package-lock.json,
       # so there is no committed lockfile (same as sdk-ts).
@@ -7867,7 +7887,7 @@ jobs:
       # `targets:` on the toolchain action, and a bare `rustup
       # target add` from the repo root, install into the STABLE
       # installation — but every cargo command here runs under
-      # `net/crates/net`, whose `rust-toolchain.toml` pins 1.99.0,
+      # `net/crates/net`, whose `rust-toolchain.toml` pins 1.100.0,
       # a separate installation with its own target set. The
       # candidate hit exactly that: `E0463: can't find crate for
       # 'core'` when building the leaf bundle. Add the target FROM
@@ -7932,7 +7952,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # The first half of the runner drives `@net-mesh/browser`
       # over the real leaf bundle; both are built here so a witness
@@ -7948,12 +7968,12 @@ jobs:
         run: sudo apt-get install -y nftables
 
       # The bindgen CLI version must EQUAL the crate version the leaf
-      # pins (`wasm-bindgen = "=0.2.129"`); a mismatch is a hard error
+      # pins (`wasm-bindgen = "=0.2.130"`); a mismatch is a hard error
       # at bindgen time, which is exactly what we want it to be.
-      - name: Install wasm-bindgen-cli 0.2.129
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       - name: Build the leaf bundle and @net-mesh/browser
         run: |
@@ -8371,12 +8391,12 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
-      - name: Install wasm-bindgen-cli 0.2.129
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       # Exactly what the browser matrix builds, plus the demo's own
       # deps: the page loads the real bundle, so a stale artefact
@@ -8513,12 +8533,12 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
-      - name: Install wasm-bindgen-cli 0.2.129
+      - name: Install wasm-bindgen-cli 0.2.130
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.129
+          tool: wasm-bindgen-cli@0.2.130
 
       # The anchor is the CLI a deployment runs, built with the feature
       # that carries `anchor serve`; the page loads the real bundle.

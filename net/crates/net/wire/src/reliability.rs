@@ -126,6 +126,22 @@ pub struct RetransmitDescriptor {
     /// unfragmented packet (which is every packet no fragmenting
     /// producer built).
     pub fragment: Option<FragmentStamp>,
+    /// Header routing fields to restamp on a rebuild, or `None` for a
+    /// packet built without them (every stream-path packet). The publish
+    /// path stamps the channel and origin hashes the receiver routes on;
+    /// a resend without them reaches the peer unroutable — dropped as
+    /// surely as the lost original.
+    pub header: Option<HeaderStamp>,
+}
+
+/// Header routing fields a rebuilt packet must carry again
+/// ([`RetransmitDescriptor::header`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderStamp {
+    /// Wire `channel_hash` (the 16-bit fast-path view).
+    pub channel_hash: u16,
+    /// Wire `origin_hash`.
+    pub origin_hash: u64,
 }
 
 /// Trait for reliability mode implementations.
@@ -200,6 +216,15 @@ pub trait ReliabilityMode: Send + Sync {
     fn take_failed(&mut self) -> bool {
         false
     }
+
+    /// The SENDER is giving up on this stream on purpose — the
+    /// application stopped mid-send (e.g. a blob holder that could not
+    /// push the rest of a chunk). Raises the same flag a retransmit
+    /// give-up does, so the next retransmit tick tells the peer with a
+    /// `StreamReset` and its pending read fails now instead of waiting
+    /// out a timeout. Default no-op: fire-and-forget never promised
+    /// delivery, so there is nothing to retract.
+    fn abandon_send(&mut self) {}
 
     /// The receiver's cumulative ack — the lowest sequence not yet
     /// contiguously received (`next_expected`). The peer piggybacks this
@@ -1373,6 +1398,10 @@ impl ReliabilityMode for ReliableStream {
         std::mem::take(&mut self.failed)
     }
 
+    fn abandon_send(&mut self) {
+        self.failed = true;
+    }
+
     #[inline]
     fn take_gap_opened(&mut self) -> bool {
         std::mem::take(&mut self.gap_opened)
@@ -1675,6 +1704,7 @@ mod tests {
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         })
     }
 
@@ -2749,6 +2779,7 @@ mod tests {
             events: events_a.clone(),
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         }));
         mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 1,
@@ -2756,6 +2787,7 @@ mod tests {
             events: events_b.clone(),
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         }));
         mode.on_send(Arc::new(RetransmitDescriptor {
             seq: 2,
@@ -2763,6 +2795,7 @@ mod tests {
             events: events_c.clone(),
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         }));
 
         // NACK seq=1.
@@ -2824,6 +2857,7 @@ mod tests {
             events: vec![Bytes::from_static(b"event-A")],
             flags: PacketFlags::RELIABLE,
             fragment: None,
+            header: None,
         });
         let original_ptr = Arc::as_ptr(&original);
         mode.on_send(Arc::clone(&original));

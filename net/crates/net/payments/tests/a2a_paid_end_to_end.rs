@@ -191,6 +191,17 @@ impl TaskAdmissionGate for CountingGate {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.redeem(claim).await
     }
+
+    // A wrapper forwards the publication too, or the engine never learns
+    // the catalog's price and the quote wire refuses every prepare
+    // (PAY-01: quotes are issued only on published terms).
+    fn publish_offer(&self, tool_id: &str, pricing_terms: &str) -> Result<(), String> {
+        self.inner.publish_offer(tool_id, pricing_terms)
+    }
+
+    fn withdraw_offer(&self, tool_id: &str) {
+        self.inner.withdraw_offer(tool_id)
+    }
 }
 
 /// What the next pay call over the wire does.

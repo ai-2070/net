@@ -360,7 +360,9 @@ pub struct SubnetRollup {
     pub is_local: bool,
 }
 
-/// One RTC anchor, as [`DeckClient::rtc_anchors`] reports it.
+/// One RTC anchor, as `DeckClient::rtc_anchors` reports it (that
+/// method needs the `webrtc` feature; this row type does not, so it is
+/// not an intra-doc link).
 ///
 /// A row exists only for a peer whose own signed announcement
 /// carries the `rtc-anchor` tag; the two address fields are the ones
@@ -1972,10 +1974,7 @@ impl<'a> AuditQuery<'a> {
                         return false;
                     }
                 }
-                if self.force_only && !r.event.is_ice() {
-                    return false;
-                }
-                true
+                !self.force_only || r.event.is_ice()
             })
             .cloned()
             .collect();
@@ -2034,10 +2033,7 @@ impl AuditFilter {
                 return false;
             }
         }
-        if self.force_only && !record.event.is_ice() {
-            return false;
-        }
-        true
+        !self.force_only || record.event.is_ice()
     }
 }
 

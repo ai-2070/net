@@ -76,8 +76,11 @@ mod net;
 // records behind `consent`. See the module docs for the two rules
 // (no model self-approval; cross-process lock on every mutation).
 pub mod pins;
+// Exclusive, full-filename staging shared by the machine-shared stores'
+// atomic temp+rename publication (pins, devices, revocation).
 #[cfg(feature = "redis")]
 pub mod redis_dedup;
+mod store_file;
 pub mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;

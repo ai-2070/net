@@ -339,9 +339,10 @@ pub(crate) type SharedRegistration = Arc<Mutex<Option<(SdkMesh, Registered)>>>;
 /// retire any registration that is still alive.
 pub(crate) type WeakRegistration = std::sync::Weak<Mutex<Option<(SdkMesh, Registered)>>>;
 
-/// Keeps the served A2A services alive (returned by `NetMesh.serveA2a` or
-/// `PaymentProvider.serveA2aConfigured`). Dropping it or calling
-/// [`stop`](Self::stop) unregisters them.
+/// The served A2A services (returned by `NetMesh.serveA2a` or
+/// `PaymentProvider.serveA2aConfigured`). They are owned by the node: they
+/// stay up until [`stop`](Self::stop) or the mesh's `shutdown()`, whether
+/// or not this handle is kept referenced.
 // `js_name` pinned: napi's auto-camelCase would emit `A2AServeHandle` /
 // `serveA2A`; the plan + Python parity spell the surface `A2aServeHandle`
 // / `serveA2a`.
@@ -353,12 +354,20 @@ pub struct A2aServeHandle {
     // is GC-finalized, not scope-dropped, so `stop()` is the deterministic
     // release (the `close()` gotcha in `bindings.md`).
     inner: SharedRegistration,
+    /// The node's hold on the services (`keepalive`): they stay up until
+    /// `stop()` or the mesh's `shutdown()`, not until V8 finalizes this
+    /// wrapper.
+    registration: crate::keepalive::Registration,
 }
 
 impl A2aServeHandle {
     pub(crate) fn new(mesh: SdkMesh, registered: Registered) -> Self {
+        let node = Arc::clone(mesh.node());
+        let inner = Arc::new(Mutex::new(Some((mesh, registered))));
+        let registration = crate::keepalive::hold(&node, &inner, None);
         Self {
-            inner: Arc::new(Mutex::new(Some((mesh, registered)))),
+            inner,
+            registration,
         }
     }
 
@@ -382,7 +391,9 @@ impl A2aServeHandle {
     /// work.
     #[napi]
     pub fn stop(&self) {
-        let _ = self.inner.lock().take();
+        let taken = self.inner.lock().take();
+        drop(taken);
+        self.registration.forget();
     }
 
     /// Whether the services are still registered.

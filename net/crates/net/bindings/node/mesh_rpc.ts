@@ -469,12 +469,23 @@ export interface RawDuplexStream {
 }
 
 /**
- * Raw napi `JsResponseSink` — outbound side surfaced to duplex
- * server handlers. Non-async (try_send under the hood; drops on
- * mpsc overflow). Returns `false` if the sink has been closed.
+ * Raw napi `JsResponseSink` — outbound side surfaced to streaming and
+ * duplex server handlers.
+ *
+ * - `send` never waits: `true` if the chunk was queued, `false` if it
+ *   was dropped (the per-call queue is full, or the call is gone).
+ * - `sendWait` waits for queue room instead of dropping; it resolves
+ *   `false` only once the call is gone. Use it when every chunk must
+ *   arrive.
+ *
+ * Both copy `body` at the call, so the Buffer may be reused as soon as
+ * `send` returns (or `sendWait` is called): a queued chunk is a snapshot,
+ * not a view of the caller's memory. The upload `send`s of the
+ * client-stream and duplex calls copy the same way.
  */
 export interface RawResponseSink {
   send(body: Buffer): boolean
+  sendWait(body: Buffer): Promise<boolean>
 }
 
 /** Raw napi `RpcStream` — minimal shape consumed by `TypedRpcStream`. */
@@ -953,8 +964,16 @@ export class TypedMeshRpc {
     // Normalize the napi POD's flat `statusKind` / `statusMessage`
     // into the TS-idiomatic tagged `RpcCallStatus` discriminator
     // before reaching user code.
+    //
+    // Isolated (NCALL-03): the observer is telemetry, dispatched from a
+    // native threadsafe function. A synchronous throw escaping into it
+    // becomes `napi_fatal_exception` — an `uncaughtException` that ends
+    // the process by default — and an `async` observer's rejected
+    // Promise became an unhandled rejection, which ends it too under
+    // `--unhandled-rejections=throw`. Both now go to a non-throwing
+    // process warning instead.
     this._raw.setObserver((raw: RawRpcCallEvent) => {
-      handler(rawEventToTyped(raw))
+      callObserverIsolated(() => handler(rawEventToTyped(raw)))
     })
   }
 
@@ -1593,17 +1612,18 @@ export class TypedDuplexStream<Resp = unknown>
 }
 
 /**
- * Typed outbound response sink for duplex server handlers.
- * Non-async — mirrors `RawResponseSink.send`. Returns `true`
- * when the chunk was enqueued; `false` if the underlying sink
- * is closed. Encode failure throws `nrpc:codec_encode:` and the
- * chunk is NOT sent.
+ * Typed outbound response sink for streaming and duplex server
+ * handlers. Encode failure throws `nrpc:codec_encode:` and the chunk is
+ * NOT sent.
  *
- * Flow control: the underlying sink `try_send`s into a bounded
- * 1024-chunk mpsc; bursts past the credit window are dropped
- * (counted by `streaming_chunks_dropped_total`). Pace your
- * `send` calls via REQUEST_GRANT cadence for lossless flow
- * control.
+ * Two ways to emit:
+ * - `send(value)` never waits. The per-call queue holds 1024 chunks; a
+ *   handler that outruns its caller fills it, and `send` then DROPS
+ *   the chunk and returns `false` (counted by
+ *   `streaming_chunks_dropped_total`).
+ * - `await sendWait(value)` waits for room instead, so nothing is
+ *   dropped and the handler runs at the caller's pace. Resolves
+ *   `false` once the call is gone.
  */
 export class TypedResponseSink<Resp = unknown> {
   private readonly _raw: RawResponseSink
@@ -1618,13 +1638,24 @@ export class TypedResponseSink<Resp = unknown> {
   }
 
   /**
-   * Encode + emit one response chunk. Returns `true` on
-   * successful enqueue; `false` if the sink has been closed.
-   * Throws `nrpc:codec_encode:` on encoding failure.
+   * Encode + emit one response chunk without waiting. Returns `true`
+   * if it was queued, `false` if it was dropped (queue full, or the
+   * call is gone). Throws `nrpc:codec_encode:` on encoding failure.
    */
   send(value: Resp): boolean {
     const buf = jsonEncode(value)
     return this._raw.send(buf)
+  }
+
+  /**
+   * Encode + emit one response chunk, waiting for queue room instead
+   * of dropping. Resolves `true` once queued, `false` if the call is
+   * gone (stop producing). Throws `nrpc:codec_encode:` on encoding
+   * failure.
+   */
+  sendWait(value: Resp): Promise<boolean> {
+    const buf = jsonEncode(value)
+    return this._raw.sendWait(buf)
   }
 }
 
@@ -2252,5 +2283,92 @@ export function rawEventToTyped(raw: RawRpcCallEvent): RpcCallEvent {
     responseBytes: raw.responseBytes,
     direction: raw.direction,
     tsUnixMs: raw.tsUnixMs,
+  }
+}
+
+/**
+ * Default sink for a failing `TypedMeshRpc.setObserver` handler: a
+ * process warning, never an exception escaping into the native
+ * observer dispatch (NCALL-03). Mirrors the SDK's stream-handler sink.
+ *
+ * @internal
+ */
+export function reportObserverError(error: unknown): void {
+  let message: string
+  try {
+    message =
+      error instanceof Error ? (error.stack ?? error.message) : String(error)
+  } catch {
+    // `String(error)` runs user code (`toString`, `Symbol.toPrimitive`)
+    // and can itself throw — or be a symbol-less object with none.
+    message = '<unprintable observer error>'
+  }
+  try {
+    process.emitWarning(`rpc observer threw: ${message}`, 'NetRpcObserverError')
+  } catch {
+    // A sink that cannot report must still not throw.
+  }
+}
+
+/** Swallow a rejection of `value` if it is a thenable; ignore anything else. */
+function consumeRejection(value: unknown): void {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return
+  try {
+    const then = (value as { then?: unknown }).then
+    if (typeof then === 'function') {
+      then.call(value, undefined, () => {
+        // Deliberately ignored: the error sink itself failed.
+      })
+    }
+  } catch {
+    // A throwing `then` getter on the sink's result is ignored too.
+  }
+}
+
+/**
+ * Run an observer so that neither a synchronous throw nor a rejected
+ * Promise escapes: both go to {@link reportObserverError}. Same shape
+ * as the SDK's `callIsolated` (`sdk-ts/src/_internal.ts`) — this
+ * package cannot import the SDK, which depends on it.
+ *
+ * @internal
+ */
+export function callObserverIsolated(
+  run: () => unknown,
+  onError: (error: unknown) => unknown = reportObserverError,
+): void {
+  const report = (error: unknown): void => {
+    let sunk: unknown
+    try {
+      sunk = onError(error)
+    } catch {
+      // An onError that itself throws must not escape either.
+      return
+    }
+    // An `async` onError that rejects must not escape as an unhandled
+    // rejection either, as in the SDK's `callIsolated`.
+    consumeRejection(sunk)
+  }
+  let result: unknown
+  try {
+    result = run()
+  } catch (error) {
+    report(error)
+    return
+  }
+  if (
+    result !== null &&
+    (typeof result === 'object' || typeof result === 'function')
+  ) {
+    try {
+      // The `then` read is inside the try: a thenable whose `then`
+      // getter throws must be reported, not escape.
+      const then = (result as { then?: unknown }).then
+      if (typeof then === 'function') {
+        then.call(result, undefined, report)
+      }
+    } catch (error) {
+      report(error)
+    }
   }
 }

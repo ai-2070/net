@@ -288,3 +288,95 @@ fn cap_announce_normalizes_whitespace_across_allow_list_parsers() {
         vec![CapabilityGroupId::from_tag(&format!("group:{}", group_padded.trim())).unwrap()]
     );
 }
+
+// ===========================================================================
+// CLI-05 — `--out` must never truncate the signing identity (or any seed).
+// ===========================================================================
+
+fn announce_to(key: &std::path::Path, out: &std::path::Path) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["cap", "announce"])
+        .arg("--key")
+        .arg(key)
+        .args(["--tag", "nrpc:echo"])
+        .arg("--out")
+        .arg(out)
+        .assert()
+}
+
+/// The audit's exact trigger: `cap announce --key ID --out ID` used to
+/// truncate the private seed with the announcement bytes and exit 0.
+#[test]
+fn cap_announce_refuses_out_naming_its_signing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    let before = std::fs::read(&key_path).unwrap();
+
+    let assert = announce_to(&key_path, &key_path).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("--key and --out"),
+        "the refusal must name the aliased flags; got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&key_path).unwrap(),
+        before,
+        "the signing seed was overwritten"
+    );
+}
+
+/// A hard link to the seed slips past any path comparison; the old
+/// `tokio::fs::write` truncated the shared inode through it. The content
+/// guard refuses it.
+#[test]
+fn cap_announce_refuses_out_hard_linked_to_a_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    let before = std::fs::read(&key_path).unwrap();
+    let alias = dir.path().join("announcement.json");
+    std::fs::hard_link(&key_path, &alias).unwrap();
+
+    let assert = announce_to(&key_path, &alias).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("operator identity key material"),
+        "the refusal must name what it found; got: {stderr}"
+    );
+    assert_eq!(std::fs::read(&key_path).unwrap(), before);
+    assert_eq!(std::fs::read(&alias).unwrap(), before);
+}
+
+/// A symlink `--out` pointing at the seed: the old write followed it.
+#[cfg(unix)]
+#[test]
+fn cap_announce_refuses_out_symlinked_to_a_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    let before = std::fs::read(&key_path).unwrap();
+    let alias = dir.path().join("announcement.json");
+    std::os::unix::fs::symlink(&key_path, &alias).unwrap();
+
+    announce_to(&key_path, &alias).failure();
+    assert_eq!(std::fs::read(&key_path).unwrap(), before);
+}
+
+/// Positive control: re-announcing to the same `--out` still replaces the
+/// older announcement (there is no `--force`; that is the existing contract),
+/// and no staging temp is left behind.
+#[test]
+fn cap_announce_still_replaces_an_older_announcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = generate_identity(&dir);
+    let out_path = dir.path().join("announcement.json");
+    std::fs::write(&out_path, b"stale").unwrap();
+
+    announce_to(&key_path, &out_path).success();
+    let bytes = std::fs::read(&out_path).unwrap();
+    CapabilityAnnouncement::from_bytes(&bytes).expect("decode replaced announcement");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "staging residue left behind: {names:?}");
+}

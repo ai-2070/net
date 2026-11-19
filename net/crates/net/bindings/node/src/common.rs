@@ -96,6 +96,76 @@ pub(crate) fn validate_whole_in_u32(
     Ok(value as u64)
 }
 
+/// A JS `Buffer` argument, copied into Rust-owned memory while the
+/// arguments are converted.
+///
+/// A napi [`Buffer`] is a reference plus a raw pointer into the live JS
+/// backing store. An `async fn` binding runs its whole body, first line
+/// included, on a tokio worker after the Promise has been handed back,
+/// so a body that copied its `Buffer` there read JS memory off the JS
+/// thread: it raced the caller rewriting the Buffer after the call
+/// returned, and could send, store or hash bytes the caller never
+/// passed (NCALL-01's residual class). napi converts an async
+/// function's arguments on the JS thread, before it spawns the body, so
+/// taking the copy in [`FromNapiValue`] snapshots exactly the bytes the
+/// caller passed.
+///
+/// Each use declares `#[napi(ts_arg_type = "Buffer")]` so the generated
+/// TypeScript signature is unchanged.
+pub struct JsBytes(Vec<u8>);
+
+impl JsBytes {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub(crate) fn into_bytes(self) -> bytes::Bytes {
+        bytes::Bytes::from(self.0)
+    }
+}
+
+impl std::ops::Deref for JsBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for JsBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TypeName for JsBytes {
+    fn type_name() -> &'static str {
+        "Buffer"
+    }
+
+    fn value_type() -> ValueType {
+        ValueType::Object
+    }
+}
+
+impl ValidateNapiValue for JsBytes {
+    unsafe fn validate(env: sys::napi_env, napi_val: sys::napi_value) -> Result<sys::napi_value> {
+        // SAFETY: forwarded unchanged from napi's own argument
+        // validation, which supplies a live env and value.
+        unsafe { BufferSlice::validate(env, napi_val) }
+    }
+}
+
+impl FromNapiValue for JsBytes {
+    unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> Result<Self> {
+        // SAFETY: called by napi on the JS thread with a live env and
+        // value. The slice borrows the JS backing store only for the
+        // copy below, which completes before control returns to JS.
+        let slice = unsafe { BufferSlice::from_napi_value(env, napi_val) }?;
+        Ok(JsBytes(slice.to_vec()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression tests for [`validate_bigint_u64_parts`] — the

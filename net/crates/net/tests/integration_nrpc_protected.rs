@@ -1425,6 +1425,76 @@ async fn removing_a_provider_grant_refuses_the_cached_granted_envelope() {
     );
 }
 
+/// ORG-02 — a capability-grant REVOCATION withdraws DISCOVER at the provider.
+/// The revocation swaps no registry pointer and leaves the installed audience
+/// record in place, so before the fix the cached granted envelope kept shipping
+/// and every rebuild re-sealed it until the grant expired. Now the send path
+/// drops the revoked grant's envelope from the CACHED emission at once, and a
+/// rebuild no longer seals it — while an overlapping grant that is still in
+/// force keeps its own envelope (only the revoked grant/key boundary closes).
+#[tokio::test]
+async fn revoking_a_provider_grant_stops_its_granted_envelope() {
+    use net::adapter::net::behavior::org_grant_revocation::{
+        OrgGrantRevocationBundle, RevokedGrant,
+    };
+    use net::adapter::net::behavior::org_scoped_ann::ScopedCapabilityAnnouncement;
+    let (p, _h, _dir, entity, org_b) = granted_provider(0x75, "revoke", "cross").await;
+    let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+    let issue = || {
+        let (g, s) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:cross"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(entity.clone()),
+            3600,
+        )
+        .expect("issue");
+        (g, s.expect("secret"))
+    };
+    let (revoked, s1) = issue();
+    let (kept, s2) = issue();
+    p.install_provider_grant_audience(revoked.clone(), s1)
+        .expect("install revoked-to-be");
+    p.install_provider_grant_audience(kept.clone(), s2)
+        .expect("install kept");
+    assert!(converge_scoped_count(&p, 2).await, "two granted envelopes");
+
+    let grant_ids = |scoped: Vec<Vec<u8>>| -> Vec<[u8; 32]> {
+        scoped
+            .iter()
+            .map(|b| {
+                *ScopedCapabilityAnnouncement::from_bytes(b)
+                    .expect("decode")
+                    .grant_id()
+            })
+            .collect()
+    };
+
+    // B withdraws one grant. No re-announce: the cached emission is unchanged.
+    let bundle = OrgGrantRevocationBundle::try_issue(&org_b, [RevokedGrant::capability(&revoked)])
+        .expect("issue revocation");
+    p.org_revocation_store()
+        .expect("installed store")
+        .apply_grant_revocations(&bundle)
+        .expect("apply revocation");
+    assert_eq!(
+        grant_ids(p.announcement_scoped_for_send_for_test()),
+        vec![kept.grant_id],
+        "the cached envelope of the revoked grant must stop shipping at once",
+    );
+
+    // A rebuild must not seal it again either.
+    p.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+    assert_eq!(
+        grant_ids(p.announcement_scoped_for_send_for_test()),
+        vec![kept.grant_id],
+        "the rebuilt emission seals no envelope for the revoked grant",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // OA3-4b2 slice 4 — consumer nonzero-grant ingest selector witnesses.
 // ---------------------------------------------------------------------------

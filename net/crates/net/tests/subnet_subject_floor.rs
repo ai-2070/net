@@ -597,3 +597,215 @@ async fn readback_reports_each_verifier_separately_and_cannot_be_forged() {
         SubnetFloorQueryError::Refused("subnet:wrong_verifier".into())
     );
 }
+
+/// SUBNET-07: a newer revision that raises no generation is still a
+/// revision watermark, and it survives a restart — so an older signed
+/// fact that was stale before the restart is still stale after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_raising_revision_watermark_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("subnet-floors");
+    let v = verifier(Some(&store)).await;
+    let b_kp = EntityKeypair::generate();
+    assert!(v
+        .apply_subnet_subject_floor(&subject_floor(&b_kp, SubnetRights::ATTACH, 2, 1))
+        .unwrap());
+    // Revision 3 raises nothing (ATTACH is already at 2).
+    assert!(!v
+        .apply_subnet_subject_floor(&subject_floor(&b_kp, SubnetRights::ATTACH, 2, 3))
+        .unwrap());
+    let older = subject_floor(&b_kp, SubnetRights::ALL, 5, 2);
+    assert!(
+        !v.apply_subnet_subject_floor(&older).unwrap(),
+        "revision 2 is stale behind the held watermark 3"
+    );
+
+    v.shutdown().await.expect("verifier shutdown");
+    drop(v);
+    let v = verifier(Some(&store)).await;
+    assert!(
+        !v.apply_subnet_subject_floor(&older).unwrap(),
+        "after a restart the watermark still makes revision 2 stale"
+    );
+    let authority = root().entity_id().clone();
+    assert_eq!(
+        v.subnet_floor_registry().subject_floor_state(
+            &authority,
+            0,
+            TopologySubnetId::new(S),
+            b_kp.entity_id()
+        ),
+        (3, [2, 0, 0]),
+        "watermark and generations are exactly what was accepted"
+    );
+}
+
+/// SUBNET-04: a floor whose durable write fails is still ENFORCED — the
+/// covered context drops and re-admission is refused — while every
+/// report says not persisted; retrying the same signed fact once storage
+/// recovers persists it, and a restart then keeps the removal.
+#[cfg(feature = "fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_floor_write_still_revokes_and_a_retry_persists_it() {
+    use net::adapter::net::subnet::floor_status::{FloorApplyOutcome, FloorStatusRequest};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("subnet-floors");
+    let v = verifier(Some(&store)).await;
+    let b_kp = EntityKeypair::generate();
+    let b = node(&b_kp).await;
+    handshake(&b, &v).await;
+    let b_set = direct(&b_kp, S, SubnetRights::ATTACH, 1);
+    admit(&v, &b_kp, &b_set, S, SubnetRights::ATTACH).expect("B admitted");
+    let readback = |v: &Arc<MeshNode>, apply: Option<&SubnetSubjectFloor>| {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let request = FloorStatusRequest::try_issue(
+            &root(),
+            scope(S),
+            0,
+            b_kp.entity_id().clone(),
+            v.entity_id().clone(),
+            nonce,
+            unix_now_secs(),
+            apply,
+        )
+        .unwrap();
+        v.answer_subnet_floor_status(&request.to_bytes(), unix_now_secs())
+            .expect("attestation")
+    };
+
+    let floor = subject_floor(&b_kp, SubnetRights::ATTACH, 2, 1);
+    let disk = v
+        .test_subnet_floor_store()
+        .expect("store configured")
+        .clone();
+    disk.set_fail_writes(true);
+    assert_eq!(
+        v.apply_subnet_subject_floor(&floor),
+        Err(SubnetAuthError::StateNotPersisted)
+    );
+    assert!(
+        v.subnet_context_for(b_kp.node_id()).is_none(),
+        "a refused write must not skip the invalidation"
+    );
+    assert_eq!(
+        admit(&v, &b_kp, &b_set, S, SubnetRights::ATTACH),
+        Err(SubnetAuthError::Revoked),
+        "the in-memory registry enforces the removal"
+    );
+    let a = readback(&v, None);
+    assert!(
+        !a.persisted,
+        "readback must attest durable coverage, not store presence"
+    );
+    // A retry while storage still refuses is still not persisted — and
+    // the readback-carried retry reports applied-not-persisted, not a
+    // refusal of a floor that IS enforced.
+    let a = readback(&v, Some(&floor));
+    assert_eq!(a.apply, FloorApplyOutcome::Applied);
+    assert!(!a.persisted && a.covers(SubnetRights::ATTACH, 2));
+
+    // A stale fact arriving meanwhile changes nothing itself, but its
+    // commit retries the pending write — which fails again. It must not
+    // report success while the earlier floor is still not on disk; the
+    // readback still calls it unchanged, with `persisted: false`.
+    let stale = subject_floor(&b_kp, SubnetRights::ATTACH, 1, 0);
+    assert_eq!(
+        v.apply_subnet_subject_floor(&stale),
+        Err(SubnetAuthError::StateNotPersisted),
+        "a no-op fact must not report durable while another is pending"
+    );
+    let a = readback(&v, Some(&stale));
+    assert_eq!(a.apply, FloorApplyOutcome::Unchanged);
+    assert!(!a.persisted);
+
+    disk.set_fail_writes(false);
+    assert_eq!(
+        v.apply_subnet_subject_floor(&floor),
+        Ok(true),
+        "retrying the same fact persists the pending acceptance"
+    );
+    assert!(readback(&v, None).persisted);
+
+    drop(disk);
+    v.shutdown().await.expect("verifier shutdown");
+    drop(v);
+    let v = verifier(Some(&store)).await;
+    reconnect(&b, &v).await;
+    assert_eq!(
+        admit(&v, &b_kp, &b_set, S, SubnetRights::ATTACH),
+        Err(SubnetAuthError::Revoked),
+        "the retried floor survived the restart"
+    );
+}
+
+/// SUBNET-05: a subject floor naming this node's OWN entity reaches its
+/// local gateway authority. The published gateway member is withdrawn
+/// (which also darkens every export stamp pinned to it), re-installing
+/// the floored credential is refused, an unaffected credential still
+/// installs, and only re-issuance at the floor generation restores the
+/// right. A floor for some other subject leaves the gateway untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subject_floor_on_the_local_entity_withdraws_its_gateway_authority() {
+    let v = verifier(None).await;
+    let gw = verifier_kp();
+    let export_wm = direct(&gw, &[3, 7, 1], SubnetRights::EXPORT, 1);
+    let route_other = direct(&gw, &[4], SubnetRights::ROUTE, 1);
+    v.install_subnet_gateway_credentials(&[export_wm.clone(), route_other.clone()])
+        .expect("install");
+    let installed = v.subnet_gateway_contexts().expect("published");
+
+    let other = EntityKeypair::generate();
+    v.apply_subnet_subject_floor(&subject_floor(&other, SubnetRights::EXPORT, 2, 1))
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&installed, &v.subnet_gateway_contexts().expect("kept")),
+        "a floor for another subject must not touch this node's authority"
+    );
+
+    assert!(v
+        .apply_subnet_subject_floor(&subject_floor(&gw, SubnetRights::EXPORT, 2, 1))
+        .unwrap());
+    assert!(
+        v.subnet_gateway_contexts().is_none(),
+        "the published gateway authority holding the removed EXPORT is withdrawn"
+    );
+    assert_eq!(
+        v.install_subnet_gateway_credentials(&[export_wm, route_other.clone()]),
+        Err(SubnetAuthError::Revoked),
+        "the old EXPORT credential no longer compiles"
+    );
+    v.install_subnet_gateway_credentials(std::slice::from_ref(&route_other))
+        .expect("an unaffected credential still installs");
+    v.install_subnet_gateway_credentials(&[
+        direct(&gw, &[3, 7, 1], SubnetRights::EXPORT, 2),
+        route_other,
+    ])
+    .expect("root-direct re-issuance at the floor restores EXPORT");
+    let reinstalled = v.subnet_gateway_contexts().expect("published");
+    assert_eq!(reinstalled.entries().len(), 2);
+
+    // A later subject floor naming this node that refuses nothing it now
+    // holds (it removes ATTACH, which no installed credential carries;
+    // EXPORT is already re-issued at the generation the first floor
+    // demands) must leave the re-credentialed gateway alone. Coverage
+    // judged as if every leaf were delegated withdrew it again.
+    assert!(v
+        .apply_subnet_subject_floor(&subject_floor(&gw, SubnetRights::ATTACH, 2, 2))
+        .unwrap());
+    assert!(
+        v.subnet_gateway_contexts()
+            .is_some_and(|now| Arc::ptr_eq(&now, &reinstalled)),
+        "credentials that satisfy every floor keep their published authority"
+    );
+
+    // A floor the re-issued credential does NOT meet still withdraws it.
+    assert!(v
+        .apply_subnet_subject_floor(&subject_floor(&gw, SubnetRights::EXPORT, 3, 3))
+        .unwrap());
+    assert!(
+        v.subnet_gateway_contexts().is_none(),
+        "a floor above the re-issued generation withdraws it again"
+    );
+}

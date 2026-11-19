@@ -32,6 +32,7 @@ use net_sdk::subnets::Visibility;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::commands::org::{publish_beside, refuse_aliased_paths, refuse_existing, SeedArtifact};
 use crate::context::{resolve_profile, CliContext};
 use crate::error::{connection_failure, generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
@@ -366,12 +367,17 @@ async fn run_issue_grant(
     let channel = parse_channel_name(&args.channel)?;
     let issuer = parse_entity(&args.issuer, "--issuer")?;
     let rights = parse_channel_rights(&args.rights)?;
-    if args.out.exists() && !args.force {
-        return Err(invalid_args(format!(
-            "{} already exists (pass --force to replace it)",
-            args.out.display()
-        )));
-    }
+    // CLI-04: `--out` must never name the private root seed this verb loads.
+    // The lexical check catches the plain spelling; the content-based
+    // foreign-seed guard in `publish_beside` catches case variants, symlinks
+    // and hard links on the replacing path, and the no-clobber hard-link
+    // refuses anything existing on the other.
+    refuse_aliased_paths(&[
+        ("--root-identity", &args.root_identity),
+        ("--out", &args.out),
+    ])?;
+    // Friendly early error only; publication enforces it race-free.
+    refuse_existing(&args.out, args.force).await?;
     let root = crate::context::load_operator_identity(&args.root_identity).await?;
     if root.entity_id() == &issuer {
         return Err(invalid_args(
@@ -393,10 +399,12 @@ async fn run_issue_grant(
         "grant_hex": hex::encode(grant.to_bytes()),
     });
     let text = serde_json::to_vec_pretty(&file).map_err(|e| generic(format!("encode: {e}")))?;
-    let tmp = args.out.with_extension("tmp-channel-grant");
-    std::fs::write(&tmp, &text)
-        .and_then(|()| std::fs::rename(&tmp, &args.out))
-        .map_err(|e| generic(format!("write {}: {e}", args.out.display())))?;
+    // CLI-04: stage in an exclusively created, uniquely named sibling (never
+    // the deterministic `.tmp-channel-grant`, which was truncated whatever it
+    // held — a root seed included), then publish no-clobber, or with
+    // `--force` atomically replace after refusing to replace any seed file.
+    // The grant is not secret (0644 on Unix), as before.
+    publish_beside(&args.out, &text, false, args.force, SeedArtifact::None).await?;
     emit_value(
         OutputFormat::resolve_oneshot(output),
         &json!({

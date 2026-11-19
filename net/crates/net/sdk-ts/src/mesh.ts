@@ -304,8 +304,20 @@ export interface MeshNodeConfig {
    * are reproducible across restarts, and a caller-side
    * `Identity.fromSeed(seed)` can issue tokens that validate
    * against this mesh. Treat as secret material.
+   *
+   * A seeded node also derives its Noise key (`publicKey()`, the key
+   * in its rendezvous string) from the seed unless `noiseStaticKey` is
+   * set, so machines that paired with it can reach it after a restart.
    */
   identitySeed?: Buffer;
+  /**
+   * 32-byte Noise (X25519) static private key — any 32 random bytes the
+   * caller stores. Keeps `publicKey()` stable across restarts
+   * independently of the identity. Leave unset to derive it from
+   * `identitySeed` (or, with no seed, get a fresh key per process).
+   * Treat as secret material.
+   */
+  noiseStaticKey?: Buffer;
   /**
    * Subnet AUTHORITY trust anchors (`SUBNET_AUTH_SDK_PLAN.md` §3.3).
    * One entry per authority; empty root sets, duplicates, and zero
@@ -554,6 +566,7 @@ export class MeshNode {
       subnet: config.subnet,
       subnetPolicy: config.subnetPolicy,
       identitySeed: config.identitySeed,
+      noiseStaticKey: config.noiseStaticKey,
       reflexOverride: config.reflexOverride,
       tryPortMapping: config.tryPortMapping,
       autoDirectUpgrade: config.autoDirectUpgrade,
@@ -1176,6 +1189,18 @@ export class MeshNode {
   //
   // These take the NATIVE enrollment objects and identity (see
   // `enrollment.ts`): pass an SDK `Identity` as `identity.toNapi()`.
+
+  /**
+   * Make sure there is a working session to the node a rendezvous locator
+   * names (as saved from an invite or a `DeviceEnrollment`), re-dialing it
+   * only when needed. Call it when a paired machine may have restarted — on
+   * either side — before talking to it again. After a restart the far side
+   * can take up to three heartbeat intervals to accept; `renew` already
+   * does this.
+   */
+  ensureAttached(...args: Parameters<NapiNetMesh['ensureAttached']>): ReturnType<NapiNetMesh['ensureAttached']> {
+    return this.native.ensureAttached(...args);
+  }
 
   /** This node's invite rendezvous locator, for `OperatorEnrollment.invite`. */
   rendezvousString(...args: Parameters<NapiNetMesh['rendezvousString']>): ReturnType<NapiNetMesh['rendezvousString']> {

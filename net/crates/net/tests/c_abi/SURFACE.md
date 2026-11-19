@@ -11,7 +11,7 @@ both.
 | Header | Declared | Called by a consumer | Called by any C program |
 | --- | ---: | ---: | ---: |
 | `net.go.h` | 218 | 105 | 120 |
-| `net.h` | 41 | 26 | 30 |
+| `net.h` | 43 | 28 | 32 |
 | `net_cortex.h` | 94 | 2 | 8 |
 | `net_deck.h` | 84 | 62 | 62 |
 | `net_mcp.h` | 22 | 20 | 20 |
@@ -254,6 +254,8 @@ both.
 | `net_fold_query_client_invalidate_cache` | aggregator | – | – |
 | `net_fold_query_client_invalidate_target` | aggregator | – | – |
 | `net_fold_query_client_new` | aggregator | – | – |
+| `net_fold_query_client_query_group_latest` | aggregator | – | – |
+| `net_fold_query_client_query_group_summarize_now` | aggregator | – | – |
 | `net_fold_query_client_query_latest` | aggregator | – | – |
 | `net_fold_query_client_query_summarize_now` | aggregator | – | – |
 | `net_fold_query_client_set_deadline` | aggregator | – | – |

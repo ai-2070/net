@@ -240,6 +240,7 @@ pub use mesh::{
     PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
     SensingRegistrationError, SessionPath, StartRefused, StreamInboundEvent, StreamInboundSink,
     StreamInbox, SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    NOISE_STATIC_KEY_CONTEXT, TRANSFER_CHUNK_IDLE_TIMEOUT,
 };
 /// Exported only so the fixtures-gated ordered-egress accessors have nameable
 /// types in integration tests; each is `#[doc(hidden)]` at its definition and
@@ -1591,6 +1592,7 @@ impl Adapter for NetAdapter {
                         // fragments: it splits a BATCH across
                         // packets and never one event.
                         fragment: None,
+                        header: None,
                     });
                     let stream = session.get_or_create_stream(stream_id);
                     stream.with_reliability(|r| r.on_send(descriptor));
@@ -1633,6 +1635,7 @@ impl Adapter for NetAdapter {
                     events: current_batch.clone(),
                     flags,
                     fragment: None,
+                    header: None,
                 });
                 let stream = session.get_or_create_stream(stream_id);
                 stream.with_reliability(|r| r.on_send(descriptor));
