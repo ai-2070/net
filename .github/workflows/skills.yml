@@ -254,7 +254,7 @@ jobs:
       # No `cache-dependency-path`: there is no `go/go.sum`, and the scratch
       # module resolves the binding through a local `replace`, so there is
       # nothing to check sums against.
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go/go.mod
 
