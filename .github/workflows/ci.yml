@@ -4740,7 +4740,7 @@ jobs:
           python3 .github/scripts/check-callback-buffer-ownership.py
 
       - name: Setup Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go/go.mod
 
@@ -5242,7 +5242,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go/go.mod
 
