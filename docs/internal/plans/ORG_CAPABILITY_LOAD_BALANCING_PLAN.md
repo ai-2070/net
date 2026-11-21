@@ -2506,7 +2506,7 @@ conflating them would be its own defect (Kyra, 2026-09-11):
 | **Operational visibility owed** | `org_sensing_truncated_total`, `org_sensing_fallback_total` | The bounded behaviour and the fallback exist and are witnessed; what is missing is a counter an operator can read. A debt to pay, **not** evidence the behaviour is absent. **Paid 2026-11-21 (completion plan C2, design D8.4a); awaits sign-off.** |
 | **Excluded from this gate** | reordered-`Deregister` repair | Removed from this release's completion promise, because the governing exact design lists closing that race among its own §15 non-goals. An excluded behaviour must not sit in a gate as an implied promise: if it is wanted, it needs a named slice with a repair and a witness, and the row returns then. |
 | **Waived by decision** | the independent RED mutation pass (recorded in the status block at the top) | Waived by the owner's sign-off, **not verified**. Reopening it takes an explicit decision, not a re-reading of this plan. |
-| **Unimplemented product slices** | P2C sampler (OLB-3), `NoViableProvider` (OLB-4) | Unbuilt product work on the unsensed lane. Not administrative closure work, and not something a documentation pass can discharge. |
+| **Unimplemented product slices** | P2C sampler (OLB-3), `NoViableProvider` (OLB-4) | Unbuilt product work on the unsensed lane. Not administrative closure work, and not something a documentation pass can discharge. **Resolved 2026-11-21 by owner decision (completion plan Phase 4):** P2C landed over a non-sensing cost signal (this node's outstanding org calls per provider) with the deterministic choice kept on a flat signal, and `NoViableProvider` is not wanted (missing readiness never refuses a call). |
 
 Nothing below is claimed of the provider-free leader arm, which is dark.
 
@@ -2549,8 +2549,13 @@ The plan is complete when all are true:
   the remote row is repaired by the node-global lease's ttl/2 refresh; the
   observation is `Unknown`/`Potential` until repair and no `org.call` fails;
   a last-holder close disarms the refresh owner (no ghost demand)."
-- [ ] **NOT CLAIMED — unsensed warmed-pool lane; no P2C sampler exists in
-      tree.** The warmed **unsensed** org.call path is: ArcSwap route-set load →
+- [ ] **NOT CLAIMED AS WRITTEN; superseded 2026-11-21 (completion plan
+      Phase 4, owner decision).** Unsensed load spreading landed as a
+      per-call P2C inside `plan` over the already-derived authorized, direct
+      pool (`OrgClient::select_spread` / `p2c_spread_choice`), using this
+      node's outstanding org calls per provider as the cost signal. It is not
+      the ArcSwap warmed route-set path described here. The historical text
+      follows. The warmed **unsensed** org.call path is: ArcSwap route-set load →
       two-index P2C → proof → send — no rediscovery, no candidate
       revalidation scan, no observation scan, no sorting, no interest
       reconciliation, no registration wait. Cold behavior is likewise
@@ -2650,7 +2655,7 @@ The plan is complete when all are true:
       witnesses. *(Was: OPEN, behaviour-only.)*
       Sensing capacity fallback is observable
       (`org_sensing_fallback_total`).
-- [ ] **NOT CLAIMED — unsensed OLB-4 lane only; superseded for this release.**
+- [ ] **NOT WANTED (owner decision 2026-11-21, completion plan Phase 4): no `NoViableProvider`. Missing readiness evidence is never a reason to refuse a call.** Historical row:
       No-viable is distinct from no-authority, local-only, counts
       `non_viable`, and is pinned in the regenerated X1 fixture across
       all four binding suites. **SUPERSEDED FOR ORGANIZATION EXACT
@@ -2663,7 +2668,7 @@ The plan is complete when all are true:
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
       §OA-6 and D7.3. This row remains live for the unsensed OLB-4
       balancing release only.
-- [ ] **NOT CLAIMED — unsensed warmed-pool lane.**
+- [x] **IMPLEMENTED 2026-11-21 (completion plan Phase 4), awaits review.** `p2c_spread_choice` takes a process-random seed and a monotonic nonce, is pure and reproducible under a fixed pair, and keeps the deterministic choice on a flat signal. Row as originally written:
       The P2C sampler contract (seed + nonce) is pinned, reproducible
       under a fixed seed, and non-stampeding — on the **unsensed
       warmed-pool** track. *(Scoped 2026-08-30: the organization-audience

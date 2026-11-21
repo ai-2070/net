@@ -2285,3 +2285,119 @@ async fn a_demand_identity_is_never_reused() {
     drop(family);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: unsensed load spreading beneath org.call (SENSING_OLB_COMPLETION_PLAN)
+// ---------------------------------------------------------------------------
+
+/// A flat signal (every load equal, an idle node included) keeps the
+/// deterministic first choice. A skewed signal picks the lower-loaded of the
+/// sampled pair, and an exact tie goes to the earlier index. RED against a
+/// sampler that ignores the loads, that spreads even when the signal is flat,
+/// or that breaks ties by draw order.
+#[test]
+fn p2c_spread_choice_keeps_the_flat_default_and_follows_a_skewed_signal() {
+    use super::call::p2c_spread_choice;
+    let cap = [7u8; 32];
+    for nonce in 0..200u64 {
+        assert_eq!(
+            p2c_spread_choice(&[0, 0, 0], 11, nonce, &cap),
+            0,
+            "flat: idle"
+        );
+        assert_eq!(
+            p2c_spread_choice(&[4, 4], 11, nonce, &cap),
+            0,
+            "flat: equal load"
+        );
+        assert_eq!(
+            p2c_spread_choice(&[3, 0], 11, nonce, &cap),
+            1,
+            "the only pair: lower wins"
+        );
+        assert_eq!(p2c_spread_choice(&[0, 3], 11, nonce, &cap), 0);
+        assert_eq!(
+            p2c_spread_choice(&[5], 11, nonce, &cap),
+            0,
+            "a single candidate"
+        );
+    }
+    // Three candidates, the first loaded: every sampled pair avoids index 0,
+    // and the two idle ones tie towards the earlier index, so both still get
+    // chosen across nonces (the pair {0,2} picks 2).
+    let picks: Vec<usize> = (0..400u64)
+        .map(|nonce| p2c_spread_choice(&[2, 0, 0], 11, nonce, &cap))
+        .collect();
+    assert!(
+        !picks.contains(&0),
+        "the loaded candidate is never chosen over an idle one"
+    );
+    assert!(
+        picks.contains(&1) && picks.contains(&2),
+        "load spreads across the idle pair"
+    );
+    // Pure: the same inputs give the same answer.
+    assert_eq!(
+        p2c_spread_choice(&[2, 0, 1, 0], 99, 7, &cap),
+        p2c_spread_choice(&[2, 0, 1, 0], 99, 7, &cap)
+    );
+}
+
+/// The live planning path: with two authorized, directly reachable providers
+/// and nothing outstanding, `plan` keeps the deterministic choice. While THIS
+/// node holds an outstanding org call to that provider, `plan` chooses the
+/// other one. When the call ends, the deterministic choice returns.
+#[tokio::test]
+async fn unsensed_planning_spreads_by_this_nodes_outstanding_calls() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("plan-spread", Some(&a)).await;
+    let p1 = EntityKeypair::generate();
+    let p2 = EntityKeypair::generate();
+    for provider in [&p1, &p2] {
+        inject_owner_envelope(&mesh, &a, provider, &["nrpc:internal.reindex"]);
+        mesh.node()
+            .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    }
+    let (first, second) = if p1.entity_id() < p2.entity_id() {
+        (&p1, &p2)
+    } else {
+        (&p2, &p1)
+    };
+    let client = bind(&mesh, &a, &identity, vec![]);
+
+    for _ in 0..20 {
+        let intent = client.plan("internal.reindex", 0).expect("plan");
+        assert_eq!(
+            &intent.provider,
+            first.entity_id(),
+            "idle: the deterministic choice"
+        );
+    }
+
+    let held = mesh.node().begin_org_call(first.entity_id().node_id());
+    assert_eq!(
+        mesh.node().org_call_in_flight(first.entity_id().node_id()),
+        1
+    );
+    for _ in 0..20 {
+        let intent = client.plan("internal.reindex", 0).expect("plan");
+        assert_eq!(
+            &intent.provider,
+            second.entity_id(),
+            "an outstanding call to the first provider steers new calls to the second"
+        );
+    }
+
+    drop(held);
+    assert_eq!(
+        mesh.node().org_call_in_flight(first.entity_id().node_id()),
+        0
+    );
+    let intent = client.plan("internal.reindex", 0).expect("plan");
+    assert_eq!(
+        &intent.provider,
+        first.entity_id(),
+        "the signal is flat again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

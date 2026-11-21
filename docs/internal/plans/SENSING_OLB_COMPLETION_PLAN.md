@@ -596,6 +596,53 @@ viability class and rank for identical inputs.
 
 ### B.5 Phase 4 — the unsensed lane: OLB-3 and OLB-4 (owner decision first)
 
+**Owner decision and status (2026-11-21): implemented, awaits review.**
+
+The decision:
+- yes to unsensed load spreading, kept beneath `org.call`, inside the
+  already-authorized, directly reachable pool;
+- no to `NoViableProvider`: missing readiness evidence is never a reason to
+  refuse a call;
+- P2C only over a cheap, meaningful cost signal that does not depend on
+  sensing. The owner chose **this node's own outstanding org calls per
+  provider**.
+
+What landed:
+- **Signal.** `MeshNode::org_call_in_flight(provider)` /
+  `begin_org_call(provider) -> OrgCallInFlight` is a node-global map with a
+  decrement-on-drop guard, held by the org facade across the single exact
+  invocation of every protected unary call (`call`, `call_exported`). It is
+  one map operation each way, with no network and no sensing. It sees only
+  this node's own calls. Streaming opens are not counted.
+- **Where.** `plan_attempt`. `apply_sensed_order` now returns a
+  `SensedOutcome`.
+  - A **viable sensed lead** decides exactly as before (the signed exact lane
+    is unchanged).
+  - Otherwise `OrgClient::select_spread` chooses among the direct candidates,
+    minus any sensed not-ready, which are kept only when nothing else is
+    direct.
+  - No direct candidate falls through to the existing `select_candidate`
+    errors, so nothing new is refused.
+- **Rule.** `p2c_spread_choice`. A **flat signal keeps the deterministic
+  first-direct choice**, so an idle node, sequential calls and every cold
+  call behave exactly as today. A skewed signal takes two distinct sampled
+  indices (process-random seed, monotonic nonce, capability); the lower load
+  wins, and an exact tie goes to the earlier index.
+- **Bindings.** Node, Python and Go `org.call` route through
+  `call_bytes_deadline`, so they inherit the behaviour with no binding change.
+
+Witnesses (SDK lib):
+- `p2c_spread_choice_keeps_the_flat_default_and_follows_a_skewed_signal`
+  (M13, the flat rule dropped, fails it);
+- `unsensed_planning_spreads_by_this_nodes_outstanding_calls`: an idle node
+  is deterministic, an outstanding call to the first provider steers to the
+  second, and the release restores the first (M14, the loads ignored, fails
+  it).
+
+`org_exact_sensing` 23/23 is unchanged. Not separately witnessed: a skewed
+signal under a *viable sensed lead* (the sensed lead must still win). It is
+guaranteed structurally by the `viable_lead` branch, with no live witness.
+
 Today an unsensed call (`Granted`, cold, `Inert`, sensing off) takes the
 deterministic first-direct-candidate order. `ScopedUnsensedRoutePool`
 (2B.3c) is built but feeds no sampler. **Decide whether the unsensed lane
@@ -615,6 +662,10 @@ still wants load spreading** before building it.
   authorized order.
 
 ### B.6 Phase 5 — the provider-free leader track (LS)
+
+**Owner decision (2026-11-21): not needed.** The LS design stays unsigned,
+`OrgCapabilityRegistration` stays dark, and `SAFE_LIVE_HEAD` stays
+unestablished. Nothing below is scheduled.
 
 This is the largest remaining piece, and the only path to a provider-free
 sensing plane, `AnyAuthorized` / tag / group selectors, public S2 scope and

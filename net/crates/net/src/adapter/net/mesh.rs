@@ -9148,6 +9148,35 @@ pub struct OrgSensingRoutingCounters {
     pub fallback_unretained: u64,
 }
 
+/// One outstanding protected org call, counted in
+/// [`MeshNode::org_call_in_flight`] until this guard drops. Obtained from
+/// [`MeshNode::begin_org_call`].
+#[must_use = "the call is counted only while the guard lives"]
+pub struct OrgCallInFlight {
+    map: Arc<DashMap<u64, u32>>,
+    provider: u64,
+}
+
+impl Drop for OrgCallInFlight {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self.map.entry(self.provider) {
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for OrgCallInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrgCallInFlight")
+            .field("provider", &format!("{:#x}", self.provider))
+            .finish()
+    }
+}
+
 impl OrgSensingRoutingCounters {
     /// Render as Prometheus text exposition, in the hand-rolled convention of
     /// `mesh_rpc_metrics::prometheus_text`. It emits the two OLB §14 names:
@@ -13154,6 +13183,10 @@ pub struct MeshNode {
     sensing_refresh_wake: Arc<tokio::sync::Notify>,
     /// Organization exact-provider demand and refresh counters.
     org_sensing_demand_counters: Arc<OrgSensingDemandCounters>,
+    /// This node's outstanding protected org calls, per provider node id: the
+    /// cost signal for unsensed `org.call` load spreading (completion plan
+    /// Phase 4). Entries exist only while a call is outstanding.
+    org_call_in_flight: Arc<DashMap<u64, u32>>,
     /// The live bound on the refused-release retention set. Initialized to
     /// [`MAX_SENSING_REFUSED_RELEASES`] and only ever narrowed by a witness
     /// (see [`MeshNode::set_refused_release_cap_for_test`]).
@@ -15518,6 +15551,7 @@ impl MeshNode {
             }),
             sensing_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             org_sensing_demand_counters: Arc::new(OrgSensingDemandCounters::default()),
+            org_call_in_flight: Arc::new(DashMap::new()),
             refused_release_cap: std::sync::atomic::AtomicUsize::new(MAX_SENSING_REFUSED_RELEASES),
             sensing_refresh_armed_cap: std::sync::atomic::AtomicUsize::new(
                 MAX_SENSING_REFRESH_ARMED,
@@ -18950,6 +18984,30 @@ impl MeshNode {
     /// Demand/refresh counters, shared with the family container.
     pub(crate) fn org_sensing_demand_counters(&self) -> &Arc<OrgSensingDemandCounters> {
         &self.org_sensing_demand_counters
+    }
+
+    /// How many protected org calls from THIS node to `provider` are
+    /// outstanding right now. Node-local, one map read, no network and no
+    /// sensing: the cost signal unsensed `org.call` load spreading compares
+    /// (completion plan Phase 4). It counts only this node's own calls, not
+    /// other callers' load on the provider.
+    pub fn org_call_in_flight(&self, provider: u64) -> u32 {
+        self.org_call_in_flight
+            .get(&provider)
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
+
+    /// Count one outstanding protected org call to `provider` until the
+    /// returned guard drops. The org facade holds it across the single exact
+    /// invocation, so an early return, an error or a cancelled future all
+    /// release the count.
+    pub fn begin_org_call(&self, provider: u64) -> OrgCallInFlight {
+        *self.org_call_in_flight.entry(provider).or_insert(0) += 1;
+        OrgCallInFlight {
+            map: Arc::clone(&self.org_call_in_flight),
+            provider,
+        }
     }
 
     /// The operator-readable sensed-routing counters (truncation and order

@@ -543,6 +543,9 @@ impl OrgClient {
         // The core call mints the call id, computes the canonical request
         // digest, signs the proof, appends exactly one admission header, and
         // pins `peer_entity_id(target) == intent.provider` before sending.
+        // The Phase 4 cost signal: this call is outstanding toward `provider`
+        // until the guard drops, whatever the outcome.
+        let _in_flight = self.node.begin_org_call(provider.node_id());
         let reply = self
             .node
             .call(provider.node_id(), service, request, opts)
@@ -632,6 +635,9 @@ impl OrgClient {
         // One send, ever: the core call mints the call id, digests, signs,
         // pins the peer entity, and the facade never launches a second
         // attempt on any outcome.
+        // The Phase 4 cost signal: this call is outstanding toward `provider`
+        // until the guard drops, whatever the outcome.
+        let _in_flight = self.node.begin_org_call(provider.node_id());
         let reply = self
             .node
             .call(provider.node_id(), service, request, opts)
@@ -976,9 +982,22 @@ impl OrgClient {
                 // remove or authorize a candidate, it mints nothing, and it
                 // runs strictly BEFORE the final currentness comparison below,
                 // which still gates the mint.
-                self.apply_sensed_order(capability, sensed, capture.authority(), &mut candidates);
-                self.select_candidate(capability, &candidates, considered)
-                    .cloned()
+                let outcome = self.apply_sensed_order(
+                    capability,
+                    sensed,
+                    capture.authority(),
+                    &mut candidates,
+                );
+                // A viable sensed lead decides, exactly as the signed exact
+                // lane does. Otherwise unsensed load spreading chooses within
+                // the same authorized, directly reachable pool (Phase 4).
+                if outcome.viable_lead {
+                    self.select_candidate(capability, &candidates, considered)
+                        .cloned()
+                } else {
+                    self.select_spread(capability, &candidates, considered, &outcome.not_ready)
+                        .cloned()
+                }
             });
         if !self.node.org_cold_authority_is_current(capture.authority()) {
             return Ok(PlanAttempt::Superseded { considered });
@@ -1106,14 +1125,14 @@ impl OrgClient {
         sensed: &SensedSelection<'_>,
         authority: &OrgColdAuthority,
         candidates: &mut Vec<AuthorizedOrgCandidate>,
-    ) {
+    ) -> SensedOutcome {
         // The authority observation THIS attempt derives under. A refusal
         // records it, and a later decision asks the node whether it is still
         // the one in force - which is how a restored authority stops being
         // paced by the failure that preceded it.
         let context = super::client::RefusalContext::new(&self.node, authority);
         let Some(acquisition) = self._sensing.acquisition() else {
-            return; // Inert: the deterministic unsensed order, no work at all.
+            return SensedOutcome::default(); // Inert: the deterministic unsensed order, no work at all.
         };
         let family = acquisition.family();
 
@@ -1177,7 +1196,7 @@ impl OrgClient {
             // section that authors and sends per provider.
             let Some(_txn) = acquisition.try_reconcile_lock() else {
                 fall_back(OrgSensedOrderFallback::Contended);
-                return;
+                return SensedOutcome::default();
             };
             // The hold's own ticket, copied out so the steps below can ask
             // whether they are STILL running under it. Losing the hold - to an
@@ -1202,7 +1221,7 @@ impl OrgClient {
                     family.retire(sensed.tag);
                 }
                 acquisition.schedule().forget(capability);
-                return;
+                return SensedOutcome::default();
             }
             // THE DECISION - read under this caller's own hold.
             acquisition.schedule().verify_holding(held);
@@ -1236,7 +1255,7 @@ impl OrgClient {
                         );
                         acquisition.schedule().verify_holding(held);
                         fall_back(OrgSensedOrderFallback::Refused);
-                        return;
+                        return SensedOutcome::default();
                     }
                 }
             }
@@ -1247,13 +1266,13 @@ impl OrgClient {
 
         let Some(demand) = family.demand(capability) else {
             fall_back(OrgSensedOrderFallback::Unretained);
-            return;
+            return SensedOutcome::default();
         };
         if candidates.len() < 2 || demand.population().is_empty() {
             // Nothing an order could change - but the reconciliation above
             // still ran, so a departure that leaves one candidate is still
             // applied to the retained demand rather than skipped.
-            return;
+            return SensedOutcome::default();
         }
         let projection = demand.project_sensed_order(now, &sensed.budget);
         let permutation = org_sensed_candidate_permutation(
@@ -1262,6 +1281,12 @@ impl OrgClient {
             projection.non_viable(),
         );
         apply_permutation(candidates, permutation);
+        SensedOutcome {
+            viable_lead: candidates
+                .iter()
+                .any(|candidate| projection.viable().contains(&candidate.provider.node_id())),
+            not_ready: projection.non_viable().to_vec(),
+        }
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -1293,6 +1318,52 @@ impl OrgClient {
             considered,
         }
         .into())
+    }
+
+    /// Unsensed load spreading beneath `org.call` (completion plan Phase 4).
+    ///
+    /// Runs only when the sensed step established no viable lead; a viable
+    /// sensed lead still decides through [`Self::select_candidate`]. The pool
+    /// is the already-authorized, DIRECTLY reachable candidates, minus any
+    /// sensed not-ready (kept if nothing else remains). The choice is
+    /// [`p2c_spread_choice`] over this node's own outstanding org calls to each
+    /// pool member. A flat signal keeps the deterministic first-direct choice
+    /// exactly, so an idle node, sequential traffic, and every cold call behave
+    /// as before.
+    ///
+    /// Never a refusal: no direct candidate falls through to
+    /// [`Self::select_candidate`] and its existing errors, and missing
+    /// readiness evidence only means the pool is not narrowed.
+    pub(crate) fn select_spread<'a>(
+        &self,
+        capability: &CapabilityAuthorityId,
+        candidates: &'a [AuthorizedOrgCandidate],
+        considered: usize,
+        not_ready: &[u64],
+    ) -> Result<&'a AuthorizedOrgCandidate, OrgSdkError> {
+        let direct: Vec<&AuthorizedOrgCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.direct)
+            .collect();
+        if direct.is_empty() {
+            return self.select_candidate(capability, candidates, considered);
+        }
+        let ready_enough: Vec<&AuthorizedOrgCandidate> = direct
+            .iter()
+            .copied()
+            .filter(|candidate| !not_ready.contains(&candidate.provider.node_id()))
+            .collect();
+        let pool = if ready_enough.is_empty() {
+            direct
+        } else {
+            ready_enough
+        };
+        let loads: Vec<u32> = pool
+            .iter()
+            .map(|candidate| self.node.org_call_in_flight(candidate.provider.node_id()))
+            .collect();
+        let index = p2c_spread_choice(&loads, spread_seed(), spread_nonce(), capability.as_bytes());
+        Ok(pool[index])
     }
 
     /// Plan a proof intent for an **exact provider node**, instead of for
@@ -1867,6 +1938,83 @@ fn sensing_planning_seam() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// What the sensed step established for one call, as `plan_attempt` needs it
+/// to choose between the sensed lead and unsensed load spreading (completion
+/// plan Phase 4).
+///
+/// `Default` is "sensing established nothing": inert, a fallback exit, or
+/// nothing to order.
+#[derive(Debug, Default)]
+pub(crate) struct SensedOutcome {
+    /// At least one authorized candidate is sensed VIABLE. The sensed order
+    /// then decides, exactly as the signed exact lane does.
+    pub(crate) viable_lead: bool,
+    /// Providers sensed not-ready. They are kept out of the spread pool
+    /// unless nothing else is directly reachable; they are never refused.
+    pub(crate) not_ready: Vec<u64>,
+}
+
+/// Unsensed load spreading's choice over `loads`: the caller's own outstanding
+/// org calls to each candidate of the spread pool, in the pool's
+/// deterministic order (completion plan Phase 4).
+///
+/// - A FLAT signal (every load equal, including an idle node) returns index 0,
+///   the existing deterministic first-direct choice. A signal that says nothing
+///   changes nothing.
+/// - Otherwise this is power-of-two choices: two distinct indices are drawn
+///   from `seed`, `nonce` and `capability`, the lower load wins, and an exact
+///   tie goes to the earlier index.
+///
+/// Pure once its inputs are given, so tests pin `seed` and `nonce`. `loads`
+/// is non-empty.
+pub(crate) fn p2c_spread_choice(loads: &[u32], seed: u64, nonce: u64, capability: &[u8]) -> usize {
+    if loads.len() < 2 || loads.iter().all(|load| *load == loads[0]) {
+        return 0;
+    }
+    // `DefaultHasher::new()` has FIXED keys, so this is a pure function of its
+    // inputs; the per-process randomness is `seed`.
+    let draw = |salt: u64| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (seed, nonce, salt, capability).hash(&mut hasher);
+        hasher.finish()
+    };
+    let n = loads.len() as u64;
+    let first = (draw(0) % n) as usize;
+    // The second draw is over the OTHER n-1 indices, so the pair is distinct.
+    let offset = (draw(1) % (n - 1)) as usize;
+    let second = (first + 1 + offset) % loads.len();
+    let (low, high) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    if loads[high] < loads[low] {
+        high
+    } else {
+        low
+    }
+}
+
+/// The process-local seed for [`p2c_spread_choice`]: random per process (the
+/// standard library's randomized hasher keys), so separate nodes never
+/// synchronize onto the same sampled pair.
+fn spread_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0x6e65_745f_7370_7264);
+        hasher.finish()
+    })
+}
+
+/// The monotonic selection counter for [`p2c_spread_choice`].
+fn spread_nonce() -> u64 {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The request-relative half of one planning attempt.
