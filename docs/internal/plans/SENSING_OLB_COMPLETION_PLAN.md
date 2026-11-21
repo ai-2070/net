@@ -54,7 +54,8 @@ Open, by the governing plans' own records:
 | language sensing bindings | sensing §7 non-goal until S2 | none exist in TS, Python, Node, Go or C |
 | provider-free leader arm, LS-1..LS-6 | LS plan | design not signed, arm dark |
 | S1 item 2 beyond candidate derivation (`AnyAuthorized`, tag/group selectors) | sensing status block | blocked on LS |
-| consumer-SDK review §3 (exhaustive remedy match) | `CODE_REVIEW_2026_09_10_SENSING_CONSUMER_SDK.md` addendum | recorded, not taken |
+| consumer-SDK review §3 (remedy coverage), re-scoped as C5: Rust-owned binding error classification | `CODE_REVIEW_2026_09_10_SENSING_CONSUMER_SDK.md` addendum | recorded, not taken |
+| close during a pending `changed()`, and cancelling a pending wait | `SensingWatch` takes `&mut self` for both, so the overlap is undefined | unspecified, binding prerequisite (B1-pre) |
 
 ---
 
@@ -202,10 +203,32 @@ The sensing release gate (§8) counts this as part of the first useful release.
 *Witnesses:* sensing §6 rows 25 and 29. The final claim can still fail after a
 Ready observation, and readiness never acts as a reservation.
 
-**C5 — consumer-SDK review §3.** Replace the hard-coded refusal sample in
-`every_refusal_names_the_remedy` with an exhaustive `match` over
-`SensingError`, so a new variant fails to compile until someone gives it a
-remedy assertion.
+**C5 — Rust owns binding error classification** (consumer-SDK review §3,
+re-scoped 2026-11-21). An exhaustive-match *test* is not a binding parity
+guard. `SensingError` is `#[non_exhaustive]`: a test inside `net-mesh-sdk`
+can match it exhaustively, but that forces nothing on a downstream crate. The
+napi and pyo3 bindings and the C shim all have to carry a `_ =>` arm, and that
+arm is exactly where a new variant goes unclassified without any error. So:
+
+- **One SDK-owned classifier.** `SensingError` gains a classification method
+  in `net-mesh-sdk`. It returns a stable code string (`sensing:<kind>`, in the
+  existing `org:<area>:<kind>` vocabulary style), whether the error is
+  terminal, and the remedy text. Its body is an exhaustive `match` with no
+  wildcard. Because it sits in the defining crate, adding a variant fails to
+  compile until someone classifies it. The guard lives there, not in a test.
+- **Bindings forward the classification; they do not re-derive it.** Node,
+  Python, C and Go surface the code, terminal flag and remedy that Rust
+  returns. None of them matches on `SensingError` variants, so a wildcard arm
+  can no longer misclassify.
+- **One shared fixture.** A golden JSON fixture (variant → code, terminal,
+  remedy), generated from the classifier, under `tests/cross_lang_*`.
+  - The Rust test asserts that every variant appears in the fixture and
+    matches the classifier.
+  - Each binding's test suite (B1–B3) asserts that its surfaced errors match
+    the same fixture.
+  - A fixture that drifts from the classifier fails in Rust first.
+- `every_refusal_names_the_remedy` becomes a test of the classifier against
+  the fixture, replacing the hand-kept sample.
 
 ### B.2 Phase 2 — S2 sensed nRPC (the generic release gate)
 
@@ -251,12 +274,36 @@ and three-provider nRPC witness are proven", which is Phase 2's exit. Order:
      including how `CadenceRefusal` and `EvaluationRequest` predicates are
      expressed without a callback.
    - **Consumer.** `watch(query)`, then `snapshot()` / `changed()` / `close()`.
-     Node uses an async iterator over `changed()`. Python needs a GIL-safe
-     pull queue, which per AGENTS.md is an FFI-specific shape and must say why
-     the SDK has no equivalent, or add one.
+   - **B1-pre — settle wait semantics in the Rust SDK before choosing any
+     wrapper.** `SensingWatch::changed` and `close` both take `&mut self`. In
+     Rust they can never overlap, so the SDK has never had to define what
+     happens when they do. Every binding shares the watch across tasks or
+     threads, so it would have to make up an answer. Settle these two in
+     `net-mesh-sdk`, with witnesses, before any binding is written:
+     1. **Close during a pending `changed()`.** A close from another task
+        wakes the pending wait promptly with one defined terminal result
+        (`SensingError::Closed`, classified through C5). It must not hang
+        until the population floor, and it must not report a spurious change.
+        This needs an SDK-owned close handle that does not need `&mut` on the
+        watch. That handle is the shape every binding then wraps.
+     2. **Cancelling a pending wait.** This covers dropping the future, Python
+        task cancellation, a JS abort, and Go context cancellation.
+        Cancellation must not consume an edge: the next `changed()` still sees
+        a change that landed during the cancelled wait. It must not leak a
+        waiter, and it must not close the watch. Write this down as
+        `changed()`'s cancel-safety contract and witness it.
+
+     Only then choose the binding shapes. Node: an async iterator, or a
+     promise per wait. Python: a GIL-safe pull queue, or an awaitable per
+     wait. Go: a channel closed by `Close`, or a blocking `Changed(ctx)`.
+     Whichever is chosen inherits the two settled behaviours rather than
+     defining its own. Per AGENTS.md, an FFI-only shape has to say why the SDK
+     has no equivalent, or add one.
    - **Sensed nRPC.** Forward to `call_service_sensed`.
-   - **Errors.** Every `SensingError` variant maps to a classified binding
-     error with its remedy, pinned by the C5 exhaustive match.
+   - **Errors.** Surface C5's Rust-owned classification (code, terminal,
+     remedy) verbatim. No binding matches on `SensingError` variants. Each
+     binding's test suite checks its surfaced errors against the C5 shared
+     fixture.
    - **Teardown.** A leaked binding watch holds node-global leases until GC or
      close. Document it the way OLB §12 documents the leaked `OrgClient`.
 2. **B2 — C ABI and Go.**
@@ -366,11 +413,11 @@ fixtures move with it.
 H1 history merge ──► H2 retire refs (confirm)
 
 Phase 1 (parallel):  C1 S4 reconcile · C2 counters (design amendment first)
-                     C3 RED decision · C4 gang wrappers · C5 exhaustive match
+                     C3 RED decision · C4 gang wrappers · C5 Rust-owned error classifier
         │
 Phase 2:  S2a helper ─► S2b join ─► S2c unary ─► S2d streaming
         │                      (= sensing §8 first useful release, with C4)
-        ├──────────────► Phase 3  B1 Node/Py ─► B2 C/Go ─► B3 TS/Py SDKs + docs
+        ├──────────────► Phase 3  B1-pre wait semantics (Rust) ─► B1 Node/Py ─► B2 C/Go ─► B3 TS/Py SDKs + docs
         └──────────────► Phase 3′ S3b compute placement
 
 Phase 4 (on decision):  OLB-3 P2C · OLB-4 NoViableProvider (+ bindings, X1)
@@ -402,7 +449,8 @@ which has already landed, so it never blocks Phases 1–4 (LS §9 rules 1–4).
 2. H2: approve deleting the three remote refs after H1.
 3. C2: amend the exact design to authorize the two counters.
 4. C3: keep the RED waiver, or run the bounded campaign (recommended).
-5. B1: the binding provider shape (value-backed evaluator vs. callback).
+5. B1: the binding provider shape (value-backed evaluator vs. callback), and,
+   after B1-pre lands, each binding's wait wrapper.
 6. Phase 4: whether the unsensed lane still wants P2C and `NoViableProvider`.
 7. Phase 5: whether to open the LS design review now.
 8. Phase 6: whether there is a named cross-org consumer.
