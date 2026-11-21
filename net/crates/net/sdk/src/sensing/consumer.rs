@@ -451,15 +451,15 @@ impl SensingSnapshot {
         (&self.ranked, not_ready)
     }
 
-    /// Build a snapshot from plain rows, for in-crate witnesses only. Each row
-    /// is `(node_id, viability)`; `ranked` is the viable rank order. No row
-    /// carries an estimate.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        capability: &str,
-        rows: &[(u64, SensedViability)],
-        ranked: &[u64],
-    ) -> Self {
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// Build a snapshot from plain rows. Each row is `(node_id, viability)`;
+    /// `ranked` is the viable rank order. No row carries an estimate. A real
+    /// snapshot comes only from [`SensingWatch::snapshot`]; this exists so a
+    /// consumer's ORDERING can be witnessed against a known capture.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn for_test(capability: &str, rows: &[(u64, SensedViability)], ranked: &[u64]) -> Self {
         Self {
             capability: capability.to_owned(),
             providers: rows

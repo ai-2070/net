@@ -508,6 +508,91 @@ impl Mesh {
         })
     }
 
+    // ---- Sensed (S2) ----
+
+    /// [`Self::call_service`] with the target chosen using an exact-provider
+    /// readiness capture (sensing plan S2).
+    ///
+    /// `readiness` must be a snapshot of `nrpc:<service>`: take it from a
+    /// [`SensingWatch`](crate::sensing::SensingWatch) opened with
+    /// `SensingQuery::new(format!("nrpc:{service}"))`. A snapshot of any other
+    /// capability is treated as **no evidence**, and the call routes exactly
+    /// like [`Self::call_service`]. Readiness for one interest never steers a
+    /// call to another.
+    ///
+    /// The candidates are [`Self::call_service`]'s, authorized the same way
+    /// and before sensing is consulted. Among them:
+    /// - the best-ranked viable provider is called;
+    /// - with none viable, the routing policy chooses among the providers the
+    ///   snapshot has no verdict for;
+    /// - with every candidate not-ready, the policy chooses among all of them.
+    ///
+    /// Nothing is pruned, and sensing never adds a provider.
+    ///
+    /// **One target, one invocation.** A provider admission denial, a timeout
+    /// or any other post-dispatch failure is returned as-is. It is never
+    /// retried against the next candidate, because the request may already
+    /// have executed.
+    ///
+    /// Which providers can appear in a snapshot: today, only providers this
+    /// node discovers through its own organization's owner-private plane
+    /// (`serve_org`). A provider that serves `service` only publicly is never
+    /// sensed, so it routes exactly as it would unsensed.
+    pub async fn call_service_sensed(
+        &self,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> std::result::Result<RpcReply, RpcError> {
+        let (viable, not_ready) = sensed_inputs_for(service, readiness);
+        self.node()
+            .call_service_sensed(service, payload, opts, &viable, &not_ready)
+            .await
+    }
+
+    /// The typed form of [`Self::call_service_sensed`]. The request is encoded
+    /// with `opts.codec` and the reply decoded with it.
+    pub async fn call_service_typed_sensed<Req, Resp>(
+        &self,
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> std::result::Result<Resp, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body = opts.codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("client encode: {e}"),
+        })?;
+        let reply = self
+            .call_service_sensed(service, Bytes::from(body), opts.raw, readiness)
+            .await?;
+        opts.codec.decode(&reply.body).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Decode,
+            message: format!("client decode: {e}"),
+        })
+    }
+
+    /// The streaming form of [`Self::call_service_sensed`], with the same
+    /// target choice and the same unary-only refusal of an org proof intent
+    /// as [`Self::call_service_streaming`].
+    pub async fn call_service_streaming_sensed(
+        &self,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> std::result::Result<RpcStream, RpcError> {
+        let (viable, not_ready) = sensed_inputs_for(service, readiness);
+        self.node()
+            .call_service_streaming_sensed(service, payload, opts, &viable, &not_ready)
+            .await
+    }
+
     // ---- Streaming (raw) ----
 
     /// Register a raw-bytes streaming RPC handler on `service`. The
@@ -1613,6 +1698,72 @@ where
                 code: NRPC_TYPED_HANDLER_ERROR,
                 message,
             })
+    }
+}
+
+/// The sensed-selection inputs `readiness` contributes to a call of
+/// `service`: its viable rank order and its not-ready set, or nothing at all
+/// when the capture is of a different capability than `nrpc:<service>`.
+///
+/// A mismatched capture is treated as absent evidence rather than refused:
+/// the call still has its full authorized candidate set and routes as
+/// unsensed. What must never happen is a readiness verdict about one interest
+/// steering a call to another (sensing plan §6 #21).
+fn sensed_inputs_for(
+    service: &str,
+    readiness: &crate::sensing::SensingSnapshot,
+) -> (Vec<u64>, std::collections::HashSet<u64>) {
+    let wanted = readiness
+        .capability()
+        .strip_prefix("nrpc:")
+        .is_some_and(|named| named == service);
+    if !wanted {
+        return (Vec::new(), std::collections::HashSet::new());
+    }
+    let (viable, not_ready) = readiness.exact_order_inputs();
+    (viable.to_vec(), not_ready)
+}
+
+#[cfg(test)]
+mod sensed_inputs_tests {
+    use super::sensed_inputs_for;
+    use crate::sensing::{SensedViability, SensingSnapshot};
+
+    fn snapshot(capability: &str) -> SensingSnapshot {
+        SensingSnapshot::for_test(
+            capability,
+            &[
+                (1, SensedViability::Viable),
+                (2, SensedViability::NotViable),
+            ],
+            &[1],
+        )
+    }
+
+    /// A snapshot of `nrpc:<service>` contributes its own classes.
+    #[test]
+    fn the_matching_capture_contributes_its_classes() {
+        let (viable, not_ready) = sensed_inputs_for("infer", &snapshot("nrpc:infer"));
+        assert_eq!(viable, vec![1]);
+        assert_eq!(not_ready, [2].into_iter().collect());
+    }
+
+    /// §6 #21: a capture of any other interest (a different service, a bare
+    /// capability name, a prefix collision) contributes nothing. RED against a
+    /// join that ignores the capability, or matches by prefix.
+    #[test]
+    fn an_unrelated_capture_contributes_nothing() {
+        for other in [
+            "nrpc:other",
+            "infer",
+            "nrpc:infer.v2",
+            "nrpc:inf",
+            "nrpc:",
+            "",
+        ] {
+            let (viable, not_ready) = sensed_inputs_for("infer", &snapshot(other));
+            assert!(viable.is_empty() && not_ready.is_empty(), "{other:?}");
+        }
     }
 }
 

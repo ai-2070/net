@@ -266,6 +266,39 @@ arm is exactly where a new variant goes unclassified without any error. So:
 
 ### B.2 Phase 2 — S2 sensed nRPC (the generic release gate)
 
+**Status (2026-11-21): S2a–S2d are implemented and await review.**
+
+**Shape decision (owner, 2026-11-21): a caller-supplied snapshot with a
+node-id join**, the same shape as C4. The decision was needed because
+exact-provider sensing covers only owner-private (`serve_org`) providers.
+Those are protected services that `OrgClient::call` already balances, and a
+public `call_service` provider is never in that population. So S2 senses
+whichever authorized candidates the caller's `nrpc:<service>` snapshot
+classifies. A provider that serves only publicly routes exactly as it would
+unsensed.
+
+What landed:
+- **S2a:** `MeshNode::routable_service_candidates`, the one helper that
+  `call_service`, `call_service_streaming` and both sensed verbs route over.
+  It is a pure refactor: the six nRPC/capability-auth integration binaries
+  pass 95/95, and the core `mesh_rpc` units pass 67/67.
+- **S2b:** the pure `sensed_service_target`. The best-ranked viable candidate
+  wins; otherwise the routing policy chooses among the unverdicted
+  candidates; otherwise among all. Nothing is pruned, and a rank outside the
+  authorized set is ignored. Six unit witnesses.
+- **S2c:** `MeshNode::call_service_sensed`, and the SDK's
+  `Mesh::call_service_sensed` / `call_service_typed_sensed`. A snapshot of a
+  capability other than `nrpc:<service>` is treated as no evidence (§6 #21).
+- **S2d:** `call_service_streaming_sensed`, with the same helper and the same
+  unary-only org-intent refusal.
+
+Live witnesses are in `sdk/tests/sensed_nrpc.rs`: six over real transport,
+covering §6 #18–#24 (#23 as "the selected provider's failure is final"). The
+binary is in the zero-retry nextest override, because its witness asserts
+exactly one execution. The S2 mutations M5 (a rank outside the authorized
+set is accepted) and M6 (the capability check is ignored) both make their
+witnesses fail.
+
 Scope exactly as sensing §5 S2: an **owner-authorized same-organization
 provider pool**. Foreign, public and `Granted` providers stay Unknown and
 unsensed. Ordinary `call_service*` is unchanged.

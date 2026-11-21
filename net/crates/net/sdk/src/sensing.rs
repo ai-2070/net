@@ -111,17 +111,20 @@
 //!
 //! What is genuinely absent, here and everywhere else in the SDK:
 //! provider-free / leader-backed sensing (no `AnyAuthorized`, tag or
-//! group selector), `Granted` and cross-organization sensing, a generic
-//! sensed CALL verb, compute-placement sensed adapters, warmed pools,
+//! group selector), `Granted` and cross-organization sensing,
+//! compute-placement sensed adapters, warmed pools,
 //! and language bindings. [`SensingQuery`] can express none of them,
 //! and [`SensingClient::watch`] refuses what it cannot mean rather than
 //! accepting an argument it would ignore.
 //!
-//! The gang scheduler is the one consumer of a snapshot outside
-//! `OrgClient`: [`Mesh::match_islands_sensed`]
-//! and [`Mesh::claim_island_sensed`]
-//! take a [`SensingSnapshot`] and apply its classes as a claim ORDER. Viable
-//! hosts lead, not-ready hosts go last, and nothing is removed.
+//! Outside `OrgClient`, a snapshot has two consumers, and both apply its
+//! classes as an ORDER (viable first, not-ready last, nothing removed):
+//!
+//! - the gang scheduler: `Mesh::match_islands_sensed` /
+//!   `Mesh::claim_island_sensed`;
+//! - service-name nRPC: `Mesh::call_service_sensed` (with typed and
+//!   streaming forms), which chooses one target among the already-authorized
+//!   candidates and invokes it exactly once.
 //!
 //! The other consumer of the same substrate is
 //! [`crate::org::OrgClient`], which binds one acquisition family per
@@ -932,7 +935,7 @@ mod tests {
             .filter(|block| block.lines().any(|line| line.trim() == "retries = 0"))
             .collect();
         assert!(!zero_retry.is_empty(), "a zero-retry override must exist");
-        for binary in ["sensing_provider", "sensing_consumer"] {
+        for binary in ["sensing_provider", "sensing_consumer", "sensed_nrpc"] {
             assert!(
                 zero_retry
                     .iter()

@@ -110,8 +110,8 @@ Read this block, not the historical receipt below it, for current state.
   / `AnyAuthorized`, tag and group selectors remain unbuilt, and the SDK
   refuses rather than pretends.
 - `Granted` and cross-organization sensing.
-- S2 (a generic sensed nRPC call verb, `call_service_sensed`), S3 (compute and
-  gang adapters), warmed pools / P2C, language bindings, and any rollout or
+- S3 compute adapters (the gang half of S3 landed as completion-plan C4, and S2 as
+  completion-plan B.2, both awaiting review), warmed pools / P2C, language bindings, and any rollout or
   default enablement. (S4 was listed here until 2026-11-21; it is delivered.
   See the S4 reconciliation above.)
 
@@ -806,6 +806,13 @@ files: `sdk/src/sensing.rs`, `sdk/src/sensing/consumer.rs`, `sdk/src/lib.rs`,
 options.
 
 ### S2 — Sensed nRPC selection
+
+**IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` B.2), awaits review.**
+The shape differs from the work list below on one point, by owner decision:
+the population is the caller's exact-provider `SensingSnapshot` for
+`nrpc:<service>`, joined to the authorized candidates by node id, rather than a
+generic owner-scope watch (which does not exist; see that plan for why).
+Items 1 to 6 are otherwise as written.
 
 **Objective:** Prove generic protocol-native capability load balancing without changing baseline calls.
 
