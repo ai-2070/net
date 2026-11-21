@@ -112,19 +112,27 @@
 //! What is genuinely absent, here and everywhere else in the SDK:
 //! provider-free / leader-backed sensing (no `AnyAuthorized`, tag or
 //! group selector), `Granted` and cross-organization sensing,
-//! compute-placement sensed adapters, warmed pools,
+//! warmed pools,
 //! and language bindings. [`SensingQuery`] can express none of them,
 //! and [`SensingClient::watch`] refuses what it cannot mean rather than
 //! accepting an argument it would ignore.
 //!
-//! Outside `OrgClient`, a snapshot has two consumers, and both apply its
+//! Outside `OrgClient`, a snapshot has three consumers, and all apply its
 //! classes as an ORDER (viable first, not-ready last, nothing removed):
 //!
 //! - the gang scheduler: `Mesh::match_islands_sensed` /
 //!   `Mesh::claim_island_sensed`;
 //! - service-name nRPC: `Mesh::call_service_sensed` (with typed and
 //!   streaming forms), which chooses one target among the already-authorized
-//!   candidates and invokes it exactly once.
+//!   candidates and invokes it exactly once;
+//! - compute placement: `DaemonRuntime::place_sensed` /
+//!   `place_migration_sensed`, over the scheduler's eligible nodes, with
+//!   placement vetoes still final.
+//!
+//! A wait parked in [`SensingWatch::changed`] can be ended from another task
+//! through a [`SensingWatchCloser`]. The wait is cancel-safe: dropping it
+//! consumes no edge. These are the two behaviours every language binding's
+//! wrapper inherits.
 //!
 //! The other consumer of the same substrate is
 //! [`crate::org::OrgClient`], which binds one acquisition family per
@@ -172,7 +180,8 @@ pub use class::{parse_sensing_wire, ERR_SENSING_PREFIX};
 /// and reuse contract.
 pub use consumer::{
     ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
-    SensingWatch, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
+    SensingWatch, SensingWatchCloser, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION,
+    POPULATION_RECONCILE_FLOOR,
 };
 
 /// The provider-side evaluator contract. A capability integration

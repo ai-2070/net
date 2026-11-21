@@ -390,7 +390,57 @@ and three-provider nRPC witness are proven", which is Phase 2's exit. Order:
 moves) passes in Rust, Node, Python and Go. No binding receives candidates,
 scores or proofs it does not already get from Rust.
 
+**B1-pre status (2026-11-21): implemented ahead of Phase 2's sign-off, by
+owner decision ("work ahead on the Rust-only pieces"); awaits review.** The
+language bindings themselves (B1–B3) stay gated.
+- **Close.** `SensingWatch::closer()` → `SensingWatchCloser` (`Clone`,
+  `Send`, `Sync`). The watch and all its closers share one close: one flag,
+  one retirement, and one `Notify` wake. A `changed()` pending on another
+  task returns `SensingError::WatchClosed` promptly, never `Ok`, and never at
+  the floor. That is the existing `WatchClosed` variant, so C5's
+  classification covers it unchanged. A snapshot whose convergence overlapped
+  a close re-retires before refusing, so no demand outlives a close.
+- **Cancellation.** `changed()` is documented as cancel-safe. Dropping it
+  consumes no edge, leaves no waiter, and neither moves the floor nor closes
+  the watch.
+
+Witnesses, in the CI roster in `sensing_consumer.rs` (floor raised 27→30,
+names pinned):
+- `a_close_from_another_task_ends_a_pending_wait_promptly`;
+- `a_cancelled_wait_consumes_no_edge_and_leaves_the_watch_open`;
+- `a_close_landing_inside_a_snapshot_leaves_no_demand`.
+
+Mutations M7 (the post-convergence re-check dropped), M8 (the close arm
+dropped) and M9 (the floor re-armed on entry) each fail their witness. One
+honest limit: "cancellation consumes no edge" has no separate inverse
+mutation. It rests on tokio's documented cancel-safety of
+`watch::Receiver::changed` plus the end-to-end witness, which would fail if
+the wait acknowledged the generation before completing.
+
 ### B.4 Phase 3′ — S3b compute placement (parallel with Phase 3)
+
+**Status (2026-11-21): implemented, by the same owner decision; awaits
+review.**
+- **Core.** `compute::SensedOrder`, and `Scheduler::place_sensed` /
+  `place_migration_sensed` / `select_migration_target_sensed` /
+  `select_member_node_sensed` / `select_promotion_target_sensed`. The sensed
+  band is the first sort key under the existing vetoes and score.
+  `pick_best_candidate` is now defined as the sensed core with no evidence,
+  so the comparator is literally the same. The LocalPreferred fast path is
+  kept within the best band.
+- **SDK.** `DaemonRuntime::place_sensed` / `place_migration_sensed`. Member
+  and promotion selection are reached through the group types, which do not
+  yet take a snapshot; their core variants exist and are witnessed.
+- **Deviation from §3.3's text**, which says "fresh-evidence non-viable
+  removed". Not-ready is **demoted, not removed**, like C4 (gang) and S2
+  (nRPC), per the exact lane's D7.2. That makes ordinary and gang placement
+  agree on classes, which is S3 item 5.
+- **PlacementReason** gains no variant, so external exhaustive matches stay
+  valid.
+
+Witnesses: five core scheduler units covering §6 #25–#28, and two SDK runtime
+units. Mutations M10 (the band key dropped) and M11 (local always wins) each
+fail their witness.
 
 As sensing §5 S3 items 1–3 and 5:
 - one pure helper applying `SensedCandidates` (`scheduler_bridge/readiness.rs`

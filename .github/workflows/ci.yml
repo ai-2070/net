@@ -2604,7 +2604,7 @@ jobs:
       # must not disappear silently. This step therefore verifies the RESULT
       # SET that run produced (`$RUNNER_TEMP/sdk-suite-junit.xml`, written by
       # `[profile.default.junit]` in `.config/nextest.toml`) rather than
-      # spending 27 more runner invocations re-proving what already ran.
+      # spending 30 more runner invocations re-proving what already ran.
       #
       # `check-witness-results.py` is fail-closed on every axis and is
       # STRICTER than the loop it replaces:
@@ -2646,7 +2646,7 @@ jobs:
           python3 "$CHECK" \
             --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
             --suite sensing_consumer \
-            --min 27 \
+            --min 30 \
             --required-file - <<'REQUIRED'
           signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher
           an_already_parked_watcher_is_woken_by_a_provider_edge
@@ -2675,6 +2675,9 @@ jobs:
           a_granted_only_provider_is_never_sensed_and_the_owner_one_is
           a_partial_acquisition_keeps_its_own_state_and_another_owners
           the_population_floor_wakes_a_quiet_parked_consumer
+          a_close_from_another_task_ends_a_pending_wait_promptly
+          a_cancelled_wait_consumes_no_edge_and_leaves_the_watch_open
+          a_close_landing_inside_a_snapshot_leaves_no_demand
           REQUIRED
 
       # === the PRODUCTION organization exact-sensing call edge =======

@@ -110,9 +110,9 @@ Read this block, not the historical receipt below it, for current state.
   / `AnyAuthorized`, tag and group selectors remain unbuilt, and the SDK
   refuses rather than pretends.
 - `Granted` and cross-organization sensing.
-- S3 compute adapters (the gang half of S3 landed as completion-plan C4, and S2 as
-  completion-plan B.2, both awaiting review), warmed pools / P2C, language bindings, and any rollout or
-  default enablement. (S4 was listed here until 2026-11-21; it is delivered.
+- Warmed pools / P2C, language bindings, and any rollout or default enablement.
+  (S2, S3 and the gang half of S3 landed 2026-11-21 as completion-plan B.2, B.4 and C4, all awaiting review.)
+  (S4 was listed here until 2026-11-21; it is delivered.
   See the S4 reconciliation above.)
 
 **Historical receipt (2026-08-30, read at `f9f423e7bfd5b3d90491600af27624a153f5f5bc`) — superseded.**
@@ -834,6 +834,8 @@ Items 1 to 6 are otherwise as written.
 **Scope boundary:** The first sensed nRPC proof is an owner-authorized same-organization provider pool. Foreign/public and `Granted` providers remain Unknown/unsensed fallback until a separate cross-organization sensing-authority decision exists; ordinary nRPC discovery and invocation continue to work unchanged.
 
 ### S3 — Compute and gang SDK adapters
+
+**IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` C4 for gang, B.4 for compute), awaits review.** One deviation, applied to both halves: a sensed NotReady is demoted to the last band, not removed (exact lane D7.2), so ordinary and gang placement agree (item 5) and §3.3's "fresh-evidence non-viable removed" line is superseded for the exact-provider snapshot.
 
 **Objective:** Reuse the same projection in every scheduler that has a concrete readiness-relative placement decision.
 

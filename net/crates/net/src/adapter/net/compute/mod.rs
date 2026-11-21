@@ -40,7 +40,7 @@ pub use orchestrator::{
 };
 pub use registry::DaemonRegistry;
 pub use replica_group::{ReplicaGroup, ReplicaGroupConfig, SUBPROTOCOL_REPLICA_GROUP};
-pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError};
+pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError, SensedOrder};
 pub use standby_group::{MemberRole, StandbyGroup, StandbyGroupConfig};
 
 /// Recovery hook for replication / fork / standby groups whose

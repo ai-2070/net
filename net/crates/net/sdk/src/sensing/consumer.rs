@@ -150,6 +150,7 @@
 //! ([`SensingError::UnsatisfiableBudget`]) and a zero provider-start
 //! bound ([`SensingError::UnsatisfiableStartBound`]).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -515,7 +516,9 @@ pub struct SensingWatch {
     /// consumer cannot miss a population change in a quiet network — and
     /// cannot spin, because the timer is re-armed each time it fires.
     floor_wake: Instant,
-    closed: bool,
+    /// The close state this watch shares with every [`SensingWatchCloser`] it
+    /// hands out: one flag, one wake, one retirement (B1-pre).
+    close: Arc<WatchClose>,
     /// Fixtures-only witness seam: see [`SensingWatch::set_capture_seam_for_test`].
     #[cfg(any(test, feature = "fixtures"))]
     capture_seam: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -600,6 +603,12 @@ impl SensingClient {
             .retain(query.capability())
             .map_err(retention_refusal)?;
         let now = Instant::now();
+        let close = Arc::new(WatchClose {
+            closed: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            family: family.clone(),
+            capability: query.capability.clone(),
+        });
         Ok(SensingWatch {
             node: Arc::clone(&self.node),
             family,
@@ -609,7 +618,7 @@ impl SensingClient {
             changes,
             converged_at: now,
             floor_wake: now + POPULATION_RECONCILE_FLOOR,
-            closed: false,
+            close,
             #[cfg(any(test, feature = "fixtures"))]
             capture_seam: None,
             #[cfg(any(test, feature = "fixtures"))]
@@ -668,7 +677,7 @@ impl SensingWatch {
     /// refusal retains nothing and releases nothing, so the installed
     /// observation keeps serving, clamped to current visibility.
     pub fn snapshot(&mut self) -> Result<SensingSnapshot, SensingError> {
-        if self.closed {
+        if self.close.is_closed() {
             return Err(SensingError::WatchClosed);
         }
         // Step 1 — see the module note above. `mark_unchanged` takes no
@@ -690,6 +699,16 @@ impl SensingWatch {
             .org_sensing_current_visibility(&self.authority)
             .ok_or(SensingError::ObserverNotQualified)?;
         let demand = self.converge()?;
+        // A close from another task (a `SensingWatchCloser`) may have landed
+        // while this read was converging, and the convergence may have
+        // installed demand AFTER the closer retired it. Retire again and
+        // refuse: no read answers after a close, and no demand outlives it.
+        // The flag is published before the closer's own retirement, so either
+        // this check sees it, or that retirement runs after this convergence.
+        if self.close.is_closed() {
+            self.family.retire(&self.capability);
+            return Err(SensingError::WatchClosed);
+        }
         let projection = demand.project_sensed_order(Instant::now(), &self.budget);
         Ok(self.assemble(&projection, &visible))
     }
@@ -720,15 +739,45 @@ impl SensingWatch {
     /// edge without pause.
     ///
     /// Refuses with [`SensingError::WatchClosed`] on a closed watch.
+    ///
+    /// # Close during a pending wait
+    ///
+    /// A [`SensingWatchCloser::close`] from another task while this wait is
+    /// pending wakes it **promptly** with [`SensingError::WatchClosed`]. It
+    /// does not wait for the population floor, and the wake is never reported
+    /// as a change. That is the only defined result: a wait that is pending
+    /// when the watch closes never returns `Ok`.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancel-safe. Dropping a pending `changed()` future (a `select!` loser,
+    /// a timeout, a binding's abort or context cancellation):
+    /// - consumes no edge: a change that landed during the cancelled wait is
+    ///   still unseen, so the next `changed()` returns at once;
+    /// - leaves no waiter registered;
+    /// - does not re-arm or move the floor deadline;
+    /// - does not close the watch.
+    ///
+    /// The generation acknowledgement and the floor re-arm happen only on
+    /// the completed return.
     pub async fn changed(&mut self) -> Result<(), SensingError> {
-        if self.closed {
+        // Register for the close wake BEFORE reading the flag. A close that
+        // lands between the two then still reaches this waiter: `enable`
+        // makes the future count as waiting for `notify_waiters`.
+        let closing = self.close.wake.notified();
+        tokio::pin!(closing);
+        closing.as_mut().enable();
+        if self.close.is_closed() {
             return Err(SensingError::WatchClosed);
         }
         let floor = tokio::time::Instant::from_std(self.floor_wake);
         tokio::select! {
-            // Biased: when both are ready, report the real change edge —
-            // a floor wake is the fallback, not the headline.
+            // Biased: a close outranks everything, then a real change edge
+            // outranks the floor, which is the fallback and not the headline.
             biased;
+            () = &mut closing => {
+                return Err(SensingError::WatchClosed);
+            }
             moved = self.changes.changed() => {
                 // The sender lives on the node this watch holds an `Arc`
                 // to, so a closed channel means the node itself is gone.
@@ -753,18 +802,48 @@ impl SensingWatch {
     /// record, and only the last owner's release deregisters it.
     ///
     /// Drop does the same thing, so a forgotten close leaks nothing.
+    ///
+    /// Equivalent to [`SensingWatchCloser::close`] on any of this watch's
+    /// closers: one shared retirement, and `true` to whichever caller got
+    /// there first.
     pub fn close(&mut self) -> bool {
-        if self.closed {
-            return false;
-        }
-        self.closed = true;
-        self.family.retire(&self.capability);
-        true
+        self.close.close()
     }
 
-    /// Whether this watch has been closed.
+    /// Whether this watch has been closed, by [`Self::close`], by drop, or by
+    /// any [`SensingWatchCloser`].
     pub fn is_closed(&self) -> bool {
-        self.closed
+        self.close.is_closed()
+    }
+
+    /// A handle that can close this watch from another task without `&mut`
+    /// access to it (B1-pre).
+    ///
+    /// [`Self::changed`] and [`Self::close`] both take `&mut self`, so in Rust
+    /// they never overlap. A binding, or any caller that parks on `changed()`
+    /// in one task and tears down from another, needs to close while a wait
+    /// is pending. Use this handle for that. Its close behaves exactly like
+    /// [`Self::close`], and a pending `changed()` returns
+    /// [`SensingError::WatchClosed`] promptly.
+    ///
+    /// A closer does not keep the observation alive: dropping the watch still
+    /// closes it, and a closer outliving its watch can only report that it is
+    /// closed.
+    pub fn closer(&self) -> SensingWatchCloser {
+        SensingWatchCloser {
+            close: Arc::clone(&self.close),
+        }
+    }
+
+    /// Unstable fixtures-only witness seam; not supported API.
+    ///
+    /// Whether this watch's family still retains demand for its capability.
+    /// A witness reads it to prove a close left NO demand behind, including
+    /// one a concurrent snapshot's convergence re-installed.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn retains_demand_for_test(&self) -> bool {
+        self.family.demand(&self.authority).is_some()
     }
 
     /// Unstable fixtures-only witness seam; not supported API.
@@ -987,6 +1066,75 @@ impl SensingWatch {
     }
 }
 
+/// The close state one [`SensingWatch`] shares with its
+/// [`SensingWatchCloser`]s: one flag, one wake, and the family and capability
+/// that one retirement releases.
+struct WatchClose {
+    closed: AtomicBool,
+    /// Wakes every pending [`SensingWatch::changed`] on close.
+    wake: tokio::sync::Notify,
+    family: OrgSensingFamily,
+    capability: String,
+}
+
+impl WatchClose {
+    /// Close once: publish the flag, retire this watch's own leases, wake
+    /// every pending wait. `true` only for the call that did it.
+    ///
+    /// The flag is published BEFORE the retirement, which is the order
+    /// [`SensingWatch::snapshot`]'s post-convergence check relies on.
+    fn close(&self) -> bool {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.family.retire(&self.capability);
+        self.wake.notify_waiters();
+        true
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+/// Closes one [`SensingWatch`] from anywhere, without `&mut` access to it
+/// (B1-pre). Obtained from [`SensingWatch::closer`].
+///
+/// `Clone`, `Send` and `Sync`. Any number of closers and the watch itself
+/// share ONE close: the first to close retires the watch's leases and wakes
+/// any pending [`SensingWatch::changed`] with [`SensingError::WatchClosed`].
+/// Every later close is a no-op returning `false`. This is the shape a
+/// language binding wraps: a JS abort, a Python task cancel, or a Go
+/// `Close()` on another goroutine closes through a closer while the wait is
+/// pending.
+#[derive(Clone)]
+pub struct SensingWatchCloser {
+    close: Arc<WatchClose>,
+}
+
+impl SensingWatchCloser {
+    /// Close the watch. Returns whether THIS call closed it. Synchronous:
+    /// when it returns `true`, the watch's own leases are released and every
+    /// wait that was pending has been woken.
+    pub fn close(&self) -> bool {
+        self.close.close()
+    }
+
+    /// Whether the watch is closed, by any route.
+    pub fn is_closed(&self) -> bool {
+        self.close.is_closed()
+    }
+}
+
+impl std::fmt::Debug for SensingWatchCloser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SensingWatchCloser")
+            .field("capability", &self.close.capability)
+            .field("closed", &self.close.is_closed())
+            .finish()
+    }
+}
+
 impl Drop for SensingWatch {
     fn drop(&mut self) {
         self.close();
@@ -998,7 +1146,7 @@ impl std::fmt::Debug for SensingWatch {
         f.debug_struct("SensingWatch")
             .field("capability", &self.capability)
             .field("budget", &self.budget.end_to_end_within)
-            .field("closed", &self.closed)
+            .field("closed", &self.close.is_closed())
             .finish()
     }
 }
@@ -1025,6 +1173,7 @@ mod tests {
     fn the_consumer_surface_is_send_and_sync() {
         fn require<T: Send + Sync>() {}
         require::<SensingWatch>();
+        require::<SensingWatchCloser>();
         require::<SensingQuery>();
         require::<SensingSnapshot>();
         require::<SensedProvider>();
