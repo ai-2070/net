@@ -38922,7 +38922,8 @@ impl MeshNode {
             // here. The main match routes `OrgProviderRegistration` to the live org
             // gate and `OrgCapabilityRegistration` to the dark drop.
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
-            | sensing::SensingInterestFrame::OrgProviderRegistration { .. } => None,
+            | sensing::SensingInterestFrame::OrgProviderRegistration { .. }
+            | sensing::SensingInterestFrame::GrantedProviderRegistration { .. } => None,
         };
         let session_root =
             if ctx.sensing_fleet_scope && claimed_scope == Some(ctx.sensing_local_root) {
@@ -39371,7 +39372,11 @@ impl MeshNode {
             // re-authoring path. The frame's membership certificate is verified at
             // this hop by the authority gate before it can reach the interest
             // table; the CAPABILITY (leader) variant below stays dark.
-            sensing::SensingInterestFrame::OrgProviderRegistration { .. } => {
+            // A GRANTED registration (OLB-6) rides the same admission and the
+            // same fenced register; its gate admits it only at its own target,
+            // so it never reaches the continuation path.
+            sensing::SensingInterestFrame::OrgProviderRegistration { .. }
+            | sensing::SensingInterestFrame::GrantedProviderRegistration { .. } => {
                 // Piece-4 exact-provider go-live (provider leg): the org authority
                 // gate admits the frame to a narrow validated wrapper + a pinned
                 // snapshot, then the SAME provider semantic operation the legacy
@@ -39448,6 +39453,11 @@ impl MeshNode {
         // `apply_provider_registration` (under the held table guard).
         let (interval, ttl) = match frame {
             sensing::SensingInterestFrame::OrgProviderRegistration {
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            }
+            | sensing::SensingInterestFrame::GrantedProviderRegistration {
                 requested_sample_interval,
                 soft_state_ttl,
                 ..
@@ -39540,10 +39550,15 @@ impl MeshNode {
         // AUTHORITY PHASE (steps 3-8), against the pinned snapshot. Consumes the
         // shape validated above, so nothing is reconstructed twice and the two
         // phases cannot drift.
+        let local_entity = ctx.signing_identity.entity_id().clone();
         let validated = match sensing::verify_org_admission(
             &shape,
             from_node,
             sender_entity,
+            sensing::LocalSensingIdentity {
+                node_id: ctx.local_node_id,
+                entity: &local_entity,
+            },
             Some(snapshot.authority_view()),
             snapshot.floors(),
             now_secs,
@@ -39675,7 +39690,14 @@ impl MeshNode {
             };
             match (admitted.authority(), org_authority) {
                 (sensing::RegistrationAuthority::Legacy { .. }, None) => register(&mut table),
-                (sensing::RegistrationAuthority::Org { .. }, Some(snapshot)) => {
+                // A GRANTED row is fenced exactly like an org row (OLB-6, D6.4):
+                // grant revocations publish through the same revocation store,
+                // so the stamp covers a grant revoked between gate and row.
+                (
+                    sensing::RegistrationAuthority::Org { .. }
+                    | sensing::RegistrationAuthority::Granted { .. },
+                    Some(snapshot),
+                ) => {
                     // The seam Arc is bound to a local so it outlives the call.
                     let seam = ctx.sensing_fence_seam_hook();
                     let fenced = sensing::with_fenced_current_authority(
@@ -39704,6 +39726,7 @@ impl MeshNode {
                 }
                 // Incoherent authority/evidence pairing — a caller bug; never mutate.
                 (sensing::RegistrationAuthority::Org { .. }, None)
+                | (sensing::RegistrationAuthority::Granted { .. }, None)
                 | (sensing::RegistrationAuthority::Legacy { .. }, Some(_)) => {
                     tracing::error!(
                         from_node = format!("{:#x}", from_node),
@@ -61688,6 +61711,206 @@ mod sensing_authority_witness_tests {
             org_commitment(),
             "the org row carries the canonical org commitment, not a legacy root"
         );
+    }
+
+    // ---- OLB-6: granted (cross-organization) registrations at dispatch ----
+
+    /// The acting (grantee) organization of the granted witnesses. The node's
+    /// owner, and so the grant's issuer, is `org()`.
+    fn grantee_org() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x52u8; 32])
+    }
+
+    /// One granted registration's credentials and the instant to admit it at:
+    /// the LATEST of the three windows' openings, because these fixtures run
+    /// at zero verification skew (see `admission_sample`).
+    struct GrantedFixture {
+        cert: OrgMembershipCert,
+        dispatcher: crate::adapter::net::behavior::org_grant::OrgDispatcherGrant,
+        grant: crate::adapter::net::behavior::org_grant::OrgCapabilityGrant,
+        at: u64,
+    }
+
+    fn granted_fixture(sender: &EntityId) -> GrantedFixture {
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+            OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+        let capability = CapabilityAuthorityId::for_tag("gpu.infer");
+        let cert = OrgMembershipCert::try_issue(
+            &grantee_org(),
+            sender.clone(),
+            1,
+            ORG_CERT_TTL_SECS_RECOMMENDED,
+        )
+        .expect("grantee membership");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &grantee_org(),
+            sender.clone(),
+            DispatcherScope::Exact(capability),
+            3600,
+        )
+        .expect("dispatcher");
+        let (grant, _) = OrgCapabilityGrant::try_issue(
+            &org(),
+            grantee_org().org_id(),
+            capability,
+            GrantRights::DISCOVER
+                .union(GrantRights::INVOKE)
+                .union(GrantRights::SENSE),
+            GrantTargetScope::AnyNodeOwnedBy(org().org_id()),
+            3600,
+        )
+        .expect("SENSE grant");
+        let at = cert
+            .not_before
+            .max(dispatcher.not_before)
+            .max(grant.not_before);
+        GrantedFixture {
+            cert,
+            dispatcher,
+            grant,
+            at,
+        }
+    }
+
+    fn granted_frame(target: u64, fixture: &GrantedFixture) -> sensing::SensingInterestFrame {
+        sensing::SensingInterestFrame::granted_provider_registration(
+            &org_spec(
+                target,
+                sensing::canonical_granted_sensing_commitment(&fixture.grant),
+            ),
+            target,
+            D,
+            ORG_TTL,
+            fixture.cert.clone(),
+            fixture.dispatcher.clone(),
+            fixture.grant.clone(),
+        )
+    }
+
+    // G1 — a granted registration addressed to THIS node lands a row under the
+    // GRANTED audience: not the provider org's same-org commitment and not a
+    // legacy entity root.
+    #[tokio::test]
+    async fn a_granted_registration_lands_a_row_under_the_granted_audience() {
+        let node = org_node("g1").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id();
+        let fixture = granted_fixture(&sender);
+        let granted_root = sensing::canonical_granted_sensing_commitment(&fixture.grant);
+        let key = sensing::ProviderInterestKey::new(org_spec(target, granted_root).key(), target);
+        let ctx = node.dispatch_ctx();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(target, &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .expect("a valid granted registration is admitted at its target");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            Instant::now(),
+            fixture.at,
+        );
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("the granted row is present");
+        assert_eq!(row.owner_root, granted_root);
+        assert_ne!(row.owner_root, org_commitment());
+    }
+
+    // G2 — a granted registration that reaches a node OTHER than its target is
+    // refused, counted, and records nothing: granted interest is never relayed.
+    #[tokio::test]
+    async fn a_granted_registration_for_another_target_creates_no_row() {
+        let node = org_node("g2").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let fixture = granted_fixture(&sender);
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(node.node_id().wrapping_add(1), &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .is_none());
+        assert!(
+            node.sensing_table_is_empty(),
+            "a relayed granted frame records nothing"
+        );
+        assert_eq!(
+            ctx.sensing_counters
+                .org_granted_refused
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+    }
+
+    // G3 — the grant is revoked by its issuer AFTER the gate admitted the frame
+    // and BEFORE the row: the revocation publish moves the authority stamp, so
+    // the fenced register refuses and no row exists. A grant revocation is
+    // therefore covered by the same currentness fence as a floor raise.
+    #[tokio::test]
+    async fn a_grant_revoked_between_gate_and_row_creates_no_row() {
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        let node = org_node("g3").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id();
+        let fixture = granted_fixture(&sender);
+        let ctx = node.dispatch_ctx();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(target, &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .expect("admitted before the revocation");
+        let bundle =
+            OrgGrantRevocationBundle::try_issue(&org(), [RevokedGrant::capability(&fixture.grant)])
+                .expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_grant_revocations(&bundle)
+            .expect("apply the revocation");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            Instant::now(),
+            fixture.at,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a grant revoked mid-admission creates no row"
+        );
+        assert_eq!(
+            ctx.sensing_counters
+                .org_stale_stamp
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        // And a fresh registration is now refused at the gate itself.
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(target, &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .is_none());
     }
 
     // W2 — a foreign-org certificate admits nothing.

@@ -53,6 +53,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::super::org::OrgMembershipCert;
+use super::super::org_grant::{OrgCapabilityGrant, OrgDispatcherGrant};
 use super::evaluator::{validate_interest_constraints, SensingCounters};
 use super::identity::{
     AudienceScopeCommitment, CanonicalConstraints, CapabilityId, ConstraintError, Digest256,
@@ -231,6 +232,55 @@ pub enum SensingInterestFrame {
         /// encoding; verified at every receiving hop.
         subscriber_membership: OrgMembershipCert,
     },
+    /// **Granted (cross-organization)** provider-addressed registration
+    /// (OLB-6, completion plan D6.3): the [`Self::OrgProviderRegistration`]
+    /// fields plus the acting organization's dispatcher grant and the
+    /// provider organization's capability grant carrying SENSE. Postcard
+    /// variant index **5** (appended; 0..=4 are frozen).
+    ///
+    /// DIRECT ONLY: the receiving node must be `target`. A node that is not
+    /// refuses it and authors no continuation, so a granted interest never
+    /// crosses a relay (protected RPC is direct-session-only already,
+    /// OA2-E0.3). The audience must be
+    /// `canonical_granted_sensing_commitment(capability_grant)`, which the
+    /// digest binds.
+    GrantedProviderRegistration {
+        /// The provider this branch targets — the receiving node.
+        target: u64,
+        /// Capability the predicate targets.
+        capability_id: CapabilityId,
+        /// Inline canonical constraint bytes C.
+        constraints: Vec<u8>,
+        /// Digest the inline bytes must hash to.
+        constraints_digest: Digest256,
+        /// Provider-evaluated latency envelope L.
+        work_latency: WorkLatencyEnvelope,
+        /// The provider population (carried for digest verification).
+        providers: ProviderSelector,
+        /// The result cardinality (carried for digest verification).
+        result_mode: ResultMode,
+        /// The disclosure class (carried for digest verification).
+        disclosure_class: DisclosureClass,
+        /// Wire scope claim — the granted audience (cross-checked; also
+        /// digest-bound).
+        audience_scope: AudienceScopeCommitment,
+        /// The capability-interest identity this branch serves.
+        interest_digest: Digest256,
+        /// Aggregated (strictest) D for the branch.
+        requested_sample_interval: Duration,
+        /// Soft-state lifetime of the branch registration.
+        soft_state_ttl: Duration,
+        /// The registering consumer's membership in the ACTING
+        /// organization (the grantee).
+        subscriber_membership: OrgMembershipCert,
+        /// The acting organization's dispatcher grant for the consumer.
+        /// Boxed only to keep the enum small; `Box<T>` serializes exactly
+        /// as `T`, so the wire bytes are unchanged.
+        dispatcher_grant: Box<OrgDispatcherGrant>,
+        /// The provider organization's capability grant to the acting
+        /// organization, carrying SENSE (boxed, as above).
+        capability_grant: Box<OrgCapabilityGrant>,
+    },
 }
 
 impl SensingInterestFrame {
@@ -340,6 +390,38 @@ impl SensingInterestFrame {
         }
     }
 
+    /// Build the GRANTED provider-addressed registration (OLB-6, D6.3) for a
+    /// resolved branch: the same semantic derivation as
+    /// [`Self::org_provider_registration`], plus the acting organization's
+    /// dispatcher grant and the provider organization's SENSE grant.
+    pub fn granted_provider_registration(
+        spec: &InterestSpec,
+        target: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        subscriber_membership: OrgMembershipCert,
+        dispatcher_grant: OrgDispatcherGrant,
+        capability_grant: OrgCapabilityGrant,
+    ) -> Self {
+        Self::GrantedProviderRegistration {
+            target,
+            capability_id: spec.capability_id.clone(),
+            constraints: spec.constraints.canonical_bytes(),
+            constraints_digest: spec.constraints.constraints_digest(),
+            work_latency: spec.work_latency,
+            providers: spec.providers.clone(),
+            result_mode: spec.result_mode,
+            disclosure_class: spec.disclosure_class,
+            audience_scope: spec.audience,
+            interest_digest: spec.interest_digest(),
+            requested_sample_interval,
+            soft_state_ttl,
+            subscriber_membership,
+            dispatcher_grant: Box::new(dispatcher_grant),
+            capability_grant: Box::new(capability_grant),
+        }
+    }
+
     /// Rebuild the COMPLETE [`InterestSpec`] a registration frame
     /// carries, given the already-validated parse of its inline
     /// constraint bytes. `None` for [`Self::Deregister`] (it carries
@@ -382,6 +464,15 @@ impl SensingInterestFrame {
                 ..
             }
             | Self::OrgProviderRegistration {
+                capability_id,
+                work_latency,
+                providers,
+                result_mode,
+                disclosure_class,
+                audience_scope,
+                ..
+            }
+            | Self::GrantedProviderRegistration {
                 capability_id,
                 work_latency,
                 providers,
@@ -460,6 +551,12 @@ impl SensingInterestFrame {
                 ..
             }
             | Self::OrgProviderRegistration {
+                constraints,
+                constraints_digest,
+                interest_digest,
+                ..
+            }
+            | Self::GrantedProviderRegistration {
                 constraints,
                 constraints_digest,
                 interest_digest,

@@ -772,6 +772,28 @@ cross-org proof and docs.
   An already-accepted row lives until its soft-state TTL, which is the same
   residual the same-org lane carries.
 
+**Status.**
+- **6a, landed** (`d9f395f55`): D6.1, the CLI `--sense` flag and a golden
+  vector.
+- **6b, landed, awaits review**: D6.2–D6.4 at the provider.
+  - `canonical_granted_sensing_commitment` and frame variant 5. The two
+    grants are boxed, which leaves the wire bytes unchanged.
+  - `verify_granted_admission` behind the shared shape phase, with
+    `OrgSensingRejection::Granted(GrantedSensingRefusal)` and the
+    `org_granted_refused` counter.
+  - `RegistrationAuthority::Granted` carries the root derived from the grant.
+    It is fenced exactly like an org row and never plans a continuation.
+  - Witnesses: four gate units, including a 13-case
+    each-refusal-for-its-own-reason table, and three dispatch witnesses
+    (G1–G3): the row lands under the granted root; a non-target refuses
+    and counts; a grant revoked between the gate and the row creates no
+    row.
+  - Mutations M18–M25 each failed their witness.
+  - Recorded residual: a node configured with an explicit sensing fleet
+    root EQUAL to a granted commitment would let a legacy row share a key
+    with a granted row. That is the closure-2 class, unreachable without
+    already holding the grant, and is not refused at install.
+
 This gates on **a named cross-organization consumer** (OLB §13). Without one
 it does not start. Then, per OLB §5.3:
 - explicit `GrantRights::SENSE` with its own structural issue/decode rule;
