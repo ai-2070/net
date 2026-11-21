@@ -2306,6 +2306,75 @@ impl MeshRpc {
         })
     }
 
+    // ---- sensed (S2 / completion plan B1) ------------------------------
+
+    /// `callService`, with the target chosen using an exact-provider readiness
+    /// capture of `nrpc:<service>` (from `SensingWatch.snapshot()`). The Rust
+    /// SDK's own sensed call runs underneath:
+    /// - the candidates are authorized exactly as `callService` authorizes
+    ///   them;
+    /// - the best-ranked viable one is called, otherwise the routing policy
+    ///   chooses among the unverdicted ones;
+    /// - nothing is pruned, and the target is invoked once, never retried.
+    ///
+    /// A snapshot of another capability is no evidence.
+    ///
+    /// Synchronous with a `PromiseRaw` so the request bytes and the snapshot
+    /// are copied on the JS thread before anything awaits.
+    #[cfg(feature = "org")]
+    #[napi]
+    pub fn call_service_sensed<'env>(
+        &self,
+        env: &'env Env,
+        service: String,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
+        opts: Option<CallOptions>,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> Result<PromiseRaw<'env, Buffer>> {
+        let inner_opts = opts.unwrap_or_default().into_inner()?;
+        let payload = request.into_bytes();
+        let readiness = readiness.inner.clone();
+        let node = self.node()?;
+        env.spawn_future(async move {
+            net_sdk::mesh_rpc::call_service_sensed_on_node(
+                &node, &service, payload, inner_opts, &readiness,
+            )
+            .await
+            .map(|reply| Buffer::from(reply.body.as_ref()))
+            .map_err(nrpc_err_from_inner)
+        })
+    }
+
+    /// The streaming form of `callServiceSensed`.
+    #[cfg(feature = "org")]
+    #[napi]
+    pub fn call_service_streaming_sensed<'env>(
+        &self,
+        env: &'env Env,
+        service: String,
+        #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
+        opts: Option<CallOptions>,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> Result<PromiseRaw<'env, RpcStream>> {
+        let opts = opts.unwrap_or_default().into_inner()?;
+        let payload = request.into_bytes();
+        let readiness = readiness.inner.clone();
+        let node = self.node()?;
+        env.spawn_future(async move {
+            let inner = net_sdk::mesh_rpc::call_service_streaming_sensed_on_node(
+                &node, &service, payload, opts, &readiness,
+            )
+            .await
+            .map_err(nrpc_err_from_inner)?;
+            let flow_controlled_cached = inner.flow_controlled();
+            Ok(RpcStream {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+                flow_controlled_cached,
+                org_errors: false,
+            })
+        })
+    }
+
     // ---- ABI 0x0002 client-streaming + duplex callers (B9-1) ----
 
     /// Open a client-streaming call. Push chunks via

@@ -3377,3 +3377,85 @@ async fn a_close_landing_inside_a_snapshot_leaves_no_demand() {
     );
     let _ = std::fs::remove_dir_all(&consumer.dir);
 }
+
+/// B1: the VALUE-backed provider every language binding wraps. A `set` on the
+/// provider reaches the consumer's snapshot through real signed attestations,
+/// a `Ready` value over the request's signed start bound reads NotReady, and
+/// closing the handle withdraws readiness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_provider_set_reaches_the_snapshot_and_honors_the_start_bound() {
+    use net_sdk::sensing::ReadinessValue;
+    let owner = org();
+    let consumer = mesh_in_org("c-value", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let provider = mesh_in_org("p-value", &owner, true, Some(&audience)).await;
+    let _service = serve(&provider);
+    bring_up(&consumer, &[&provider]).await;
+    converge_population(&consumer, &[&provider], 1).await;
+    let provider_id = provider.node.node_id();
+
+    let value = provider
+        .mesh
+        .sensing()
+        .expect("sensing client")
+        .provide_value(
+            TAG,
+            ReadinessValue::Ready {
+                estimated_start: Some(Duration::from_millis(80)),
+            },
+        )
+        .expect("provide_value");
+
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let ready = until_snapshot("the value never read Ready", &mut observation, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+    })
+    .await;
+    assert_eq!(
+        row(&ready, provider_id).estimated_start(),
+        Some(Duration::from_millis(80)),
+        "the value's estimate is what the provider signed"
+    );
+
+    // A set publishes, then wakes. The consumer sees the new value.
+    assert_eq!(
+        value.get(),
+        ReadinessValue::Ready {
+            estimated_start: Some(Duration::from_millis(80))
+        }
+    );
+    value.set(ReadinessValue::NotReady { reason: 9 });
+    until_snapshot(
+        "a NotReady set never reached the consumer",
+        &mut observation,
+        |snap| {
+            snap.provider(provider_id)
+                .is_some_and(|p| p.viability() == SensedViability::NotViable)
+        },
+    )
+    .await;
+
+    // A Ready value whose estimate exceeds the signed start bound does NOT
+    // hold the predicate: the consumer reads NotReady, not Ready.
+    let mut strict = watch(
+        &consumer,
+        SensingQuery::new(TAG).start_within(Duration::from_millis(100)),
+    );
+    value.set(ReadinessValue::Ready {
+        estimated_start: Some(Duration::from_millis(400)),
+    });
+    until_snapshot("an over-bound Ready read as Ready", &mut strict, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::NotReady)
+    })
+    .await;
+
+    assert!(value.close(), "the handle removed its registration");
+    assert!(
+        !value.set(ReadinessValue::Unevaluable),
+        "a closed handle stores nothing"
+    );
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&provider.dir);
+}

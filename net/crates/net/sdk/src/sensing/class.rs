@@ -114,6 +114,32 @@ pub fn parse_sensing_wire(wire: &str) -> Option<&str> {
     portable.then_some(kind)
 }
 
+/// The Rust-owned classification of one sensing wire string.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SensingWireClass {
+    /// The stable kind token ([`SensingError::kind`]).
+    pub kind: &'static str,
+    /// Whether the refusal is terminal ([`SensingError::is_terminal`]).
+    pub terminal: bool,
+}
+
+/// Classify a sensing wire string the way Rust classifies the error that
+/// produced it, or `None` when `wire` is not a sensing wire string or names a
+/// kind this build does not know.
+///
+/// This is what a binding calls instead of keeping its own kind→terminal
+/// table: the answer comes from [`SensingError::is_terminal`], so a binding
+/// can never disagree with Rust about it.
+pub fn classify_sensing_wire(wire: &str) -> Option<SensingWireClass> {
+    let kind = parse_sensing_wire(wire)?;
+    canonical_instances()
+        .into_iter()
+        .find(|error| error.kind() == kind)
+        .map(|error| SensingWireClass {
+            kind: error.kind(),
+            terminal: error.is_terminal(),
+        })
+}
 /// One canonical instance of every variant, in declaration order: the
 /// fixture's population.
 ///
@@ -121,7 +147,6 @@ pub fn parse_sensing_wire(wire: &str) -> Option<&str> {
 /// `the_canonical_population_covers_every_declared_variant`, so a new variant
 /// absent from it fails a test even though the list itself is not
 /// compiler-checked.
-#[cfg(test)]
 pub(crate) fn canonical_instances() -> Vec<SensingError> {
     vec![
         SensingError::Disabled,
@@ -318,5 +343,25 @@ mod tests {
         }
         .to_string()
         .contains("gpu.infer"));
+    }
+    /// The binding-facing classifier answers every fixture vector with the
+    /// fixture's own kind and terminal flag, and refuses what is not a known
+    /// sensing wire string. A binding that surfaces this answer cannot drift
+    /// from Rust's `is_terminal`.
+    #[test]
+    fn classify_sensing_wire_reproduces_every_fixture_vector() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_path()).expect("fixture"))
+                .expect("json");
+        let vectors = doc["vectors"].as_array().expect("vectors");
+        assert_eq!(vectors.len(), canonical_instances().len());
+        for v in vectors {
+            let wire = v["wire"].as_str().expect("wire");
+            let class = classify_sensing_wire(wire).expect("a fixture wire classifies");
+            assert_eq!(class.kind, v["kind"].as_str().unwrap(), "{wire}");
+            assert_eq!(class.terminal, v["terminal"].as_bool().unwrap(), "{wire}");
+        }
+        assert_eq!(classify_sensing_wire("sensing:not_a_kind: x"), None);
+        assert_eq!(classify_sensing_wire("org:rpc:timeout: x"), None);
     }
 }

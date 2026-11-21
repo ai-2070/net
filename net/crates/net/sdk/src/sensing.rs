@@ -170,9 +170,18 @@ use crate::mesh::Mesh;
 
 mod class;
 pub mod consumer;
+mod incarnation_file;
+mod value;
 
 /// The Rust-owned error classification every binding forwards (see [`SensingError::kind`]).
-pub use class::{parse_sensing_wire, ERR_SENSING_PREFIX};
+pub use class::{classify_sensing_wire, parse_sensing_wire, SensingWireClass, ERR_SENSING_PREFIX};
+
+/// The value-backed provider: readiness as a stored value the evaluator only
+/// reads (see [`SensingClient::provide_value`]).
+pub use value::{ReadinessValue, ValueReadiness, START_BOUND_EXCEEDED};
+
+/// A crash-safe, file-backed boot counter for [`next_incarnation`].
+pub use incarnation_file::FileIncarnation;
 
 /// The own-organization exact-provider consumer observation: one bounded
 /// query, one request-relative snapshot, missed-wake-safe change
@@ -589,6 +598,13 @@ impl ReadinessRegistration {
         &self.capability_id
     }
 
+    /// Whether THIS handle has been closed (by [`Self::close`] or drop). A
+    /// handle superseded by [`SensingClient::provide_replacing`] is not
+    /// closed, but it owns nothing: its [`Self::changed`] returns `false`.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Announce that local state affecting this capability changed:
     /// pull every live observation path on it forward to now,
     /// min-gapped at the provider's cadence floor.
@@ -752,6 +768,8 @@ mod tests {
             include_str!("sensing.rs"),
             include_str!("sensing/consumer.rs"),
             include_str!("sensing/class.rs"),
+            include_str!("sensing/value.rs"),
+            include_str!("sensing/incarnation_file.rs"),
         ];
         // WHOLE declarations, not first lines: every `pub use` statement
         // up to its `;`, and every public function signature — `pub fn`,

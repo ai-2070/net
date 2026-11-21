@@ -327,6 +327,69 @@ selected provider, not merely as a snapshot change.
 
 ### B.3 Phase 3 — language bindings (opens only when Phase 2 signs)
 
+**Status (2026-11-21): B1 (Node, Python) and B3 (the pure SDKs plus
+`SENSING.md`) are implemented and await review.** The owner said "continue
+with the plan", which opened this phase ahead of Phase 2's sign-off. B2 (the
+C ABI and Go) is not started.
+
+Rust SDK first:
+- **The value provider.** `SensingClient::provide_value` → `ValueReadiness`
+  (`set` publishes, then wakes). The evaluator only reads the value, and a
+  `Ready` estimate over the signed start bound answers `NotReady`. This is
+  the decision the plan proposed for the binding provider shape: value-backed,
+  not a callback.
+- **Incarnation storage.** `FileIncarnation`, a crash-safe file
+  `IncarnationPersistence`, because a binding cannot ask its caller for a
+  Rust trait implementation.
+- **Classification.** `classify_sensing_wire` is C5's table, answerable from
+  a wire string.
+- **Node-level bridges.** `#[doc(hidden)]` `call_service_sensed_on_node` /
+  `call_service_streaming_sensed_on_node`, which the SDK's own `Mesh` methods
+  delegate to.
+
+Bindings:
+- Node: `enableSensing` / `sensingIncarnationPath`; `sensingProvide`;
+  `sensingWatch`, whose `snapshot()` and `changed()` return promises;
+  `MeshRpc.callServiceSensed` / `callServiceStreamingSensed`;
+  `sensingErrorClass`.
+- Python: the same kwargs; `sensing_provide`, `sensing_watch`,
+  `sensing_error_class`; `SensingError`; `MeshRpc.call_service_sensed`.
+  `changed(timeout_ms)` blocks with the GIL released and returns `False` on
+  timeout.
+- No binding matches `SensingError` variants. Each forwards the Rust wire
+  string, and each test suite checks every fixture vector through
+  `sensingErrorClass`.
+
+Wait-wrapper decision, made after B1-pre landed:
+- Node uses a promise per wait.
+- Python uses a blocking call with a timeout, GIL released.
+- Both inherit B1-pre unchanged: close from another task or thread ends a
+  pending wait as `watch_closed`, and a cancelled or timed-out wait loses no
+  edge.
+
+One test lesson: on a node with a live provider, "a wait still pending at
+close" cannot be observed reliably. Real edges keep arriving, and a Rust
+resolution can be queued behind the JS timer. So close-during-wait is
+witnessed on a quiet, peerless node with its own authority (the scenario's
+foreign identity). The live cell asserts only what it can observe
+deterministically.
+
+Evidence on this host:
+- SDK: lib (value, file incarnation, classifier) plus `sensing_consumer`
+  31/31, with the new live `a_value_provider_set_reaches_the_snapshot_and_honors_the_start_bound`
+  in the CI roster at `--min 31`. M12 (the start-bound check dropped) fails
+  its witness.
+- Node: `sensing.test.ts` 5/5; full suite 824 passed, 10 skipped.
+- Python: `test_sensing.py` 3/3 plus the stub-coverage and constructor-parity
+  guards.
+- TS SDK: 735/735, including the native option and method wrap guards (both
+  extended).
+
+B3: `@net-mesh/sdk/sensing` and `net_sdk.sensing` (thin forwards plus a
+`snapshots()` iterator), `MeshNode.sensingProvide` / `sensingWatch` /
+`orgSensingRoutingCounters` in TS, constructor forwarding in sdk-py, and a
+`SENSING.md` section.
+
 The sensing plan holds binding parity as a non-goal until "the Rust lifecycle
 and three-provider nRPC witness are proven", which is Phase 2's exit. Order:
 

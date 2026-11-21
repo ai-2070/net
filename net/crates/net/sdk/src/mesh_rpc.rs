@@ -545,10 +545,7 @@ impl Mesh {
         opts: CallOptions,
         readiness: &crate::sensing::SensingSnapshot,
     ) -> std::result::Result<RpcReply, RpcError> {
-        let (viable, not_ready) = sensed_inputs_for(service, readiness);
-        self.node()
-            .call_service_sensed(service, payload, opts, &viable, &not_ready)
-            .await
+        call_service_sensed_on_node(self.node(), service, payload, opts, readiness).await
     }
 
     /// The typed form of [`Self::call_service_sensed`]. The request is encoded
@@ -587,10 +584,7 @@ impl Mesh {
         opts: CallOptions,
         readiness: &crate::sensing::SensingSnapshot,
     ) -> std::result::Result<RpcStream, RpcError> {
-        let (viable, not_ready) = sensed_inputs_for(service, readiness);
-        self.node()
-            .call_service_streaming_sensed(service, payload, opts, &viable, &not_ready)
-            .await
+        call_service_streaming_sensed_on_node(self.node(), service, payload, opts, readiness).await
     }
 
     // ---- Streaming (raw) ----
@@ -1699,6 +1693,43 @@ where
                 message,
             })
     }
+}
+
+/// Unstable binding bridge; not supported API. Use
+/// [`Mesh::call_service_sensed`] from Rust.
+///
+/// The SDK's sensed service call on a bare node, for the language bindings,
+/// which wrap `MeshNode` directly rather than `Mesh`. This IS the
+/// implementation `Mesh::call_service_sensed` runs, so a binding forwards
+/// here and inherits the same snapshot join (including the capability
+/// match) instead of re-deriving it.
+#[doc(hidden)]
+pub async fn call_service_sensed_on_node(
+    node: &Arc<net::adapter::net::MeshNode>,
+    service: &str,
+    payload: Bytes,
+    opts: CallOptions,
+    readiness: &crate::sensing::SensingSnapshot,
+) -> std::result::Result<RpcReply, RpcError> {
+    let (viable, not_ready) = sensed_inputs_for(service, readiness);
+    node.call_service_sensed(service, payload, opts, &viable, &not_ready)
+        .await
+}
+
+/// Unstable binding bridge; not supported API. The streaming counterpart of
+/// [`call_service_sensed_on_node`]; use [`Mesh::call_service_streaming_sensed`]
+/// from Rust.
+#[doc(hidden)]
+pub async fn call_service_streaming_sensed_on_node(
+    node: &Arc<net::adapter::net::MeshNode>,
+    service: &str,
+    payload: Bytes,
+    opts: CallOptions,
+    readiness: &crate::sensing::SensingSnapshot,
+) -> std::result::Result<RpcStream, RpcError> {
+    let (viable, not_ready) = sensed_inputs_for(service, readiness);
+    node.call_service_streaming_sensed(service, payload, opts, &viable, &not_ready)
+        .await
 }
 
 /// The sensed-selection inputs `readiness` contributes to a call of

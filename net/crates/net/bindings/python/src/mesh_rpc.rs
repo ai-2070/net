@@ -2707,6 +2707,46 @@ impl PyMeshRpc {
         ))
     }
 
+    /// ``call_service``, with the target chosen using an exact-provider
+    /// readiness capture of ``nrpc:<service>`` (``SensingWatch.snapshot()``).
+    /// The Rust SDK's own sensed call runs underneath:
+    ///
+    /// - candidates are authorized exactly as ``call_service`` authorizes
+    ///   them;
+    /// - the best-ranked viable one is called, otherwise the routing policy
+    ///   chooses among the unverdicted ones;
+    /// - nothing is pruned, and the target is invoked once, never retried.
+    ///
+    /// A snapshot of another capability is no evidence.
+    #[cfg(feature = "org")]
+    #[pyo3(signature = (service, request, readiness, opts=None))]
+    fn call_service_sensed<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        readiness: &crate::sensing::PySensingSnapshot,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let readiness = readiness.inner.clone();
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let result = py.detach(|| {
+            runtime.block_on(async move {
+                net_sdk::mesh_rpc::call_service_sensed_on_node(
+                    &node, &service, req_bytes, inner_opts, &readiness,
+                )
+                .await
+            })
+        });
+        Ok(PyBytes::new(
+            py,
+            result.map_err(rpc_error_to_pyerr)?.body.as_ref(),
+        ))
+    }
+
     /// Open a streaming-response call. Returns an [`PyRpcStream`];
     /// drain via the iterator protocol. Drop / `close()` emits
     /// CANCEL to the server. Pass ``opts={'cancel': cancel}`` to

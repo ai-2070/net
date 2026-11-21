@@ -530,6 +530,60 @@ after an admitted row produces a beat. The authority refusal for
 exact-provider acquisition lives on that acquisition path, in the core,
 not in the provider registry.
 
+### Consumers of a snapshot, the value provider, and the bindings
+
+(`docs/internal/plans/SENSING_OLB_COMPLETION_PLAN.md` C4, C5, S2, S3b, B1 and B3.)
+
+**Consumers of a snapshot.** Three verbs besides `OrgClient::call` take a
+caller's `SensingSnapshot`, and all three apply its classes as an ORDER:
+viable providers first in rank order, then providers with no verdict, then
+not-ready ones. Nothing is ever removed.
+
+- `Mesh::match_islands_sensed` / `claim_island_sensed`: the gang scheduler.
+- `Mesh::call_service_sensed` (also typed and streaming forms): nRPC service
+  routing. The candidates are authorized exactly as `call_service` authorizes
+  them. A snapshot of anything other than `nrpc:<service>` is no evidence.
+  The chosen target is invoked once and never retried.
+- `DaemonRuntime::place_sensed` / `place_migration_sensed`: compute
+  placement. Placement vetoes stay final.
+
+**The value-backed provider.** A synchronous evaluator runs on the
+attestation path, and that is a poor fit for a language binding. So
+`mesh.sensing()?.provide_value(cap, ReadinessValue::Ready { .. })` returns a
+`ValueReadiness` whose `set(value)` publishes a value first and then wakes
+the observation paths. The evaluator only reads that value. A `Ready` value
+whose estimate exceeds the request's signed `start_within` bound answers
+`NotReady` (`START_BOUND_EXCEEDED`). `FileIncarnation` is a crash-safe,
+file-backed `IncarnationPersistence`: temp file, sync, rename.
+
+**Waits.** `SensingWatch::closer()` returns a `SensingWatchCloser` that can
+close from another task. A `changed()` pending at that moment returns
+`SensingError::WatchClosed` promptly: never `Ok`, and never at the floor.
+`changed()` is cancel-safe. Dropping it consumes no edge and leaves no
+waiter, and it neither moves the floor nor closes the watch.
+
+**Errors.** `SensingError::kind()`, `is_terminal()` and `to_wire()`
+(`sensing:<kind>: <message>`) are Rust's classification. They are
+exhaustive in the defining crate, which is the only place a
+`#[non_exhaustive]` enum can be matched exhaustively.
+`classify_sensing_wire` answers from that same table, and every binding
+asserts against the generated fixture
+`tests/cross_lang_sensing/error_vectors.json`.
+
+**Bindings.**
+- Node: mesh options `enableSensing` / `sensingIncarnationPath`;
+  `mesh.sensingProvide(cap, { state, estimatedStartMs, reason })`;
+  `mesh.sensingWatch(cap, { withinMs, startWithinMs })`, whose `snapshot()`
+  and `changed()` return promises; `MeshRpc.callServiceSensed`;
+  `sensingErrorClass(message)`.
+- Python: `NetMesh(enable_sensing=..., sensing_incarnation_path=...)`;
+  `net.sensing_provide`, `net.sensing_watch` and `net.sensing_error_class`;
+  `MeshRpc.call_service_sensed`. `SensingWatch.changed(timeout_ms)` blocks
+  with the GIL released, returns `False` on timeout without losing an edge,
+  and raises `SensingError` when another thread closes the watch.
+- Pure SDKs: `@net-mesh/sdk/sensing` and `net_sdk.sensing`, which forward
+  and add a `snapshots(watch)` iterator.
+
 ## Observability
 
 Read a snapshot through `MeshNode::sensing_counters()` (an

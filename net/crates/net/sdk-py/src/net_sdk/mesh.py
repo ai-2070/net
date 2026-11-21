@@ -169,6 +169,8 @@ class MeshNode:
         auto_direct_upgrade: Optional[bool] = None,
         permissive_channels: Optional[bool] = None,
         noise_static_key: Optional[bytes] = None,
+        enable_sensing: Optional[bool] = None,
+        sensing_incarnation_path: Optional[str] = None,
     ) -> None:
         """Construct a mesh node. Every keyword is forwarded unchanged to
         the native ``NetMesh`` constructor, which validates it.
@@ -192,6 +194,11 @@ class MeshNode:
           keep ``public_key`` (and so this node's rendezvous address) stable
           across restarts independently of the identity. Unset, a node
           given ``identity_seed`` derives it from the seed — already stable.
+        - ``enable_sensing``: turn the capability-sensing plane on (it ships
+          dark). Required for ``net.sensing_watch`` / ``net.sensing_provide``.
+        - ``sensing_incarnation_path``: the file holding this node's sensing
+          boot counter, persisted before the node exists. Required, with
+          ``identity_seed``, for ``net.sensing_provide``.
 
         ``tests/test_sdk_mesh_ctor_parity.py`` (in the binding's test
         suite) fails if this signature drifts from the native one.
@@ -222,6 +229,8 @@ class MeshNode:
             subnet_control_channel=subnet_control_channel,
             subnet_exports=subnet_exports,
             noise_static_key=noise_static_key,
+            enable_sensing=enable_sensing,
+            sensing_incarnation_path=sensing_incarnation_path,
         )
 
     def serve_subnet_exported(

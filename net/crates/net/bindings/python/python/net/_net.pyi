@@ -911,6 +911,8 @@ class NetMesh:
         subnet_control_channel: Optional[str] = None,
         subnet_exports: Optional[list] = None,
         noise_static_key: Optional[bytes] = None,
+        enable_sensing: Optional[bool] = None,
+        sensing_incarnation_path: Optional[str] = None,
     ) -> None:
         """Construct a new mesh node.
 
@@ -3740,6 +3742,17 @@ class MeshRpc:
         local capability index (``nrpc:<service>`` tags), applies the
         routing policy, then calls."""
         ...
+    def call_service_sensed(
+        self,
+        service: str,
+        request: bytes,
+        readiness: "SensingSnapshot",
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """``call_service`` with the target chosen from an exact-provider
+        readiness capture of ``nrpc:<service>`` (org feature). Nothing is
+        pruned; the target is invoked once."""
+        ...
     def call_streaming(
         self,
         target_node_id: int,
@@ -6026,3 +6039,69 @@ class ChunkingStrategy:
         ...
 
     def __repr__(self) -> str: ...
+
+# ---------------------------------------------------------------------------
+# Capability sensing (SENSING_OLB_COMPLETION_PLAN B1; `org` feature)
+# ---------------------------------------------------------------------------
+
+class SensingError(Exception):
+    """A capability-sensing refusal. ``str(e)`` is the Rust SDK's
+    ``sensing:<kind>: <message>`` wire string; ``sensing_error_class(str(e))``
+    returns Rust's classification of it."""
+
+class ReadinessProvider:
+    """An owning handle on one value-backed readiness registration."""
+
+    def set(
+        self,
+        state: str,
+        estimated_start_ms: Optional[float] = None,
+        reason: Optional[int] = None,
+    ) -> bool: ...
+    def get(self) -> dict: ...
+    def close(self) -> bool: ...
+    @property
+    def closed(self) -> bool: ...
+    @property
+    def capability(self) -> str: ...
+
+class SensingSnapshot:
+    """One immutable capture of an authorized population's readiness."""
+
+    @property
+    def capability(self) -> str: ...
+    @property
+    def providers(self) -> list[dict]: ...
+    @property
+    def ranked(self) -> list[int]: ...
+    @property
+    def preferred(self) -> Optional[int]: ...
+
+class SensingWatch:
+    """An owning observation of one capability's authorized exact-provider
+    readiness. ``changed`` blocks with the GIL released, returns False on
+    timeout (consuming no edge), and raises ``SensingError`` when the watch is
+    closed, including by ``close()`` from another thread."""
+
+    def snapshot(self) -> SensingSnapshot: ...
+    def changed(self, timeout_ms: Optional[float] = None) -> bool: ...
+    def close(self) -> bool: ...
+    @property
+    def closed(self) -> bool: ...
+    @property
+    def capability(self) -> str: ...
+
+def sensing_error_class(wire: str) -> Optional[dict]: ...
+def sensing_provide(
+    mesh: Any,
+    capability: str,
+    state: str,
+    estimated_start_ms: Optional[float] = None,
+    reason: Optional[int] = None,
+) -> ReadinessProvider: ...
+def sensing_watch(
+    mesh: Any,
+    capability: str,
+    within_ms: Optional[float] = None,
+    start_within_ms: Optional[float] = None,
+) -> SensingWatch: ...
