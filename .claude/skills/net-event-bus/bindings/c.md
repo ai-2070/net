@@ -5,7 +5,7 @@ is only what is C-specific.
 
 ## Headers and the library — there is no single "C SDK"
 
-C is **eleven headers over one shared library**, `libnet` — as the last column
+C is **twelve headers over one shared library**, `libnet` — as the last column
 below says on every row. Picking the wrong header is the first thing that goes
 wrong; picking the wrong library is not a mistake you can make.
 
@@ -21,6 +21,7 @@ wrong; picking the wrong library is not a mistake you can make.
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth, unary through duplex (own ABI stamp `NET_ORG_ABI_VERSION` `0x0002`) | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet` |
+| `net_sensing.h` | `NET_SENSING_H` | Capability sensing — value provider, watch, sensed service call | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
 **`net.h` and `net.go.h` share the `NET_SDK_H` guard, and `net.go.h` is not a

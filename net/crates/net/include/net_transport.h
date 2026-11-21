@@ -3,7 +3,7 @@
  *   blob transfer + directory transfer over the fairscheduler stream
  *   transport (Transport SDK plan, T-C).
  *
- * One of eleven headers, all resolving against a single shared library.
+ * One of twelve headers, all resolving against a single shared library.
  * These symbols are exported by the same `libnet` cdylib as the rest of
  * the C ABI; this header only declares the transport slice. The transfer
  * engine moves

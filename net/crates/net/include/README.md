@@ -11,9 +11,9 @@ Dart, Swift, Kotlin, Haskell, Erlang, PHP.
 [Headers and linking](https://ai2070.net/docs/sdk/c/headers-and-linking) ·
 [Memory and threading](https://ai2070.net/docs/sdk/c/memory-and-threading)
 
-## Eleven headers, one library
+## Twelve headers, one library
 
-This is not one header. It is eleven — and every one of them resolves against
+This is not one header. It is twelve — and every one of them resolves against
 the same `libnet`. The full map, with the surface each header covers, is in
 [Headers and Linking](https://ai2070.net/docs/sdk/c/headers-and-linking).
 
@@ -29,6 +29,7 @@ the same `libnet`. The full map, with the surface each header covers, is in
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority (provision / serve / call) | `libnet` |
+| `net_sensing.h` | `NET_SENSING_H` | Capability sensing (value provider, watch, sensed call) | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
 > **Every header resolves out of one `libnet`.** The surfaces are built as

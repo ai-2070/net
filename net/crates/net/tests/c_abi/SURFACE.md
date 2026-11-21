@@ -19,6 +19,7 @@ both.
 | `net_meshos.h` | 23 | 22 | 22 |
 | `net_org.h` | 30 | 18 | 22 |
 | `net_rpc.h` | 71 | 10 | 17 |
+| `net_sensing.h` | 15 | 0 | 0 |
 | `net_subnet.h` | 4 | 3 | 3 |
 | `net_transport.h` | 7 | 7 | 7 |
 
@@ -679,6 +680,26 @@ both.
 | `net_rpc_watch_tools_close` | – | – | – |
 | `net_rpc_watch_tools_free` | – | – | – |
 | `net_rpc_watch_tools_next` | – | – | – |
+
+## `net_sensing.h`
+
+| Function | Consumers | Arming | Skill examples |
+| --- | --- | --- | --- |
+| `net_sensing_abi_version` | – | – | – |
+| `net_sensing_call_service` | – | – | – |
+| `net_sensing_error_class` | – | – | – |
+| `net_sensing_next_incarnation` | – | – | – |
+| `net_sensing_provide` | – | – | – |
+| `net_sensing_provider_close` | – | – | – |
+| `net_sensing_provider_free` | – | – | – |
+| `net_sensing_provider_set` | – | – | – |
+| `net_sensing_snapshot_free` | – | – | – |
+| `net_sensing_snapshot_json` | – | – | – |
+| `net_sensing_watch` | – | – | – |
+| `net_sensing_watch_changed` | – | – | – |
+| `net_sensing_watch_close` | – | – | – |
+| `net_sensing_watch_free` | – | – | – |
+| `net_sensing_watch_snapshot` | – | – | – |
 
 ## `net_subnet.h`
 

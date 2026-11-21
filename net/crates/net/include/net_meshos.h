@@ -1,7 +1,7 @@
 /*
  * net_meshos.h — C SDK header for the MeshOS daemon-author SDK C ABI.
  *
- * One of eleven headers, all resolving against a single shared
+ * One of twelve headers, all resolving against a single shared
  * library. Mirrors the layout of `net.h` / `net_meshdb.h` /
  * `net_rpc.h` next to it. The Go binding's `go/meshos.go` cgo
  * include block is the sister-consumer contract; this file is the

@@ -2,7 +2,7 @@
  * net_mcp.h — C SDK header for the MCP bridge pure helpers + the
  * graduated consent / pin surface (C ABI).
  *
- * One of eleven headers, all resolving against a single shared library.
+ * One of twelve headers, all resolving against a single shared library.
  * Mirrors the layout of `net.h` / `net_meshdb.h` next to it. These
  * symbols are compiled into `libnet`; `bindings/go/mcp-ffi` is an rlib
  * linked into it and emits no library of its own — there is no

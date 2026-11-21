@@ -252,7 +252,10 @@ GREEN-SURVIVOR**:
   - Re-scoped rows (`rows2.txt`: B2b / B3b against the SDK and core lib, F3b
     against the core lib) were **stopped mid-baseline by the host's
     low-memory guard**. No mutation had been applied, and the worktree is
-    clean. They are pending a re-run, so no verdict is claimed for them yet.
+    clean. **Owner decision (2026-11-21): left to CI.** The pure-function
+    witnesses these rows would exercise (`org::tests_call`'s granted-candidate
+    permutation test, `strictest_sample_interval_is_min_dominance`) run in
+    CI's ordinary unit jobs. No mutation verdict is claimed for B2, B3 or F3.
 
 **C3 — RED-pass decision record.** The waiver stands until the owner decides
 otherwise. Present one of two options:
@@ -471,7 +474,47 @@ and three-provider nRPC witness are proven", which is Phase 2's exit. Order:
      fixture.
    - **Teardown.** A leaked binding watch holds node-global leases until GC or
      close. Document it the way OLB §12 documents the leaked `OrgClient`.
-2. **B2 — C ABI and Go.**
+2. **B2 — C ABI and Go.** **Status (2026-11-21): implemented, awaits
+   review.**
+   - **Home.** `bindings/go/org-ffi/src/sensing.rs` (an rlib already
+     carrying `net-sdk`, linked into the one `libnet`; no new cdylib), with
+     `include/net_sensing.h` as the twelfth header.
+   - **Surface.** 15 `net_sensing_*` entry points: next-incarnation over the
+     SDK's `FileIncarnation`; Rust-owned error classification; the value
+     provider; the watch (snapshot, blocking `changed` with a timeout, close
+     from another thread); snapshot JSON; and the sensed service call.
+   - **Core FFI config.** `net_mesh_new` gains `enable_sensing` and
+     `sensing_incarnation`. The latter is the already-persisted value; 0 is
+     refused before the node exists.
+   - **Go.** `go/sensing.go` provides `MeshConfig.EnableSensing` /
+     `SensingIncarnationPath`, which `NewMeshNode` persists through Rust;
+     `ProvideReadiness`; `WatchSensing` with `Changed(ctx)` (ctx cancellation
+     slices the native wait, consumes no edge and does not close the watch);
+     `CallServiceSensed`; and `ClassifySensingError`. `Close` keeps the native
+     handle until the finalizer runs, so every call after a close reaches Rust
+     and gets Rust's own `watch_closed` wire. Go never synthesizes a sensing
+     error.
+   - **Gates.**
+     - The header numeric contract is pinned twice: org-ffi
+       `sensing_header_numeric_contract_matches_rust`, and Go
+       `TestSensingPreambleMatchesTheHeader`.
+     - Both export baselines are hand-extended by the 15 names (shipped
+       599→614, test-helpers 607→622).
+     - `check-c-abi.py` on the production bundle reports 0 findings on every
+       axis (612 declared functions, all real).
+     - `c-surface-record.py --check` passes. `SURFACE.md` records 0 C
+       consumers for `net_sensing.h`: no `.c` program calls it yet, only
+       Go's cgo tests.
+     - `check-header-count.py` agrees across 368 files.
+   - **Evidence.**
+     - org-ffi lib 23/23, including the C classifier against every fixture
+       vector and the persisted, monotonic incarnation.
+     - Core `ffi::mesh` 49/49, including
+       `net_mesh_new_wires_sensing_and_refuses_a_zero_incarnation`.
+     - Go sensing 5/5, including the live test: a provider set reaches the
+       consumer, a cancelled ctx leaves the watch open, and on a quiet node
+       Close ends a pending `Changed` as `watch_closed`.
+     - `go vet` is clean with cgo.
    - Add the C-ABI shim as an rlib aggregated into `bindings/go/net-ffi`. **Do
      not add a cdylib** (single-cdylib rule; the duplicate-crate parking_lot
      hang).

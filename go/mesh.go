@@ -328,6 +328,22 @@ type MeshConfig struct {
 	// derived from IdentitySeedHex, or fresh per process with no seed.
 	NoiseStaticKeyHex string `json:"noise_static_key_hex,omitempty"`
 
+	// EnableSensing turns the capability-sensing plane on (it ships dark).
+	// Required for WatchSensing and ProvideReadiness.
+	EnableSensing bool `json:"enable_sensing,omitempty"`
+
+	// SensingIncarnationPath is the file holding this node's sensing boot
+	// counter. NewMeshNode reads, increments and durably persists it (through
+	// Rust) BEFORE the node exists and passes the result as
+	// SensingIncarnation. Required, with IdentitySeedHex, for
+	// ProvideReadiness. Keep it beside the identity material.
+	SensingIncarnationPath string `json:"-"`
+
+	// SensingIncarnation is this boot's already-persisted incarnation.
+	// Leave it zero and set SensingIncarnationPath instead; set it directly
+	// only with a value SensingNextIncarnation returned.
+	SensingIncarnation uint64 `json:"sensing_incarnation,omitempty"`
+
 	// ReflexOverride pins this mesh's publicly-advertised reflex
 	// to the supplied external "ip:port". Classification is
 	// skipped; the node starts in nat:open and advertises this
@@ -542,6 +558,13 @@ func (m *MeshNode) withHandleForChild(fn func(h unsafe.Pointer)) bool {
 
 // NewMeshNode opens a mesh node. Call Shutdown to cleanly tear down.
 func NewMeshNode(cfg MeshConfig) (*MeshNode, error) {
+	if cfg.SensingIncarnationPath != "" && cfg.SensingIncarnation == 0 {
+		incarnation, err := SensingNextIncarnation(cfg.SensingIncarnationPath)
+		if err != nil {
+			return nil, err
+		}
+		cfg.SensingIncarnation = incarnation
+	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)

@@ -16,7 +16,7 @@ cargo build --release --features ffi,net
 
 ## Surface
 
-The ABI is split across eleven headers, all compiled into one library, `libnet`
+The ABI is split across twelve headers, all compiled into one library, `libnet`
 (shared or static). Together they cover the event bus, mesh transport, capability
 announce/discover, channels, nRPC, RedEX/CortEX storage, blob and directory
 transfer, federated queries, daemon operations, and the Deck operator surface.

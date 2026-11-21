@@ -579,6 +579,21 @@ struct MeshNewConfig {
     /// disable through a JSON surface that omits empty values.
     #[serde(default)]
     auto_direct_upgrade: Option<bool>,
+    /// Turn the capability-sensing plane on (it ships dark). Required for
+    /// the `net_sensing_*` surface (SENSING_OLB_COMPLETION_PLAN B2).
+    #[serde(default)]
+    enable_sensing: bool,
+    /// This boot's sensing incarnation: the counter value returned by
+    /// `net_sensing_next_incarnation`, which has ALREADY read, incremented and
+    /// durably persisted it.
+    ///
+    /// Pass only a value obtained that way. A value that was never persisted
+    /// could be reissued by a later boot, which is exactly the unordered
+    /// incarnation the sensing protocol exists to refuse. Zero is never a
+    /// valid incarnation and is refused. Required, with a seeded identity, for
+    /// providing readiness.
+    #[serde(default)]
+    sensing_incarnation: Option<u64>,
 }
 
 /// FFI handle for a [`MeshNode`].
@@ -756,6 +771,22 @@ pub unsafe extern "C" fn net_mesh_new(
     // Same drop-on-the-floor pattern as reflex_override above.
     #[cfg(not(feature = "nat-traversal"))]
     let _ = cfg.auto_direct_upgrade;
+
+    // Capability sensing (completion plan B2). Persistence happened before
+    // this call, in `net_sensing_next_incarnation`, so the node never boots
+    // under an incarnation that was not durably recorded first.
+    if cfg.enable_sensing {
+        node_cfg = node_cfg.with_sensing_coalescing(true);
+    }
+    match cfg.sensing_incarnation {
+        Some(0) => return NetError::InvalidJson.into(),
+        Some(value) => {
+            node_cfg = node_cfg.with_sensing_incarnation(
+                crate::adapter::net::behavior::sensing::Incarnation::new(value),
+            );
+        }
+        None => {}
+    }
 
     // Record identity provenance (§D1a of ORG_CAPABILITY_LANGUAGE_SDKS_PLAN):
     // a caller-supplied seed is a durable, org-bindable identity; a generated
@@ -6139,6 +6170,49 @@ mod tests {
             "a generated ephemeral fallback must leave configured_identity false"
         );
         unsafe { net_mesh_free(out) };
+    }
+
+    /// Completion plan B2: the JSON config turns sensing on and carries an
+    /// already-persisted incarnation. Zero is never a valid incarnation and is
+    /// refused before any node exists. Without the fields, sensing stays dark.
+    #[test]
+    fn net_mesh_new_wires_sensing_and_refuses_a_zero_incarnation() {
+        let build = |extra: serde_json::Value| {
+            let mut cfg = serde_json::json!({
+                "bind_addr": "127.0.0.1:0",
+                "psk_hex": "0".repeat(64),
+            });
+            cfg.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let cfg_c = CString::new(cfg.to_string()).unwrap();
+            let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
+            let code = unsafe { net_mesh_new(cfg_c.as_ptr(), &mut out) };
+            (code, out)
+        };
+
+        let (code, out) = build(serde_json::json!({}));
+        assert_eq!(code, 0);
+        assert!(
+            !unsafe { &*out }.inner.sensing_enabled(),
+            "sensing ships dark"
+        );
+        unsafe { net_mesh_free(out) };
+
+        let (code, out) = build(serde_json::json!({
+            "enable_sensing": true,
+            "sensing_incarnation": 1,
+        }));
+        assert_eq!(code, 0);
+        assert!(unsafe { &*out }.inner.sensing_enabled());
+        unsafe { net_mesh_free(out) };
+
+        let (code, out) = build(serde_json::json!({
+            "enable_sensing": true,
+            "sensing_incarnation": 0,
+        }));
+        assert_ne!(code, 0, "a zero incarnation must be refused");
+        assert!(out.is_null(), "no node exists after a refusal");
     }
 
     /// Regression: BUG_REPORT.md #19 — `net_mesh_send` family

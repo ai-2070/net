@@ -22,7 +22,7 @@ operation works; they are not a coverage record.
 **The Go row is the shipped module, and it is the only Go tree.** An older, uncompiled Go reference tree (no `go.mod`) used to sit beside the Rust FFI crates; it was removed. What it had either ships in `go/` now or is not available from Go, and its source stays in git history at commit `610cd4e`.
 A Go cell that says `not exposed` means exactly that.
 
-### C is eleven headers over one library, not one SDK
+### C is twelve headers over one library, not one SDK
 
 A `supported` C cell tells you a symbol exists. It does not tell you that you can
 reach it from the translation unit you are already in.
@@ -39,6 +39,7 @@ reach it from the translation unit you are already in.
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet` |
+| `net_sensing.h` | `NET_SENSING_H` | Capability sensing — value provider, watch, sensed service call | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
 **`net.h` and `net.go.h` share the `NET_SDK_H` guard, and `net.go.h` is not a
