@@ -8949,6 +8949,18 @@ pub(crate) struct OrgSensingDemandCounters {
     refused_view_moved: AtomicU64,
     /// Authorized populations truncated at the sensing cap.
     truncated: AtomicU64,
+    /// Sensed `org.call`s that took the deterministic unsensed order because
+    /// another caller held this capability's reconciliation (a declined, not
+    /// blocked, convergence). See [`OrgSensedOrderFallback::Contended`].
+    ///
+    /// [`OrgSensedOrderFallback::Contended`]: super::behavior::org_sensing_demand::OrgSensedOrderFallback::Contended
+    order_fallback_contended: AtomicU64,
+    /// Sensed `org.call`s that took the unsensed order because this call's
+    /// convergence was refused.
+    order_fallback_refused: AtomicU64,
+    /// Sensed `org.call`s that took the unsensed order because no demand was
+    /// installed for the capability (an earlier refusal still pacing).
+    order_fallback_unretained: AtomicU64,
     /// Acquisitions RELEASED again because no refresh owner could be armed for
     /// them (the schedule is terminal, at its bound, or already owned by a
     /// strictly newer installation).
@@ -9040,6 +9052,20 @@ impl OrgSensingDemandCounters {
         self.refused_at_capacity.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One sensed call fell back to the deterministic unsensed order.
+    pub(crate) fn note_order_fallback(
+        &self,
+        reason: super::behavior::org_sensing_demand::OrgSensedOrderFallback,
+    ) {
+        use super::behavior::org_sensing_demand::OrgSensedOrderFallback as Reason;
+        let counter = match reason {
+            Reason::Contended => &self.order_fallback_contended,
+            Reason::Refused => &self.order_fallback_refused,
+            Reason::Unretained => &self.order_fallback_unretained,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `count` carried-forward holders were dropped because their installation
     /// no longer exists.
     pub(crate) fn note_ownership_invalidated(&self, count: u64) {
@@ -9090,6 +9116,73 @@ impl OrgSensingDemandCounters {
                 self.refused_other.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// Operator-readable counters for sensed organization call routing (OLB §14,
+/// `org_sensing_truncated_total` / `org_sensing_fallback_total`). They are
+/// monotonic and diagnostic only, and nothing reads them to make a decision.
+/// Read through [`MeshNode::org_sensing_routing_counters`].
+///
+/// A fallback is a sensed call that **wanted** sensing but went out in the
+/// deterministic unsensed order. Three cases are deliberately not fallbacks:
+/// - a node with sensing off (inert: it never wanted sensing);
+/// - a capability with nothing to sense;
+/// - a projection that simply has no evidence (sensing ran and had nothing to
+///   say).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OrgSensingRoutingCounters {
+    /// Authorized populations truncated at the sensing cap
+    /// (`MAX_SENSED_POPULATION`, 32): the excess providers stay unsensed and
+    /// advisory `Unknown`, never dropped from the call.
+    pub truncated_total: u64,
+    /// Every sensed call that fell back to the unsensed order: the sum of the
+    /// three reasons below.
+    pub fallback_total: u64,
+    /// Fallbacks because another caller held the capability's reconciliation.
+    pub fallback_contended: u64,
+    /// Fallbacks because this call's convergence was refused.
+    pub fallback_refused: u64,
+    /// Fallbacks because no demand was installed (an earlier refusal pacing).
+    pub fallback_unretained: u64,
+}
+
+impl OrgSensingRoutingCounters {
+    /// Render as Prometheus text exposition, in the hand-rolled convention of
+    /// `mesh_rpc_metrics::prometheus_text`. It emits the two OLB §14 names:
+    ///
+    /// ```text
+    /// org_sensing_truncated_total N
+    /// org_sensing_fallback_total{reason="contended|refused|unretained"} N
+    /// ```
+    ///
+    /// The unlabelled fallback sum is deliberately not emitted: it is
+    /// `sum(org_sensing_fallback_total)` at query time, and a second series
+    /// for the same events would double-count under a naive aggregation.
+    pub fn prometheus_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(512);
+        out.push_str(
+            "# HELP org_sensing_truncated_total Sensed authorized populations truncated at the sensing cap.\n",
+        );
+        out.push_str("# TYPE org_sensing_truncated_total counter\n");
+        let _ = writeln!(out, "org_sensing_truncated_total {}", self.truncated_total);
+        out.push_str(
+            "# HELP org_sensing_fallback_total Sensed org calls that took the deterministic unsensed order, by reason.\n",
+        );
+        out.push_str("# TYPE org_sensing_fallback_total counter\n");
+        for (reason, value) in [
+            ("contended", self.fallback_contended),
+            ("refused", self.fallback_refused),
+            ("unretained", self.fallback_unretained),
+        ] {
+            let _ = writeln!(
+                out,
+                "org_sensing_fallback_total{{reason=\"{reason}\"}} {value}"
+            );
+        }
+        out
     }
 }
 
@@ -18857,6 +18950,23 @@ impl MeshNode {
     /// Demand/refresh counters, shared with the family container.
     pub(crate) fn org_sensing_demand_counters(&self) -> &Arc<OrgSensingDemandCounters> {
         &self.org_sensing_demand_counters
+    }
+
+    /// The operator-readable sensed-routing counters (truncation and order
+    /// fallback). Production API: unlike the demand/refresh state witnesses
+    /// read, this is not gated to `fixtures`. See [`OrgSensingRoutingCounters`].
+    pub fn org_sensing_routing_counters(&self) -> OrgSensingRoutingCounters {
+        let counters = &self.org_sensing_demand_counters;
+        let contended = counters.order_fallback_contended.load(Ordering::Relaxed);
+        let refused = counters.order_fallback_refused.load(Ordering::Relaxed);
+        let unretained = counters.order_fallback_unretained.load(Ordering::Relaxed);
+        OrgSensingRoutingCounters {
+            truncated_total: counters.truncated.load(Ordering::Relaxed),
+            fallback_total: contended.saturating_add(refused).saturating_add(unretained),
+            fallback_contended: contended,
+            fallback_refused: refused,
+            fallback_unretained: unretained,
+        }
     }
 
     /// The organization sensing demand/refresh counters and schedule state, for
@@ -50323,6 +50433,32 @@ impl MeshNode {
             &down,
             &non_viable,
             &sensed.viable,
+        )
+    }
+
+    /// The organization exact-provider lane's gang match: [`Self::match_islands`]
+    /// (liveness gate included), reordered by one exact-provider readiness
+    /// capture. Islands of `viable_order` hosts lead in that order, islands of
+    /// `not_ready` hosts come last, and none are removed. See
+    /// [`super::behavior::gang::match_islands_exact_sensed`] for why this lane
+    /// demotes where SI-6's [`Self::match_islands_sensed`] prunes.
+    ///
+    /// The capture is the caller's: this takes plain node ids, not an
+    /// interest. It derives no interest from `criteria` and acquires no lease.
+    pub fn match_islands_exact_sensed(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+        viable_order: &[super::behavior::fold::NodeId],
+        not_ready: &std::collections::HashSet<super::behavior::fold::NodeId>,
+    ) -> Vec<super::behavior::fold::IslandId> {
+        let down = self.liveness_down.load();
+        super::behavior::gang::match_islands_exact_sensed(
+            &self.capability_fold,
+            &self.island_fold,
+            criteria,
+            &down,
+            viable_order,
+            not_ready,
         )
     }
 

@@ -236,6 +236,72 @@ pub fn match_islands_sensed(
             criteria.prefer_capability.clone(),
         );
     }
+    band_by_sensing(candidates, criteria, sensed_viable_order, None)
+}
+
+/// The organization EXACT-PROVIDER lane's gang matcher. It is
+/// [`match_islands`] with one exact-provider readiness capture joined into
+/// the claim ORDER. It never joins it into the candidate SET.
+///
+/// The exact lane's ordering doctrine (organization exact-sensing design
+/// D7.2, the same rule `org_sensed_bucket_permutation` applies to
+/// `OrgClient::call`) decides the bands:
+///
+/// - islands hosted by `sensed_viable_order` providers lead, in that rank
+///   order;
+/// - islands of every host with no verdict keep the selection policy's own
+///   order;
+/// - islands hosted by `sensed_not_ready` providers come **last**, and are
+///   **not removed**.
+///
+/// So unlike [`match_islands_sensed`] (the SI-6 aggregate lane, which prunes
+/// NotReady hosts from the match), this function returns exactly the islands
+/// [`match_islands`] returns, reordered. A not-ready observation is evidence
+/// about one instant. It is never a reason to leave a caller with fewer
+/// candidates than the unsensed matcher would offer, and readiness is never a
+/// reservation: the claim against a sensed-ready island can still lose.
+///
+/// Both sensed inputs empty ⇒ byte-identical to [`match_islands`]. The
+/// banding is stable and uses the same single topology snapshot as the
+/// selection (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §3).
+pub fn match_islands_exact_sensed(
+    capability_fold: &Fold<CapabilityFold>,
+    topology_fold: &Fold<IslandTopologyFold>,
+    criteria: &MatchCriteria,
+    down_nodes: &HashSet<NodeId>,
+    sensed_viable_order: &[NodeId],
+    sensed_not_ready: &HashSet<NodeId>,
+) -> Vec<IslandId> {
+    let candidates = match_island_records(capability_fold, topology_fold, criteria, down_nodes);
+    if (sensed_viable_order.is_empty() && sensed_not_ready.is_empty()) || candidates.len() < 2 {
+        return select_with_affinity(
+            candidates,
+            criteria.selection,
+            criteria.prefer_capability.clone(),
+        );
+    }
+    band_by_sensing(
+        candidates,
+        criteria,
+        sensed_viable_order,
+        Some(sensed_not_ready),
+    )
+}
+
+/// Select `candidates` under `criteria`, then stably re-rank the result into
+/// sensed bands:
+/// - `sensed_viable_order` ranks first;
+/// - hosts with no verdict next;
+/// - `demoted_last` hosts (when given) last.
+///
+/// One record set feeds both the selection and the band map, which is the
+/// single-snapshot contract of PERF_AUDIT_2026_07_31_GANG_SCHEDULER §3.
+fn band_by_sensing(
+    candidates: Vec<IslandRecord>,
+    criteria: &MatchCriteria,
+    sensed_viable_order: &[NodeId],
+    demoted_last: Option<&HashSet<NodeId>>,
+) -> Vec<IslandId> {
     let hosts: std::collections::HashMap<IslandId, NodeId> =
         candidates.iter().map(|r| (r.id, r.host)).collect();
     let mut ordered = select_with_affinity(
@@ -252,21 +318,31 @@ pub fn match_islands_sensed(
     for (rank, provider) in sensed_viable_order.iter().enumerate() {
         provider_rank.entry(*provider).or_insert(rank);
     }
+    // Band values: viable ranks are `0..len`; unverdicted hosts are
+    // `UNVERDICTED`; demoted (sensed not-ready) hosts are `DEMOTED`, after
+    // everything. A host that is somehow in both sensed sets takes its viable
+    // rank: the rank is the positive evidence, and banding is an ordering, not
+    // a filter.
+    const UNVERDICTED: usize = usize::MAX - 1;
+    const DEMOTED: usize = usize::MAX;
     let bands: std::collections::HashMap<IslandId, usize> = ordered
         .iter()
         .map(|island| {
-            let band = hosts
-                .get(island)
+            let host = hosts.get(island);
+            let band = host
                 .and_then(|host| provider_rank.get(host).copied())
-                // Unsensed / potential hosts form the trailing
-                // band, in the selection policy's own order.
-                .unwrap_or(usize::MAX);
+                .unwrap_or_else(|| match (host, demoted_last) {
+                    (Some(host), Some(demoted)) if demoted.contains(host) => DEMOTED,
+                    // Unsensed / potential hosts form the trailing
+                    // band, in the selection policy's own order.
+                    _ => UNVERDICTED,
+                });
             (*island, band)
         })
         .collect();
     // Stable: within a band, the [3]-step selection order survives.
     // No fold queries inside the O(n log n) sort.
-    ordered.sort_by_key(|island| bands.get(island).copied().unwrap_or(usize::MAX));
+    ordered.sort_by_key(|island| bands.get(island).copied().unwrap_or(UNVERDICTED));
     ordered
 }
 
@@ -553,6 +629,112 @@ mod tests {
             prefer_capability: None,
         };
         (caps, topo, kps, nodes, criteria)
+    }
+
+    // -----------------------------------------------------------
+    // Exact-provider lane (SENSING_OLB_COMPLETION_PLAN C4): reorder,
+    // never prune.
+    // -----------------------------------------------------------
+
+    /// The exact lane DEMOTES a not-ready host; it does not prune it.
+    /// RED against a `band_by_sensing` that drops demoted islands, and
+    /// against one that leaves them in the unverdicted band (they would
+    /// then precede the unverdicted host B, which is plain least-loaded
+    /// order A, B, C reversed only by the viable lead).
+    #[test]
+    fn exact_sensed_match_demotes_not_ready_last_and_removes_nothing() {
+        let (caps, topo, _kps, nodes, criteria) = sensed_fixture();
+        let (a, c) = (nodes[0], nodes[2]);
+        let plain = match_islands(&caps, &topo, &criteria, &HashSet::new());
+        assert_eq!(
+            plain,
+            vec![0xA0, 0xA1, 0xA2],
+            "fixture: least-loaded A, B, C"
+        );
+
+        // C viable, A not-ready, B unverdicted.
+        let not_ready: HashSet<NodeId> = [a].into_iter().collect();
+        let order =
+            match_islands_exact_sensed(&caps, &topo, &criteria, &HashSet::new(), &[c], &not_ready);
+        assert_eq!(
+            order,
+            vec![0xA2, 0xA1, 0xA0],
+            "viable C leads, unverdicted B keeps its place, not-ready A is last",
+        );
+
+        let mut same_set = order.clone();
+        same_set.sort_unstable();
+        let mut plain_set = plain.clone();
+        plain_set.sort_unstable();
+        assert_eq!(
+            same_set, plain_set,
+            "the exact lane is a permutation of the plain match"
+        );
+    }
+
+    /// Every host sensed not-ready still leaves every island claimable, in
+    /// the selection policy's order. This is the all-pruned case of design
+    /// D7.2 ("an all-pruned list still proceeds in the original order"), and
+    /// it is the behaviour that separates this lane from SI-6's
+    /// `match_islands_sensed`, which would return nothing here.
+    #[test]
+    fn exact_sensed_match_with_every_host_not_ready_keeps_the_plain_order() {
+        let (caps, topo, _kps, nodes, criteria) = sensed_fixture();
+        let plain = match_islands(&caps, &topo, &criteria, &HashSet::new());
+        let all: HashSet<NodeId> = nodes.iter().copied().collect();
+
+        assert_eq!(
+            match_islands_exact_sensed(&caps, &topo, &criteria, &HashSet::new(), &[], &all),
+            plain,
+        );
+        assert!(
+            match_islands_sensed(&caps, &topo, &criteria, &HashSet::new(), &all, &[]).is_empty(),
+            "control: the SI-6 lane prunes the same input to nothing",
+        );
+    }
+
+    /// No sensed input ⇒ byte-identical to the plain matcher, and a down host
+    /// is still removed: liveness is a gate, sensing is only an order.
+    #[test]
+    fn exact_sensed_match_without_evidence_is_the_plain_match_and_keeps_the_liveness_gate() {
+        let (caps, topo, _kps, nodes, criteria) = sensed_fixture();
+        assert_eq!(
+            match_islands_exact_sensed(
+                &caps,
+                &topo,
+                &criteria,
+                &HashSet::new(),
+                &[],
+                &HashSet::new()
+            ),
+            match_islands(&caps, &topo, &criteria, &HashSet::new()),
+        );
+
+        let down: HashSet<NodeId> = [nodes[1]].into_iter().collect();
+        let not_ready: HashSet<NodeId> = [nodes[0]].into_iter().collect();
+        assert_eq!(
+            match_islands_exact_sensed(&caps, &topo, &criteria, &down, &[nodes[2]], &not_ready),
+            vec![0xA2, 0xA0],
+            "down B removed by the liveness gate; not-ready A demoted, not removed",
+        );
+    }
+
+    /// The exact lane reads the topology fold exactly once, like SI-6's
+    /// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §3).
+    #[test]
+    fn exact_sensed_match_takes_exactly_one_topology_snapshot() {
+        let (caps, topo, _kps, nodes, criteria) = sensed_fixture();
+        let not_ready: HashSet<NodeId> = [nodes[0]].into_iter().collect();
+        let before = topo.metrics().queries();
+        let _ = match_islands_exact_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &[nodes[2]],
+            &not_ready,
+        );
+        assert_eq!(topo.metrics().queries() - before, 1);
     }
 
     /// §3, the direct witness: the sensed matcher must read the

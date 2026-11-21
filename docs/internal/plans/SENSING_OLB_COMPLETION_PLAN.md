@@ -164,6 +164,40 @@ Exit criteria:
 
 ### B.1 Phase 1 — small closures (parallel, each independently reviewable)
 
+**Phase 1 status (2026-11-21): C1, C2, C4 and C5 are implemented and await
+review. C3 awaits the owner's decision.** Evidence on this host:
+- core `behavior::org_sensing_demand` + `behavior::gang`: 113/113;
+- SDK lib: 381/381;
+- SDK `org_exact_sensing`, `gang_surface`, `sensing_consumer` and
+  `sensing_provider`: 66/66.
+
+Six mutations were each run against exactly one selected witness, with the
+file restored and SHA256-verified afterwards. All six failed as intended:
+- C4 M1: demoted hosts treated as unverdicted;
+- C4 M2: `Potential` counted as not-ready;
+- C5: the drift guard, the source-scan coverage check, and the exhaustive
+  needle table are compile-forced or fixture-forced;
+- C2 M3: counted even when there is no order to lose;
+- C2 M4: the `Contended` count dropped.
+
+What landed, against what was written below:
+- **C1:** as written.
+- **C4:** differs from "wrap core `match_islands_sensed`", for two reasons:
+  - That function takes `InterestSpec` and `ConsumerLatencyBudget`, which the
+    SDK surface guard forbids.
+  - It reads the SI-6 provider-free aggregate, which the SDK does not
+    express.
+
+  So the SDK verbs take the caller's exact-provider `SensingSnapshot` instead,
+  and a new core seam (`match_islands_exact_sensed`) **orders not-ready hosts
+  last rather than pruning them**. That is the exact lane's D7.2 rule; the
+  SI-6 lane's pruning is unchanged.
+- **C5:** as written. The classifier is `SensingError::kind` / `is_terminal` /
+  `to_wire`, the reference parser is `parse_sensing_wire`, and the fixture is
+  `tests/cross_lang_sensing/error_vectors.json`.
+- **C2:** as written, with the reason set `contended|refused|unretained`. The
+  exact design's D8.4a records how it maps onto OLB §7's original sketch.
+
 **C1 — S4 reconciliation (docs only).** The sensing plan lists S4 as unbuilt.
 But S4's five work items describe exactly what PR #943 delivered: feed the
 owner-private population into exact leases, retain Unknown, select one exact

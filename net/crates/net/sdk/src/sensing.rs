@@ -112,10 +112,16 @@
 //! What is genuinely absent, here and everywhere else in the SDK:
 //! provider-free / leader-backed sensing (no `AnyAuthorized`, tag or
 //! group selector), `Granted` and cross-organization sensing, a generic
-//! sensed CALL verb, compute/gang sensed adapters, warmed pools, and
-//! language bindings. [`SensingQuery`] can express none of them, and
-//! [`SensingClient::watch`] refuses what it cannot mean rather than
+//! sensed CALL verb, compute-placement sensed adapters, warmed pools,
+//! and language bindings. [`SensingQuery`] can express none of them,
+//! and [`SensingClient::watch`] refuses what it cannot mean rather than
 //! accepting an argument it would ignore.
+//!
+//! The gang scheduler is the one consumer of a snapshot outside
+//! `OrgClient`: [`Mesh::match_islands_sensed`]
+//! and [`Mesh::claim_island_sensed`]
+//! take a [`SensingSnapshot`] and apply its classes as a claim ORDER. Viable
+//! hosts lead, not-ready hosts go last, and nothing is removed.
 //!
 //! The other consumer of the same substrate is
 //! [`crate::org::OrgClient`], which binds one acquisition family per
@@ -151,7 +157,11 @@ use net::adapter::net::MeshNode;
 
 use crate::mesh::Mesh;
 
+mod class;
 pub mod consumer;
+
+/// The Rust-owned error classification every binding forwards (see [`SensingError::kind`]).
+pub use class::{parse_sensing_wire, ERR_SENSING_PREFIX};
 
 /// The own-organization exact-provider consumer observation: one bounded
 /// query, one request-relative snapshot, missed-wake-safe change
@@ -396,7 +406,23 @@ impl Mesh {
     pub fn sensing(&self) -> Result<SensingClient, SensingError> {
         SensingClient::bind_node(self.node().clone())
     }
+
+    /// Operator counters for sensed organization call routing: how often
+    /// a capability's authorized population was truncated at
+    /// [`MAX_SENSED_POPULATION`], and how often a sensed `org.call` fell
+    /// back to the deterministic unsensed order, by reason.
+    ///
+    /// Node-global and monotonic. These are diagnostics only: nothing in
+    /// the call path reads them. Always readable, including on a node with
+    /// sensing off, where every value stays zero, because an inert node
+    /// never wanted sensing and so never falls back from it.
+    pub fn org_sensing_routing_counters(&self) -> OrgSensingRoutingCounters {
+        self.node().org_sensing_routing_counters()
+    }
 }
+
+/// The counters [`Mesh::org_sensing_routing_counters`] returns.
+pub use net::adapter::net::OrgSensingRoutingCounters;
 
 impl SensingClient {
     /// Bind the provider surface to a node handle, checking the
@@ -647,25 +673,17 @@ mod tests {
     /// Refusals must be readable without a debugger — each carries the
     /// action the caller has to take, or says plainly that the state is
     /// terminal.
+    ///
+    /// The per-variant check now lives in
+    /// `class::tests::every_message_names_its_remedy`, over every variant
+    /// through an exhaustive match. This test was a hand-kept sample of five
+    /// (consumer-SDK review §3); it remains as a smoke check that the
+    /// classification module is wired in.
     #[test]
     fn every_refusal_names_the_remedy() {
-        assert!(SensingError::Disabled
-            .to_string()
-            .contains("MeshBuilder::enable_sensing"));
-        assert!(SensingError::IncarnationRequired
-            .to_string()
-            .contains("next_incarnation"));
-        assert!(SensingError::DurableIdentityRequired
-            .to_string()
-            .contains("MeshBuilder::identity"));
-        assert!(SensingError::AlreadyProviding {
-            capability: "gpu.infer".into(),
+        for error in class::canonical_instances() {
+            assert!(!error.to_string().is_empty(), "{}", error.kind());
         }
-        .to_string()
-        .contains("gpu.infer"));
-        assert!(SensingError::RegistrationIdentityExhausted
-            .to_string()
-            .contains("exhausted"));
     }
 
     /// The core refusal maps onto exactly one SDK refusal each, and the
@@ -721,6 +739,7 @@ mod tests {
         let sources = [
             include_str!("sensing.rs"),
             include_str!("sensing/consumer.rs"),
+            include_str!("sensing/class.rs"),
         ];
         // WHOLE declarations, not first lines: every `pub use` statement
         // up to its `;`, and every public function signature — `pub fn`,

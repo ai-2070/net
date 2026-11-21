@@ -671,6 +671,12 @@ async fn the_production_call_lands_on_the_sensed_provider() {
         both,
         "a deprioritized provider stays authorized"
     );
+    // C2: every call here converged or reused a certified demand and applied
+    // the sensed order. None of them is a fallback, and a two-provider
+    // population is far below the truncation cap.
+    let routing = cell.consumer.node.org_sensing_routing_counters();
+    assert_eq!(routing.fallback_total, 0, "{routing:?}");
+    assert_eq!(routing.truncated_total, 0, "{routing:?}");
     cell.cleanup();
 }
 
@@ -1245,6 +1251,18 @@ async fn contending_clones_produce_exactly_one_convergence() {
     assert_eq!(
         convergences, 1,
         "one change, one convergence: {arrivals} contending callers must not each converge"
+    );
+    // C2 (OLB §14 `org_sensing_fallback_total`): every caller that DECLINED
+    // the held section left on the unsensed order, and is counted once, as
+    // contended - no more, no less, and under no other reason.
+    let routing = cell.consumer.node.org_sensing_routing_counters();
+    assert_eq!(
+        routing.fallback_contended, contended,
+        "each declined caller is one contended fallback: {routing:?}"
+    );
+    assert_eq!(
+        routing.fallback_total, routing.fallback_contended,
+        "contention is the only reason any caller fell back here: {routing:?}"
     );
 
     // ...and the shared state they all read is the same one.

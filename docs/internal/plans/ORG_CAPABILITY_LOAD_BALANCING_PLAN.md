@@ -2503,7 +2503,7 @@ conflating them would be its own defect (Kyra, 2026-09-11):
 
 | Disposition | Rows | Meaning |
 |---|---|---|
-| **Operational visibility owed** | `org_sensing_truncated_total`, `org_sensing_fallback_total` | The bounded behaviour and the fallback exist and are witnessed; what is missing is a counter an operator can read. A debt to pay, **not** evidence the behaviour is absent. |
+| **Operational visibility owed** | `org_sensing_truncated_total`, `org_sensing_fallback_total` | The bounded behaviour and the fallback exist and are witnessed; what is missing is a counter an operator can read. A debt to pay, **not** evidence the behaviour is absent. **Paid 2026-11-21 (completion plan C2, design D8.4a); awaits sign-off.** |
 | **Excluded from this gate** | reordered-`Deregister` repair | Removed from this release's completion promise, because the governing exact design lists closing that race among its own §15 non-goals. An excluded behaviour must not sit in a gate as an implied promise: if it is wanted, it needs a named slice with a repair and a witness, and the row returns then. |
 | **Waived by decision** | the independent RED mutation pass (recorded in the status block at the top) | Waived by the owner's sign-off, **not verified**. Reopening it takes an explicit decision, not a re-reading of this plan. |
 | **Unimplemented product slices** | P2C sampler (OLB-3), `NoViableProvider` (OLB-4) | Unbuilt product work on the unsensed lane. Not administrative closure work, and not something a documentation pass can discharge. |
@@ -2614,10 +2614,14 @@ The plan is complete when all are true:
 - [x] The per-call temporal recheck of membership/dispatcher/grant
       remains on the hot path — the route cache is never an authority
       cache.
-- [ ] **PARTIAL — the bound and its deterministic truncation are implemented
-      and witnessed; `org_sensing_truncated_total` does NOT exist (the exact
-      design authorized no new counter, and `MAX_SENSED_POPULATION` clamping is
-      observed through behaviour instead).**
+- [x] **IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` C2). Awaits
+      sign-off; not covered by the 2026-09-11 signature.** The exact design's
+      D8.4a amendment authorizes the counter. It is readable in production
+      through `MeshNode::org_sensing_routing_counters().truncated_total` and
+      `prometheus_text()`, and witnessed by
+      `a_population_over_the_cap_is_clamped_and_counted_once_per_derivation`.
+      *(Was: PARTIAL. The bound was implemented, but the count was readable
+      only by fixtures-gated witnesses.)*
       Sensed fan-out is bounded (32 sensed providers per capability /
       **64 authority-scoped demands per clone family**, `MAX_HANDLES_PER_FAMILY`
       at `org_routing_registry.rs:52`) with
@@ -2638,9 +2642,12 @@ The plan is complete when all are true:
       NonViable. *(Corrected 2026-08-30.)*
 - [x] Cold/unavailable sensing preserves the current call path
       byte-for-byte, including `ProviderNotDirect`.
-- [ ] **OPEN — `org_sensing_fallback_total` does NOT exist. Every degradation
-      is witnessed behaviourally instead (it lands on the deterministic
-      unsensed order), which is weaker than a counter an operator can read.**
+- [x] **IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` C2). Awaits
+      sign-off; not covered by the 2026-09-11 signature.**
+      `org_sensing_fallback_total{reason="contended|refused|unretained"}`, one
+      reason per exit of `apply_sensed_order`, is specified in design D8.4a.
+      That section maps these reasons onto this plan's §7 sketch and lists the
+      witnesses. *(Was: OPEN, behaviour-only.)*
       Sensing capacity fallback is observable
       (`org_sensing_fallback_total`).
 - [ ] **NOT CLAIMED — unsensed OLB-4 lane only; superseded for this release.**

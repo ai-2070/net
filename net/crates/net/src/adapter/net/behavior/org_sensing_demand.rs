@@ -162,6 +162,27 @@ pub enum OrgSensingDemandRefused {
     FamilyUnavailable,
 }
 
+/// Why one sensed call took the deterministic unsensed order (OLB §14,
+/// `org_sensing_fallback_total`). Recorded through
+/// [`OrgSensingFamily::note_order_fallback`], read through
+/// [`MeshNode::org_sensing_routing_counters`].
+///
+/// Each variant is a call that WANTED sensing (an acquisition exists, and the
+/// capability has owner-plane candidates to sense) and still ordered without
+/// it. Inert nodes, capabilities with nothing to sense and evidence-free
+/// projections are not fallbacks, and have no variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgSensedOrderFallback {
+    /// Another caller held this capability's reconciliation, and this call
+    /// declined rather than blocked.
+    Contended,
+    /// This call's convergence was refused (authority, capacity, identity).
+    Refused,
+    /// No demand was installed for the capability when the order was applied:
+    /// an earlier refusal is still pacing re-convergence.
+    Unretained,
+}
+
 /// One retained provider inside one capability's demand.
 struct RetainedProvider {
     provider: u64,
@@ -761,6 +782,15 @@ impl OrgSensingFamily {
     /// retires its demand.
     pub fn owners(&self) -> usize {
         Arc::strong_count(&self.inner)
+    }
+
+    /// Record that one sensed call on this family's node took the unsensed
+    /// order, and why. Diagnostic only: it changes no demand and no order.
+    pub fn note_order_fallback(&self, reason: OrgSensedOrderFallback) {
+        self.inner
+            .node
+            .org_sensing_demand_counters()
+            .note_order_fallback(reason);
     }
 
     /// The capabilities this family currently retains demand for.
@@ -3445,6 +3475,61 @@ mod tests {
     /// projected onto a node id through the TOFU pin map. That chain is what
     /// `retain` depends on, so it has to be exercised with a record in it —
     /// stamp movement over an empty query says nothing about provenance.
+    /// C2 (OLB §14 `org_sensing_truncated_total`): a verified authorized
+    /// population above `MAX_ORG_SENSING_POPULATION` is clamped to the cap,
+    /// and the clamp is visible through the PRODUCTION counter accessor, once
+    /// per derivation. A population at the cap is not counted.
+    ///
+    /// RED against a derivation that clamps silently, and against a counter
+    /// that fires at `len == cap` (an off-by-one would count every full
+    /// population).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_population_over_the_cap_is_clamped_and_counted_once_per_derivation() {
+        let node = demand_node("population-truncation", Duration::from_secs(30)).await;
+        let capability = CapabilityAuthorityId::for_tag(TAG);
+        for index in 0..MAX_ORG_SENSING_POPULATION as u64 {
+            let entity = announce_owner_provider(&node);
+            node.pin_peer_entity_for_test(node.node_id().wrapping_add(100 + index), entity);
+        }
+
+        assert_eq!(
+            node.org_sensing_authorized_population(&capability).len(),
+            MAX_ORG_SENSING_POPULATION,
+            "precondition: exactly the cap"
+        );
+        assert_eq!(
+            node.org_sensing_routing_counters().truncated_total,
+            0,
+            "a population AT the cap is not truncated"
+        );
+
+        let entity = announce_owner_provider(&node);
+        node.pin_peer_entity_for_test(node.node_id().wrapping_add(99), entity);
+        let clamped = node.org_sensing_authorized_population(&capability);
+        assert_eq!(
+            clamped.len(),
+            MAX_ORG_SENSING_POPULATION,
+            "clamped to the cap"
+        );
+        assert_eq!(node.org_sensing_routing_counters().truncated_total, 1);
+        let _ = node.org_sensing_authorized_population(&capability);
+        assert_eq!(
+            node.org_sensing_routing_counters().truncated_total,
+            2,
+            "one count per truncating derivation"
+        );
+        let text = node.org_sensing_routing_counters().prometheus_text();
+        assert!(text.contains("\norg_sensing_truncated_total 2\n"), "{text}");
+        for reason in ["contended", "refused", "unretained"] {
+            assert!(
+                text.contains(&format!(
+                    "org_sensing_fallback_total{{reason=\"{reason}\"}} 0\n"
+                )),
+                "{text}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_verified_discovery_population_retains_and_follows_floor_movement() {
         let node = demand_node("discovery-population", Duration::from_secs(30)).await;

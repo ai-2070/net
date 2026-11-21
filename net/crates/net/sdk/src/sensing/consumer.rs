@@ -432,6 +432,49 @@ impl SensingSnapshot {
     pub fn provider(&self, node_id: u64) -> Option<&SensedProvider> {
         self.providers.iter().find(|row| row.node_id == node_id)
     }
+
+    /// The two inputs an exact-lane ORDERING consumes, both folds of this one
+    /// capture: the viable providers in rank order, and the providers sensed
+    /// not-ready.
+    ///
+    /// Crate-internal on purpose. Consumers such as the sensed gang match read
+    /// it so they apply the snapshot's own classes instead of re-deriving them
+    /// from rows, and nothing outside the crate gets a second vocabulary for
+    /// the same capture.
+    pub(crate) fn exact_order_inputs(&self) -> (&[u64], std::collections::HashSet<u64>) {
+        let not_ready = self
+            .providers
+            .iter()
+            .filter(|row| row.viability == SensedViability::NotViable)
+            .map(|row| row.node_id)
+            .collect();
+        (&self.ranked, not_ready)
+    }
+
+    /// Build a snapshot from plain rows, for in-crate witnesses only. Each row
+    /// is `(node_id, viability)`; `ranked` is the viable rank order. No row
+    /// carries an estimate.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        capability: &str,
+        rows: &[(u64, SensedViability)],
+        ranked: &[u64],
+    ) -> Self {
+        Self {
+            capability: capability.to_owned(),
+            providers: rows
+                .iter()
+                .map(|&(node_id, viability)| SensedProvider {
+                    node_id,
+                    readiness: ProjectedReadiness::Unknown,
+                    viability,
+                    estimated_start: None,
+                    route_estimate: None,
+                })
+                .collect(),
+            ranked: ranked.to_vec(),
+        }
+    }
 }
 
 /// An owning observation of one capability's authorized exact-provider

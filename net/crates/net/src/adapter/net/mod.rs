@@ -236,8 +236,8 @@ pub use mesh::SensingOffLockObservation;
 #[cfg(feature = "nat-traversal")]
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
-    ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, PartitionFilter,
-    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
+    ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, OrgSensingRoutingCounters,
+    PartitionFilter, PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
     SensingRegistrationError, SessionPath, StartRefused, StreamInboundEvent, StreamInboundSink,
     StreamInbox, SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
     NOISE_STATIC_KEY_CONTEXT, TRANSFER_CHUNK_IDLE_TIMEOUT,

@@ -1800,6 +1800,84 @@ async fn a_refused_wave_paces_but_a_restored_authority_does_not_wait() {
         "a restored authority is a NEW context: reconciliation must resume at \
          once rather than wait out the refusal floor"
     );
+    // C2 control: with ONE candidate there is no order to lose, so neither the
+    // refused attempt nor the paced wave is a fallback. RED against a counter
+    // that ignores `could_order`.
+    assert_eq!(
+        mesh.org_sensing_routing_counters().fallback_total,
+        0,
+        "a single-candidate call never counts as an order fallback"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C2 (OLB §14 `org_sensing_fallback_total`): a sensed call that WANTED
+/// sensing and left on the unsensed order is counted once, under its reason.
+/// A converged call is not counted.
+///
+/// Two providers, so every attempt has an order to lose. The node is poisoned
+/// BEFORE the first attempt, so no demand is ever installed until recovery:
+///
+/// 1. the first attempt converges, `retain` refuses → `Refused`;
+/// 2. the next attempt is paced by that refusal and finds no demand →
+///    `Unretained`;
+/// 3. after the authority is restored, the attempt converges and applies the
+///    projection → no new fallback.
+#[tokio::test]
+async fn sensed_order_fallbacks_are_counted_once_by_reason() {
+    let a = org_a();
+    let (mesh, identity, dir) =
+        super::tests::mesh_with_authority_sensing("plan-fallback-reasons", Some(&a), true).await;
+    let tag = "nrpc:internal.reindex";
+    for _ in 0..2 {
+        let provider = EntityKeypair::generate();
+        inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+        mesh.node()
+            .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    }
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+    let sensed = super::call::SensedSelection::new(tag, 0);
+    let attempt = || {
+        let capture = client
+            .capture_private(&capability)
+            .expect("the authority stays installed, so the caller keeps capturing");
+        let _ = client.plan_attempt(&capability, &capture, &sensed);
+    };
+    let counters = || mesh.org_sensing_routing_counters();
+
+    mesh.node()
+        .org_revocation_store()
+        .expect("an installed store")
+        .mark_poisoned_for_test();
+
+    attempt();
+    assert_eq!(
+        client.sensing_last_expectation().map(|e| e.len()),
+        Some(2),
+        "precondition: both providers are in the sensed expectation"
+    );
+    let after_refusal = counters();
+    assert_eq!(after_refusal.fallback_refused, 1, "{after_refusal:?}");
+    assert_eq!(after_refusal.fallback_total, 1, "{after_refusal:?}");
+
+    attempt();
+    let after_wave = counters();
+    assert_eq!(after_wave.fallback_unretained, 1, "{after_wave:?}");
+    assert_eq!(
+        after_wave.fallback_refused, 1,
+        "the paced wave is not a second refusal"
+    );
+    assert_eq!(after_wave.fallback_total, 2, "{after_wave:?}");
+
+    renew_authority_at(&mesh, &a, &identity, &dir, "restored");
+    attempt();
+    assert_eq!(
+        counters().fallback_total,
+        2,
+        "a converged call applied the sensed order and is not a fallback"
+    );
+    assert_eq!(counters().fallback_contended, 0, "no caller ever contended");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

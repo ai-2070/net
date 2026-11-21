@@ -52,7 +52,9 @@ use net::adapter::net::behavior::org_cold_plan::{
     OrgColdAuthority, OrgColdDiscovery, OrgColdRefusal,
 };
 use net::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
-use net::adapter::net::behavior::org_sensing_demand::org_sensed_bucket_permutation;
+use net::adapter::net::behavior::org_sensing_demand::{
+    org_sensed_bucket_permutation, OrgSensedOrderFallback,
+};
 use net::adapter::net::behavior::sensing::ConsumerLatencyBudget;
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{
@@ -1148,6 +1150,17 @@ impl OrgClient {
         // capture, recorded before anything acts on it.
         acquisition.schedule().note_expectation(&expected);
 
+        // Whether THIS call is one sensing could have reordered: two or more
+        // candidates and an owner-plane population to sense. Only such a call
+        // counts as a FALLBACK when it leaves on the unsensed order (OLB §14,
+        // `org_sensing_fallback_total`). A single candidate, or nothing to
+        // sense, has no order to lose.
+        let could_order = candidates.len() >= 2 && !expected.is_empty();
+        let fall_back = |reason: OrgSensedOrderFallback| {
+            if could_order {
+                family.note_order_fallback(reason);
+            }
+        };
         let now = Instant::now();
         // ONE section: decide, converge, record. `retain` is synchronous and
         // takes core's own transaction lock inside; nothing here awaits.
@@ -1163,6 +1176,7 @@ impl OrgClient {
             // at the price of blocking the runtime inside a synchronous
             // section that authors and sends per provider.
             let Some(_txn) = acquisition.try_reconcile_lock() else {
+                fall_back(OrgSensedOrderFallback::Contended);
                 return;
             };
             // The hold's own ticket, copied out so the steps below can ask
@@ -1221,6 +1235,7 @@ impl OrgClient {
                             now,
                         );
                         acquisition.schedule().verify_holding(held);
+                        fall_back(OrgSensedOrderFallback::Refused);
                         return;
                     }
                 }
@@ -1231,6 +1246,7 @@ impl OrgClient {
         sensing_planning_seam();
 
         let Some(demand) = family.demand(capability) else {
+            fall_back(OrgSensedOrderFallback::Unretained);
             return;
         };
         if candidates.len() < 2 || demand.population().is_empty() {
