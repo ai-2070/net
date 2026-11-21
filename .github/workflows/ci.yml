@@ -2703,13 +2703,14 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py" \
             --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
             --suite org_exact_sensing \
-            --min 22 \
+            --min 23 \
             --required-file - <<'REQUIRED'
           the_production_call_lands_on_the_sensed_provider
           the_production_call_follows_the_sensed_rank_between_viable_providers
           a_deadline_below_every_estimate_falls_back_to_the_deterministic_order
           a_provider_discovered_after_the_first_call_enters_the_population
           a_departed_provider_leaves_the_warmed_population
+          a_departure_to_zero_retires_the_demand
           a_capacity_refused_holder_is_recovered_by_a_later_call
           a_holder_that_dies_after_convergence_is_reacquired
           unknown_services_strand_no_sensing_capacity

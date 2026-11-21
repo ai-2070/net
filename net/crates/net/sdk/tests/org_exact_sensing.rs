@@ -929,6 +929,56 @@ async fn a_departed_provider_leaves_the_warmed_population() {
     cell.cleanup();
 }
 
+/// DEPARTURE TO ZERO (C3 campaign, survivor E2): when EVERY provider leaves,
+/// the next calls retire the capability's demand outright. The demand does
+/// not linger with a dead population whose holders keep renewing toward
+/// providers that are gone.
+///
+/// The narrowing witness above departs from two providers to one. Removing
+/// the empty-expectation retirement survived it, because one survivor keeps
+/// the expectation nonempty. This is the zero case that witness never
+/// reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departure_to_zero_retires_the_demand() {
+    let cell = Cell::stand_up_with(
+        "zero",
+        true,
+        &[
+            (true, Duration::from_millis(1)),
+            (true, Duration::from_millis(1)),
+        ],
+        Duration::from_secs(2),
+    )
+    .await;
+    let _armed = cell.call().await;
+    assert!(
+        demand_state(&cell.client).is_some(),
+        "precondition: the first call installed a demand"
+    );
+
+    for provider in &cell.providers {
+        net::adapter::Adapter::shutdown(provider.node.as_ref())
+            .await
+            .expect("stop a provider");
+    }
+    until(
+        "the departed providers never left the authorized population",
+        Duration::from_secs(30),
+        || population(&cell.consumer).is_empty(),
+    )
+    .await;
+
+    // Calls now fail (nobody serves), but planning still runs the sensed
+    // step. An empty expectation must retire the installed demand.
+    cell.call_until(
+        "a departure to zero never retired the installed demand",
+        SETTLE,
+        || demand_state(&cell.client).is_none(),
+    )
+    .await;
+    cell.cleanup();
+}
+
 /// A holder the acquisition could not take - the node's interest capacity was
 /// full - is RECOVERED by a later call once capacity frees, without any
 /// authority movement and without a per-call re-acquisition in between.

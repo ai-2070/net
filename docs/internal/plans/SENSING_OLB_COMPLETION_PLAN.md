@@ -219,6 +219,41 @@ non-degraded path. Use counter-unmoved assertions in the W-W12 style, because
 partial publication is how the M-Z14 survivor hid.
 *Exit:* both OLB §14 rows flip to `[x]`.
 
+**C3 status (2026-11-21): the owner chose option (b). The bounded campaign
+has run, at `34d28fc33` in a separate worktree.** It covered 19 mutations of
+the exact lane's production code (SDK call planning and convergence
+schedule, the core bucket permutation, the classifier, the lease registry,
+the authority fence, and the org egress). Each row:
+- ran every listed binary in full, with the started count checked against a
+  clean baseline: `sdk:org_exact_sensing` 22, `root:sensing_org_lease_wire`
+  9, `root:sensing_org_exact_seam` 8, and SDK lib `org::` 123;
+- restored the mutated file and verified it by SHA-256;
+- went to an append-only ledger
+  (`C:\Users\chief\Documents\net-c3-campaign\ledger.tsv`, harness `run.pl`,
+  rows `rows.txt`).
+
+**15 RED** (A1–A3, B1, C1–C3, D1–D4, E1, F1, F2, F4) and **4
+GREEN-SURVIVOR**:
+- **E2** (the departure-to-zero retirement removed): a **real witness gap**.
+  The departure witness only ever narrowed from two providers to one. It is
+  repaired by `a_departure_to_zero_retires_the_demand` (now pinned,
+  `org_exact_sensing` floor 22→23), which fails under the E2 mutation in the
+  main tree.
+- **B2 / B3** (the `owned_at` guard removed from the ranked and pruned passes)
+  and **F3** (strictest becomes loosest): the rows were **scoped too
+  narrowly**, not necessarily under-witnessed.
+  - B2 / B3 are defence in depth that the end-to-end binaries cannot reach: a
+    Granted-only provider never enters the sensed population (A1 is RED), and
+    a dual-plane provider dedups owner-first. The pure-function witness is
+    SDK lib `tests_call` (a granted id ranked or pruned keeps the identity
+    permutation), which the core rows did not include.
+  - F3's wire witness has a single surviving holder, where `min == max`; the
+    min-over-many property is `sensing::identity::tests::strictest_sample_interval_is_min_dominance`.
+  - Re-scoped rows (`rows2.txt`: B2b / B3b against the SDK and core lib, F3b
+    against the core lib) were **stopped mid-baseline by the host's
+    low-memory guard**. No mutation had been applied, and the worktree is
+    clean. They are pending a re-run, so no verdict is claimed for them yet.
+
 **C3 — RED-pass decision record.** The waiver stands until the owner decides
 otherwise. Present one of two options:
 - **(a)** keep the waiver and record it as permanent for the signed head; or
