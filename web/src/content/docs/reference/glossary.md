@@ -97,7 +97,8 @@ no delegation chains.
 
 **Capability grant** — a provider organization's root-signed grant of `DISCOVER`
 and/or `INVOKE` rights to another organization over an exact capability and
-provider scope. The grantee cannot manufacture it.
+provider scope. A grant may add `SENSE`, which requires both, for
+cross-organization readiness sensing. The grantee cannot manufacture it.
 
 **Protected call / `OrgAccess`** — an invocation admitted by provider-side,
 per-service organization admission; the caller presents a proof composing a

@@ -822,6 +822,14 @@ cross-org proof and docs.
       `without_sense_a_cross_org_call_keeps_the_deterministic_order`.
   - Mutations M26–M30 each failed their witness. The `org_exact_sensing`
     roster floor rises to 25 and both names are pinned.
+- **6d, landed**: docs.
+  - `docs/SENSING.md` gains a "Granted (cross-organization) sensing"
+    section, and two stale statements are corrected (cross-org candidates
+    were always unsensed; the "still absent" list named work Phases 2–3
+    delivered).
+  - SENSE is documented in the web organization concept, glossary and CLI
+    reference, and in the skill `cli.md` and `org.md`.
+  - The OLB-6 section is marked built.
 
 This gates on **a named cross-organization consumer** (OLB §13). Without one
 it does not start. Then, per OLB §5.3:
@@ -877,18 +885,24 @@ which has already landed, so it never blocks Phases 1–4 (LS §9 rules 1–4).
 - Sensing §8 holds through S2. S3 is delivered. S4 is reconciled.
 - Rust, Node, Python and Go pass the same three-provider sensed scenario.
 - `SAFE_LIVE_HEAD` is established by LS-6, or LS is formally deferred by
-  decision.
+  decision. **Deferred by owner decision 2026-11-21 (Phase 5: not needed).**
 - OLB-6 is built against a named consumer, or recorded as awaiting one.
+  **Built 2026-11-21 without a named consumer, by owner decision (Phase 6).**
 
 ## Decisions needed from the owner
 
+All eight are answered (2026-11-21). Kept for the record:
+
 1. H1: approve a no-content `-s ours` merge PR, and the CI bypass for an empty
-   diff, if branch protection requires it.
-2. H2: approve deleting the three remote refs after H1.
-3. C2: amend the exact design to authorize the two counters.
+   diff, if branch protection requires it. **Done (H1); the PR must merge with
+   a merge commit.**
+2. H2: approve deleting the three remote refs after H1. **Refs retained.**
+3. C2: amend the exact design to authorize the two counters. **Amended (D8.4a).**
 4. C3: keep the RED waiver, or run the bounded campaign (recommended).
+   **Campaign run; B2, B3 and F3 left to CI.**
 5. B1: the binding provider shape (value-backed evaluator vs. callback), and,
-   after B1-pre lands, each binding's wait wrapper.
+   after B1-pre lands, each binding's wait wrapper. **Value-backed; landed.**
 6. Phase 4: whether the unsensed lane still wants P2C and `NoViableProvider`.
-7. Phase 5: whether to open the LS design review now.
-8. Phase 6: whether there is a named cross-org consumer.
+   **P2C yes, over a non-sensing cost signal; `NoViableProvider` no.**
+7. Phase 5: whether to open the LS design review now. **Not needed.**
+8. Phase 6: whether there is a named cross-org consumer. **Build without one.**

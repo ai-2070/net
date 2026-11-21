@@ -437,7 +437,8 @@ viable candidates first in sensed rank order, then everything with no
 verdict in the caller's own order, then the not-ready ones last — still
 present. The population cap bounds what is SENSED, never what is
 offered, so same-organization candidates beyond it, and every
-cross-organization one, survive as unsensed fallback. The result is
+cross-organization one not sensed under a SENSE grant (see "Granted
+(cross-organization) sensing" below), survive as unsensed fallback. The result is
 advisory plain data: it holds no lease, mints no grant, reserves
 nothing, and cannot admit an invocation.
 
@@ -512,10 +513,10 @@ budget, derived from that call's own deadline.
 
 What is still genuinely absent: no continuous ranking (a snapshot is
 asked for, never pushed as an order), no provider-free/leader sensing,
-no `Granted` or cross-organization sensing, no sensed ordering on the
-subnet-exported plane, no sensed `call_service` and no compute/gang
-sensed adapters, and no language bindings — both the consumer watch
-and the sensed call path are Rust-SDK-only. Acquisition is still not a
+and no sensed ordering on the subnet-exported plane. Cross-organization
+sensing exists under an explicit SENSE grant (below). The sensed
+`call_service`, the compute and gang adapters and the language bindings
+are covered in the next section. Acquisition is still not a
 projection: the SDK's `watch` reads the same per-request projection the
 call path does, and publishes no ranking artifact of its own.
 
@@ -583,6 +584,68 @@ asserts against the generated fixture
   and raises `SensingError` when another thread closes the watch.
 - Pure SDKs: `@net-mesh/sdk/sensing` and `net_sdk.sensing`, which forward
   and add a `snapshots(watch)` iterator.
+
+### Granted (cross-organization) sensing
+
+A provider organization B can let another organization A's `org.call`
+be ordered by B's providers' live readiness. B issues A a capability
+grant carrying the **SENSE** right:
+
+```text
+net-mesh org grant-capability ... --invoke --discover --sense --audience-out <PATH>
+```
+
+SENSE requires both INVOKE and DISCOVER, at issue, at decode and at
+every verifier. The sensed population is the grant's own discovery
+plane, and readiness for a capability A cannot invoke would be load
+disclosure with no routing use. An older build decodes a SENSE grant as
+unknown rights and refuses it.
+
+Nothing else changes for the caller. An `OrgClient` bound with a SENSE
+grant senses that grant's providers automatically:
+- The node registers the credentials when the client binds. It accepts
+  them only for a grant issued to its own owner organization, with its
+  own dispatcher grant.
+- Exact-provider registrations go directly to each of B's providers.
+  They are never relayed.
+- The call follows the merged sensed order, exactly as it does for
+  same-organization providers.
+
+A grant without SENSE, or one the node cannot sense under, leaves those
+providers in the deterministic order. Missing readiness never refuses a
+call.
+
+**At the provider**, each registration must pass every one of these
+checks before anything is recorded:
+- it arrives at its own target, from the member it names;
+- the grant was issued by this node's owner org, to the member's
+  (different) org;
+- the grant carries SENSE for this capability and covers this node;
+- the dispatcher grant is that member's own, for that org and this
+  capability;
+- the certificate, dispatcher and grant windows are all current;
+- the member is not below its org's floor (if those floors were
+  imported here);
+- neither grant has been revoked by its issuer;
+- the audience is the grant's own.
+
+Refusals count in `org_granted_refused`. A grant revoked between the
+check and the row creates no row.
+
+**Audience isolation.** Each grant has its own audience, derived from
+its id, issuer, grantee and capability and bound into the interest
+digest. Granted observations therefore never coalesce with the
+same-organization audience or with another grant's, and are never
+shared with them.
+
+**What revocation reaches.** Every refresh re-runs the provider's
+checks. These take effect at the next refresh:
+- B revoking the grant (cuts off every A member at once);
+- either grant's window ending;
+- a removed A member, but only on providers that import A's floor
+  bundles, the same boundary cross-org nRPC admission has.
+
+A row already accepted lives until its soft-state TTL.
 
 ## Observability
 

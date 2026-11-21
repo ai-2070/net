@@ -2485,6 +2485,13 @@ sensing snapshot changed
 
 ### OLB-6 — granted sensing, separately activated
 
+**Status (2026-11-21): built and awaiting review, by owner decision WITHOUT a
+named consumer** (completion plan Phase 6, commits 6a `d9f395f55`, 6b
+`b11282753`, 6c `36b312f83`, 6d docs). Every bullet below is delivered as
+completion plan D6.1–D6.8 records it. The one change from this text: issuer-side
+grant revocation exists, so the invalidation story is stronger than §5.3 first
+stated (see the correction there).
+
 Only after a named cross-organization load-balancing consumer:
 
 - define explicit `GrantRights::SENSE` with its own structural
