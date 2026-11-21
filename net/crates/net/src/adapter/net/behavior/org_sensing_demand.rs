@@ -160,6 +160,10 @@ pub enum OrgSensingDemandRefused {
     /// family space is bounded and terminal). Mapped, never propagated: a
     /// binding that cannot sense is inert, not broken.
     FamilyUnavailable,
+    /// A GRANTED family (OLB-6) was asked to retain a capability its SENSE
+    /// grant does not name, or the node's owner organization is no longer the
+    /// grant's grantee. Nothing is acquired.
+    CapabilityNotGranted,
 }
 
 /// Why one sensed call took the deterministic unsensed order (OLB §14,
@@ -700,6 +704,23 @@ struct OrgSensingFamilyInner {
     /// (validated on holder identity and audience, not on the digest) would
     /// then be kept for an interest this family no longer asks.
     work_latency: sensing::WorkLatencyEnvelope,
+    /// WHICH sensing plane this family retains demand on, fixed at mint
+    /// (OLB-6, D6.6): the owner plane, or ONE SENSE grant's plane. For a
+    /// granted family this holds the node's credential registration, so the
+    /// credentials outlive every lease the family releases on drop (fields
+    /// drop after `Drop::drop` runs).
+    plane: OrgSensingPlane,
+}
+
+/// The sensing plane one family retains demand on (OLB-6, D6.6).
+enum OrgSensingPlane {
+    /// Same-org: the canonical organization audience over owner-private
+    /// discovery.
+    Owner,
+    /// Cross-org: ONE SENSE grant's audience over its own discovery plane.
+    /// Boxed: the registration carries a whole grant, and a family is built
+    /// once per binding, so the indirection costs nothing that matters.
+    Granted(Box<crate::adapter::net::mesh::GrantedSensingRegistration>),
 }
 
 impl Drop for OrgSensingFamilyInner {
@@ -764,8 +785,44 @@ impl OrgSensingFamily {
                 work_latency,
                 txn_mu: parking_lot::Mutex::new(()),
                 demand_mu: parking_lot::Mutex::new(BTreeMap::new()),
+                plane: OrgSensingPlane::Owner,
             }),
         })
+    }
+
+    /// Mint a GRANTED family (OLB-6, completion plan D6.6) bound to `node`,
+    /// retaining demand on ONE SENSE grant's plane under its granted audience,
+    /// asking the fixed internal provider-start predicate.
+    ///
+    /// The family holds `registration` for its whole life, so the node can
+    /// author (and release) granted registrations for every lease the family
+    /// owns.
+    pub fn mint_granted(
+        node: &Arc<MeshNode>,
+        registration: crate::adapter::net::mesh::GrantedSensingRegistration,
+    ) -> Result<Self, OrgSensingDemandRefused> {
+        let family = node
+            .org_routing_family()
+            .map_err(|_| OrgSensingDemandRefused::FamilyUnavailable)?;
+        Ok(Self {
+            inner: Arc::new(OrgSensingFamilyInner {
+                node: Arc::clone(node),
+                _family: family,
+                work_latency: SENSING_WORK_LATENCY,
+                txn_mu: parking_lot::Mutex::new(()),
+                demand_mu: parking_lot::Mutex::new(BTreeMap::new()),
+                plane: OrgSensingPlane::Granted(Box::new(registration)),
+            }),
+        })
+    }
+
+    /// The SENSE grant this family senses under, or `None` for an owner
+    /// family.
+    pub fn granted_grant(&self) -> Option<&super::org_grant::OrgCapabilityGrant> {
+        match &self.inner.plane {
+            OrgSensingPlane::Owner => None,
+            OrgSensingPlane::Granted(registration) => Some(registration.grant()),
+        }
     }
 
     /// The provider-start predicate this family asks.
@@ -863,6 +920,13 @@ impl OrgSensingFamily {
     ) -> Result<Arc<OrgSensingCapabilityDemand>, OrgSensingDemandRefused> {
         let capability = CapabilityAuthorityId::for_tag(tag);
         let node = &self.inner.node;
+        // A granted family senses ONE capability: the one its SENSE grant
+        // names (OLB-6). Any other tag acquires nothing.
+        if let OrgSensingPlane::Granted(registration) = &self.inner.plane {
+            if registration.grant().capability != capability {
+                return Err(OrgSensingDemandRefused::CapabilityNotGranted);
+            }
+        }
         // ONE convergence at a time for this family, taken OUTERMOST.
         let _txn = self.inner.txn_mu.lock();
         for _attempt in 0..QUALIFICATION_ATTEMPTS {
@@ -873,9 +937,15 @@ impl OrgSensingFamily {
             let snapshot = node
                 .capture_sensing_authority_snapshot()
                 .map_err(|_| OrgSensingDemandRefused::NoAuthority)?;
-            let population = match explicit {
-                Some(explicit) => explicit.to_vec(),
-                None => node.org_sensing_authorized_population(&capability),
+            let population = match (explicit, &self.inner.plane) {
+                (Some(explicit), _) => explicit.to_vec(),
+                (None, OrgSensingPlane::Owner) => {
+                    node.org_sensing_authorized_population(&capability)
+                }
+                // The grant's OWN discovery plane (OLB-6, D6.6).
+                (None, OrgSensingPlane::Granted(registration)) => {
+                    node.org_sensing_granted_population(registration.grant())
+                }
             };
             node.fire_sensing_population_seam();
             if !node.sensing_authority_snapshot_current(&snapshot) {
@@ -902,8 +972,19 @@ impl OrgSensingFamily {
         population: Vec<u64>,
     ) -> Result<Arc<OrgSensingCapabilityDemand>, OrgSensingDemandRefused> {
         let node = &self.inner.node;
-        let audience =
-            sensing::canonical_org_sensing_commitment(&snapshot.authority_view().owner_org);
+        let owner_org = snapshot.authority_view().owner_org;
+        let audience = match &self.inner.plane {
+            OrgSensingPlane::Owner => sensing::canonical_org_sensing_commitment(&owner_org),
+            // The granted audience, but only while this node's owner is still
+            // the grant's grantee: an owner rotation retires granted demand
+            // rather than authoring under a grant issued to another org.
+            OrgSensingPlane::Granted(registration) => {
+                if registration.grant().grantee_org != owner_org {
+                    return Err(OrgSensingDemandRefused::CapabilityNotGranted);
+                }
+                registration.audience()
+            }
+        };
         let authority_epoch = *snapshot.stamp();
         // Bound the sensed subset. The derivation helper already counts its own
         // truncation; an explicit population is clamped here so both entry

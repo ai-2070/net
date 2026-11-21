@@ -236,12 +236,12 @@ pub use mesh::SensingOffLockObservation;
 #[cfg(feature = "nat-traversal")]
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
-    ControlPlaneStats, MeshNode, MeshNodeConfig, NoiseStaticKey, OrgCallInFlight,
-    OrgSensingRoutingCounters, PartitionFilter, PublishChainConflict, SensingLeaseReleaseRefused,
-    SensingReadinessOverlay, SensingRegistrationError, SessionPath, StartRefused,
-    StreamInboundEvent, StreamInboundSink, StreamInbox, SubnetFloorQueryError,
-    UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG, NOISE_STATIC_KEY_CONTEXT,
-    TRANSFER_CHUNK_IDLE_TIMEOUT,
+    ControlPlaneStats, GrantedSensingRegistration, GrantedSensingUnavailable, MeshNode,
+    MeshNodeConfig, NoiseStaticKey, OrgCallInFlight, OrgSensingRoutingCounters, PartitionFilter,
+    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
+    SensingRegistrationError, SessionPath, StartRefused, StreamInboundEvent, StreamInboundSink,
+    StreamInbox, SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
+    NOISE_STATIC_KEY_CONTEXT, TRANSFER_CHUNK_IDLE_TIMEOUT,
 };
 /// Exported only so the fixtures-gated ordered-egress accessors have nameable
 /// types in integration tests; each is `#[doc(hidden)]` at its definition and

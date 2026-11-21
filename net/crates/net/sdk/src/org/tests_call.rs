@@ -1572,7 +1572,7 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // moves nothing. A mapping that called it same-organization would emit it
     // FIRST.
     assert_eq!(
-        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[]),
+        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[], &[]),
         identity_permutation,
         "a Granted id cannot be ranked: the input order is kept"
     );
@@ -1580,7 +1580,7 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // CASE 2 - PRUNED. Same reasoning in the other direction: a mapping that
     // called it same-organization would emit it LAST.
     assert_eq!(
-        super::call::org_sensed_candidate_permutation(&candidates, &[], &[granted_id]),
+        super::call::org_sensed_candidate_permutation(&candidates, &[], &[granted_id], &[]),
         identity_permutation,
         "a Granted id cannot be pruned either"
     );
@@ -1588,7 +1588,12 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // CASE 3 - both at once, which is what the granted plane looks like to a
     // projection that has no row for it at all.
     assert_eq!(
-        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[granted_id]),
+        super::call::org_sensed_candidate_permutation(
+            &candidates,
+            &[granted_id],
+            &[granted_id],
+            &[]
+        ),
         identity_permutation,
     );
 
@@ -1596,7 +1601,8 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // candidate keeps its relative place, nothing is dropped.
     let owner_id = owner_only.entity_id().node_id();
     let mut reordered = candidates.clone();
-    let permutation = super::call::org_sensed_candidate_permutation(&reordered, &[owner_id], &[]);
+    let permutation =
+        super::call::org_sensed_candidate_permutation(&reordered, &[owner_id], &[], &[]);
     assert_eq!(
         permutation,
         vec![2, 0, 1],
@@ -1644,6 +1650,7 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
         &reordered,
         &[higher.entity_id().node_id()],
         &[],
+        &[],
     );
     super::call::apply_permutation(&mut reordered, permutation);
     assert_eq!(&reordered[0].provider, higher.entity_id());
@@ -1680,6 +1687,7 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
     let permutation = super::call::org_sensed_candidate_permutation(
         &reordered,
         &[higher.entity_id().node_id()],
+        &[],
         &[],
     );
     super::call::apply_permutation(&mut reordered, permutation);

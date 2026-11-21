@@ -82,7 +82,7 @@ pub(crate) use lease::{LeasePlane, MAX_HOLDERS_PER_INTEREST, MAX_LEASED_INTEREST
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 pub use org_gate::{
     canonical_granted_sensing_commitment, canonical_org_sensing_commitment,
-    verify_org_sensing_registration, GrantedSensingRefusal, LocalSensingIdentity,
+    verify_org_sensing_registration, GrantedSensingRefusal, LocalSensingIdentity, OrgAuthorityView,
     OrgSensingRejection, ValidatedOrgSensingRegistration,
 };
 pub(crate) use org_gate::{

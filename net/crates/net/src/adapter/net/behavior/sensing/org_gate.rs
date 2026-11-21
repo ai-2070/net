@@ -917,6 +917,9 @@ pub(crate) enum LocalOrgEgressRefusal {
 pub(crate) struct LocalOrgEgress {
     proven_root: AudienceScopeCommitment,
     membership: OrgMembershipCert,
+    /// Present for a GRANTED egress (OLB-6, D6.5): the dispatcher grant and
+    /// the SENSE grant the planner attaches as variant 5.
+    granted: Option<(OrgDispatcherGrant, OrgCapabilityGrant)>,
 }
 
 impl LocalOrgEgress {
@@ -928,7 +931,29 @@ impl LocalOrgEgress {
         Self {
             proven_root: canonical_org_sensing_commitment(&membership.org_id()),
             membership: membership.owner_cert().clone(),
+            granted: None,
         }
+    }
+
+    /// Derive a GRANTED egress plan (OLB-6, D6.5) from a live local
+    /// membership capture and the node-registered granted credentials. The
+    /// proven root is `canonical_granted_sensing_commitment(grant)`, never a
+    /// caller value. `None` unless the grant was issued TO the captured
+    /// membership's organization and the dispatcher grant acts for it.
+    pub(crate) fn from_live_membership_granted(
+        membership: &LiveOrgRelayMembership,
+        dispatcher: OrgDispatcherGrant,
+        grant: OrgCapabilityGrant,
+    ) -> Option<Self> {
+        let org = membership.org_id();
+        if grant.grantee_org != org || dispatcher.org_id != org || !grant.permits_sense() {
+            return None;
+        }
+        Some(Self {
+            proven_root: canonical_granted_sensing_commitment(&grant),
+            membership: membership.owner_cert().clone(),
+            granted: Some((dispatcher, grant)),
+        })
     }
 
     /// The organization-derived root the interest table row registers under.
@@ -965,13 +990,25 @@ pub(crate) fn plan_local_org_provider_registration(
     if !selector_names_target(spec, target) {
         return Err(LocalOrgEgressRefusal::SelectorTargetMismatch);
     }
-    Ok(SensingInterestFrame::org_provider_registration(
-        spec,
-        target,
-        requested_sample_interval,
-        soft_state_ttl,
-        egress.membership.clone(),
-    ))
+    Ok(match &egress.granted {
+        // A granted egress emits variant 5 with its credentials (OLB-6).
+        Some((dispatcher, grant)) => SensingInterestFrame::granted_provider_registration(
+            spec,
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+            egress.membership.clone(),
+            dispatcher.clone(),
+            grant.clone(),
+        ),
+        None => SensingInterestFrame::org_provider_registration(
+            spec,
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+            egress.membership.clone(),
+        ),
+    })
 }
 
 /// The leg-specific parameters extracted from the frame once (step 1). `Copy`

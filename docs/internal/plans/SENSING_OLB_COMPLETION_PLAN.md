@@ -793,6 +793,35 @@ cross-org proof and docs.
     root EQUAL to a granted commitment would let a legacy row share a key
     with a granted row. That is the closure-2 class, unreachable without
     already holding the grant, and is not refused at install.
+- **6c, landed, awaits review**: D6.5–D6.7 at the consumer, plus the
+  cross-org multi-provider proof.
+  - `MeshNode::register_granted_sensing` validates the pair (SENSE; granted
+    TO this node's owner and not by it; this node's own dispatcher covering
+    the capability) and returns a `GrantedSensingRegistration` guard. The
+    last drop removes the credentials.
+  - Both `prepare_org_egress` sites plan a granted `LocalOrgEgress` for a
+    registered granted audience; the planner emits variant 5.
+  - `org_sensing_granted_population` derives the population.
+  - `OrgSensingFamily::mint_granted` fixes the family's plane. The family
+    owns the registration, so credentials outlive every release.
+  - `OrgClient` mints one granted acquisition per held SENSE grant at bind.
+    `apply_sensed_order` merges the owner and granted projections.
+    `org_sensed_candidate_permutation` may move a granted candidate only
+    when its id came from a SENSE grant's own plane, so an owner projection
+    still can never reorder one (the existing unit invariant holds).
+  - Witnesses:
+    - core E1: pair checks, and the holder lifetime;
+    - core E2: the emitted granted frame passes the provider's real gate,
+      and an unregistered audience plans nothing;
+    - SDK, the proof:
+      `a_cross_org_call_lands_on_the_sensed_provider_under_a_sense_grant`.
+      Three providers in another organization, over real transport; the
+      call follows the granted rank, and the unready and slower providers
+      never run;
+    - SDK, the control:
+      `without_sense_a_cross_org_call_keeps_the_deterministic_order`.
+  - Mutations M26–M30 each failed their witness. The `org_exact_sensing`
+    roster floor rises to 25 and both names are pinned.
 
 This gates on **a named cross-organization consumer** (OLB §13). Without one
 it does not start. Then, per OLB §5.3:

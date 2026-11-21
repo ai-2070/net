@@ -1157,6 +1157,9 @@ fn retention_refusal(refusal: OrgSensingDemandRefused) -> SensingError {
         OrgSensingDemandRefused::NoAuthority => SensingError::NoOrganizationAuthority,
         OrgSensingDemandRefused::FamilyAtCapacity => SensingError::WatchesAtCapacity,
         OrgSensingDemandRefused::FamilyUnavailable => SensingError::ObservationIdentityUnavailable,
+        // Unreachable here: a `SensingQuery` watch only ever mints OWNER families.
+        // Mapped to the authority class, the nearest honest reading.
+        OrgSensingDemandRefused::CapabilityNotGranted => SensingError::NoOrganizationAuthority,
     }
 }
 

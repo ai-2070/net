@@ -2924,3 +2924,316 @@ fn char_literal_end(bytes: &[u8], index: usize) -> Option<usize> {
     let close = scan + one.len_utf8();
     (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
 }
+
+// ---------------------------------------------------------------------------
+// OLB-6: granted (cross-organization) sensing, end to end
+// ---------------------------------------------------------------------------
+
+/// The PROVIDER organization of the cross-org witnesses. The consumer acts for
+/// `org()`.
+fn provider_org() -> OrgKeypair {
+    OrgKeypair::from_bytes([0x6Bu8; 32])
+}
+
+/// A cross-organization cell: `readiness.len()` providers in
+/// `provider_org()`, each serving the capability with `OrgAccess::Granted`
+/// and serving real readiness, and a sensing consumer in `org()` that holds a
+/// grant from the provider org. `rights` decides whether that grant carries
+/// SENSE.
+struct CrossOrgCell {
+    consumer: Member,
+    providers: Vec<Member>,
+    client: OrgClient,
+    grant_id: [u8; 32],
+    calls: Vec<Arc<AtomicUsize>>,
+    names: Vec<&'static str>,
+    _serves: Vec<ServeHandle>,
+    _ready: Vec<ReadinessRegistration>,
+}
+
+impl CrossOrgCell {
+    async fn stand_up(
+        tag: &str,
+        rights: net_sdk::org::types::GrantRights,
+        readiness: &[(bool, Duration)],
+    ) -> Self {
+        use net_sdk::org::types::{GrantTargetScope, OrgAudienceSecret, OrgCapabilityGrant};
+
+        let b = provider_org();
+        let mut members: Vec<Member> = Vec::new();
+        for index in 0..readiness.len() {
+            members.push(
+                mesh_in_org_with(
+                    &format!("{tag}-p{index}"),
+                    &b,
+                    true,
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await,
+            );
+        }
+        let consumer = mesh_in_org_with(
+            &format!("{tag}-c"),
+            &org(),
+            true,
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
+        let refs: Vec<&Member> = members.iter().collect();
+        bring_up(&consumer, &refs).await;
+        members.sort_by(|x, y| {
+            x.node
+                .entity_id()
+                .as_bytes()
+                .cmp(y.node.entity_id().as_bytes())
+        });
+
+        // B grants A the capability on any B-owned node.
+        let (grant, secret) = OrgCapabilityGrant::try_issue(
+            &b,
+            org().org_id(),
+            capability(),
+            rights,
+            GrantTargetScope::AnyNodeOwnedBy(b.org_id()),
+            3600,
+        )
+        .expect("issue the cross-org grant");
+        let secret = secret.expect("a DISCOVER grant carries audience material");
+
+        let mut calls = Vec::new();
+        let mut serves = Vec::new();
+        let mut ready = Vec::new();
+        let mut names = Vec::new();
+        for (index, member) in members.iter().enumerate() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let name = NAMES[index];
+            let served = counter.clone();
+            // Registration first, audience after: the provider-side contract.
+            serves.push(
+                member
+                    .mesh
+                    .serve_org(
+                        SERVICE,
+                        OrgAccess::Granted,
+                        move |_caller: OrgCaller, _req: Ping| {
+                            let served = served.clone();
+                            async move {
+                                served.fetch_add(1, Ordering::SeqCst);
+                                Ok(Pong {
+                                    served_by: name.to_string(),
+                                })
+                            }
+                        },
+                    )
+                    .expect("serve_org"),
+            );
+            member
+                .node
+                .install_provider_grant_audience(
+                    grant.clone(),
+                    OrgAudienceSecret::decode_config(&secret.encode_config()).expect("copy"),
+                )
+                .expect("provider grant audience");
+            let (is_ready, start) = readiness[index];
+            ready.push(provide_at(member, is_ready, start));
+            calls.push(counter);
+            names.push(name);
+        }
+
+        let entity = consumer.identity.entity_id().clone();
+        let cert =
+            OrgMembershipCert::try_issue(&org(), entity.clone(), 1, 3600).expect("membership");
+        let dispatcher = OrgDispatcherGrant::try_issue(&org(), entity, DispatcherScope::Any, 3600)
+            .expect("dispatcher grant");
+        let grant_id = grant.grant_id;
+        let credentials =
+            OrgCredentials::new(cert, dispatcher, vec![grant], vec![secret]).expect("credentials");
+        let client = consumer.mesh.org(credentials).expect("bind");
+
+        // Converge the GRANTED discovery plane over the live scoped send.
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            for member in &members {
+                member
+                    .node
+                    .announce_capabilities(CapabilitySet::new())
+                    .await
+                    .ok();
+            }
+            let seen = consumer.node.granted_capability_providers(&grant_id).len();
+            if seen >= members.len() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "granted discovery resolved {seen} of {} providers",
+                members.len()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        Self {
+            consumer,
+            providers: members,
+            client,
+            grant_id,
+            calls,
+            names,
+            _serves: serves,
+            _ready: ready,
+        }
+    }
+
+    fn id(&self, index: usize) -> u64 {
+        self.providers[index].node.node_id()
+    }
+
+    fn served(&self, index: usize) -> usize {
+        self.calls[index].load(Ordering::SeqCst)
+    }
+
+    async fn call(&self) -> String {
+        let reply: Pong = self
+            .client
+            .call(SERVICE, &Ping { n: 1 })
+            .await
+            .expect("the cross-org protected call is admitted");
+        reply.served_by
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_dir_all(&self.consumer.dir);
+        for provider in &self.providers {
+            let _ = std::fs::remove_dir_all(&provider.dir);
+        }
+    }
+}
+
+fn sense_rights() -> net_sdk::org::types::GrantRights {
+    use net_sdk::org::types::GrantRights;
+    GrantRights::DISCOVER
+        .union(GrantRights::INVOKE)
+        .union(GrantRights::SENSE)
+}
+
+/// THE cross-org multi-provider proof (OLB-6, completion plan D6.7). Three
+/// providers in ANOTHER organization, reached under a SENSE grant. The one
+/// deterministic selection takes is not ready, the others are ready with
+/// different estimates. Real signed evidence crosses the organization
+/// boundary, the granted projection ranks the faster ready provider first and
+/// prunes the unready one, and the protected call lands on the faster one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_org_call_lands_on_the_sensed_provider_under_a_sense_grant() {
+    let cell = CrossOrgCell::stand_up(
+        "xorg-sense",
+        sense_rights(),
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(400)),
+            (true, Duration::from_millis(5)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        cell.client.granted_sensing_acquisitions(),
+        1,
+        "the SENSE grant produced one granted acquisition"
+    );
+
+    // Only a call reconciles; drive calls until the granted evidence has the
+    // expected shape.
+    let (fast, slow, unready) = (cell.id(2), cell.id(1), cell.id(0));
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let _ = cell.call().await;
+        let shaped = cell
+            .client
+            .granted_sensing_projection(
+                &cell.grant_id,
+                &capability(),
+                Instant::now(),
+                &ConsumerLatencyBudget::default(),
+            )
+            .is_some_and(|projection| {
+                projection.viable() == [fast, slow] && projection.non_viable() == [unready]
+            });
+        if shaped {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the granted evidence never ranked the providers"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let before: Vec<usize> = (0..3).map(|index| cell.served(index)).collect();
+    for _ in 0..5 {
+        assert_eq!(
+            cell.call().await,
+            cell.names[2],
+            "the call follows the GRANTED sensed rank across the org boundary"
+        );
+    }
+    assert_eq!(cell.served(2) - before[2], 5);
+    assert_eq!(
+        cell.served(0) - before[0],
+        0,
+        "the unready provider never ran"
+    );
+    assert_eq!(
+        cell.served(1) - before[1],
+        0,
+        "the slower provider never ran"
+    );
+
+    // The providers ACCEPTED the granted registrations: nothing was refused
+    // on the granted gate anywhere.
+    for provider in &cell.providers {
+        let refused = provider
+            .node
+            .sensing_counters()
+            .org_granted_refused
+            .load(Ordering::Relaxed);
+        assert_eq!(refused, 0, "a provider refused a granted registration");
+    }
+    cell.cleanup();
+}
+
+/// The same cell under a grant WITHOUT SENSE: no granted acquisition exists,
+/// nothing is sensed, and the call keeps the deterministic order, landing on
+/// the unready provider. Readiness never refuses a call. RED against a
+/// consumer that senses on DISCOVER|INVOKE alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_sense_a_cross_org_call_keeps_the_deterministic_order() {
+    use net_sdk::org::types::GrantRights;
+    let cell = CrossOrgCell::stand_up(
+        "xorg-nosense",
+        GrantRights::DISCOVER.union(GrantRights::INVOKE),
+        &[
+            (false, Duration::from_millis(1)),
+            (true, Duration::from_millis(5)),
+        ],
+    )
+    .await;
+    assert_eq!(cell.client.granted_sensing_acquisitions(), 0);
+    for _ in 0..4 {
+        assert_eq!(
+            cell.call().await,
+            cell.names[0],
+            "with no SENSE right the deterministic first provider is called, ready or not"
+        );
+    }
+    assert!(cell
+        .client
+        .granted_sensing_projection(
+            &cell.grant_id,
+            &capability(),
+            Instant::now(),
+            &ConsumerLatencyBudget::default()
+        )
+        .is_none());
+    cell.cleanup();
+}

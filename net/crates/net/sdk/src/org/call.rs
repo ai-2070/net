@@ -53,7 +53,7 @@ use net::adapter::net::behavior::org_cold_plan::{
 };
 use net::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
 use net::adapter::net::behavior::org_sensing_demand::{
-    org_sensed_bucket_permutation, OrgSensedOrderFallback,
+    org_sensed_bucket_permutation, OrgSensedOrderFallback, OrgSensedProjection,
 };
 use net::adapter::net::behavior::sensing::ConsumerLatencyBudget;
 use net::adapter::net::identity::EntityId;
@@ -982,12 +982,7 @@ impl OrgClient {
                 // remove or authorize a candidate, it mints nothing, and it
                 // runs strictly BEFORE the final currentness comparison below,
                 // which still gates the mint.
-                let outcome = self.apply_sensed_order(
-                    capability,
-                    sensed,
-                    capture.authority(),
-                    &mut candidates,
-                );
+                let outcome = self.apply_sensed_order(capability, sensed, capture, &mut candidates);
                 // A viable sensed lead decides, exactly as the signed exact
                 // lane does. Otherwise unsensed load spreading chooses within
                 // the same authorized, directly reachable pool (Phase 4).
@@ -1123,16 +1118,151 @@ impl OrgClient {
         &self,
         capability: &CapabilityAuthorityId,
         sensed: &SensedSelection<'_>,
-        authority: &OrgColdAuthority,
+        capture: &OrgColdDiscovery,
         candidates: &mut Vec<AuthorizedOrgCandidate>,
     ) -> SensedOutcome {
+        let mut viable: Vec<u64> = Vec::new();
+        let mut not_ready: Vec<u64> = Vec::new();
+        let mut take = |projection: OrgSensedProjection| {
+            viable.extend_from_slice(projection.viable());
+            not_ready.extend_from_slice(projection.non_viable());
+        };
+        // The owner plane first, then each SENSE grant's plane (OLB-6, D6.7).
+        // Each plane is its own demand with its own audience; a provider is
+        // sensed on at most one of them, because the owner plane is
+        // owner-private discovery and a granted plane is another
+        // organization's providers.
+        if let Some(projection) =
+            self.owner_plane_projection(capability, sensed, capture.authority(), candidates)
+        {
+            take(projection);
+        }
+        // The ids a SENSE grant's own plane sensed: the only granted
+        // candidates the permutation may move.
+        let mut granted_sensed: Vec<u64> = Vec::new();
+        for granted in self._sensing.granted() {
+            if let Some(projection) =
+                self.granted_plane_projection(granted, capability, sensed, capture, candidates)
+            {
+                granted_sensed.extend_from_slice(projection.viable());
+                granted_sensed.extend_from_slice(projection.non_viable());
+                take(projection);
+            }
+        }
+        if candidates.len() < 2 || (viable.is_empty() && not_ready.is_empty()) {
+            return SensedOutcome::default();
+        }
+        let permutation =
+            org_sensed_candidate_permutation(candidates, &viable, &not_ready, &granted_sensed);
+        apply_permutation(candidates, permutation);
+        SensedOutcome {
+            viable_lead: candidates
+                .iter()
+                .any(|candidate| viable.contains(&candidate.provider.node_id())),
+            not_ready,
+        }
+    }
+
+    /// ONE SENSE grant's plane (OLB-6, completion plan D6.7): reconcile that
+    /// grant's own demand and project it.
+    ///
+    /// The expectation is this derivation's DIRECT candidates that the grant's
+    /// own discovery plane surfaced (owned by its issuer and covered by its
+    /// target scope), the same rows core derives the granted population from
+    /// (`org_sensing_granted_population`), so the two sides can agree. The
+    /// same decide → converge → record section and retry floor as the owner
+    /// plane, on the granted acquisition's own schedule. Advisory in every
+    /// direction: it never adds, removes or authorizes a candidate.
+    fn granted_plane_projection(
+        &self,
+        granted: &super::client::OrgSensingAcquisition,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        capture: &OrgColdDiscovery,
+        candidates: &[AuthorizedOrgCandidate],
+    ) -> Option<OrgSensedProjection> {
+        let family = granted.family();
+        let grant = family.granted_grant()?;
+        if grant.capability != *capability {
+            return None;
+        }
+        let surfaced: std::collections::BTreeSet<&EntityId> = capture
+            .granted_providers(&grant.grant_id)
+            .iter()
+            .filter(|row| {
+                row.owner_org == grant.issuer_org
+                    && grant
+                        .target_scope
+                        .covers(&row.provider, Some(&row.owner_org))
+            })
+            .map(|row| &row.provider)
+            .collect();
+        let mut expected: Vec<u64> = candidates
+            .iter()
+            .filter(|candidate| candidate.direct && surfaced.contains(&candidate.provider))
+            .map(|candidate| candidate.provider.node_id())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let context = super::client::RefusalContext::new(&self.node, capture.authority());
+        let now = Instant::now();
+        {
+            // Decline rather than block, exactly as the owner plane does.
+            let _txn = granted.try_reconcile_lock()?;
+            let installed = family.demand(capability);
+            if expected.is_empty() {
+                if installed.is_some() {
+                    family.retire(sensed.tag);
+                }
+                granted.schedule().forget(capability);
+                return None;
+            }
+            if granted.schedule().needs_convergence(
+                capability,
+                &expected,
+                installed.as_ref(),
+                now,
+                RECONCILE_RETRY_FLOOR,
+                &context,
+            ) {
+                match family.retain(sensed.tag) {
+                    Ok(demand) => granted
+                        .schedule()
+                        .certify(*capability, expected, &demand, now),
+                    Err(_refusal) => {
+                        granted.schedule().record_refusal(
+                            *capability,
+                            expected,
+                            installed.as_ref(),
+                            &context,
+                            now,
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        let demand = family.demand(capability)?;
+        if demand.population().is_empty() {
+            return None;
+        }
+        Some(demand.project_sensed_order(now, &sensed.budget))
+    }
+
+    fn owner_plane_projection(
+        &self,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        authority: &OrgColdAuthority,
+        candidates: &[AuthorizedOrgCandidate],
+    ) -> Option<OrgSensedProjection> {
         // The authority observation THIS attempt derives under. A refusal
         // records it, and a later decision asks the node whether it is still
         // the one in force - which is how a restored authority stops being
         // paced by the failure that preceded it.
         let context = super::client::RefusalContext::new(&self.node, authority);
         let Some(acquisition) = self._sensing.acquisition() else {
-            return SensedOutcome::default(); // Inert: the deterministic unsensed order, no work at all.
+            return None; // Inert: the deterministic unsensed order, no work at all.
         };
         let family = acquisition.family();
 
@@ -1196,7 +1326,7 @@ impl OrgClient {
             // section that authors and sends per provider.
             let Some(_txn) = acquisition.try_reconcile_lock() else {
                 fall_back(OrgSensedOrderFallback::Contended);
-                return SensedOutcome::default();
+                return None;
             };
             // The hold's own ticket, copied out so the steps below can ask
             // whether they are STILL running under it. Losing the hold - to an
@@ -1221,7 +1351,7 @@ impl OrgClient {
                     family.retire(sensed.tag);
                 }
                 acquisition.schedule().forget(capability);
-                return SensedOutcome::default();
+                return None;
             }
             // THE DECISION - read under this caller's own hold.
             acquisition.schedule().verify_holding(held);
@@ -1255,7 +1385,7 @@ impl OrgClient {
                         );
                         acquisition.schedule().verify_holding(held);
                         fall_back(OrgSensedOrderFallback::Refused);
-                        return SensedOutcome::default();
+                        return None;
                     }
                 }
             }
@@ -1266,27 +1396,15 @@ impl OrgClient {
 
         let Some(demand) = family.demand(capability) else {
             fall_back(OrgSensedOrderFallback::Unretained);
-            return SensedOutcome::default();
+            return None;
         };
         if candidates.len() < 2 || demand.population().is_empty() {
             // Nothing an order could change - but the reconciliation above
             // still ran, so a departure that leaves one candidate is still
             // applied to the retained demand rather than skipped.
-            return SensedOutcome::default();
+            return None;
         }
-        let projection = demand.project_sensed_order(now, &sensed.budget);
-        let permutation = org_sensed_candidate_permutation(
-            candidates,
-            projection.viable(),
-            projection.non_viable(),
-        );
-        apply_permutation(candidates, permutation);
-        SensedOutcome {
-            viable_lead: candidates
-                .iter()
-                .any(|candidate| projection.viable().contains(&candidate.provider.node_id())),
-            not_ready: projection.non_viable().to_vec(),
-        }
+        Some(demand.project_sensed_order(now, &sensed.budget))
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -2057,18 +2175,29 @@ impl<'a> SensedSelection<'a> {
 /// sort over the candidate list, no ordering structure, no second rule to
 /// diverge from the first. `Mode::Granted` maps to `false`, which is what
 /// keeps a granted candidate unsensed and unpruned.
+///
+/// The one exception is `granted_sensed` (OLB-6, completion plan D6.7): the
+/// provider ids a held SENSE grant's OWN plane sensed. A granted candidate is
+/// eligible only when its id is there, so an owner-plane projection still can
+/// never reorder or prune a granted candidate, even on an id collision.
 pub(crate) fn org_sensed_candidate_permutation(
     cands: &[AuthorizedOrgCandidate],
     ranked: &[u64],
     pruned: &[u64],
+    granted_sensed: &[u64],
 ) -> Vec<usize> {
     let mut providers: Vec<u64> = Vec::with_capacity(cands.len());
-    let mut same_org: Vec<bool> = Vec::with_capacity(cands.len());
+    // Core names this slice `same_org`; what it means is "may be sensed".
+    let mut sensable: Vec<bool> = Vec::with_capacity(cands.len());
     for candidate in cands {
-        providers.push(candidate.provider.node_id());
-        same_org.push(matches!(candidate.mode, Mode::SameOrg));
+        let id = candidate.provider.node_id();
+        providers.push(id);
+        sensable.push(match &candidate.mode {
+            Mode::SameOrg => true,
+            Mode::Granted(_) => granted_sensed.contains(&id),
+        });
     }
-    org_sensed_bucket_permutation(&same_org, &providers, ranked, pruned)
+    org_sensed_bucket_permutation(&sensable, &providers, ranked, pruned)
 }
 
 /// Reorder `items` by `permutation`, losing nothing.

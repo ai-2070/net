@@ -2513,7 +2513,7 @@ jobs:
       #     service discovery, plus the refresh-schedule and
       #     authority-clearing observations).
       #   - org_exact_sensing       — production organization
-      #     exact-sensing call edge (22 tests). Needs the SDK's own
+      #     exact-sensing call edge (25 tests, two cross-org). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
       #     binary does not compile, which is loud rather than silent.
@@ -2703,9 +2703,11 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py" \
             --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
             --suite org_exact_sensing \
-            --min 23 \
+            --min 25 \
             --required-file - <<'REQUIRED'
           the_production_call_lands_on_the_sensed_provider
+          a_cross_org_call_lands_on_the_sensed_provider_under_a_sense_grant
+          without_sense_a_cross_org_call_keeps_the_deterministic_order
           the_production_call_follows_the_sensed_rank_between_viable_providers
           a_deadline_below_every_estimate_falls_back_to_the_deterministic_order
           a_provider_discovered_after_the_first_call_enters_the_population
