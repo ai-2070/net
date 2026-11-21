@@ -514,6 +514,12 @@ pub struct GrantCapabilityArgs {
     #[arg(long)]
     pub discover: bool,
 
+    /// Grant SENSE rights (register exact-provider sensing interest on the
+    /// covered providers, so the grantee's org calls can be ordered by
+    /// live readiness). Requires both `--invoke` and `--discover`.
+    #[arg(long)]
+    pub sense: bool,
+
     /// Target an EXACT provider node by entity id (64 hex chars).
     /// Mutually exclusive with `--target-any-owned-by`.
     #[arg(long = "target-node")]
@@ -1651,12 +1657,27 @@ async fn run_grant_capability(
         (false, true) => GrantRights::DISCOVER,
         (true, true) => GrantRights::INVOKE.union(GrantRights::DISCOVER),
     };
+    // SENSE requires INVOKE and DISCOVER (OLB-6 D6.1). Refused here with a
+    // flag-level message; the grant layer refuses the same shape again.
+    let rights = if args.sense {
+        if !(args.invoke && args.discover) {
+            return Err(invalid_args(
+                "--sense requires both --invoke and --discover",
+            ));
+        }
+        rights.union(GrantRights::SENSE)
+    } else {
+        rights
+    };
     let mut rights_labels = Vec::new();
     if args.invoke {
         rights_labels.push("invoke");
     }
     if args.discover {
         rights_labels.push("discover");
+    }
+    if args.sense {
+        rights_labels.push("sense");
     }
 
     // Audience-secret discipline: an audience file is minted iff

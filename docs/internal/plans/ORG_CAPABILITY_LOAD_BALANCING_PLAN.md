@@ -921,6 +921,12 @@ membership current
 + interest capability matches grant
 ```
 
+> **Corrected 2026-11-21 (completion plan D6.8).** Issuer-side grant
+> revocation now exists (`org_grant_revocation.rs`, checked through
+> `is_grant_revoked` at admission), so the "no CRL keyed on `grant_id`"
+> sentence below is out of date. The granted sensing gate checks it. The
+> acting-org floor boundary is unchanged.
+
 **Invalidation, stated honestly (OA §D1).** There is no floor, denylist,
 or CRL keyed on `grant_id` — a cross-org grant dies only at `not_after`.
 What "immediately invalidates" a granted sensing interest is therefore:

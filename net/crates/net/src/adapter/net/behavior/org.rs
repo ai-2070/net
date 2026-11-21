@@ -340,6 +340,10 @@ pub enum OrgError {
     /// old verifier — wire evolution is honest, so they refuse
     /// loudly instead of being masked off.
     UnknownRights,
+    /// A grant carries SENSE without both INVOKE and DISCOVER (OLB-6,
+    /// completion plan D6.1). Refused at issue, decode and verify: such a
+    /// grant could never populate or justify a sensed order.
+    SenseRequiresInvokeDiscover,
     /// A grant's rights bitset is empty (OA-2). A credential that
     /// permits nothing is structurally meaningless — minting or
     /// accepting it can only hide a caller bug.
@@ -397,6 +401,9 @@ impl std::fmt::Display for OrgError {
             ),
             Self::UnknownRights => write!(f, "grant rights carry unknown bits"),
             Self::EmptyRights => write!(f, "grant rights are empty"),
+            Self::SenseRequiresInvokeDiscover => {
+                write!(f, "grant SENSE right requires both INVOKE and DISCOVER")
+            }
             Self::TargetOrgNotIssuer => write!(
                 f,
                 "grant AnyNodeOwnedBy target org is not the issuer org (permanently unusable)"

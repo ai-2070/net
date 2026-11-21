@@ -694,6 +694,84 @@ sensing plane, `AnyAuthorized` / tag / group selectors, public S2 scope and
 
 ### B.7 Phase 6 — granted / cross-organization sensing (OLB-6)
 
+**Owner decision (2026-11-21): build it now, without a named consumer.** The
+gate below is lifted. The slice lands as four commits: 6a the right, 6b the
+provider gate and frame, 6c the consumer egress and the SDK, and 6d the
+cross-org proof and docs.
+
+**Design (recorded before code).**
+
+- **D6.1 The right.** `GrantRights::SENSE = 1 << 2`.
+  - Structural rule, enforced at issue, decode and verify:
+    `SENSE ⇒ INVOKE ∧ DISCOVER`. A refusal is `OrgError::SenseRequiresInvokeDiscover`.
+  - Why both: the granted sensed population is the grant's own discovery
+    plane, and sensing readiness of a capability the grantee cannot invoke is
+    load disclosure with no routing use. This follows the
+    `TargetOrgNotIssuer` precedent: a permanently unusable credential is
+    refused, not minted.
+  - An older build decodes a SENSE grant as `UnknownRights` (fails closed).
+    The CLI gains `--sense`.
+- **D6.2 The audience.** `canonical_granted_sensing_commitment(grant)` is a
+  BLAKE3 `derive_key("net.sensing.granted-audience.v1")` over
+  `grant_id ‖ issuer_org ‖ grantee_org ‖ capability`. It is bound into the
+  interest digest, so a granted interest never coalesces with the same-org
+  audience or with another grant's, and never shares their observations.
+- **D6.3 The frame.** Postcard variant index **5**,
+  `GrantedProviderRegistration`, is `OrgProviderRegistration` plus the acting
+  org's `dispatcher_grant` and the issuer's `capability_grant`. It is
+  provider-addressed and **direct only**: a node that is not the frame's
+  `target` refuses it and authors no continuation. Protected RPC is
+  direct-session-only already (OA2-E0.3).
+- **D6.4 Provider acceptance**, in order, before any table mutation:
+  1. frame shape (the shared semantic and digest check, and selector = `Node(target)`);
+  2. `target` is this node;
+  3. session entity = `cert.member`;
+  4. an installed authority;
+  5. `grant.issuer_org` = this node's owner org;
+  6. `grant.grantee_org` = `cert.org_id` ≠ owner org (same-org uses variant 4);
+  7. SENSE is present;
+  8. `grant.capability` = `for_tag(capability tag)`;
+  9. `target_scope` covers this node;
+  10. the dispatcher acts for the acting org, is the member, and covers the capability;
+  11. the cert window;
+  12. the acting org's floor (the OA §D1 boundary, documented at the line);
+  13. the dispatcher and grant windows;
+  14. the dispatcher and grant revocation;
+  15. audience = `canonical_granted_sensing_commitment(grant)`.
+
+  Then the same fenced currentness recheck as variant 4 runs immediately
+  before the row: grant revocations publish through the same revocation
+  store, so the stamp covers them.
+- **D6.5 Consumer egress.** A node-held granted-credential registry, keyed
+  by granted audience.
+  - `OrgClient` registers each held SENSE grant whose grantee is both the
+    acting org and the node's owner org, when its dispatcher is this node's
+    entity.
+  - The registration lives while the binding does.
+  - `prepare_org_egress` (and its release twin) recognizes a registered
+    granted audience and plans variant 5 with the node's own live owner
+    membership, the same capture the same-org lane makes.
+- **D6.6 Population.** `org_sensing_granted_population(grant)` takes the
+  grant's own discovery plane (`granted_capability_providers`), keeps only
+  providers owned by the issuer and covered by the target scope that have a
+  pinned direct session, and applies the same cap and truncation counter.
+- **D6.7 SDK.** Each held SENSE grant gets its own demand, with its
+  expectation taken from that grant's direct granted-plane candidates. The
+  owner and granted projections merge into one advisory permutation.
+  Phase 4's rule is unchanged: a viable sensed lead decides, otherwise load
+  spreading does, and nothing is refused.
+- **D6.8 Invalidation, stated honestly.** Every refresh re-runs acceptance,
+  so the following land at the next registration:
+  - the acting org's membership floors, *if the provider imports that org's
+    floor bundles* (the §D1 boundary, unchanged);
+  - the grant and dispatcher windows;
+  - **issuer-side grant revocation**. It now exists (`is_grant_revoked`), so
+    the "no CRL keyed on `grant_id`" sentence in OLB §5.3 is out of date and
+    is corrected there.
+
+  An already-accepted row lives until its soft-state TTL, which is the same
+  residual the same-org lane carries.
+
 This gates on **a named cross-organization consumer** (OLB §13). Without one
 it does not start. Then, per OLB §5.3:
 - explicit `GrantRights::SENSE` with its own structural issue/decode rule;

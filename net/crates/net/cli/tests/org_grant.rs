@@ -264,6 +264,16 @@ fn grant_capability_flag_validation() {
         ),
         // neither target flag
         (vec!["--invoke"], "one of --target-node"),
+        // --sense without --discover (OLB-6 D6.1)
+        (
+            vec![
+                "--invoke",
+                "--sense",
+                "--target-any-owned-by",
+                issuer_org.as_str(),
+            ],
+            "--sense requires both --invoke and --discover",
+        ),
     ] {
         let mut c = Command::cargo_bin("net-mesh").unwrap();
         c.args(["org", "grant-capability", "--org-key"])
@@ -899,4 +909,43 @@ fn heartbeat_writes_an_empty_signed_floor_bundle() {
         .unwrap();
     assert!(!nowhere.status.success());
     assert!(String::from_utf8_lossy(&nowhere.stderr).contains("nothing would receive"));
+}
+
+/// OLB-6: `--sense` with `--invoke --discover` issues a grant whose decoded
+/// rights carry SENSE, and the JSON report names it.
+#[test]
+fn grant_capability_sense_issues_a_sense_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = keygen(dir.path(), "org.toml");
+    let grant = dir.path().join("cap.grant.json");
+    let secret = dir.path().join("cap.audience.key");
+    let issuer_org = org_id_of(&key);
+
+    let assert = Command::cargo_bin("net-mesh")
+        .unwrap()
+        .args(["--output", "json", "org", "grant-capability", "--org-key"])
+        .arg(&key)
+        .args(["--grantee-org", GRANTEE_ORG_HEX])
+        .args(["--capability", "nrpc:svc"])
+        .args(["--invoke", "--discover", "--sense"])
+        .args(["--target-any-owned-by", issuer_org.as_str()])
+        .args(["--out"])
+        .arg(&grant)
+        .args(["--audience-out"])
+        .arg(&secret)
+        .assert()
+        .code(0);
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("invoke,discover,sense"),
+        "the report names the SENSE right: {stdout}"
+    );
+
+    let text = std::fs::read_to_string(&grant).unwrap();
+    let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let hex_grant = envelope["grant"].as_str().expect("grant hex");
+    let bytes = hex::decode(hex_grant).expect("hex");
+    let decoded = net::adapter::net::behavior::org_grant::OrgCapabilityGrant::from_bytes(&bytes)
+        .expect("the issued grant decodes");
+    assert!(decoded.permits_sense() && decoded.permits_invoke() && decoded.permits_discover());
 }
