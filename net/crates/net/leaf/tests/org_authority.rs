@@ -407,6 +407,55 @@ fn golden_dispatcher_grant_wire_bytes_match() {
     decoded.verify().unwrap();
 }
 
+/// Core's golden SENSE grant (OLB-6), byte for byte: the leaf decodes, verifies
+/// and re-encodes a grant carrying SENSE exactly as core issues it, so a
+/// browser holding one is not refused as "unknown rights".
+const GOLDEN_SENSE_GRANT_HEX: &str = "11111111111111111111111111111111111111111111111111111111111111112152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7b7cf23907dfe3cad1152c9c5e14bec0bbdd0beeaafaff54ee27d5e5974788bab07000000022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1201abababababababababababababababababababababababababababababababab3338c46839907f71578cf4730fcf8eb0ec586ef8b496b453390fa38e38c33aa700f153650000000010ff53650000000011223344556677884c587c4dd1cc5f6242fae758e81e0a0b741de855da2a734f1ae5814d4402da3e1ad8d7ee9174f130c1710fdc5ae5824585e35c81fb61ed39ea09bc90404f6a0b";
+
+#[test]
+fn golden_sense_grant_matches_core_and_decodes() {
+    let org_b = owner();
+    let org_a = grantee();
+    let binding = GrantedDiscoveryBinding {
+        audience_handle: [0xAB; 32],
+        key_commitment: audience_key_commitment(&[0xCD; 32]),
+    };
+    let sense = GrantRights::DISCOVER
+        .union(GrantRights::INVOKE)
+        .union(GrantRights::SENSE);
+    let grant = OrgCapabilityGrant::issue_at(
+        &org_b,
+        [0x11; 32],
+        org_a.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:oa2-echo"),
+        sense,
+        GrantTargetScope::AnyNodeOwnedBy(org_b.org_id()),
+        Some(binding),
+        1_700_000_000,
+        1_700_003_600,
+        0x8877_6655_4433_2211,
+    );
+    assert_eq!(hex_lower(&grant.to_bytes()), GOLDEN_SENSE_GRANT_HEX);
+    let decoded = OrgCapabilityGrant::from_bytes(&unhex(GOLDEN_SENSE_GRANT_HEX).unwrap()).unwrap();
+    assert_eq!(decoded, grant);
+    assert!(decoded.permits_sense() && decoded.permits_invoke() && decoded.permits_discover());
+    decoded.verify().unwrap();
+}
+
+/// The SENSE structural rule, at decode: SENSE without INVOKE is refused,
+/// exactly as core refuses it.
+#[test]
+fn a_sense_grant_without_invoke_is_refused_at_decode() {
+    let mut bytes = unhex(GOLDEN_SENSE_GRANT_HEX).unwrap();
+    // rights = DISCOVER | SENSE (5): the DISCOVER binding stays coherent, so
+    // only the SENSE rule can refuse it.
+    bytes[128..132].copy_from_slice(&5u32.to_le_bytes());
+    assert!(matches!(
+        OrgCapabilityGrant::from_bytes(&bytes),
+        Err(OrgError::SenseRequiresInvokeDiscover)
+    ));
+}
+
 #[test]
 fn golden_capability_grant_wire_bytes_match() {
     let org_b = owner();

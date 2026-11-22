@@ -102,8 +102,21 @@ impl GrantRights {
     pub const DISCOVER: Self = Self(1);
     /// May invoke this capability (subject to full admission).
     pub const INVOKE: Self = Self(1 << 1);
+    /// May register exact-provider sensing interest on the covered
+    /// providers (OLB-6). Requires INVOKE and DISCOVER: see
+    /// `check_sense_rule`. Mirrors core bit for bit.
+    pub const SENSE: Self = Self(1 << 2);
     /// Every bit this build understands.
-    const KNOWN_MASK: u32 = 0b11;
+    const KNOWN_MASK: u32 = 0b111;
+
+    /// Core's SENSE structural rule, ported: `SENSE ⇒ INVOKE ∧ DISCOVER`,
+    /// enforced at issue, decode and verify.
+    pub(crate) fn check_sense_rule(self) -> Result<(), OrgError> {
+        if self.contains(Self::SENSE) && !self.contains(Self::INVOKE.union(Self::DISCOVER)) {
+            return Err(OrgError::SenseRequiresInvokeDiscover);
+        }
+        Ok(())
+    }
 
     /// The union of two rights sets.
     pub const fn union(self, other: Self) -> Self {
@@ -142,6 +155,9 @@ impl core::fmt::Debug for GrantRights {
         }
         if self.contains(Self::INVOKE) {
             parts.push("INVOKE");
+        }
+        if self.contains(Self::SENSE) {
+            parts.push("SENSE");
         }
         if self.0 & !Self::KNOWN_MASK != 0 {
             parts.push("UNKNOWN");
@@ -643,7 +659,7 @@ impl core::fmt::Debug for OrgDispatcherGrant {
 /// issuer_org:       32 (OrgId B — the verifying key)
 /// grantee_org:      32 (OrgId A)
 /// capability:       32 (CapabilityAuthorityId)
-/// rights:            4 (u32 LE bitset: DISCOVER=1, INVOKE=2)
+/// rights:            4 (u32 LE bitset: DISCOVER=1, INVOKE=2, SENSE=4)
 /// target_tag:        1 (0x01 = ExactNode, 0x02 = AnyNodeOwnedBy)
 /// target_id:        32 (EntityId or OrgId per tag)
 /// discovery_tag:     1 (0x00 = absent, 0x01 = present)
@@ -752,6 +768,7 @@ impl OrgCapabilityGrant {
         // constructed through the checked API — the bitset is `Copy`
         // and could arrive from a decode path.
         let rights = GrantRights::try_from_bits(rights.bits())?;
+        rights.check_sense_rule()?;
         if duration_secs == 0 {
             return Err(OrgError::ZeroTtl);
         }
@@ -897,6 +914,7 @@ impl OrgCapabilityGrant {
             return Err(OrgError::ReservedGrantId);
         }
         let rights = GrantRights::try_from_bits(self.rights.bits())?;
+        rights.check_sense_rule()?;
         if rights.contains(GrantRights::DISCOVER) != self.discovery.is_some() {
             return Err(OrgError::DiscoveryBindingMismatch);
         }
@@ -924,6 +942,11 @@ impl OrgCapabilityGrant {
     /// `rights ⊇ DISCOVER`.
     pub fn permits_discover(&self) -> bool {
         self.rights.contains(GrantRights::DISCOVER)
+    }
+
+    /// `rights ⊇ SENSE` (OLB-6).
+    pub fn permits_sense(&self) -> bool {
+        self.rights.contains(GrantRights::SENSE)
     }
 
     /// Serialize to canonical wire format.
@@ -978,6 +1001,7 @@ impl OrgCapabilityGrant {
             }
             _ => return Err(OrgError::InvalidFormat),
         };
+        rights.check_sense_rule()?;
         if rights.contains(GrantRights::DISCOVER) != discovery.is_some() {
             return Err(OrgError::DiscoveryBindingMismatch);
         }
