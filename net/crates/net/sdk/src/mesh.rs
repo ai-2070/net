@@ -1644,8 +1644,12 @@ impl Mesh {
     /// The snapshot is the caller's: take it from a
     /// [`SensingWatch`](crate::sensing::SensingWatch) whose capability is the
     /// one these islands serve. This derives no interest from `criteria` and
-    /// opens no observation. A snapshot for an unrelated capability is
-    /// harmless, but it is also meaningless: its hosts simply do not match.
+    /// opens no observation. **The snapshot's capability is not checked**:
+    /// gang criteria carry a capability QUERY, not one capability, so there is
+    /// nothing exact to compare it with. A snapshot of an unrelated capability
+    /// therefore still orders any host that serves both, by readiness for the
+    /// wrong thing. Pass a snapshot of the capability the islands are being
+    /// claimed for.
     pub fn match_islands_sensed(
         &self,
         criteria: &crate::gang::MatchCriteria,

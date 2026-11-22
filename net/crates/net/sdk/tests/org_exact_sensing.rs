@@ -3205,6 +3205,9 @@ async fn a_cross_org_call_lands_on_the_sensed_provider_under_a_sense_grant() {
         "the slower provider never ran"
     );
 
+    // C2 on the granted plane: a healthy granted run counts no fallback.
+    let routing = cell.consumer.node.org_sensing_routing_counters();
+    assert_eq!(routing.fallback_total, 0, "{routing:?}");
     // The providers ACCEPTED the granted registrations: nothing was refused
     // on the granted gate anywhere.
     for provider in &cell.providers {

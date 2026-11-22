@@ -936,7 +936,7 @@ This slice is optional for the generic sensing SDK release and gates only on the
 ### Compute and gang
 
 25. Ordinary placement and gang matching consume the same viability classification and order.
-26. NotReady prunes only the exact interest and never suspends capability-fold membership.
+26. NotReady affects only the exact interest and never suspends capability-fold membership. On the exact-provider snapshot path (S3, the delivered gang and compute adapters) a NotReady candidate is **demoted to the last band, never removed** (exact lane D7.2); pruning applies only to the SI-6 provider-free lane.
 27. Potential candidates remain available when no viable provider exists.
 28. Migration/member/promotion placement preserves existing placement vetoes and tie-breakers within sensed classes.
 29. The final gang claim may still fail after a Ready observation; readiness never appears as a reservation.

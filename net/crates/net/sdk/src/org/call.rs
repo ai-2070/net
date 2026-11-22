@@ -1262,9 +1262,21 @@ impl OrgClient {
         expected.dedup();
         let context = super::client::RefusalContext::new(&self.node, capture.authority());
         let now = Instant::now();
+        // The same fallback accounting as the owner plane (OLB §14
+        // `org_sensing_fallback_total`): only a call this plane could have
+        // reordered counts when it leaves without a sensed order.
+        let could_order = candidates.len() >= 2 && !expected.is_empty();
+        let fall_back = |reason: OrgSensedOrderFallback| {
+            if could_order {
+                family.note_order_fallback(reason);
+            }
+        };
         {
             // Decline rather than block, exactly as the owner plane does.
-            let _txn = granted.try_reconcile_lock()?;
+            let Some(_txn) = granted.try_reconcile_lock() else {
+                fall_back(OrgSensedOrderFallback::Contended);
+                return None;
+            };
             let installed = family.demand(capability);
             if expected.is_empty() {
                 if installed.is_some() {
@@ -1293,12 +1305,16 @@ impl OrgClient {
                             &context,
                             now,
                         );
+                        fall_back(OrgSensedOrderFallback::Refused);
                         return None;
                     }
                 }
             }
         }
-        let demand = family.demand(capability)?;
+        let Some(demand) = family.demand(capability) else {
+            fall_back(OrgSensedOrderFallback::Unretained);
+            return None;
+        };
         if demand.population().is_empty() {
             return None;
         }

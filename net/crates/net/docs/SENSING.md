@@ -629,8 +629,15 @@ checks before anything is recorded:
 - neither grant has been revoked by its issuer;
 - the audience is the grant's own.
 
-Refusals count in `org_granted_refused`. A grant revoked between the
-check and the row creates no row.
+Granted-specific refusals (target, issuer, grantee, SENSE, capability,
+scope, dispatcher, grant windows and grant revocation) count in
+`org_granted_refused`. Certificate, sender, authority, floor and audience
+failures count in the same organization counters a same-org registration
+uses (`org_cert_invalid`, `org_sender_member_mismatch`,
+`org_authority_unavailable`, `org_below_floor`, `org_audience_mismatch`). A
+grant revoked between the check and the row creates no row and counts in
+`org_stale_stamp`. A granted root equal to the node's configured legacy
+fleet root is refused outright.
 
 **Audience isolation.** Each grant has its own audience, derived from
 its id, issuer, grantee and capability and bound into the interest

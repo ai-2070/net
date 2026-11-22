@@ -461,7 +461,8 @@ Issue a capability grant: "org A holds these rights on this capability over this
 
 ```
 net-mesh org grant-capability --org-key <PATH> --grantee-org <HEX> --capability <TAG> --out <PATH>
-                              (--invoke | --discover --audience-out <PATH>) [--sense]
+                              (--invoke | --discover --audience-out <PATH>
+                               | --invoke --discover --sense --audience-out <PATH>)
                               (--target-node <HEX> | --target-any-owned-by <HEX>) [--ttl-secs <N>]
 ```
 

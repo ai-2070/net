@@ -2685,7 +2685,7 @@ jobs:
       #
       # Same shape and same reasoning as the gate above: the suite step already ran
       # this binary, one process per test, so this gate verifies that run's
-      # result set instead of re-invoking the runner 22 more times. The
+      # result set instead of re-invoking the runner 25 more times. The
       # `<flakyFailure>` rejection matters here in particular — the
       # `.config/nextest.toml` override keeps this binary at `retries = 0`
       # because a retry could turn a lost readiness observation into green,

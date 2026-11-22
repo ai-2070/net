@@ -38,6 +38,11 @@ SAFE_LIVE_HEAD                                = not established
 - **Nothing has moved since sign-off** apart from `20e69e388` (09-19) and
   `22a146a35` (09-22).
 
+> **This section is the starting snapshot (2026-11-21, at `cb42977aa`).**
+> Every row below has since been delivered or given an owner disposition. The
+> per-phase status blocks, **Done means** and the answered decisions list are
+> the current record.
+
 Open, by the governing plans' own records:
 
 | Item | Source | Kind |
@@ -198,7 +203,9 @@ What landed, against what was written below:
 - **C2:** as written, with the reason set `contended|refused|unretained`. The
   exact design's D8.4a records how it maps onto OLB §7's original sketch.
 
-**C1 — S4 reconciliation (docs only).** The sensing plan lists S4 as unbuilt.
+**C1 — S4 reconciliation (docs only).** *Delivered: the sensing plan now
+records S4 as delivered at `a2efc950a`, with no residual slice. The text below
+is the original work item.* The sensing plan lists S4 as unbuilt.
 But S4's five work items describe exactly what PR #943 delivered: feed the
 owner-private population into exact leases, retain Unknown, select one exact
 provider, mint the canonical proof intent, and leave `Granted` unsensed.
@@ -257,8 +264,11 @@ GREEN-SURVIVOR**:
     permutation test, `strictest_sample_interval_is_min_dominance`) run in
     CI's ordinary unit jobs. No mutation verdict is claimed for B2, B3 or F3.
 
-**C3 — RED-pass decision record.** The waiver stands until the owner decides
-otherwise. Present one of two options:
+**C3 — RED-pass decision record.** *Decided: option (b), run. The disposition
+is the status block above: 15 RED, E2 repaired with a witness, and B2, B3 and
+F3 re-scoped and left to CI with no mutation verdict claimed. The options below
+are the original record.* The waiver stood until the owner decided. Present one
+of two options:
 - **(a)** keep the waiver and record it as permanent for the signed head; or
 - **(b)** run a bounded campaign over the exact lane's security-bearing
   witnesses (`org_exact_sensing` 22, `sensing_org_exact_guards`,
@@ -269,7 +279,10 @@ this area found at least one witness that a neighbouring check was silently
 rescuing (M-Z18, M-Z14, W-W13), and the signed lane is now the production
 default.
 
-**C4 — S3a SDK gang wrappers.** Wrap `MeshNode::match_islands_sensed` and
+**C4 — S3a SDK gang wrappers.** *Delivered differently (status above): the SDK
+verbs take the caller's exact-provider `SensingSnapshot` and order through the
+new core `match_islands_exact_sensed`, not the SI-6 seams named below, whose
+line references are historical.* Wrap `MeshNode::match_islands_sensed` and
 `claim_island_sensed` (core, `mesh.rs:50308` / `:50334`) in `sdk/src/gang.rs`.
 The sensing release gate (§8) counts this as part of the first useful release.
 *Witnesses:* sensing §6 rows 25 and 29. The final claim can still fail after a
@@ -363,12 +376,13 @@ consumer watches → nRPC selects one exact viable provider → admission final 
 close" is shown at the SDK boundary, with the response provably from the
 selected provider, not merely as a snapshot change.
 
-### B.3 Phase 3 — language bindings (opens only when Phase 2 signs)
+### B.3 Phase 3 — language bindings (opened ahead of Phase 2's sign-off)
 
-**Status (2026-11-21): B1 (Node, Python) and B3 (the pure SDKs plus
-`SENSING.md`) are implemented and await review.** The owner said "continue
-with the plan", which opened this phase ahead of Phase 2's sign-off. B2 (the
-C ABI and Go) is not started.
+**Status (2026-11-21): B1 (Node, Python), B2 (the C ABI and Go) and B3 (the
+pure SDKs plus `SENSING.md`) are implemented and await review.** The owner said
+"continue with the plan", which opened this phase ahead of Phase 2's sign-off,
+so the "opens only when Phase 2 signs" gate written for this phase no longer
+applies. B2's own status block is below.
 
 Rust SDK first:
 - **The value provider.** `SensingClient::provide_value` → `ValueReadiness`
@@ -610,38 +624,46 @@ The decision:
 What landed:
 - **Signal.** `MeshNode::org_call_in_flight(provider)` /
   `begin_org_call(provider) -> OrgCallInFlight` is a node-global map with a
-  decrement-on-drop guard, held by the org facade across the single exact
-  invocation of every protected unary call (`call`, `call_exported`). It is
-  one map operation each way, with no network and no sensing. It sees only
-  this node's own calls. Streaming opens are not counted.
-- **Where.** `plan_attempt`. `apply_sensed_order` now returns a
-  `SensedOutcome`.
-  - A **viable sensed lead** decides exactly as before (the signed exact lane
-    is unchanged).
-  - Otherwise `OrgClient::select_spread` chooses among the direct candidates,
-    minus any sensed not-ready, which are kept only when nothing else is
-    direct.
+  decrement-on-drop guard. The org facade holds it across every protected
+  unary call (`call`, `call_exported`) and for the life of every typed
+  streaming handle (`OrgStream`, `OrgStreamRaw`, `OrgClientStreamCall`,
+  `OrgDuplexCall` and both split halves). The raw `*_bytes_deadline`
+  streaming seams the bindings use count only the opening. It is one map
+  operation each way, with no network and no sensing, and it sees only this
+  node's own calls.
+- **Where.** `plan_attempt`. `apply_sensed_order` returns a `SensedOutcome`.
+  - **Whenever sensing produced any verdict** for the call's candidates, the
+    signed exact lane decides over the sensed order through
+    `select_candidate`, exactly as signed. Load spreading never overrides it,
+    including when nothing is viable (review fix, 2026-11-22).
+  - Only a **genuinely unsensed** call (an inert binding, a sensing
+    fallback, or no evidence at all) goes to `OrgClient::select_spread`,
+    which chooses among the direct candidates.
   - No direct candidate falls through to the existing `select_candidate`
     errors, so nothing new is refused.
-- **Rule.** `p2c_spread_choice`. A **flat signal keeps the deterministic
-  first-direct choice**, so an idle node, sequential calls and every cold
-  call behave exactly as today. A skewed signal takes two distinct sampled
-  indices (process-random seed, monotonic nonce, capability); the lower load
-  wins, and an exact tie goes to the earlier index.
+- **Rule.** `p2c_spread_choice` over `p2c_pair`. A **flat signal keeps the
+  deterministic first-direct choice**, so idle and sequential calls stay
+  deterministic; a skewed signal is spread, including on a cold call. Two
+  distinct indices are sampled (process-random seed, monotonic nonce,
+  capability); the lower load wins, and an exact tie goes to the earlier
+  index.
 - **Bindings.** Node, Python and Go `org.call` route through
   `call_bytes_deadline`, so they inherit the behaviour with no binding change.
 
-Witnesses (SDK lib):
+Witnesses:
 - `p2c_spread_choice_keeps_the_flat_default_and_follows_a_skewed_signal`
-  (M13, the flat rule dropped, fails it);
-- `unsensed_planning_spreads_by_this_nodes_outstanding_calls`: an idle node
-  is deterministic, an outstanding call to the first provider steers to the
-  second, and the release restores the first (M14, the loads ignored, fails
-  it).
+  (M13, the flat rule dropped, fails it), which also isolates the tie rule
+  through a nonce whose pair is (0, 1);
+- `unsensed_planning_spreads_by_this_nodes_outstanding_calls` (M14, the
+  loads ignored, fails it);
+- `an_all_not_ready_population_still_calls_in_the_deterministic_order`
+  holds outstanding calls on the deterministic provider and still lands on
+  it: with sensed verdicts the exact lane is not load-spread;
+- `org_streaming`'s live server-streaming and duplex witnesses assert the
+  count while open, after drop, and across split halves.
 
-`org_exact_sensing` 23/23 is unchanged. Not separately witnessed: a skewed
-signal under a *viable sensed lead* (the sensed lead must still win). It is
-guaranteed structurally by the `viable_lead` branch, with no live witness.
+The original work item follows (OLB-3 is delivered as the per-call design
+above, not the warmed `ArcSwap` pool; OLB-4 is not wanted).
 
 Today an unsensed call (`Granted`, cold, `Inert`, sensing off) takes the
 deterministic first-direct-candidate order. `ScopedUnsensedRoutePool`
@@ -697,7 +719,10 @@ sensing plane, `AnyAuthorized` / tag / group selectors, public S2 scope and
 **Owner decision (2026-11-21): build it now, without a named consumer.** The
 gate below is lifted. The slice lands as four commits: 6a the right, 6b the
 provider gate and frame, 6c the consumer egress and the SDK, and 6d the
-cross-org proof and docs.
+cross-org proof and docs. Each slice's witnesses and mutation round are named in its status
+entry below: 6a the issue/decode/verify refusals and the golden vector; 6b the
+gate table and dispatch witnesses G1–G4; 6c the egress witnesses E1–E2 and
+the live cross-org proof over real transport.
 
 **Design (recorded before code).**
 
@@ -831,8 +856,9 @@ cross-org proof and docs.
     reference, and in the skill `cli.md` and `org.md`.
   - The OLB-6 section is marked built.
 
-This gates on **a named cross-organization consumer** (OLB §13). Without one
-it does not start. Then, per OLB §5.3:
+*Original gate (lifted by the owner decision above; kept for the record):*
+This gated on **a named cross-organization consumer** (OLB §13). Without one
+it would not start. Then, per OLB §5.3:
 - explicit `GrantRights::SENSE` with its own structural issue/decode rule;
 - binding it into registration;
 - enforcement at acceptance, with the §D1 revocation gap documented;
@@ -866,12 +892,12 @@ Phase 2:  S2a helper ─► S2b join ─► S2c unary ─► S2d streaming
         ├──────────────► Phase 3  B1-pre wait semantics (Rust) ─► B1 Node/Py ─► B2 C/Go ─► B3 TS/Py SDKs + docs
         └──────────────► Phase 3′ S3b compute placement
 
-Phase 4 (on decision):  OLB-3 P2C · OLB-4 NoViableProvider (+ bindings, X1)
+Phase 4 (decided):  OLB-3 load spreading (per-call P2C) — DONE · OLB-4 NoViableProvider — NOT WANTED
 
-Phase 5 (independent, starts on design sign-off; may run beside Phases 1–3):
-        LS sign-off ─► LS-1..LS-5 (dark) ─► LS-6 lighting = SAFE_LIVE_HEAD ─► LS-7 SDK
+Phase 5:  NOT NEEDED (owner decision 2026-11-21; LS stays unsigned and dark)
+        (was: LS sign-off ─► LS-1..LS-5 (dark) ─► LS-6 lighting = SAFE_LIVE_HEAD ─► LS-7 SDK)
 
-Phase 6 (on a named consumer):  OLB-6 granted sensing
+Phase 6 (built without a named consumer, by decision):  OLB-6 granted sensing — DONE (6a–6d)
 ```
 
 Phase 5 shares only the indexed-discovery and source substrate with the rest,

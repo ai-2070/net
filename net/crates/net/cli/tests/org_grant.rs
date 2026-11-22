@@ -274,6 +274,16 @@ fn grant_capability_flag_validation() {
             ],
             "--sense requires both --invoke and --discover",
         ),
+        // --sense without --invoke
+        (
+            vec![
+                "--discover",
+                "--sense",
+                "--target-any-owned-by",
+                issuer_org.as_str(),
+            ],
+            "--sense requires both --invoke and --discover",
+        ),
     ] {
         let mut c = Command::cargo_bin("net-mesh").unwrap();
         c.args(["org", "grant-capability", "--org-key"])
