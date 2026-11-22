@@ -51,7 +51,14 @@ jobs:
           path-to-signatures: signatures/version1/cla.json
           path-to-document: https://github.com/ai-2070/net/blob/master/CLA/individual-cla.md
           # Renovate opens the bulk of PRs on this repo and cannot sign.
-          allowlist: renovate[bot],dependabot[bot],github-actions[bot],LZL0
+          # `netwriter` is the maintainer's own local automation identity
+          # (commits authored `netwriter <netwriter@local>`, an address no
+          # GitHub account can verify, so the bot can never take a signature
+          # for it). Its work is the maintainer's, under the maintainer's
+          # license. For commits not linked to a GitHub account this entry
+          # matches the author NAME, which anyone can set: a commit claiming
+          # this name from anyone else is a review finding, not a signature.
+          allowlist: renovate[bot],dependabot[bot],github-actions[bot],LZL0,netwriter
           custom-notsigned-prcomment: >-
             Thanks for the pull request. Before it can be merged, please sign the
             [Net Individual CLA](https://github.com/ai-2070/net/blob/master/CLA/individual-cla.md)
