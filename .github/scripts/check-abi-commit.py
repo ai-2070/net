@@ -31,6 +31,9 @@ WHAT IT REQUIRES. The same commit must touch all four groups:
   3. a Go mirror    - go/net.h, go/net_cortex.h
   4. a Go ABI test  - go/abi_stability*_test.go, go/header_parity_test.go
 
+and, for a header whose Go mirror is a cgo PREAMBLE (`PREAMBLE_MIRRORS`:
+net_sensing.h -> go/sensing.go), that preamble file when the header moves.
+
 WHAT IT DOES NOT CHECK. That the two headers agree constant-for-constant
 (`header_parity_test.go` owns that), that one value is identical everywhere,
 or that a new extern function is witnessed — only that the groups move
@@ -81,6 +84,13 @@ C_HEADER_PREFIX = "net/crates/net/include/"
 MIRRORED_HEADERS = {
     "net/crates/net/include/net.go.h",
     "net/crates/net/include/net_cortex.h",
+}
+# Headers whose Go mirror is a cgo PREAMBLE rather than a go/*.h header. A
+# commit that changes the ABI and touches one of these headers must touch its
+# preamble file too: the header-to-preamble constant test cannot see a
+# signature the preamble never declared.
+PREAMBLE_MIRRORS = {
+    "net/crates/net/include/net_sensing.h": "go/sensing.go",
 }
 GO_HEADER_RE = re.compile(r"^go/[^/]+\.h$")
 GO_ABI_TEST_RE = re.compile(r"^go/(abi_stability.*|header_parity)_test\.go$")
@@ -293,6 +303,9 @@ def violations(
     ):
         groups["go_headers"] = True
     missing = [label for key, label in _GROUP_LABELS.items() if not groups[key]]
+    for header, preamble in sorted(PREAMBLE_MIRRORS.items()):
+        if header in touched and preamble not in touched:
+            missing.append(f"the cgo preamble that mirrors {header} ({preamble})")
     if not missing:
         return []
     what = []
@@ -595,6 +608,19 @@ def self_test() -> int:
     expect(
         "the extern-C-only diff drives its rejection end to end",
         violations(consts, extern_c, files) != [],
+    )
+    sensing = {
+        "net/crates/net/bindings/go/org-ffi/src/sensing.rs",
+        "net/crates/net/include/net_sensing.h",
+        "go/abi_stability_sensing_test.go",
+    }
+    expect(
+        "a sensing ABI change without its cgo preamble (go/sensing.go) is rejected",
+        violations(set(), True, sensing) != [],
+    )
+    expect(
+        "the same sensing change WITH go/sensing.go lands atomically",
+        violations(set(), True, sensing | {"go/sensing.go"}) == [],
     )
     expect(
         'violations(set(), True, {ffi-file}) is non-empty — an '
