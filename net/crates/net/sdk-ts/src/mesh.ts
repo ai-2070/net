@@ -41,6 +41,11 @@ import type {
   IslandCriteria,
   IslandTopologyInput,
   MeshOptions as NapiMeshOptions,
+  OrgSensingRoutingCountersJs,
+  ReadinessProvider,
+  ReadinessValueJs,
+  SensingQueryOptions,
+  SensingWatch,
   StoredEvent,
 } from '@net-mesh/core';
 // The subnet AUTHORITY provider verb (SSDK §3.5). Imported from the
@@ -376,6 +381,17 @@ export interface MeshNodeConfig {
    * the tool-calling surface do not. Leave it off unless you need it.
    */
   permissiveChannels?: boolean;
+  /**
+   * Turn the capability-sensing plane on (it ships dark). Required for
+   * `@net-mesh/sdk/sensing`'s `watch` and `provide`.
+   */
+  enableSensing?: boolean;
+  /**
+   * File holding this node's sensing boot counter, persisted before the node
+   * exists. Required, with `identitySeed`, for `provide`. Keep it beside the
+   * identity material. Needs an `org`-feature build.
+   */
+  sensingIncarnationPath?: string;
 }
 
 // Drift guard (NODE_SDK_GAPS_PLAN.md S2). `MeshNode.create` once dropped four
@@ -571,6 +587,8 @@ export class MeshNode {
       tryPortMapping: config.tryPortMapping,
       autoDirectUpgrade: config.autoDirectUpgrade,
       permissiveChannels: config.permissiveChannels,
+      enableSensing: config.enableSensing,
+      sensingIncarnationPath: config.sensingIncarnationPath,
       ...subnetOptions,
     });
     return new MeshNode(native);
@@ -1287,6 +1305,27 @@ export class MeshNode {
    */
   matchIslands(criteria: IslandCriteria): bigint[] {
     return this.native.matchIslands(criteria);
+  }
+
+  /**
+   * Serve readiness for `capability` from a stored value (capability
+   * sensing). Same as `provide` in `@net-mesh/sdk/sensing`.
+   */
+  sensingProvide(capability: string, value: ReadinessValueJs): ReadinessProvider {
+    return this.native.sensingProvide(capability, value);
+  }
+
+  /**
+   * Observe the own organization's authorized providers of `capability`
+   * (capability sensing). Same as `watch` in `@net-mesh/sdk/sensing`.
+   */
+  sensingWatch(capability: string, options?: SensingQueryOptions): SensingWatch {
+    return this.native.sensingWatch(capability, options);
+  }
+
+  /** Operator counters for sensed organization call routing. */
+  orgSensingRoutingCounters(): OrgSensingRoutingCountersJs {
+    return this.native.orgSensingRoutingCounters();
   }
 
   /**

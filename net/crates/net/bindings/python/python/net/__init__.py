@@ -1019,6 +1019,32 @@ else:
         ]
     )
 
+# Capability sensing (SENSING_OLB_COMPLETION_PLAN B1) rides the `org` gate.
+try:
+    from ._net import (
+        ReadinessProvider,
+        SensingError,
+        SensingSnapshot,
+        SensingWatch,
+        sensing_error_class,
+        sensing_provide,
+        sensing_watch,
+    )
+except ImportError:
+    pass
+else:
+    __all__.extend(
+        [
+            "ReadinessProvider",
+            "SensingError",
+            "SensingSnapshot",
+            "SensingWatch",
+            "sensing_error_class",
+            "sensing_provide",
+            "sensing_watch",
+        ]
+    )
+
 # Subnet authority (SSDK S4b, the `org` feature): the native provider verb,
 # admin functions, and `SubnetProvisionError`, plus the pure-Python typed /
 # vocabulary layer in `net.subnet`.

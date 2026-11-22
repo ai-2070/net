@@ -97,8 +97,14 @@ retries = 0
 # that runs it verified nothing per-test, so `retries = 2` could retry the
 # proof into green. A spawn/handshake flake here is itself a defect worth
 # seeing, same as every suite above.
+#
+# `sensed_nrpc` (net-mesh-sdk) joins too (completion plan S2): its
+# failure-at-the-selected-provider witness asserts EXACTLY ONE execution, with
+# nothing falling through to the next rank. A retry would re-run the whole
+# cell, so an intermittent double execution could be retried into green: the
+# defect the witness exists to catch.
 [[profile.default.overrides]]
-filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_consumer) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing) + binary(org_rpc_streaming) + binary(org_scoped_cross_process)'
+filter = 'binary(integration_nrpc_protected) + binary(org_ownership) + binary(capability_exposure_revocation) + binary(org_admission_gate) + binary(org_admission_wire) + binary(nrpc_call_hijack) + binary(nrpc_response_routing) + binary(nrpc_service_equality) + binary(nrpc_route_discriminator) + binary(nrpc_streaming_gate) + binary(nrpc_registration_order) + binary(sensing_provider) + binary(sensing_consumer) + binary(sensing_org_lease_wire) + binary(sensing_org_exact_projection) + binary(sensing_org_exact_seam) + binary(sensing_org_three_node) + binary(org_exact_sensing) + binary(org_rpc_streaming) + binary(org_scoped_cross_process) + binary(sensed_nrpc)'
 retries = 0
 
 # Stage 3 RTC acceptance witnesses get NO retries.

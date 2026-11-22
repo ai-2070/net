@@ -1,7 +1,7 @@
 /*
  * net_org.h — C SDK header for the organization capability-auth C ABI.
  *
- * One of eleven headers, all resolving against a single shared library.
+ * One of twelve headers, all resolving against a single shared library.
  * Mirrors the layout of `net_rpc.h` next to it. The Go binding's
  * `go/org.go` cgo include block is the de-facto contract for non-Go
  * consumers; this file is the canonical drop-in for C / C++ / Zig /

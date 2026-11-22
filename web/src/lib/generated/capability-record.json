@@ -153,6 +153,26 @@
       },
       "domain": "event-bus"
     },
+    "Capability sensing (value provider, watch, sensed call)": {
+      "bindings": {
+        "C": {
+          "status": "partial"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
     "Channel policy — origin binding + queue-group policy": {
       "bindings": {
         "C": {

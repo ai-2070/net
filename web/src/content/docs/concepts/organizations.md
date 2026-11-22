@@ -47,7 +47,8 @@ additional owners; they receive explicit grants from the provider organization.
 For an internal call, a member presents its membership and dispatcher authority.
 For a cross-organization call, the provider's organization additionally grants
 the caller's organization `DISCOVER`, `INVOKE`, or both over an exact capability
-and provider scope.
+and provider scope. A grant may also carry `SENSE` (which requires both), letting
+the caller's calls be ordered by the provider organization's live readiness.
 
 The direction is important:
 

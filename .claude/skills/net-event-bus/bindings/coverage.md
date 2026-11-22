@@ -22,7 +22,7 @@ operation works; they are not a coverage record.
 **The Go row is the shipped module, and it is the only Go tree.** An older, uncompiled Go reference tree (no `go.mod`) used to sit beside the Rust FFI crates; it was removed. What it had either ships in `go/` now or is not available from Go, and its source stays in git history at commit `610cd4e`.
 A Go cell that says `not exposed` means exactly that.
 
-### C is eleven headers over one library, not one SDK
+### C is twelve headers over one library, not one SDK
 
 A `supported` C cell tells you a symbol exists. It does not tell you that you can
 reach it from the translation unit you are already in.
@@ -39,6 +39,7 @@ reach it from the translation unit you are already in.
 | `net_deck.h` | `NET_DECK_H` | Operator surface | `libnet` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve, gateway provisioning | `libnet` |
+| `net_sensing.h` | `NET_SENSING_H` | Capability sensing — value provider, watch, sensed service call | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge, consent / pin surface | `libnet` |
 
 **`net.h` and `net.go.h` share the `NET_SDK_H` guard, and `net.go.h` is not a
@@ -99,6 +100,7 @@ A mode is written after the status: `supported · core-only`.
 | A2A — paid task admission (prepare → purchase → submit) | supported | supported | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
+| Capability sensing (value provider, watch, sensed call) | supported | supported | supported | supported | partial |
 | Subnet gateway provisioning | supported | supported | supported | supported | supported |
 | Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
 | Subnet-exported organization call | supported | supported | supported | supported | supported |
@@ -143,6 +145,7 @@ should not infer one binding's API from another's.
 | A2A — paid task admission (prepare → purchase → submit) | `serve_a2a_configured` | `serveA2aConfigured` | `serve_a2a_configured` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
 | Organization-scoped streaming RPC | `call_streaming` | `callStreaming` | `call_streaming` | `CallStreaming` | `net_org_call_streaming` |
+| Capability sensing (value provider, watch, sensed call) | `provide_value` | `sensingProvide` | `sensing_provide` | `ProvideReadiness` | `net_sensing_provide` |
 | Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
 | Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExported` | `net_subnet_serve_exported` |
 | Subnet-exported organization call | `call_exported` | `callExported` | `call_exported` | `CallExportedBytes` | `net_org_call_exported` |
@@ -180,6 +183,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Gang-claim scheduler | supported | `islands.c` | — |
 | Organization capability auth | supported | `org_call.c` | — |
 | Organization-scoped streaming RPC | supported | `net_org_streaming.c` | — |
+| Capability sensing (value provider, watch, sensed call) | partial | — | Declared in net_sensing.h, exported and audited against Rust, and exercised through the Go binding; no C program CI runs calls it yet. |
 | Subnet gateway provisioning | supported | `subnet.c` | — |
 | Subnet-exported nRPC serve | supported | `subnet.c` | — |
 | Subnet-exported organization call | supported | `subnet.c` | — |

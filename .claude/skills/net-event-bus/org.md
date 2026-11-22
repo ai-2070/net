@@ -46,7 +46,7 @@ The shape verbs, exactly. Caller side, all on `OrgClient`: `call`, `call_streami
 |---|---|---|---|
 | `OrgMembershipCert` | org root (A) | "node/entity X belongs to org A" | any invocation authority |
 | `OrgDispatcherGrant` | org root (A) | "entity X may act **for** org A" over a capability (or `Any`) | any invocation authority |
-| `OrgCapabilityGrant` | org root (B, the *provider* org) | "org A holds `INVOKE`/`DISCOVER` on capability C over target T" | invocation *by itself* |
+| `OrgCapabilityGrant` | org root (B, the *provider* org) | "org A holds `INVOKE`/`DISCOVER` (and optionally `SENSE`, which needs both) on capability C over target T" | invocation *by itself* |
 
 **Belonging is not authority.** Holding all three is not permission to invoke — the provider verifies a fresh **per-call proof** against its own installed authority every single call. A grant is what makes the proof *constructible*, not what makes it *accepted*.
 

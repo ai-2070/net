@@ -261,6 +261,11 @@ pub struct SensingCounters {
     pub org_stale_stamp: AtomicU64,
     /// The installed revocation store is poisoned — all org intake fails dark.
     pub org_store_poisoned: AtomicU64,
+    /// A GRANTED (cross-organization) registration failed a granted check
+    /// (OLB-6, D6.4): wrong issuer or grantee, no SENSE, wrong capability,
+    /// target not covered, dispatcher scope, an invalid or revoked grant, or
+    /// a granted frame that reached a node other than its target.
+    pub org_granted_refused: AtomicU64,
 
     // ── Coalescing + delivery lifecycle (SI-7) ──
     /// Consumer capability-registrations admitted at THIS node's

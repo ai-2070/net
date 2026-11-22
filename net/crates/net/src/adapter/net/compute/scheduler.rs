@@ -495,18 +495,304 @@ impl Scheduler {
         //
         // Pinned by `pick_best_candidate_drops_nan_scores` (tie-break
         // direction) and the BestScore tests in this module.
+        Self::pick_best_candidate_sensed(
+            candidates,
+            artifact,
+            placement,
+            tie_break,
+            SensedOrder::none(),
+        )
+    }
+
+    /// [`Self::pick_best_candidate`] with a sensed band as the FIRST sort key
+    /// (S3b). Vetoes are unchanged and applied first: a candidate the filter
+    /// scores `None` or non-finite is dropped whatever its readiness. Among
+    /// survivors, a better band wins outright: viable in rank order, then no
+    /// verdict, then not-ready. Within one band, the existing score and the
+    /// §7-LOCKED tie-breaker decide exactly as before.
+    ///
+    /// With [`SensedOrder::none`] every band is equal, so the comparator is
+    /// the unsensed one: `pick_best_candidate` is defined as this call.
+    fn pick_best_candidate_sensed<I: IntoIterator<Item = u64>>(
+        candidates: I,
+        artifact: &Artifact<'_>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+        sensed: SensedOrder<'_>,
+    ) -> Option<u64> {
+        let bands = sensed.bands();
         candidates
             .into_iter()
             .filter_map(|n| placement.placement_score(&n, artifact).map(|s| (n, s)))
             .filter(|(_, s)| s.is_finite())
             .max_by(|(a, sa), (b, sb)| {
-                sa.partial_cmp(sb)
-                    .unwrap_or(Ordering::Equal)
+                // Lower band wins, so `a` is GREATER when its band is lower.
+                bands
+                    .band(*b)
+                    .cmp(&bands.band(*a))
+                    .then_with(|| sa.partial_cmp(sb).unwrap_or(Ordering::Equal))
                     .then_with(|| tie_break_compare(*b, *a, tie_break))
             })
             .map(|(n, _)| n)
     }
+
+    /// Sensed daemon placement (S3b): [`Self::place_with_locality`]'s
+    /// eligible set, reordered by `sensed`.
+    ///
+    /// The eligible set is unchanged: the local node when it matches and is
+    /// not drained, plus every index match (minus the local node when
+    /// drained). The choice is the best sensed band. Within it, the local
+    /// node is still preferred, and otherwise the index's own first match
+    /// wins. Not-ready candidates are demoted, never removed (design D7.2),
+    /// so this never returns `NoCandidate` where the unsensed placement would
+    /// not.
+    ///
+    /// The reason is the existing vocabulary: `OnlyCandidate`,
+    /// `LocalPreferred` when the local node won, `FirstMatch` otherwise.
+    /// There is no new variant, so a match on [`PlacementReason`] elsewhere
+    /// stays exhaustive.
+    pub fn place_sensed(
+        &self,
+        filter: &CapabilityFilter,
+        local_drained: bool,
+        sensed: SensedOrder<'_>,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        let mut eligible: Vec<u64> = Vec::new();
+        let local_inserted = !local_drained && self.can_run_locally(filter);
+        if local_inserted {
+            eligible.push(self.local_node_id);
+        }
+        // `find_nodes_matching` already returns each node once, so the only
+        // possible duplicate is the local node inserted above: one comparison,
+        // not a linear membership scan per result.
+        for node in capability_bridge::find_nodes_matching(&self.capability_fold, filter) {
+            if node == self.local_node_id && (local_drained || local_inserted) {
+                continue;
+            }
+            eligible.push(node);
+        }
+        if eligible.is_empty() {
+            return Err(SchedulerError::NoCandidate);
+        }
+        if eligible.len() == 1 {
+            return Ok(PlacementDecision {
+                node_id: eligible[0],
+                reason: if eligible[0] == self.local_node_id {
+                    PlacementReason::LocalPreferred
+                } else {
+                    PlacementReason::OnlyCandidate
+                },
+            });
+        }
+        let node_id = self.best_band_local_first(&eligible, sensed);
+        Ok(PlacementDecision {
+            node_id,
+            reason: if node_id == self.local_node_id {
+                PlacementReason::LocalPreferred
+            } else {
+                PlacementReason::FirstMatch
+            },
+        })
+    }
+
+    /// Sensed v1 migration placement (S3b): [`Self::place_migration`]'s
+    /// candidates (migration-capable, filter-matching, source excluded), with
+    /// the choice made as in [`Self::place_sensed`].
+    pub fn place_migration_sensed(
+        &self,
+        daemon_filter: &CapabilityFilter,
+        source_node: u64,
+        sensed: SensedOrder<'_>,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        let candidates = self.find_migration_targets(daemon_filter, source_node);
+        if candidates.is_empty() {
+            return Err(SchedulerError::NoCandidate);
+        }
+        if candidates.len() == 1 {
+            // The same reason `place_migration` gives a sole local target.
+            return Ok(PlacementDecision {
+                node_id: candidates[0],
+                reason: if candidates[0] == self.local_node_id {
+                    PlacementReason::LocalPreferred
+                } else {
+                    PlacementReason::OnlyCandidate
+                },
+            });
+        }
+        let node_id = self.best_band_local_first(&candidates, sensed);
+        Ok(PlacementDecision {
+            node_id,
+            reason: if node_id == self.local_node_id {
+                PlacementReason::LocalPreferred
+            } else {
+                PlacementReason::FirstMatch
+            },
+        })
+    }
+
+    /// Sensed scored migration target (S3b): [`Self::select_migration_target`]
+    /// with the sensed band as the first key. The LocalPreferred fast path
+    /// survives within the band: the local node wins when the filter does not
+    /// veto it and it is in the best band any eligible candidate reaches. A
+    /// viable remote therefore beats a local node with no verdict, and a local
+    /// node in the top band still skips scoring, exactly as today.
+    pub fn select_migration_target_sensed(
+        &self,
+        artifact: &Artifact<'_>,
+        daemon_filter: &CapabilityFilter,
+        source_node: u64,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+        sensed: SensedOrder<'_>,
+    ) -> Option<u64> {
+        let candidates = self.find_migration_targets(daemon_filter, source_node);
+        if candidates.is_empty() {
+            return None;
+        }
+        if self.local_node_id != source_node
+            && candidates.contains(&self.local_node_id)
+            && placement
+                .placement_score(&self.local_node_id, artifact)
+                .is_some_and(f32::is_finite)
+        {
+            let bands = sensed.bands();
+            let best_band = candidates
+                .iter()
+                .filter(|n| {
+                    placement
+                        .placement_score(n, artifact)
+                        .is_some_and(f32::is_finite)
+                })
+                .map(|n| bands.band(*n))
+                .min();
+            if best_band == Some(bands.band(self.local_node_id)) {
+                return Some(self.local_node_id);
+            }
+        }
+        Self::pick_best_candidate_sensed(candidates, artifact, placement, tie_break, sensed)
+    }
+
+    /// Sensed group-member placement (S3b): [`Self::select_member_node`] with
+    /// the sensed band as the first key. `exclude` and placement vetoes apply
+    /// first and are unchanged.
+    pub fn select_member_node_sensed(
+        &self,
+        artifact: &Artifact<'_>,
+        requirements: &CapabilityFilter,
+        exclude: &std::collections::HashSet<u64>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+        sensed: SensedOrder<'_>,
+    ) -> Option<u64> {
+        let candidates = self
+            .query_candidates(requirements)
+            .into_iter()
+            .filter(|n| !exclude.contains(n));
+        Self::pick_best_candidate_sensed(candidates, artifact, placement, tie_break, sensed)
+    }
+
+    /// Sensed standby promotion (S3b): [`Self::select_promotion_target`] with
+    /// the sensed band as the first key.
+    pub fn select_promotion_target_sensed(
+        &self,
+        candidates: Vec<u64>,
+        artifact: &Artifact<'_>,
+        placement: &dyn PlacementFilter,
+        tie_break: &TieBreakContext<'_>,
+        sensed: SensedOrder<'_>,
+    ) -> Option<u64> {
+        Self::pick_best_candidate_sensed(candidates, artifact, placement, tie_break, sensed)
+    }
+
+    /// The best sensed band among `eligible`. Within it, the local node first,
+    /// then `eligible`'s own order. `eligible` is non-empty.
+    fn best_band_local_first(&self, eligible: &[u64], sensed: SensedOrder<'_>) -> u64 {
+        let bands = sensed.bands();
+        let best = eligible
+            .iter()
+            .map(|n| bands.band(*n))
+            .min()
+            .unwrap_or(SensedOrder::UNVERDICTED);
+        if eligible.contains(&self.local_node_id) && bands.band(self.local_node_id) == best {
+            return self.local_node_id;
+        }
+        eligible
+            .iter()
+            .copied()
+            .find(|n| bands.band(*n) == best)
+            .unwrap_or(eligible[0])
+    }
 }
+
+/// One exact-provider readiness capture, as plain node ids, for the sensed
+/// scheduler variants (sensing plan S3; SENSING_OLB_COMPLETION_PLAN B.4).
+///
+/// The pure scheduler opens no watch and holds no sensing state: the caller
+/// takes a snapshot and passes its two classes in. A node in neither set has
+/// no verdict. The scheduler derives no interest from a `CapabilityFilter`
+/// (S3 item 6); the capture is whatever interest the caller asked about.
+#[derive(Debug, Clone, Copy)]
+pub struct SensedOrder<'a> {
+    /// Viable providers, best first.
+    pub viable_order: &'a [u64],
+    /// Providers sensed not-ready. Demoted below every other band, never
+    /// removed.
+    pub not_ready: &'a std::collections::HashSet<u64>,
+}
+
+impl<'a> SensedOrder<'a> {
+    /// No evidence: every node is unverdicted, and every sensed variant is
+    /// its unsensed counterpart.
+    pub fn none() -> SensedOrder<'static> {
+        SensedOrder {
+            viable_order: &[],
+            not_ready: &EMPTY_NOT_READY,
+        }
+    }
+
+    /// The band of a node with no verdict.
+    const UNVERDICTED: usize = usize::MAX - 1;
+
+    /// The band lookup for ONE selection, built once: a node-to-rank map, so a
+    /// comparator asks in O(1) instead of scanning `viable_order` per
+    /// comparison. A duplicated provider keeps its FIRST rank, exactly as a
+    /// linear `position()` did.
+    fn bands(&self) -> SensedBands<'a> {
+        let mut ranks = std::collections::HashMap::with_capacity(self.viable_order.len());
+        for (rank, node) in self.viable_order.iter().enumerate() {
+            ranks.entry(*node).or_insert(rank);
+        }
+        SensedBands {
+            ranks,
+            not_ready: self.not_ready,
+        }
+    }
+}
+
+/// [`SensedOrder::bands`]' lookup.
+struct SensedBands<'a> {
+    ranks: std::collections::HashMap<u64, usize>,
+    not_ready: &'a std::collections::HashSet<u64>,
+}
+
+impl SensedBands<'_> {
+    /// The node's band: its viable rank, then `UNVERDICTED`, then the
+    /// not-ready band (`usize::MAX`). Lower is better. A node in both sets
+    /// takes its viable rank, because the rank is the positive evidence.
+    fn band(&self, node: u64) -> usize {
+        if let Some(rank) = self.ranks.get(&node) {
+            *rank
+        } else if self.not_ready.contains(&node) {
+            usize::MAX
+        } else {
+            SensedOrder::UNVERDICTED
+        }
+    }
+}
+
+/// Backing store for [`SensedOrder::none`]'s empty not-ready set.
+static EMPTY_NOT_READY: std::sync::LazyLock<std::collections::HashSet<u64>> =
+    std::sync::LazyLock::new(std::collections::HashSet::new);
 
 impl std::fmt::Debug for Scheduler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -702,6 +988,35 @@ mod tests {
             .place_migration(&CapabilityFilter::default(), 0x1111)
             .unwrap();
         assert_eq!(decision.node_id, 0x2222);
+        assert_eq!(decision.reason, PlacementReason::OnlyCandidate);
+    }
+
+    /// A SOLE local migration target is `LocalPreferred` in the sensed variant,
+    /// exactly as `place_migration` reports it, and a sole remote one stays
+    /// `OnlyCandidate`.
+    #[test]
+    fn place_migration_sensed_reports_a_sole_local_target_as_local_preferred() {
+        let fold = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        // Local is 0x2222; the source 0x1111 is excluded, so local is the only target.
+        let scheduler = Scheduler::new(fold.clone(), 0x2222, caps_no_gpu());
+        let unsensed = scheduler
+            .place_migration(&CapabilityFilter::default(), 0x1111)
+            .unwrap();
+        let sensed = scheduler
+            .place_migration_sensed(&CapabilityFilter::default(), 0x1111, SensedOrder::none())
+            .unwrap();
+        assert_eq!(sensed.node_id, 0x2222);
+        assert_eq!(sensed.reason, PlacementReason::LocalPreferred);
+        assert_eq!(sensed.reason, unsensed.reason);
+
+        let remote = Scheduler::new(fold.clone(), 0x3333, caps_no_gpu());
+        let decision = remote
+            .place_migration_sensed(&CapabilityFilter::default(), 0x2222, SensedOrder::none())
+            .unwrap();
+        assert_eq!(decision.node_id, 0x1111);
         assert_eq!(decision.reason, PlacementReason::OnlyCandidate);
     }
 
@@ -1548,6 +1863,283 @@ mod tests {
             decision.reason,
             PlacementReason::LocalPreferred,
             "v1 path should still stamp LocalPreferred (legacy contract)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // S3b: sensed placement (sensing plan §6 compute witnesses 25-28)
+    // -----------------------------------------------------------------
+
+    fn order<'a>(
+        viable: &'a [u64],
+        not_ready: &'a std::collections::HashSet<u64>,
+    ) -> SensedOrder<'a> {
+        SensedOrder {
+            viable_order: viable,
+            not_ready,
+        }
+    }
+
+    fn set(ids: &[u64]) -> std::collections::HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    /// Three GPU remotes and a non-matching local node. A viable remote leads
+    /// in RANK order; with no evidence, placement is byte-identical to
+    /// `place`; and with every remote not-ready, placement still succeeds,
+    /// because not-ready demotes and never removes (#26/#27).
+    #[test]
+    fn sensed_placement_ranks_viable_first_and_never_removes() {
+        let fold = make_index_with_nodes(vec![
+            (0x2222, caps_with_gpu()),
+            (0x3333, caps_with_gpu()),
+            (0x4444, caps_with_gpu()),
+        ]);
+        let scheduler = Scheduler::new(fold, 0x1111, caps_no_gpu());
+        let gpu = CapabilityFilter::new().require_gpu();
+        let plain = scheduler.place(&gpu).unwrap();
+
+        let none = set(&[]);
+        let unsensed = scheduler
+            .place_sensed(&gpu, false, SensedOrder::none())
+            .unwrap();
+        assert_eq!(
+            (unsensed.node_id, unsensed.reason),
+            (plain.node_id, plain.reason)
+        );
+
+        let ranked = scheduler
+            .place_sensed(&gpu, false, order(&[0x4444, 0x3333], &none))
+            .unwrap();
+        assert_eq!(ranked.node_id, 0x4444, "rank order, not index order");
+
+        let all = set(&[0x2222, 0x3333, 0x4444]);
+        let demoted = scheduler
+            .place_sensed(&gpu, false, order(&[], &all))
+            .expect("not-ready demotes; it never produces NoCandidate");
+        assert_eq!(demoted.node_id, plain.node_id);
+
+        let unknown_beats_not_ready = scheduler
+            .place_sensed(&gpu, false, order(&[], &set(&[plain.node_id])))
+            .unwrap();
+        assert_ne!(unknown_beats_not_ready.node_id, plain.node_id);
+    }
+
+    /// The local fast path survives WITHIN its band: an unverdicted local
+    /// node still beats unverdicted remotes, but a viable remote beats it,
+    /// and a viable local is LocalPreferred (#28: existing tie-breakers hold
+    /// within sensed classes).
+    #[test]
+    fn sensed_placement_keeps_local_preference_within_the_band() {
+        let fold = make_index_with_nodes(vec![(0x2222, caps_no_gpu()), (0x3333, caps_no_gpu())]);
+        let scheduler = Scheduler::new(fold, 0x1111, caps_no_gpu());
+        let any = CapabilityFilter::default();
+        let none = set(&[]);
+
+        let unverdicted = scheduler
+            .place_sensed(&any, false, SensedOrder::none())
+            .unwrap();
+        assert_eq!(
+            (unverdicted.node_id, unverdicted.reason),
+            (0x1111, PlacementReason::LocalPreferred)
+        );
+
+        let remote = scheduler
+            .place_sensed(&any, false, order(&[0x3333], &none))
+            .unwrap();
+        assert_eq!(
+            (remote.node_id, remote.reason),
+            (0x3333, PlacementReason::FirstMatch)
+        );
+
+        let local = scheduler
+            .place_sensed(&any, false, order(&[0x1111, 0x3333], &none))
+            .unwrap();
+        assert_eq!(local.reason, PlacementReason::LocalPreferred);
+
+        let drained = scheduler
+            .place_sensed(&any, true, order(&[0x1111], &none))
+            .unwrap();
+        assert_ne!(
+            drained.node_id, 0x1111,
+            "a drained local node is never eligible"
+        );
+    }
+
+    /// #28: a placement VETO is final. A candidate the filter vetoes is
+    /// never chosen however well it is ranked, and an all-equal score falls
+    /// to the sensed band, not to the lex tie-breaker.
+    #[test]
+    fn sensed_member_selection_preserves_vetoes_and_ranks_within_equal_scores() {
+        let fold = make_index_with_nodes(vec![
+            (0x2222, caps_no_gpu()),
+            (0x3333, caps_no_gpu()),
+            (0x4444, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(fold, 0x1111, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let vetoing = FixedScore {
+            score: 1.0,
+            veto: vec![0x4444],
+        };
+        let exclude = set(&[0x1111]);
+        let none = set(&[]);
+
+        let plain = scheduler
+            .select_member_node(
+                &artifact,
+                &CapabilityFilter::default(),
+                &exclude,
+                &vetoing,
+                &tb,
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler.select_member_node_sensed(
+                &artifact,
+                &CapabilityFilter::default(),
+                &exclude,
+                &vetoing,
+                &tb,
+                SensedOrder::none(),
+            ),
+            Some(plain),
+            "no evidence is the unsensed choice"
+        );
+
+        assert_eq!(
+            scheduler.select_member_node_sensed(
+                &artifact,
+                &CapabilityFilter::default(),
+                &exclude,
+                &vetoing,
+                &tb,
+                order(&[0x4444, 0x3333], &none),
+            ),
+            Some(0x3333),
+            "the vetoed best rank is skipped; the next rank wins over the lex tie-breaker"
+        );
+
+        let promoted = scheduler.select_promotion_target_sensed(
+            vec![0x2222, 0x3333],
+            &artifact,
+            &vetoing,
+            &tb,
+            order(&[], &set(&[0x2222])),
+        );
+        assert_eq!(
+            promoted,
+            Some(0x3333),
+            "not-ready demoted below unverdicted"
+        );
+    }
+
+    /// The scored migration path: a viable remote outranks a local node with
+    /// no verdict, while a local node in the top band keeps the fast path.
+    #[test]
+    fn sensed_migration_target_keeps_the_local_fast_path_within_the_band() {
+        let fold = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        let scheduler = Scheduler::new(fold.clone(), 0x1111, caps_no_gpu());
+        let req = empty_caps_pf();
+        let opt = empty_caps_pf();
+        let artifact = daemon_artifact_pf(&req, &opt);
+        let placement = LegacyPlacement::permissive(&fold);
+        let tb = TieBreakContext {
+            rtt_lookup: None,
+            resource_axis: ResourceAxis::Compute,
+        };
+        let none = set(&[]);
+        let any = CapabilityFilter::default();
+
+        assert_eq!(
+            scheduler.select_migration_target_sensed(
+                &artifact,
+                &any,
+                0x9999,
+                &placement,
+                &tb,
+                SensedOrder::none()
+            ),
+            scheduler.select_migration_target(&artifact, &any, 0x9999, &placement, &tb),
+        );
+        assert_eq!(
+            scheduler.select_migration_target_sensed(
+                &artifact,
+                &any,
+                0x9999,
+                &placement,
+                &tb,
+                order(&[0x2222], &none)
+            ),
+            Some(0x2222),
+            "a viable remote beats an unverdicted local"
+        );
+        assert_eq!(
+            scheduler.select_migration_target_sensed(
+                &artifact,
+                &any,
+                0x9999,
+                &placement,
+                &tb,
+                order(&[0x1111, 0x2222], &none)
+            ),
+            Some(0x1111),
+            "a top-band local keeps the fast path"
+        );
+    }
+
+    /// #25: ordinary placement and the gang matcher read ONE capture the same
+    /// way: viable in rank order, then unverdicted in each scheduler's own
+    /// order, then not-ready, and neither removes a not-ready node. The gang
+    /// half is `behavior::gang::tests::exact_sensed_match_*`; this pins the
+    /// ordinary half against the same three-class rule.
+    #[test]
+    fn ordinary_placement_follows_the_same_three_classes_as_the_gang_matcher() {
+        let fold = make_index_with_nodes(vec![
+            (0x2222, caps_no_gpu()),
+            (0x3333, caps_no_gpu()),
+            (0x4444, caps_no_gpu()),
+        ]);
+        let scheduler = Scheduler::new(fold, 0x1111, caps_no_gpu());
+        let any = CapabilityFilter::default();
+        let drained = true; // exclude the local node so the three hosts compete
+        let not_ready = set(&[0x2222]);
+
+        assert_eq!(
+            scheduler
+                .place_sensed(&any, drained, order(&[0x4444], &not_ready))
+                .unwrap()
+                .node_id,
+            0x4444,
+            "viable first"
+        );
+        let unverdicted = scheduler
+            .place_sensed(&any, drained, order(&[], &not_ready))
+            .unwrap()
+            .node_id;
+        assert!(
+            [0x3333, 0x4444].contains(&unverdicted),
+            "then unverdicted, never the not-ready host: got {unverdicted:#x}"
+        );
+        assert_eq!(
+            scheduler
+                .place_sensed(&any, drained, order(&[], &set(&[0x2222, 0x3333, 0x4444])))
+                .unwrap()
+                .node_id,
+            scheduler
+                .place_with_locality(&any, drained)
+                .unwrap()
+                .node_id,
+            "all not-ready: the scheduler's own unsensed choice, not a refusal"
         );
     }
 }

@@ -60,6 +60,8 @@
 
 use super::super::org::{OrgError, OrgId, OrgMembershipCert};
 use super::super::org_authority::{NodeAuthority, OrgAuthorityError};
+use super::super::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
+use super::super::org_grant_revocation::RevokedGrantKind;
 use super::super::org_revocation::{BarrieredGeneration, OrgRevocationState, OrgRevocationStore};
 use super::frames::{FrameSpecError, SensingInterestFrame};
 use super::identity::{AudienceScopeCommitment, InterestSpec, ProviderSelector};
@@ -99,6 +101,71 @@ pub fn canonical_org_sensing_commitment(org_id: &OrgId) -> AudienceScopeCommitme
     let mut hasher = blake3::Hasher::new_derive_key(ORG_SENSING_AUDIENCE_DOMAIN);
     hasher.update(org_id.as_bytes());
     AudienceScopeCommitment::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Domain separation for the GRANTED sensing audience (OLB-6, D6.2): distinct
+/// from [`ORG_SENSING_AUDIENCE_DOMAIN`], so a granted audience can never equal
+/// an organization's same-org audience.
+const GRANTED_SENSING_AUDIENCE_DOMAIN: &str = "net.sensing.granted-audience.v1";
+
+/// The canonical sensing audience for ONE cross-organization SENSE grant
+/// (OLB-6, completion plan D6.2): a domain-separated BLAKE3 derivation over
+/// `grant_id ‖ issuer_org ‖ grantee_org ‖ capability`.
+///
+/// It is bound into the interest digest, so a granted interest never coalesces
+/// with the same-org audience, with another grant's, or with the same grant
+/// re-issued under a new id, and never shares their observations. Both ends
+/// derive it from the same signed grant; neither side can name another.
+pub fn canonical_granted_sensing_commitment(grant: &OrgCapabilityGrant) -> AudienceScopeCommitment {
+    let mut hasher = blake3::Hasher::new_derive_key(GRANTED_SENSING_AUDIENCE_DOMAIN);
+    hasher.update(&grant.grant_id);
+    hasher.update(grant.issuer_org.as_bytes());
+    hasher.update(grant.grantee_org.as_bytes());
+    hasher.update(grant.capability.as_bytes());
+    AudienceScopeCommitment::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// This node's own identity, as the granted gate needs it (OLB-6, D6.4): a
+/// granted registration is DIRECT ONLY, so the gate must know which node it
+/// is running on to require `target == node_id`, and which entity it is to
+/// check the grant's target scope covers it.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalSensingIdentity<'a> {
+    /// This node's id.
+    pub node_id: u64,
+    /// This node's entity.
+    pub entity: &'a EntityId,
+}
+
+/// Why a GRANTED (cross-organization) sensing registration was refused
+/// (OLB-6, D6.4). Carried by [`OrgSensingRejection::Granted`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrantedSensingRefusal {
+    /// This node is not the frame's `target`. Granted registrations are
+    /// direct only and are never relayed.
+    NotDirect,
+    /// The capability grant was not issued by this node's owner organization.
+    ForeignIssuer,
+    /// The grant's grantee is not the member's organization, or the member's
+    /// organization IS this node's owner (same-org sensing uses variant 4).
+    GranteeMismatch,
+    /// The grant does not carry SENSE.
+    LacksSense,
+    /// The grant names a different capability than the interest.
+    CapabilityMismatch,
+    /// The grant's target scope does not cover this node.
+    TargetNotCovered,
+    /// The dispatcher grant does not empower this member to act for the
+    /// acting organization over this capability.
+    DispatcherScope,
+    /// The dispatcher grant failed signature or window validation.
+    DispatcherInvalid(OrgError),
+    /// The capability grant failed signature or window validation.
+    GrantInvalid(OrgError),
+    /// The dispatcher grant was revoked by its issuer.
+    DispatcherRevoked,
+    /// The capability grant was revoked by its issuer.
+    GrantRevoked,
 }
 
 /// A zero-size witness that a [`ValidatedOrgSensingRegistration`] was minted by
@@ -153,6 +220,26 @@ enum ValidatedInner {
         subscriber: EntityId,
         /// The verified organization.
         org_id: OrgId,
+        /// Gate-only construction proof (review §7).
+        gate_proof: GateProof,
+    },
+    /// A GRANTED (cross-organization) provider-addressed registration
+    /// (OLB-6, D6.4). Always targets THIS node.
+    GrantedProvider {
+        /// The re-derived, digest-validated interest spec.
+        spec: InterestSpec,
+        /// The provider this branch targets (this node).
+        target: u64,
+        /// The delivery-continuity interval.
+        requested_sample_interval: Duration,
+        /// The per-downstream soft-state lifetime.
+        soft_state_ttl: Duration,
+        /// The verified subscriber entity (== `cert.member`).
+        subscriber: EntityId,
+        /// The verified acting (grantee) organization.
+        acting_org: OrgId,
+        /// The granted audience, DERIVED from the verified grant.
+        proven_root: AudienceScopeCommitment,
         /// Gate-only construction proof (review §7).
         gate_proof: GateProof,
     },
@@ -214,6 +301,25 @@ impl Clone for ValidatedOrgSensingRegistration {
                 soft_state_ttl: *soft_state_ttl,
                 subscriber: subscriber.clone(),
                 org_id: *org_id,
+                gate_proof: GateProof(()),
+            },
+            ValidatedInner::GrantedProvider {
+                spec,
+                target,
+                requested_sample_interval,
+                soft_state_ttl,
+                subscriber,
+                acting_org,
+                proven_root,
+                ..
+            } => ValidatedInner::GrantedProvider {
+                spec: spec.clone(),
+                target: *target,
+                requested_sample_interval: *requested_sample_interval,
+                soft_state_ttl: *soft_state_ttl,
+                subscriber: subscriber.clone(),
+                acting_org: *acting_org,
+                proven_root: *proven_root,
                 gate_proof: GateProof(()),
             },
         })
@@ -281,6 +387,10 @@ pub enum OrgSensingRejection {
     /// break for any downstream exhaustive matcher; in-tree the cost is the
     /// single wildcard-free match in this file.
     SelectorTargetMismatch,
+    /// A GRANTED (cross-organization) registration failed one of the granted
+    /// checks (OLB-6, D6.4). Appended; the same deliberate semver note as
+    /// [`Self::SelectorTargetMismatch`] applies.
+    Granted(GrantedSensingRefusal),
 }
 
 /// Steps 1–8 of the org-sensing authority gate against a PINNED revocation
@@ -302,6 +412,7 @@ pub fn verify_org_sensing_registration(
     frame: &SensingInterestFrame,
     from_node: u64,
     sender_entity: &EntityId,
+    local: LocalSensingIdentity<'_>,
     node_authority: Option<OrgAuthorityView>,
     revocation: &OrgRevocationState,
     now_secs: u64,
@@ -312,6 +423,7 @@ pub fn verify_org_sensing_registration(
             &shape,
             from_node,
             sender_entity,
+            local,
             node_authority,
             revocation,
             now_secs,
@@ -344,6 +456,7 @@ pub(crate) fn count_org_rejection(rejection: &OrgSensingRejection, counters: &Se
         OrgSensingRejection::ConsumerBindingMismatch
         | OrgSensingRejection::NotOrgRegistration
         | OrgSensingRejection::SelectorTargetMismatch => Some(&counters.protocol_invalid),
+        OrgSensingRejection::Granted(_) => Some(&counters.org_granted_refused),
         OrgSensingRejection::Semantic(_) => None,
     };
     if let Some(counter) = counter {
@@ -356,10 +469,12 @@ pub(crate) fn count_org_rejection(rejection: &OrgSensingRejection, counters: &Se
 /// it pairs with [`validate_org_frame_shape`] to give the same total validation
 /// as [`verify_org_sensing_registration`], in two explicitly ordered halves, so
 /// the authority-free refusals can be taken before any `org_install` work.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_org_admission(
     shape: &OrgFrameShape<'_>,
     from_node: u64,
     sender_entity: &EntityId,
+    local: LocalSensingIdentity<'_>,
     node_authority: Option<OrgAuthorityView>,
     revocation: &OrgRevocationState,
     now_secs: u64,
@@ -369,6 +484,7 @@ pub(crate) fn verify_org_admission(
         shape,
         from_node,
         sender_entity,
+        local,
         node_authority,
         revocation,
         now_secs,
@@ -398,6 +514,16 @@ pub(crate) struct OrgFrameShape<'a> {
     spec: InterestSpec,
     leg: Leg,
     membership: &'a OrgMembershipCert,
+    /// The granted credentials, present exactly for
+    /// [`SensingInterestFrame::GrantedProviderRegistration`] (OLB-6).
+    granted: Option<GrantedCredentials<'a>>,
+}
+
+/// The two grants a granted registration carries (OLB-6, D6.3).
+#[derive(Clone, Copy)]
+struct GrantedCredentials<'a> {
+    dispatcher: &'a OrgDispatcherGrant,
+    grant: &'a OrgCapabilityGrant,
 }
 
 impl OrgFrameShape<'_> {
@@ -419,7 +545,30 @@ pub(crate) fn validate_org_frame_shape<'a>(
 ) -> Result<OrgFrameShape<'a>, OrgSensingRejection> {
     // Step 1: the frame must be an organization registration variant, and we
     // extract the leg parameters + the membership certificate exactly once.
+    let mut granted = None;
     let (membership, leg) = match frame {
+        SensingInterestFrame::GrantedProviderRegistration {
+            subscriber_membership,
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+            dispatcher_grant,
+            capability_grant,
+            ..
+        } => {
+            granted = Some(GrantedCredentials {
+                dispatcher: dispatcher_grant,
+                grant: capability_grant,
+            });
+            (
+                subscriber_membership,
+                Leg::Provider {
+                    target: *target,
+                    requested_sample_interval: *requested_sample_interval,
+                    soft_state_ttl: *soft_state_ttl,
+                },
+            )
+        }
         SensingInterestFrame::OrgCapabilityRegistration {
             subscriber_membership,
             consumer,
@@ -483,6 +632,7 @@ pub(crate) fn validate_org_frame_shape<'a>(
         spec,
         leg,
         membership,
+        granted,
     })
 }
 
@@ -493,6 +643,7 @@ fn verify_org_admission_with_shape(
     shape: &OrgFrameShape<'_>,
     from_node: u64,
     sender_entity: &EntityId,
+    local: LocalSensingIdentity<'_>,
     node_authority: Option<OrgAuthorityView>,
     revocation: &OrgRevocationState,
     now_secs: u64,
@@ -501,7 +652,26 @@ fn verify_org_admission_with_shape(
         spec,
         leg,
         membership,
+        granted,
     } = shape;
+
+    // A granted (cross-organization) registration has its own authority
+    // phase: it never reaches the same-org steps below (OLB-6, D6.4).
+    if let Some(credentials) = granted {
+        return verify_granted_admission(
+            spec,
+            leg,
+            membership,
+            *credentials,
+            sender_entity,
+            local,
+            node_authority,
+            revocation,
+            now_secs,
+        );
+    }
+    // The local identity is used only by the granted phase.
+    let _ = local;
 
     // Step 3: the authenticated hop is the certificate's member. The
     // certificate binds an EntityId; it does NOT replace the routed-origin
@@ -578,6 +748,133 @@ fn verify_org_admission_with_shape(
     }))
 }
 
+/// The GRANTED authority phase (OLB-6, completion plan D6.4), in order. Every
+/// check runs before any table mutation; the dispatch layer's fenced
+/// currentness recheck (step 9) follows it exactly as for variant 4.
+#[allow(clippy::too_many_arguments)]
+fn verify_granted_admission(
+    spec: &InterestSpec,
+    leg: &Leg,
+    membership: &OrgMembershipCert,
+    credentials: GrantedCredentials<'_>,
+    sender_entity: &EntityId,
+    local: LocalSensingIdentity<'_>,
+    node_authority: Option<OrgAuthorityView>,
+    revocation: &OrgRevocationState,
+    now_secs: u64,
+) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+    use GrantedSensingRefusal as R;
+    let refuse = |reason: R| Err(OrgSensingRejection::Granted(reason));
+    let GrantedCredentials { dispatcher, grant } = credentials;
+    let Leg::Provider {
+        target,
+        requested_sample_interval,
+        soft_state_ttl,
+    } = *leg
+    else {
+        // The shape phase builds a granted shape only for the provider leg.
+        return Err(OrgSensingRejection::NotOrgRegistration);
+    };
+
+    // 1. Direct only: this node is the frame's target. A granted interest is
+    //    never relayed, so a node that is not the target refuses it outright.
+    if target != local.node_id {
+        return refuse(R::NotDirect);
+    }
+    // 2. The authenticated hop is the certificate's member.
+    if *sender_entity != membership.member {
+        return Err(OrgSensingRejection::SenderMemberMismatch);
+    }
+    // 3. An installed authority.
+    let authority = node_authority.ok_or(OrgSensingRejection::MissingAuthority)?;
+    let acting_org = membership.org_id;
+    // 4. The capability grant is authority only if THIS node's owner issued it,
+    if grant.issuer_org != authority.owner_org {
+        return refuse(R::ForeignIssuer);
+    }
+    //    to the member's org, and that org is a DIFFERENT organization: a
+    //    same-org consumer uses variant 4 and the same-org audience.
+    if grant.grantee_org != acting_org || acting_org == authority.owner_org {
+        return refuse(R::GranteeMismatch);
+    }
+    // 5. SENSE, for exactly this capability, covering exactly this node.
+    if !grant.permits_sense() {
+        return refuse(R::LacksSense);
+    }
+    let capability = CapabilityAuthorityId::for_tag(spec.capability_id.as_str());
+    if grant.capability != capability {
+        return refuse(R::CapabilityMismatch);
+    }
+    if !grant
+        .target_scope
+        .covers(local.entity, Some(&authority.owner_org))
+    {
+        return refuse(R::TargetNotCovered);
+    }
+    // 6. The dispatcher grant empowers THIS member to act for the acting org
+    //    over this capability.
+    if dispatcher.org_id != acting_org
+        || dispatcher.dispatcher != membership.member
+        || !dispatcher.covers_capability(&capability)
+    {
+        return refuse(R::DispatcherScope);
+    }
+    // 7. Credentials at ONE captured clock: membership, floor, both grants.
+    membership
+        .is_valid_at_with_skew(now_secs, authority.verification_skew_secs)
+        .map_err(OrgSensingRejection::CertInvalid)?;
+    // OA §D1 BOUNDARY, stated at the line: `floor_for` returns 0 for an org
+    // this node holds no floors for, so for a FOREIGN acting org this check
+    // bites only if this node imports that org's floor bundles. Without them
+    // a revoked member of the acting org keeps sensing until its cert
+    // expires — unless this node's owner revokes the GRANT (checked below),
+    // which cuts off every member at once. The same boundary nRPC admission
+    // documents for CrossOrgGranted.
+    if membership.generation < revocation.floor_for(&acting_org, &membership.member) {
+        return Err(OrgSensingRejection::BelowFloor);
+    }
+    dispatcher
+        .is_valid_at_with_skew(now_secs, authority.verification_skew_secs)
+        .map_err(|e| OrgSensingRejection::Granted(R::DispatcherInvalid(e)))?;
+    grant
+        .is_valid_at_with_skew(now_secs, authority.verification_skew_secs)
+        .map_err(|e| OrgSensingRejection::Granted(R::GrantInvalid(e)))?;
+    // 8. Issuer-side revocation of either grant, each under its OWN issuer.
+    if revocation.is_grant_revoked(
+        &dispatcher.org_id,
+        RevokedGrantKind::Dispatcher,
+        &dispatcher.revocation_id(),
+    ) {
+        return refuse(R::DispatcherRevoked);
+    }
+    if revocation.is_grant_revoked(
+        &grant.issuer_org,
+        RevokedGrantKind::Capability,
+        &grant.grant_id,
+    ) {
+        return refuse(R::GrantRevoked);
+    }
+    // 9. The audience is the granted commitment of THIS grant. It is
+    //    digest-bound (shape phase), so this pins the row to the grant.
+    let proven_root = canonical_granted_sensing_commitment(grant);
+    if spec.audience != proven_root {
+        return Err(OrgSensingRejection::AudienceMismatch);
+    }
+
+    Ok(ValidatedOrgSensingRegistration(
+        ValidatedInner::GrantedProvider {
+            spec: spec.clone(),
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+            subscriber: membership.member.clone(),
+            acting_org,
+            proven_root,
+            gate_proof: GateProof(()),
+        },
+    ))
+}
+
 /// The ONE selector <-> target exactness rule (design D2.6), shared by the
 /// inbound intake gate and the local-origin egress planner so the two can never
 /// disagree about what "exact provider" means.
@@ -620,6 +917,9 @@ pub(crate) enum LocalOrgEgressRefusal {
 pub(crate) struct LocalOrgEgress {
     proven_root: AudienceScopeCommitment,
     membership: OrgMembershipCert,
+    /// Present for a GRANTED egress (OLB-6, D6.5): the dispatcher grant and
+    /// the SENSE grant the planner attaches as variant 5.
+    granted: Option<(OrgDispatcherGrant, OrgCapabilityGrant)>,
 }
 
 impl LocalOrgEgress {
@@ -631,7 +931,29 @@ impl LocalOrgEgress {
         Self {
             proven_root: canonical_org_sensing_commitment(&membership.org_id()),
             membership: membership.owner_cert().clone(),
+            granted: None,
         }
+    }
+
+    /// Derive a GRANTED egress plan (OLB-6, D6.5) from a live local
+    /// membership capture and the node-registered granted credentials. The
+    /// proven root is `canonical_granted_sensing_commitment(grant)`, never a
+    /// caller value. `None` unless the grant was issued TO the captured
+    /// membership's organization and the dispatcher grant acts for it.
+    pub(crate) fn from_live_membership_granted(
+        membership: &LiveOrgRelayMembership,
+        dispatcher: OrgDispatcherGrant,
+        grant: OrgCapabilityGrant,
+    ) -> Option<Self> {
+        let org = membership.org_id();
+        if grant.grantee_org != org || dispatcher.org_id != org || !grant.permits_sense() {
+            return None;
+        }
+        Some(Self {
+            proven_root: canonical_granted_sensing_commitment(&grant),
+            membership: membership.owner_cert().clone(),
+            granted: Some((dispatcher, grant)),
+        })
     }
 
     /// The organization-derived root the interest table row registers under.
@@ -668,13 +990,25 @@ pub(crate) fn plan_local_org_provider_registration(
     if !selector_names_target(spec, target) {
         return Err(LocalOrgEgressRefusal::SelectorTargetMismatch);
     }
-    Ok(SensingInterestFrame::org_provider_registration(
-        spec,
-        target,
-        requested_sample_interval,
-        soft_state_ttl,
-        egress.membership.clone(),
-    ))
+    Ok(match &egress.granted {
+        // A granted egress emits variant 5 with its credentials (OLB-6).
+        Some((dispatcher, grant)) => SensingInterestFrame::granted_provider_registration(
+            spec,
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+            egress.membership.clone(),
+            dispatcher.clone(),
+            grant.clone(),
+        ),
+        None => SensingInterestFrame::org_provider_registration(
+            spec,
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+            egress.membership.clone(),
+        ),
+    })
 }
 
 /// The leg-specific parameters extracted from the frame once (step 1). `Copy`
@@ -737,6 +1071,15 @@ pub(crate) enum RegistrationAuthority {
     Org {
         /// The verified organization id.
         org_id: OrgId,
+    },
+    /// GRANTED (cross-organization) admission (OLB-6): the verified acting
+    /// organization and the granted audience DERIVED from the verified grant.
+    /// Direct only, so it never authors a continuation.
+    Granted {
+        /// The verified acting (grantee) organization.
+        acting_org: OrgId,
+        /// The granted audience the row is registered under.
+        proven_root: AudienceScopeCommitment,
     },
 }
 
@@ -833,6 +1176,26 @@ impl AdmittedSensingRegistration {
                 },
                 authority: RegistrationAuthority::Org { org_id },
             },
+            ValidatedInner::GrantedProvider {
+                spec,
+                target,
+                requested_sample_interval,
+                soft_state_ttl,
+                acting_org,
+                proven_root,
+                ..
+            } => Self {
+                spec,
+                leg: RegistrationLeg::Provider {
+                    target,
+                    requested_sample_interval,
+                    soft_state_ttl,
+                },
+                authority: RegistrationAuthority::Granted {
+                    acting_org,
+                    proven_root,
+                },
+            },
         }
     }
 
@@ -854,6 +1217,7 @@ impl AdmittedSensingRegistration {
         match &self.authority {
             RegistrationAuthority::Legacy { proven_root } => *proven_root,
             RegistrationAuthority::Org { org_id } => canonical_org_sensing_commitment(org_id),
+            RegistrationAuthority::Granted { proven_root, .. } => *proven_root,
         }
     }
 
@@ -1534,6 +1898,10 @@ pub(crate) fn plan_provider_continuation(
                 membership.owner_cert().clone(),
             ))
         }
+        // Granted registrations are DIRECT ONLY (OLB-6, D6.3): the gate admits
+        // one only at its own target, so there is never an upstream to author
+        // for. Nothing is emitted even if a caller asks.
+        RegistrationAuthority::Granted { .. } => None,
     }
 }
 
@@ -1559,6 +1927,20 @@ mod tests {
 
     fn org_kp() -> OrgKeypair {
         OrgKeypair::from_bytes([0x42u8; 32])
+    }
+
+    /// The node the gate runs on in these tests: node 0x77, the target the
+    /// provider-leg fixtures name.
+    fn local_entity() -> &'static EntityId {
+        static LOCAL: std::sync::OnceLock<EntityId> = std::sync::OnceLock::new();
+        LOCAL.get_or_init(|| EntityId::from_bytes([0x77u8; 32]))
+    }
+
+    fn local_identity() -> LocalSensingIdentity<'static> {
+        LocalSensingIdentity {
+            node_id: 0x77,
+            entity: local_entity(),
+        }
     }
 
     fn member() -> EntityId {
@@ -1631,6 +2013,7 @@ mod tests {
             frame,
             FROM_NODE,
             sender,
+            local_identity(),
             authority,
             floors,
             now_secs(),
@@ -1744,6 +2127,7 @@ mod tests {
             &frame,
             FROM_NODE,
             &member(),
+            local_identity(),
             Some(authority()),
             &empty_floors(),
             now_secs(),
@@ -3037,6 +3421,7 @@ mod tests {
             &frame,
             FROM_NODE,
             &member(),
+            local_identity(),
             Some(authority()),
             &empty_floors(),
             now_secs(),
@@ -3212,6 +3597,7 @@ mod tests {
                 &shape,
                 FROM_NODE,
                 &member(),
+                local_identity(),
                 Some(authority()),
                 &empty_floors(),
                 now_secs(),
@@ -3360,6 +3746,414 @@ mod tests {
                 assert_eq!(got, &spec, "the admitted spec equals the planned spec");
             }
             _ => panic!("expected a provider registration"),
+        }
+    }
+
+    // ---- OLB-6: granted (cross-organization) registrations -------------
+
+    mod granted {
+        use super::*;
+        use crate::adapter::net::behavior::org_grant::{
+            DispatcherScope, GrantRights, GrantTargetScope,
+        };
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+
+        /// The ACTING (grantee) organization. The provider's owner is
+        /// `org_kp()`, the organization `authority()` names.
+        fn org_a() -> OrgKeypair {
+            OrgKeypair::from_bytes([0x51u8; 32])
+        }
+
+        fn cap() -> CapabilityAuthorityId {
+            CapabilityAuthorityId::for_tag("gpu.infer")
+        }
+
+        fn sense() -> GrantRights {
+            GrantRights::DISCOVER
+                .union(GrantRights::INVOKE)
+                .union(GrantRights::SENSE)
+        }
+
+        fn cert_a() -> OrgMembershipCert {
+            OrgMembershipCert::try_issue(&org_a(), member(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("cert")
+        }
+
+        fn dispatcher_for(entity: EntityId) -> OrgDispatcherGrant {
+            OrgDispatcherGrant::try_issue(&org_a(), entity, DispatcherScope::Exact(cap()), 3600)
+                .expect("dispatcher")
+        }
+
+        fn grant_with(
+            issuer: &OrgKeypair,
+            grantee: OrgId,
+            capability: CapabilityAuthorityId,
+            rights: GrantRights,
+            target: GrantTargetScope,
+        ) -> OrgCapabilityGrant {
+            OrgCapabilityGrant::try_issue(issuer, grantee, capability, rights, target, 3600)
+                .expect("grant")
+                .0
+        }
+
+        /// ONE fixed good grant and dispatcher per test process: the
+        /// revocation cases need the SAME instance in the frame and in the
+        /// bundle, and `try_issue` mints a fresh random id on every call.
+        fn good_grant() -> OrgCapabilityGrant {
+            static GRANT: std::sync::OnceLock<OrgCapabilityGrant> = std::sync::OnceLock::new();
+            GRANT
+                .get_or_init(|| {
+                    grant_with(
+                        &org_kp(),
+                        org_a().org_id(),
+                        cap(),
+                        sense(),
+                        GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+                    )
+                })
+                .clone()
+        }
+
+        fn good_dispatcher() -> OrgDispatcherGrant {
+            static DISPATCHER: std::sync::OnceLock<OrgDispatcherGrant> = std::sync::OnceLock::new();
+            DISPATCHER.get_or_init(|| dispatcher_for(member())).clone()
+        }
+
+        /// The granted frame, with the audience derived from `grant` unless
+        /// `audience` overrides it.
+        fn frame_with(
+            target: u64,
+            cert: OrgMembershipCert,
+            dispatcher: OrgDispatcherGrant,
+            grant: OrgCapabilityGrant,
+            audience: Option<AudienceScopeCommitment>,
+        ) -> SensingInterestFrame {
+            let audience = audience.unwrap_or_else(|| canonical_granted_sensing_commitment(&grant));
+            let mut spec = spec_with(audience);
+            spec.providers = ProviderSelector::Node(target);
+            SensingInterestFrame::granted_provider_registration(
+                &spec, target, D, TTL, cert, dispatcher, grant,
+            )
+        }
+
+        fn good_frame() -> SensingInterestFrame {
+            frame_with(0x77, cert_a(), good_dispatcher(), good_grant(), None)
+        }
+
+        fn run_granted(
+            frame: &SensingInterestFrame,
+            floors: &OrgRevocationState,
+            counters: &SensingCounters,
+        ) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+            verify_org_sensing_registration(
+                frame,
+                FROM_NODE,
+                &member(),
+                local_identity(),
+                Some(authority()),
+                floors,
+                now_secs(),
+                counters,
+            )
+        }
+
+        fn revoking(issuer: &OrgKeypair, entry: RevokedGrant) -> OrgRevocationState {
+            let bundle = OrgGrantRevocationBundle::try_issue(issuer, [entry]).expect("bundle");
+            let mut floors = OrgRevocationState::empty();
+            floors.merge_grant_revocations(&bundle, now_secs());
+            floors
+        }
+
+        /// The positive control: a correct granted registration is admitted
+        /// as a GRANTED provider row for this node, under the granted
+        /// audience and the acting organization, and it plans no
+        /// continuation.
+        #[test]
+        fn a_valid_granted_registration_is_admitted_direct_under_the_granted_audience() {
+            let grant = good_grant();
+            let validated =
+                run_granted(&good_frame(), &empty_floors(), &SensingCounters::default())
+                    .expect("admitted");
+            match &validated.0 {
+                ValidatedInner::GrantedProvider {
+                    target,
+                    acting_org,
+                    proven_root,
+                    subscriber,
+                    ..
+                } => {
+                    assert_eq!(*target, 0x77);
+                    assert_eq!(*acting_org, org_a().org_id());
+                    assert_eq!(*subscriber, member());
+                    assert_eq!(*proven_root, canonical_granted_sensing_commitment(&grant));
+                }
+                other => panic!("expected a granted provider row, got {other:?}"),
+            }
+            let admitted = AdmittedSensingRegistration::from_validated_org(validated);
+            assert_eq!(
+                admitted.proven_root(),
+                canonical_granted_sensing_commitment(&grant)
+            );
+            assert_ne!(
+                admitted.proven_root(),
+                canonical_org_sensing_commitment(&org_kp().org_id()),
+                "a granted row never shares the provider org's same-org audience"
+            );
+            assert!(
+                plan_provider_continuation(&admitted, |_| None).is_none(),
+                "a granted registration is direct only and never authors a continuation"
+            );
+        }
+
+        /// Every granted refusal, each for its OWN reason, and each granted
+        /// refusal counted. RED against any single check of
+        /// `verify_granted_admission` being dropped: the case for that check
+        /// then admits, or is refused for a different reason.
+        #[test]
+        fn granted_refusals_each_fire_for_their_own_reason() {
+            use GrantedSensingRefusal as R;
+            let other_org = OrgKeypair::from_bytes([0x61u8; 32]);
+            let now = now_secs();
+            // An expired grant must carry SENSE to reach the window check, and
+            // SENSE needs DISCOVER, which needs a binding.
+            let (_, binding) =
+                crate::adapter::net::behavior::org_grant::OrgAudienceSecret::mint([0x33u8; 32]);
+            let expired = OrgCapabilityGrant::issue_at(
+                &org_kp(),
+                [0x33u8; 32],
+                org_a().org_id(),
+                cap(),
+                sense(),
+                GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+                Some(binding),
+                now - 7200,
+                now - 3600,
+                9,
+            );
+            let same_org_dispatcher = OrgDispatcherGrant::try_issue(
+                &org_kp(),
+                member(),
+                DispatcherScope::Exact(cap()),
+                3600,
+            )
+            .expect("dispatcher");
+            let provider_target =
+                |target| grant_with(&org_kp(), org_a().org_id(), cap(), sense(), target);
+            let cases: Vec<(
+                &str,
+                SensingInterestFrame,
+                OrgRevocationState,
+                OrgSensingRejection,
+            )> = vec![
+                (
+                    "not the target",
+                    frame_with(0x78, cert_a(), good_dispatcher(), good_grant(), None),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::NotDirect),
+                ),
+                (
+                    "issued by a foreign org",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        good_dispatcher(),
+                        grant_with(
+                            &other_org,
+                            org_a().org_id(),
+                            cap(),
+                            sense(),
+                            GrantTargetScope::AnyNodeOwnedBy(other_org.org_id()),
+                        ),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::ForeignIssuer),
+                ),
+                (
+                    "granted to another org",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        good_dispatcher(),
+                        grant_with(
+                            &org_kp(),
+                            other_org.org_id(),
+                            cap(),
+                            sense(),
+                            GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+                        ),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::GranteeMismatch),
+                ),
+                (
+                    "a same-org grant",
+                    frame_with(
+                        0x77,
+                        cert_gen(1),
+                        same_org_dispatcher,
+                        grant_with(
+                            &org_kp(),
+                            org_kp().org_id(),
+                            cap(),
+                            sense(),
+                            GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+                        ),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::GranteeMismatch),
+                ),
+                (
+                    "no SENSE",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        good_dispatcher(),
+                        grant_with(
+                            &org_kp(),
+                            org_a().org_id(),
+                            cap(),
+                            GrantRights::DISCOVER.union(GrantRights::INVOKE),
+                            GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+                        ),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::LacksSense),
+                ),
+                (
+                    "another capability",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        good_dispatcher(),
+                        grant_with(
+                            &org_kp(),
+                            org_a().org_id(),
+                            CapabilityAuthorityId::for_tag("gpu.train"),
+                            sense(),
+                            GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+                        ),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::CapabilityMismatch),
+                ),
+                (
+                    "another exact target",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        good_dispatcher(),
+                        provider_target(GrantTargetScope::ExactNode(EntityId::from_bytes(
+                            [0x78u8; 32],
+                        ))),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::TargetNotCovered),
+                ),
+                (
+                    "a dispatcher for someone else",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        dispatcher_for(EntityId::from_bytes([0x25u8; 32])),
+                        good_grant(),
+                        None,
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::DispatcherScope),
+                ),
+                (
+                    "an expired grant",
+                    frame_with(0x77, cert_a(), good_dispatcher(), expired, None),
+                    empty_floors(),
+                    OrgSensingRejection::Granted(R::GrantInvalid(OrgError::Expired)),
+                ),
+                (
+                    "a revoked grant",
+                    good_frame(),
+                    revoking(&org_kp(), RevokedGrant::capability(&good_grant())),
+                    OrgSensingRejection::Granted(R::GrantRevoked),
+                ),
+                (
+                    "a revoked dispatcher",
+                    good_frame(),
+                    revoking(&org_a(), RevokedGrant::dispatcher(&good_dispatcher())),
+                    OrgSensingRejection::Granted(R::DispatcherRevoked),
+                ),
+                (
+                    "a member below the acting org's floor",
+                    good_frame(),
+                    floors_at(org_a().org_id(), member(), 2),
+                    OrgSensingRejection::BelowFloor,
+                ),
+                (
+                    "the same-org audience",
+                    frame_with(
+                        0x77,
+                        cert_a(),
+                        good_dispatcher(),
+                        good_grant(),
+                        Some(canonical_org_sensing_commitment(&org_a().org_id())),
+                    ),
+                    empty_floors(),
+                    OrgSensingRejection::AudienceMismatch,
+                ),
+            ];
+            for (name, frame, floors, expected) in cases {
+                let counters = SensingCounters::default();
+                let got = run_granted(&frame, &floors, &counters);
+                assert_eq!(got.err(), Some(expected.clone()), "case {name:?}");
+                if matches!(expected, OrgSensingRejection::Granted(_)) {
+                    assert_eq!(
+                        counters.org_granted_refused.load(Ordering::Relaxed),
+                        1,
+                        "case {name:?} is counted as a granted refusal"
+                    );
+                }
+            }
+        }
+
+        /// The granted frame round-trips the wire codec as variant 5 and fits
+        /// the frame cap with room to spare.
+        #[test]
+        fn the_granted_frame_round_trips_within_the_frame_cap() {
+            let frame = good_frame();
+            let bytes = crate::adapter::net::behavior::sensing::encode_interest_frame(&frame)
+                .expect("encodes");
+            assert_eq!(bytes[0], 5, "postcard variant index 5");
+            assert!(
+                bytes.len() < crate::adapter::net::behavior::sensing::MAX_SENSING_FRAME_BYTES / 2,
+                "{} bytes",
+                bytes.len()
+            );
+            let back = crate::adapter::net::behavior::sensing::decode_interest_frame(&bytes)
+                .expect("decodes");
+            assert_eq!(back, frame);
+        }
+
+        /// Distinct grants derive distinct granted audiences, and none equals
+        /// either organization's same-org audience.
+        #[test]
+        fn granted_audiences_are_isolated_per_grant() {
+            let one = good_grant();
+            let two = grant_with(
+                &org_kp(),
+                org_a().org_id(),
+                cap(),
+                sense(),
+                GrantTargetScope::AnyNodeOwnedBy(org_kp().org_id()),
+            );
+            let a = canonical_granted_sensing_commitment(&one);
+            assert_ne!(a, canonical_granted_sensing_commitment(&two));
+            assert_ne!(a, canonical_org_sensing_commitment(&org_kp().org_id()));
+            assert_ne!(a, canonical_org_sensing_commitment(&org_a().org_id()));
         }
     }
 }

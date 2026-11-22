@@ -8949,6 +8949,18 @@ pub(crate) struct OrgSensingDemandCounters {
     refused_view_moved: AtomicU64,
     /// Authorized populations truncated at the sensing cap.
     truncated: AtomicU64,
+    /// Sensed `org.call`s that took the deterministic unsensed order because
+    /// another caller held this capability's reconciliation (a declined, not
+    /// blocked, convergence). See [`OrgSensedOrderFallback::Contended`].
+    ///
+    /// [`OrgSensedOrderFallback::Contended`]: super::behavior::org_sensing_demand::OrgSensedOrderFallback::Contended
+    order_fallback_contended: AtomicU64,
+    /// Sensed `org.call`s that took the unsensed order because this call's
+    /// convergence was refused.
+    order_fallback_refused: AtomicU64,
+    /// Sensed `org.call`s that took the unsensed order because no demand was
+    /// installed for the capability (an earlier refusal still pacing).
+    order_fallback_unretained: AtomicU64,
     /// Acquisitions RELEASED again because no refresh owner could be armed for
     /// them (the schedule is terminal, at its bound, or already owned by a
     /// strictly newer installation).
@@ -9040,6 +9052,20 @@ impl OrgSensingDemandCounters {
         self.refused_at_capacity.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One sensed call fell back to the deterministic unsensed order.
+    pub(crate) fn note_order_fallback(
+        &self,
+        reason: super::behavior::org_sensing_demand::OrgSensedOrderFallback,
+    ) {
+        use super::behavior::org_sensing_demand::OrgSensedOrderFallback as Reason;
+        let counter = match reason {
+            Reason::Contended => &self.order_fallback_contended,
+            Reason::Refused => &self.order_fallback_refused,
+            Reason::Unretained => &self.order_fallback_unretained,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `count` carried-forward holders were dropped because their installation
     /// no longer exists.
     pub(crate) fn note_ownership_invalidated(&self, count: u64) {
@@ -9090,6 +9116,182 @@ impl OrgSensingDemandCounters {
                 self.refused_other.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// Operator-readable counters for sensed organization call routing (OLB §14,
+/// `org_sensing_truncated_total` / `org_sensing_fallback_total`). They are
+/// monotonic and diagnostic only, and nothing reads them to make a decision.
+/// Read through [`MeshNode::org_sensing_routing_counters`].
+///
+/// A fallback is a sensed call that **wanted** sensing but went out in the
+/// deterministic unsensed order. Three cases are deliberately not fallbacks:
+/// - a node with sensing off (inert: it never wanted sensing);
+/// - a capability with nothing to sense;
+/// - a projection that simply has no evidence (sensing ran and had nothing to
+///   say).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OrgSensingRoutingCounters {
+    /// Authorized populations truncated at the sensing cap
+    /// (`MAX_SENSED_POPULATION`, 32): the excess providers stay unsensed and
+    /// advisory `Unknown`, never dropped from the call.
+    pub truncated_total: u64,
+    /// Every sensed call that fell back to the unsensed order: the sum of the
+    /// three reasons below.
+    pub fallback_total: u64,
+    /// Fallbacks because another caller held the capability's reconciliation.
+    pub fallback_contended: u64,
+    /// Fallbacks because this call's convergence was refused.
+    pub fallback_refused: u64,
+    /// Fallbacks because no demand was installed (an earlier refusal pacing).
+    pub fallback_unretained: u64,
+}
+
+/// The granted sensing credentials one node may author under (OLB-6, D6.5):
+/// granted audience → (dispatcher grant, SENSE grant, holder count).
+type GrantedSensingRegistry = Arc<
+    parking_lot::Mutex<
+        HashMap<
+            sensing::AudienceScopeCommitment,
+            (
+                super::behavior::org_grant::OrgDispatcherGrant,
+                super::behavior::org_grant::OrgCapabilityGrant,
+                usize,
+            ),
+        >,
+    >,
+>;
+
+/// Why [`MeshNode::register_granted_sensing`] refused a credential pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantedSensingUnavailable {
+    /// This node has no installed organization authority.
+    NoAuthority,
+    /// The grant does not carry SENSE.
+    LacksSense,
+    /// The grant was not issued TO this node's owner organization, or was
+    /// issued BY it (same-org sensing needs no grant).
+    NotGrantedToThisOrg,
+    /// The dispatcher grant is not this node's own, for its owner
+    /// organization, over the grant's capability.
+    DispatcherMismatch,
+    /// Credentials are already registered under this grant's audience for a
+    /// DIFFERENT grant (same id, issuer, grantee and capability, other
+    /// bytes). Refused rather than mixed: discovery and egress must always
+    /// use one grant.
+    GrantConflict,
+    /// The grant's audience equals this node's configured legacy sensing
+    /// fleet root, so granted and legacy leases would share keys.
+    FleetRootCollision,
+}
+
+/// One holder of a node's granted sensing credentials (OLB-6, D6.5). While any
+/// holder lives, the node can author granted registrations under
+/// [`Self::audience`]; the last drop removes the credentials.
+#[must_use = "the credentials are registered only while the guard lives"]
+pub struct GrantedSensingRegistration {
+    registry: GrantedSensingRegistry,
+    audience: sensing::AudienceScopeCommitment,
+    grant: super::behavior::org_grant::OrgCapabilityGrant,
+}
+
+impl GrantedSensingRegistration {
+    /// The granted audience these credentials author under.
+    pub fn audience(&self) -> sensing::AudienceScopeCommitment {
+        self.audience
+    }
+
+    /// The SENSE grant.
+    pub fn grant(&self) -> &super::behavior::org_grant::OrgCapabilityGrant {
+        &self.grant
+    }
+}
+
+impl Drop for GrantedSensingRegistration {
+    fn drop(&mut self) {
+        let mut map = self.registry.lock();
+        if let Some(entry) = map.get_mut(&self.audience) {
+            entry.2 = entry.2.saturating_sub(1);
+            if entry.2 == 0 {
+                map.remove(&self.audience);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for GrantedSensingRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrantedSensingRegistration")
+            .field("audience", &self.audience)
+            .finish()
+    }
+}
+
+/// One outstanding protected org call, counted in
+/// [`MeshNode::org_call_in_flight`] until this guard drops. Obtained from
+/// [`MeshNode::begin_org_call`].
+#[must_use = "the call is counted only while the guard lives"]
+pub struct OrgCallInFlight {
+    map: Arc<DashMap<u64, u32>>,
+    provider: u64,
+}
+
+impl Drop for OrgCallInFlight {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self.map.entry(self.provider) {
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for OrgCallInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrgCallInFlight")
+            .field("provider", &format!("{:#x}", self.provider))
+            .finish()
+    }
+}
+
+impl OrgSensingRoutingCounters {
+    /// Render as Prometheus text exposition, in the hand-rolled convention of
+    /// `mesh_rpc_metrics::prometheus_text`. It emits the two OLB §14 names:
+    ///
+    /// ```text
+    /// org_sensing_truncated_total N
+    /// org_sensing_fallback_total{reason="contended|refused|unretained"} N
+    /// ```
+    ///
+    /// The unlabelled fallback sum is deliberately not emitted: it is
+    /// `sum(org_sensing_fallback_total)` at query time, and a second series
+    /// for the same events would double-count under a naive aggregation.
+    pub fn prometheus_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(512);
+        out.push_str(
+            "# HELP org_sensing_truncated_total Sensed authorized populations truncated at the sensing cap.\n",
+        );
+        out.push_str("# TYPE org_sensing_truncated_total counter\n");
+        let _ = writeln!(out, "org_sensing_truncated_total {}", self.truncated_total);
+        out.push_str(
+            "# HELP org_sensing_fallback_total Sensed org calls that took the deterministic unsensed order, by reason.\n",
+        );
+        out.push_str("# TYPE org_sensing_fallback_total counter\n");
+        for (reason, value) in [
+            ("contended", self.fallback_contended),
+            ("refused", self.fallback_refused),
+            ("unretained", self.fallback_unretained),
+        ] {
+            let _ = writeln!(
+                out,
+                "org_sensing_fallback_total{{reason=\"{reason}\"}} {value}"
+            );
+        }
+        out
     }
 }
 
@@ -13061,6 +13263,15 @@ pub struct MeshNode {
     sensing_refresh_wake: Arc<tokio::sync::Notify>,
     /// Organization exact-provider demand and refresh counters.
     org_sensing_demand_counters: Arc<OrgSensingDemandCounters>,
+    /// This node's outstanding protected org calls, per provider node id: the
+    /// cost signal for unsensed `org.call` load spreading (completion plan
+    /// Phase 4). Entries exist only while a call is outstanding.
+    org_call_in_flight: Arc<DashMap<u64, u32>>,
+    /// The GRANTED sensing credentials this node may author registrations
+    /// under (OLB-6, completion plan D6.5), keyed by granted audience. Held
+    /// by [`GrantedSensingRegistration`] guards; an entry leaves with its
+    /// last guard.
+    granted_sensing: GrantedSensingRegistry,
     /// The live bound on the refused-release retention set. Initialized to
     /// [`MAX_SENSING_REFUSED_RELEASES`] and only ever narrowed by a witness
     /// (see [`MeshNode::set_refused_release_cap_for_test`]).
@@ -15425,6 +15636,8 @@ impl MeshNode {
             }),
             sensing_refresh_wake: Arc::new(tokio::sync::Notify::new()),
             org_sensing_demand_counters: Arc::new(OrgSensingDemandCounters::default()),
+            org_call_in_flight: Arc::new(DashMap::new()),
+            granted_sensing: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             refused_release_cap: std::sync::atomic::AtomicUsize::new(MAX_SENSING_REFUSED_RELEASES),
             sensing_refresh_armed_cap: std::sync::atomic::AtomicUsize::new(
                 MAX_SENSING_REFRESH_ARMED,
@@ -17291,13 +17504,20 @@ impl MeshNode {
         let Some(authority) = self.node_authority.load_full() else {
             return Ok(None);
         };
-        if *audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
-            // Not our organization's commitment. A FOREIGN organization's
-            // commitment is undetectable from the sending side (a commitment is
-            // a one-way derivation), so it takes the legacy path exactly as
-            // before — fail-closed there, and a recorded residual.
-            return Ok(None);
-        }
+        // Not our organization's commitment: a GRANTED audience this node holds
+        // credentials for (OLB-6, D6.5) authors a granted egress below.
+        // Anything else is undetectable from the sending side (a commitment is
+        // a one-way derivation), so it takes the legacy path exactly as before
+        // — fail-closed there, and a recorded residual.
+        let granted =
+            if *audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+                match self.granted_sensing_credentials(audience) {
+                    Some(credentials) => Some(credentials),
+                    None => return Ok(None),
+                }
+            } else {
+                None
+            };
         // (1) Exactness before ANY mutation, for every provider branch.
         if !sensing::selector_names_target(spec, provider) {
             return Err(SensingRegistrationError::OrgAudienceUnsupported);
@@ -17316,10 +17536,16 @@ impl MeshNode {
             crate::adapter::net::behavior::org::current_timestamp(),
         )
         .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
-        Ok(Some((
-            sensing::LocalOrgEgress::from_live_membership(&membership),
-            snapshot,
-        )))
+        let egress = match granted {
+            Some((dispatcher, grant)) => sensing::LocalOrgEgress::from_live_membership_granted(
+                &membership,
+                dispatcher,
+                grant,
+            )
+            .ok_or(SensingRegistrationError::OrgAudienceUnsupported)?,
+            None => sensing::LocalOrgEgress::from_live_membership(&membership),
+        };
+        Ok(Some((egress, snapshot)))
     }
 
     /// Release a sensing-interest lease, PRESERVING the pre-existing
@@ -18706,6 +18932,122 @@ impl MeshNode {
         population
     }
 
+    /// Register GRANTED sensing credentials (OLB-6, completion plan D6.5): the
+    /// acting organization's dispatcher grant for THIS node and a SENSE grant
+    /// issued by another organization to this node's owner organization.
+    ///
+    /// While the returned guard lives, this node's lease leg can author
+    /// granted registrations under the grant's audience (variant 5). The
+    /// pair is checked here so a mismatched pair is refused before anything
+    /// is emitted; the provider re-checks all of it at acceptance.
+    pub fn register_granted_sensing(
+        &self,
+        dispatcher: super::behavior::org_grant::OrgDispatcherGrant,
+        grant: super::behavior::org_grant::OrgCapabilityGrant,
+    ) -> Result<GrantedSensingRegistration, GrantedSensingUnavailable> {
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(GrantedSensingUnavailable::NoAuthority)?;
+        let owner = authority.owner_org();
+        if !grant.permits_sense() {
+            return Err(GrantedSensingUnavailable::LacksSense);
+        }
+        if grant.grantee_org != owner || grant.issuer_org == owner {
+            return Err(GrantedSensingUnavailable::NotGrantedToThisOrg);
+        }
+        if dispatcher.org_id != owner
+            || dispatcher.dispatcher != *self.entity_id()
+            || !dispatcher.covers_capability(&grant.capability)
+        {
+            return Err(GrantedSensingUnavailable::DispatcherMismatch);
+        }
+        let audience = sensing::canonical_granted_sensing_commitment(&grant);
+        // The consumer-side twin of the provider's fleet-root refusal: a granted
+        // lease keyed under this node's legacy fleet root would share keys with
+        // legacy leases.
+        if self.config.sensing_owner_root.is_some() && audience == self.sensing_local_root {
+            return Err(GrantedSensingUnavailable::FleetRootCollision);
+        }
+        {
+            let mut map = self.granted_sensing.lock();
+            if let Some(existing) = map.get(&audience) {
+                if existing.1 != grant {
+                    return Err(GrantedSensingUnavailable::GrantConflict);
+                }
+            }
+            let entry = map
+                .entry(audience)
+                .or_insert_with(|| (dispatcher.clone(), grant.clone(), 0));
+            // A re-registration of the SAME grant replaces the dispatcher grant
+            // (a renewal) and keeps the holder count.
+            entry.0 = dispatcher;
+            entry.2 += 1;
+        }
+        Ok(GrantedSensingRegistration {
+            registry: Arc::clone(&self.granted_sensing),
+            audience,
+            grant,
+        })
+    }
+
+    /// The granted credentials registered under `audience`, if any.
+    fn granted_sensing_credentials(
+        &self,
+        audience: &sensing::AudienceScopeCommitment,
+    ) -> Option<(
+        super::behavior::org_grant::OrgDispatcherGrant,
+        super::behavior::org_grant::OrgCapabilityGrant,
+    )> {
+        self.granted_sensing
+            .lock()
+            .get(audience)
+            .map(|(dispatcher, grant, _)| (dispatcher.clone(), grant.clone()))
+    }
+
+    /// The GRANTED sensed population for `grant` (OLB-6, D6.6): providers on
+    /// the grant's own discovery plane, owned by its issuer and covered by its
+    /// target scope, that this node holds a pinned direct session to. Capped
+    /// and truncation-counted exactly like the owner population.
+    pub(crate) fn org_sensing_granted_population(
+        &self,
+        grant: &super::behavior::org_grant::OrgCapabilityGrant,
+    ) -> Vec<u64> {
+        let authorized: std::collections::BTreeSet<EntityId> = self
+            .granted_capability_providers(&grant.grant_id)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.owner_org == grant.issuer_org
+                    && grant
+                        .target_scope
+                        .covers(&candidate.provider, Some(&candidate.owner_org))
+            })
+            .map(|candidate| candidate.provider)
+            .collect();
+        if authorized.is_empty() {
+            return Vec::new();
+        }
+        let pinned: Vec<(u64, EntityId)> = self
+            .peer_entity_ids
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        let mut population: Vec<u64> = pinned
+            .into_iter()
+            .filter(|(_, entity)| authorized.contains(entity))
+            .map(|(node, _)| node)
+            .collect();
+        population.sort_unstable();
+        population.dedup();
+        if population.len() > MAX_ORG_SENSING_POPULATION {
+            population.truncate(MAX_ORG_SENSING_POPULATION);
+            self.org_sensing_demand_counters
+                .truncated
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        population
+    }
+
     /// The INSTALLATION `ticket` is a live holder of, or `None` when it holds
     /// nothing — ONE registry observation of both facts.
     ///
@@ -18859,6 +19201,47 @@ impl MeshNode {
         &self.org_sensing_demand_counters
     }
 
+    /// How many protected org calls from THIS node to `provider` are
+    /// outstanding right now. Node-local, one map read, no network and no
+    /// sensing: the cost signal unsensed `org.call` load spreading compares
+    /// (completion plan Phase 4). It counts only this node's own calls, not
+    /// other callers' load on the provider.
+    pub fn org_call_in_flight(&self, provider: u64) -> u32 {
+        self.org_call_in_flight
+            .get(&provider)
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
+
+    /// Count one outstanding protected org call to `provider` until the
+    /// returned guard drops. The org facade holds it across the single exact
+    /// invocation, so an early return, an error or a cancelled future all
+    /// release the count.
+    pub fn begin_org_call(&self, provider: u64) -> OrgCallInFlight {
+        *self.org_call_in_flight.entry(provider).or_insert(0) += 1;
+        OrgCallInFlight {
+            map: Arc::clone(&self.org_call_in_flight),
+            provider,
+        }
+    }
+
+    /// The operator-readable sensed-routing counters (truncation and order
+    /// fallback). Production API: unlike the demand/refresh state witnesses
+    /// read, this is not gated to `fixtures`. See [`OrgSensingRoutingCounters`].
+    pub fn org_sensing_routing_counters(&self) -> OrgSensingRoutingCounters {
+        let counters = &self.org_sensing_demand_counters;
+        let contended = counters.order_fallback_contended.load(Ordering::Relaxed);
+        let refused = counters.order_fallback_refused.load(Ordering::Relaxed);
+        let unretained = counters.order_fallback_unretained.load(Ordering::Relaxed);
+        OrgSensingRoutingCounters {
+            truncated_total: counters.truncated.load(Ordering::Relaxed),
+            fallback_total: contended.saturating_add(refused).saturating_add(unretained),
+            fallback_contended: contended,
+            fallback_refused: refused,
+            fallback_unretained: unretained,
+        }
+    }
+
     /// The organization sensing demand/refresh counters and schedule state, for
     /// witnesses and diagnostics. Read-only.
     #[cfg(any(test, feature = "fixtures"))]
@@ -18969,9 +19352,16 @@ impl MeshNode {
         let Some(authority) = self.node_authority.load_full() else {
             return Ok(None);
         };
-        if *audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
-            return Ok(None);
-        }
+        // The same granted branch as `prepare_org_egress` (OLB-6, D6.5).
+        let granted =
+            if *audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+                match self.granted_sensing_credentials(audience) {
+                    Some(credentials) => Some(credentials),
+                    None => return Ok(None),
+                }
+            } else {
+                None
+            };
         let snapshot = self
             .capture_sensing_authority_snapshot()
             .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
@@ -18985,10 +19375,16 @@ impl MeshNode {
             crate::adapter::net::behavior::org::current_timestamp(),
         )
         .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
-        Ok(Some((
-            sensing::LocalOrgEgress::from_live_membership(&membership),
-            snapshot,
-        )))
+        let egress = match granted {
+            Some((dispatcher, grant)) => sensing::LocalOrgEgress::from_live_membership_granted(
+                &membership,
+                dispatcher,
+                grant,
+            )
+            .ok_or(SensingRegistrationError::OrgAudienceUnsupported)?,
+            None => sensing::LocalOrgEgress::from_live_membership(&membership),
+        };
+        Ok(Some((egress, snapshot)))
     }
 
     /// Execute the wire transition a lease mutation calls for. Called only
@@ -38754,7 +39150,8 @@ impl MeshNode {
             // here. The main match routes `OrgProviderRegistration` to the live org
             // gate and `OrgCapabilityRegistration` to the dark drop.
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
-            | sensing::SensingInterestFrame::OrgProviderRegistration { .. } => None,
+            | sensing::SensingInterestFrame::OrgProviderRegistration { .. }
+            | sensing::SensingInterestFrame::GrantedProviderRegistration { .. } => None,
         };
         let session_root =
             if ctx.sensing_fleet_scope && claimed_scope == Some(ctx.sensing_local_root) {
@@ -39203,7 +39600,11 @@ impl MeshNode {
             // re-authoring path. The frame's membership certificate is verified at
             // this hop by the authority gate before it can reach the interest
             // table; the CAPABILITY (leader) variant below stays dark.
-            sensing::SensingInterestFrame::OrgProviderRegistration { .. } => {
+            // A GRANTED registration (OLB-6) rides the same admission and the
+            // same fenced register; its gate admits it only at its own target,
+            // so it never reaches the continuation path.
+            sensing::SensingInterestFrame::OrgProviderRegistration { .. }
+            | sensing::SensingInterestFrame::GrantedProviderRegistration { .. } => {
                 // Piece-4 exact-provider go-live (provider leg): the org authority
                 // gate admits the frame to a narrow validated wrapper + a pinned
                 // snapshot, then the SAME provider semantic operation the legacy
@@ -39280,6 +39681,11 @@ impl MeshNode {
         // `apply_provider_registration` (under the held table guard).
         let (interval, ttl) = match frame {
             sensing::SensingInterestFrame::OrgProviderRegistration {
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            }
+            | sensing::SensingInterestFrame::GrantedProviderRegistration {
                 requested_sample_interval,
                 soft_state_ttl,
                 ..
@@ -39372,10 +39778,15 @@ impl MeshNode {
         // AUTHORITY PHASE (steps 3-8), against the pinned snapshot. Consumes the
         // shape validated above, so nothing is reconstructed twice and the two
         // phases cannot drift.
+        let local_entity = ctx.signing_identity.entity_id().clone();
         let validated = match sensing::verify_org_admission(
             &shape,
             from_node,
             sender_entity,
+            sensing::LocalSensingIdentity {
+                node_id: ctx.local_node_id,
+                entity: &local_entity,
+            },
             Some(snapshot.authority_view()),
             snapshot.floors(),
             now_secs,
@@ -39402,11 +39813,24 @@ impl MeshNode {
         // An admitted registration clears the window, so an honest peer that
         // occasionally fails (a cert renewal race, a floor moving mid-flight) does
         // not accumulate toward the throttle.
+        let admitted = sensing::AdmittedSensingRegistration::from_validated_org(validated);
+        // A GRANTED root equal to this node's configured sensing FLEET root
+        // would share a `ProviderInterestKey` with legacy rows proven under that
+        // root (the closure-2 class, from the granted side). Refused and
+        // counted; unreachable without already holding the grant.
+        if matches!(
+            admitted.authority(),
+            sensing::RegistrationAuthority::Granted { .. }
+        ) && ctx.sensing_fleet_scope
+            && admitted.proven_root() == ctx.sensing_local_root
+        {
+            ctx.sensing_counters
+                .org_granted_refused
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         Self::clear_auth_failures(from_node, ctx);
-        Some((
-            sensing::AdmittedSensingRegistration::from_validated_org(validated),
-            snapshot,
-        ))
+        Some((admitted, snapshot))
     }
 
     /// OLB org-auth (piece 4, exact-provider): the shared PROVIDER re-authoring
@@ -39507,7 +39931,14 @@ impl MeshNode {
             };
             match (admitted.authority(), org_authority) {
                 (sensing::RegistrationAuthority::Legacy { .. }, None) => register(&mut table),
-                (sensing::RegistrationAuthority::Org { .. }, Some(snapshot)) => {
+                // A GRANTED row is fenced exactly like an org row (OLB-6, D6.4):
+                // grant revocations publish through the same revocation store,
+                // so the stamp covers a grant revoked between gate and row.
+                (
+                    sensing::RegistrationAuthority::Org { .. }
+                    | sensing::RegistrationAuthority::Granted { .. },
+                    Some(snapshot),
+                ) => {
                     // The seam Arc is bound to a local so it outlives the call.
                     let seam = ctx.sensing_fence_seam_hook();
                     let fenced = sensing::with_fenced_current_authority(
@@ -39536,6 +39967,7 @@ impl MeshNode {
                 }
                 // Incoherent authority/evidence pairing — a caller bug; never mutate.
                 (sensing::RegistrationAuthority::Org { .. }, None)
+                | (sensing::RegistrationAuthority::Granted { .. }, None)
                 | (sensing::RegistrationAuthority::Legacy { .. }, Some(_)) => {
                     tracing::error!(
                         from_node = format!("{:#x}", from_node),
@@ -50323,6 +50755,32 @@ impl MeshNode {
             &down,
             &non_viable,
             &sensed.viable,
+        )
+    }
+
+    /// The organization exact-provider lane's gang match: [`Self::match_islands`]
+    /// (liveness gate included), reordered by one exact-provider readiness
+    /// capture. Islands of `viable_order` hosts lead in that order, islands of
+    /// `not_ready` hosts come last, and none are removed. See
+    /// [`super::behavior::gang::match_islands_exact_sensed`] for why this lane
+    /// demotes where SI-6's [`Self::match_islands_sensed`] prunes.
+    ///
+    /// The capture is the caller's: this takes plain node ids, not an
+    /// interest. It derives no interest from `criteria` and acquires no lease.
+    pub fn match_islands_exact_sensed(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+        viable_order: &[super::behavior::fold::NodeId],
+        not_ready: &std::collections::HashSet<super::behavior::fold::NodeId>,
+    ) -> Vec<super::behavior::fold::IslandId> {
+        let down = self.liveness_down.load();
+        super::behavior::gang::match_islands_exact_sensed(
+            &self.capability_fold,
+            &self.island_fold,
+            criteria,
+            &down,
+            viable_order,
+            not_ready,
         )
     }
 
@@ -61493,6 +61951,456 @@ mod sensing_authority_witness_tests {
             row.owner_root,
             org_commitment(),
             "the org row carries the canonical org commitment, not a legacy root"
+        );
+    }
+
+    // ---- OLB-6: granted (cross-organization) registrations at dispatch ----
+
+    /// The acting (grantee) organization of the granted witnesses. The node's
+    /// owner, and so the grant's issuer, is `org()`.
+    fn grantee_org() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x52u8; 32])
+    }
+
+    /// One granted registration's credentials and the instant to admit it at:
+    /// the LATEST of the three windows' openings, because these fixtures run
+    /// at zero verification skew (see `admission_sample`).
+    struct GrantedFixture {
+        cert: OrgMembershipCert,
+        dispatcher: crate::adapter::net::behavior::org_grant::OrgDispatcherGrant,
+        grant: crate::adapter::net::behavior::org_grant::OrgCapabilityGrant,
+        at: u64,
+    }
+
+    fn granted_fixture(sender: &EntityId) -> GrantedFixture {
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope,
+            OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+        let capability = CapabilityAuthorityId::for_tag("gpu.infer");
+        let cert = OrgMembershipCert::try_issue(
+            &grantee_org(),
+            sender.clone(),
+            1,
+            ORG_CERT_TTL_SECS_RECOMMENDED,
+        )
+        .expect("grantee membership");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &grantee_org(),
+            sender.clone(),
+            DispatcherScope::Exact(capability),
+            3600,
+        )
+        .expect("dispatcher");
+        let (grant, _) = OrgCapabilityGrant::try_issue(
+            &org(),
+            grantee_org().org_id(),
+            capability,
+            GrantRights::DISCOVER
+                .union(GrantRights::INVOKE)
+                .union(GrantRights::SENSE),
+            GrantTargetScope::AnyNodeOwnedBy(org().org_id()),
+            3600,
+        )
+        .expect("SENSE grant");
+        let at = cert
+            .not_before
+            .max(dispatcher.not_before)
+            .max(grant.not_before);
+        GrantedFixture {
+            cert,
+            dispatcher,
+            grant,
+            at,
+        }
+    }
+
+    fn granted_frame(target: u64, fixture: &GrantedFixture) -> sensing::SensingInterestFrame {
+        sensing::SensingInterestFrame::granted_provider_registration(
+            &org_spec(
+                target,
+                sensing::canonical_granted_sensing_commitment(&fixture.grant),
+            ),
+            target,
+            D,
+            ORG_TTL,
+            fixture.cert.clone(),
+            fixture.dispatcher.clone(),
+            fixture.grant.clone(),
+        )
+    }
+
+    // G1 — a granted registration addressed to THIS node lands a row under the
+    // GRANTED audience: not the provider org's same-org commitment and not a
+    // legacy entity root.
+    #[tokio::test]
+    async fn a_granted_registration_lands_a_row_under_the_granted_audience() {
+        let node = org_node("g1").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id();
+        let fixture = granted_fixture(&sender);
+        let granted_root = sensing::canonical_granted_sensing_commitment(&fixture.grant);
+        let key = sensing::ProviderInterestKey::new(org_spec(target, granted_root).key(), target);
+        let ctx = node.dispatch_ctx();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(target, &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .expect("a valid granted registration is admitted at its target");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            Instant::now(),
+            fixture.at,
+        );
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("the granted row is present");
+        assert_eq!(row.owner_root, granted_root);
+        assert_ne!(row.owner_root, org_commitment());
+    }
+
+    // G2 — a granted registration that reaches a node OTHER than its target is
+    // refused, counted, and records nothing: granted interest is never relayed.
+    #[tokio::test]
+    async fn a_granted_registration_for_another_target_creates_no_row() {
+        let node = org_node("g2").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let fixture = granted_fixture(&sender);
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(node.node_id().wrapping_add(1), &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .is_none());
+        assert!(
+            node.sensing_table_is_empty(),
+            "a relayed granted frame records nothing"
+        );
+        assert_eq!(
+            ctx.sensing_counters
+                .org_granted_refused
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+    }
+
+    // G4 — a granted root equal to this node's configured legacy FLEET root is
+    // refused and counted: granted and legacy rows must never share a key. The
+    // same pair is admitted on an ordinary node.
+    #[tokio::test]
+    async fn a_granted_root_equal_to_the_fleet_root_is_refused() {
+        let sender = EntityKeypair::generate().entity_id().clone();
+        let fixture = granted_fixture(&sender);
+        let granted_root = sensing::canonical_granted_sensing_commitment(&fixture.grant);
+        let node = fleet_node(granted_root).await;
+        node.install_node_authority(adopt(&node, &org(), "g4"))
+            .expect("the fleet root is not the org commitment, so install succeeds");
+        pin_sender(&node, &sender);
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(node.node_id(), &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .is_none());
+        assert_eq!(
+            ctx.sensing_counters
+                .org_granted_refused
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+
+        let ordinary = org_node("g4-control").await;
+        pin_sender(&ordinary, &sender);
+        assert!(
+            MeshNode::admit_org_registration(
+                &ordinary.dispatch_ctx(),
+                &granted_frame(ordinary.node_id(), &fixture),
+                FROM_NODE,
+                &sender,
+                fixture.at,
+            )
+            .is_some(),
+            "control: the same registration is admitted without the collision"
+        );
+    }
+
+    // G3 — the grant is revoked by its issuer AFTER the gate admitted the frame
+    // and BEFORE the row: the revocation publish moves the authority stamp, so
+    // the fenced register refuses and no row exists. A grant revocation is
+    // therefore covered by the same currentness fence as a floor raise.
+    #[tokio::test]
+    async fn a_grant_revoked_between_gate_and_row_creates_no_row() {
+        use crate::adapter::net::behavior::org_grant_revocation::{
+            OrgGrantRevocationBundle, RevokedGrant,
+        };
+        let node = org_node("g3").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id();
+        let fixture = granted_fixture(&sender);
+        let ctx = node.dispatch_ctx();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(target, &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .expect("admitted before the revocation");
+        let bundle =
+            OrgGrantRevocationBundle::try_issue(&org(), [RevokedGrant::capability(&fixture.grant)])
+                .expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_grant_revocations(&bundle)
+            .expect("apply the revocation");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            Instant::now(),
+            fixture.at,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a grant revoked mid-admission creates no row"
+        );
+        assert_eq!(
+            ctx.sensing_counters
+                .org_stale_stamp
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        // And a fresh registration is now refused at the gate itself.
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(target, &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .is_none());
+    }
+
+    // ---- OLB-6: the consumer's granted egress (completion plan D6.5) ------
+
+    /// The organization that ISSUES the SENSE grant to this node's owner
+    /// `org()` in the egress witnesses.
+    fn issuing_org() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x53u8; 32])
+    }
+
+    fn sense_grant_from(
+        issuer: &OrgKeypair,
+        grantee: crate::adapter::net::behavior::org::OrgId,
+        rights: crate::adapter::net::behavior::org_grant::GrantRights,
+    ) -> crate::adapter::net::behavior::org_grant::OrgCapabilityGrant {
+        use crate::adapter::net::behavior::org_grant::{
+            CapabilityAuthorityId, GrantTargetScope, OrgCapabilityGrant,
+        };
+        OrgCapabilityGrant::try_issue(
+            issuer,
+            grantee,
+            CapabilityAuthorityId::for_tag("gpu.infer"),
+            rights,
+            GrantTargetScope::AnyNodeOwnedBy(issuer.org_id()),
+            3600,
+        )
+        .expect("grant")
+        .0
+    }
+
+    fn full_sense() -> crate::adapter::net::behavior::org_grant::GrantRights {
+        use crate::adapter::net::behavior::org_grant::GrantRights;
+        GrantRights::DISCOVER
+            .union(GrantRights::INVOKE)
+            .union(GrantRights::SENSE)
+    }
+
+    fn own_dispatcher(
+        node: &MeshNode,
+    ) -> crate::adapter::net::behavior::org_grant::OrgDispatcherGrant {
+        use crate::adapter::net::behavior::org_grant::{DispatcherScope, OrgDispatcherGrant};
+        OrgDispatcherGrant::try_issue(&org(), node.entity_id().clone(), DispatcherScope::Any, 3600)
+            .expect("dispatcher")
+    }
+
+    // E1 — the node refuses a credential pair it could never author under, each
+    // for its own reason, and an accepted pair lives exactly as long as its
+    // last holder.
+    #[tokio::test]
+    async fn granted_sensing_registration_checks_the_pair_and_lives_with_its_holders() {
+        use crate::adapter::net::behavior::org_grant::{
+            DispatcherScope, GrantRights, OrgDispatcherGrant,
+        };
+        let node = sensing_org_node("e1").await;
+        let good = sense_grant_from(&issuing_org(), org().org_id(), full_sense());
+        let refused = |dispatcher, grant| node.register_granted_sensing(dispatcher, grant).err();
+        assert_eq!(
+            refused(
+                own_dispatcher(&node),
+                sense_grant_from(
+                    &issuing_org(),
+                    org().org_id(),
+                    GrantRights::DISCOVER.union(GrantRights::INVOKE)
+                ),
+            ),
+            Some(GrantedSensingUnavailable::LacksSense)
+        );
+        assert_eq!(
+            refused(
+                own_dispatcher(&node),
+                sense_grant_from(&issuing_org(), issuing_org().org_id(), full_sense()),
+            ),
+            Some(GrantedSensingUnavailable::NotGrantedToThisOrg),
+            "a grant to another organization"
+        );
+        assert_eq!(
+            refused(
+                own_dispatcher(&node),
+                sense_grant_from(&org(), org().org_id(), full_sense()),
+            ),
+            Some(GrantedSensingUnavailable::NotGrantedToThisOrg),
+            "a same-org grant needs no granted sensing"
+        );
+        let someone_else = OrgDispatcherGrant::try_issue(
+            &org(),
+            EntityKeypair::generate().entity_id().clone(),
+            DispatcherScope::Any,
+            3600,
+        )
+        .expect("dispatcher");
+        assert_eq!(
+            refused(someone_else, good.clone()),
+            Some(GrantedSensingUnavailable::DispatcherMismatch)
+        );
+
+        let audience = sensing::canonical_granted_sensing_commitment(&good);
+        let first = node
+            .register_granted_sensing(own_dispatcher(&node), good.clone())
+            .expect("accepted");
+        let second = node
+            .register_granted_sensing(own_dispatcher(&node), good.clone())
+            .expect("accepted again");
+        assert_eq!(first.audience(), audience);
+        // The SAME audience under DIFFERENT grant bytes (same id, issuer,
+        // grantee and capability; another nonce and window) is refused, never
+        // mixed with the registered grant.
+        let (_, binding) =
+            crate::adapter::net::behavior::org_grant::OrgAudienceSecret::mint(good.grant_id);
+        let now = current_timestamp();
+        let twin = crate::adapter::net::behavior::org_grant::OrgCapabilityGrant::issue_at(
+            &issuing_org(),
+            good.grant_id,
+            org().org_id(),
+            good.capability,
+            full_sense(),
+            good.target_scope.clone(),
+            Some(binding),
+            now,
+            now + 600,
+            good.nonce.wrapping_add(1),
+        );
+        assert_eq!(
+            sensing::canonical_granted_sensing_commitment(&twin),
+            audience
+        );
+        assert_eq!(
+            refused(own_dispatcher(&node), twin),
+            Some(GrantedSensingUnavailable::GrantConflict)
+        );
+        drop(first);
+        assert!(
+            node.granted_sensing_credentials(&audience).is_some(),
+            "a surviving holder keeps the credentials"
+        );
+        drop(second);
+        assert!(
+            node.granted_sensing_credentials(&audience).is_none(),
+            "the last holder's drop removes them"
+        );
+    }
+
+    // E2 — with credentials registered, the lease leg plans a GRANTED frame for
+    // the granted audience, and that exact frame passes the PROVIDER's real
+    // granted gate. Without them, the same audience plans nothing.
+    #[tokio::test]
+    async fn a_granted_egress_frame_passes_the_providers_real_gate() {
+        let node = sensing_org_node("e2").await;
+        let grant = sense_grant_from(&issuing_org(), org().org_id(), full_sense());
+        let audience = sensing::canonical_granted_sensing_commitment(&grant);
+        let provider_entity = EntityKeypair::generate().entity_id().clone();
+        let provider = provider_entity.node_id();
+        let spec = org_spec(provider, audience);
+
+        assert!(
+            node.prepare_org_egress(&audience, &spec, provider)
+                .expect("no refusal")
+                .is_none(),
+            "an unregistered granted audience plans no organization egress"
+        );
+
+        let _registration = node
+            .register_granted_sensing(own_dispatcher(&node), grant.clone())
+            .expect("accepted");
+        let (egress, _snapshot) = node
+            .prepare_org_egress(&audience, &spec, provider)
+            .expect("no refusal")
+            .expect("a registered granted audience plans an egress");
+        assert_eq!(egress.proven_root(), audience);
+        let frame =
+            sensing::plan_local_org_provider_registration(&egress, &spec, provider, D, ORG_TTL)
+                .expect("planned");
+        assert!(
+            matches!(
+                frame,
+                sensing::SensingInterestFrame::GrantedProviderRegistration { .. }
+            ),
+            "the granted egress emits variant 5"
+        );
+
+        // The provider is owned by the ISSUING org; its gate admits this frame.
+        let cert_window = match &frame {
+            sensing::SensingInterestFrame::GrantedProviderRegistration {
+                subscriber_membership,
+                ..
+            } => subscriber_membership.not_before,
+            _ => unreachable!(),
+        };
+        let admitted = sensing::verify_org_sensing_registration(
+            &frame,
+            node.node_id(),
+            node.entity_id(),
+            sensing::LocalSensingIdentity {
+                node_id: provider,
+                entity: &provider_entity,
+            },
+            Some(sensing::OrgAuthorityView {
+                owner_org: issuing_org().org_id(),
+                verification_skew_secs: 60,
+            }),
+            &crate::adapter::net::behavior::org_revocation::OrgRevocationState::empty(),
+            cert_window.max(grant.not_before) + 1,
+            &sensing::SensingCounters::default(),
+        );
+        assert!(
+            admitted.is_ok(),
+            "the provider's real gate admits the consumer's granted frame: {admitted:?}"
         );
     }
 

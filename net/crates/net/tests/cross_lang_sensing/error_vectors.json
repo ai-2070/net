@@ -1,0 +1,85 @@
+{
+  "description": "The canonical `sensing:` error vocabulary. Rust owns the classification (net_sdk::sensing::SensingError::kind / is_terminal / to_wire); every language binding surfaces it verbatim and asserts against these vectors. A binding MUST recover `kind` from `wire` (prefix `sensing:`, the kind runs to the first `: `), MUST report `terminal` exactly as listed, and MUST NOT derive either from the message. GENERATED - do not hand-edit; regenerate with: NET_REGENERATE_SENSING_FIXTURE=1 cargo test -p net-mesh-sdk --features net --lib sensing::class::tests::the_checked_in_fixture_matches_the_classifier",
+  "prefix": "sensing:",
+  "vectors": [
+    {
+      "kind": "disabled",
+      "message": "capability sensing is disabled on this mesh — build it with MeshBuilder::enable_sensing()",
+      "terminal": true,
+      "wire": "sensing:disabled: capability sensing is disabled on this mesh — build it with MeshBuilder::enable_sensing()"
+    },
+    {
+      "kind": "incarnation_required",
+      "message": "provider readiness needs a persisted sensing incarnation — derive one with net_sdk::sensing::next_incarnation over durable storage and pass it to MeshBuilder::sensing_incarnation()",
+      "terminal": true,
+      "wire": "sensing:incarnation_required: provider readiness needs a persisted sensing incarnation — derive one with net_sdk::sensing::next_incarnation over durable storage and pass it to MeshBuilder::sensing_incarnation()"
+    },
+    {
+      "kind": "already_providing",
+      "message": "a readiness evaluator is already registered for capability `fixture.capability` — close that registration or call provide_replacing to supersede it",
+      "terminal": false,
+      "wire": "sensing:already_providing: a readiness evaluator is already registered for capability `fixture.capability` — close that registration or call provide_replacing to supersede it"
+    },
+    {
+      "kind": "durable_identity_required",
+      "message": "provider readiness needs a durable node identity — build the mesh with MeshBuilder::identity(..) instead of the generated ephemeral keypair",
+      "terminal": true,
+      "wire": "sensing:durable_identity_required: provider readiness needs a durable node identity — build the mesh with MeshBuilder::identity(..) instead of the generated ephemeral keypair"
+    },
+    {
+      "kind": "registration_identity_exhausted",
+      "message": "this node's readiness-registration identity space is exhausted — no further provider registration can be installed on it",
+      "terminal": true,
+      "wire": "sensing:registration_identity_exhausted: this node's readiness-registration identity space is exhausted — no further provider registration can be installed on it"
+    },
+    {
+      "kind": "empty_capability",
+      "message": "a sensing query needs a capability name — the same id the provider passes to SensingClient::provide",
+      "terminal": false,
+      "wire": "sensing:empty_capability: a sensing query needs a capability name — the same id the provider passes to SensingClient::provide"
+    },
+    {
+      "kind": "unsatisfiable_budget",
+      "message": "a zero end-to-end budget admits no provider — pass the request's real deadline to SensingQuery::within, or leave the budget unbounded",
+      "terminal": false,
+      "wire": "sensing:unsatisfiable_budget: a zero end-to-end budget admits no provider — pass the request's real deadline to SensingQuery::within, or leave the budget unbounded"
+    },
+    {
+      "kind": "no_organization_authority",
+      "message": "observing capability readiness needs a live installed organization authority on this node — adopt one (net_sdk::org::provision) and install it before watching, and retry if it is being rotated",
+      "terminal": false,
+      "wire": "sensing:no_organization_authority: observing capability readiness needs a live installed organization authority on this node — adopt one (net_sdk::org::provision) and install it before watching, and retry if it is being rotated"
+    },
+    {
+      "kind": "observer_not_qualified",
+      "message": "this node is not currently entitled to observe capability readiness — its own organization membership is absent, expired, revoked below the current floor, or its authority view is unreadable; snapshots resume once membership is valid again AND the authority view is readable and stable",
+      "terminal": false,
+      "wire": "sensing:observer_not_qualified: this node is not currently entitled to observe capability readiness — its own organization membership is absent, expired, revoked below the current floor, or its authority view is unreadable; snapshots resume once membership is valid again AND the authority view is readable and stable"
+    },
+    {
+      "kind": "unsatisfiable_start_bound",
+      "message": "a zero provider-start bound can never be satisfied — pass the real bound to SensingQuery::start_within",
+      "terminal": false,
+      "wire": "sensing:unsatisfiable_start_bound: a zero provider-start bound can never be satisfied — pass the real bound to SensingQuery::start_within"
+    },
+    {
+      "kind": "watches_at_capacity",
+      "message": "this observation root already retains the maximum number of capabilities — the node's observation state is exhausted",
+      "terminal": false,
+      "wire": "sensing:watches_at_capacity: this observation root already retains the maximum number of capabilities — the node's observation state is exhausted"
+    },
+    {
+      "kind": "observation_identity_unavailable",
+      "message": "this node can no longer mint an observation identity — no further capability watch can be established on it",
+      "terminal": true,
+      "wire": "sensing:observation_identity_unavailable: this node can no longer mint an observation identity — no further capability watch can be established on it"
+    },
+    {
+      "kind": "watch_closed",
+      "message": "this capability watch is closed — open a new one with SensingClient::watch",
+      "terminal": true,
+      "wire": "sensing:watch_closed: this capability watch is closed — open a new one with SensingClient::watch"
+    }
+  ],
+  "version": 1
+}

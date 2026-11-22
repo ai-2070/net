@@ -111,11 +111,28 @@
 //!
 //! What is genuinely absent, here and everywhere else in the SDK:
 //! provider-free / leader-backed sensing (no `AnyAuthorized`, tag or
-//! group selector), `Granted` and cross-organization sensing, a generic
-//! sensed CALL verb, compute/gang sensed adapters, warmed pools, and
-//! language bindings. [`SensingQuery`] can express none of them, and
-//! [`SensingClient::watch`] refuses what it cannot mean rather than
+//! group selector), `Granted` and cross-organization sensing,
+//! warmed pools,
+//! and language bindings. [`SensingQuery`] can express none of them,
+//! and [`SensingClient::watch`] refuses what it cannot mean rather than
 //! accepting an argument it would ignore.
+//!
+//! Outside `OrgClient`, a snapshot has three consumers, and all apply its
+//! classes as an ORDER (viable first, not-ready last, nothing removed):
+//!
+//! - the gang scheduler: `Mesh::match_islands_sensed` /
+//!   `Mesh::claim_island_sensed`;
+//! - service-name nRPC: `Mesh::call_service_sensed` (with typed and
+//!   streaming forms), which chooses one target among the already-authorized
+//!   candidates and invokes it exactly once;
+//! - compute placement: `DaemonRuntime::place_sensed` /
+//!   `place_migration_sensed`, over the scheduler's eligible nodes, with
+//!   placement vetoes still final.
+//!
+//! A wait parked in [`SensingWatch::changed`] can be ended from another task
+//! through a [`SensingWatchCloser`]. The wait is cancel-safe: dropping it
+//! consumes no edge. These are the two behaviours every language binding's
+//! wrapper inherits.
 //!
 //! The other consumer of the same substrate is
 //! [`crate::org::OrgClient`], which binds one acquisition family per
@@ -151,7 +168,20 @@ use net::adapter::net::MeshNode;
 
 use crate::mesh::Mesh;
 
+mod class;
 pub mod consumer;
+mod incarnation_file;
+mod value;
+
+/// The Rust-owned error classification every binding forwards (see [`SensingError::kind`]).
+pub use class::{classify_sensing_wire, parse_sensing_wire, SensingWireClass, ERR_SENSING_PREFIX};
+
+/// The value-backed provider: readiness as a stored value the evaluator only
+/// reads (see [`SensingClient::provide_value`]).
+pub use value::{ReadinessValue, ValueReadiness, START_BOUND_EXCEEDED};
+
+/// A crash-safe, file-backed boot counter for [`next_incarnation`].
+pub use incarnation_file::FileIncarnation;
 
 /// The own-organization exact-provider consumer observation: one bounded
 /// query, one request-relative snapshot, missed-wake-safe change
@@ -159,7 +189,8 @@ pub mod consumer;
 /// and reuse contract.
 pub use consumer::{
     ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
-    SensingWatch, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
+    SensingWatch, SensingWatchCloser, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION,
+    POPULATION_RECONCILE_FLOOR,
 };
 
 /// The provider-side evaluator contract. A capability integration
@@ -396,7 +427,23 @@ impl Mesh {
     pub fn sensing(&self) -> Result<SensingClient, SensingError> {
         SensingClient::bind_node(self.node().clone())
     }
+
+    /// Operator counters for sensed organization call routing: how often
+    /// a capability's authorized population was truncated at
+    /// [`MAX_SENSED_POPULATION`], and how often a sensed `org.call` fell
+    /// back to the deterministic unsensed order, by reason.
+    ///
+    /// Node-global and monotonic. These are diagnostics only: nothing in
+    /// the call path reads them. Always readable, including on a node with
+    /// sensing off, where every value stays zero, because an inert node
+    /// never wanted sensing and so never falls back from it.
+    pub fn org_sensing_routing_counters(&self) -> OrgSensingRoutingCounters {
+        self.node().org_sensing_routing_counters()
+    }
 }
+
+/// The counters [`Mesh::org_sensing_routing_counters`] returns.
+pub use net::adapter::net::OrgSensingRoutingCounters;
 
 impl SensingClient {
     /// Bind the provider surface to a node handle, checking the
@@ -551,6 +598,13 @@ impl ReadinessRegistration {
         &self.capability_id
     }
 
+    /// Whether THIS handle has been closed (by [`Self::close`] or drop). A
+    /// handle superseded by [`SensingClient::provide_replacing`] is not
+    /// closed, but it owns nothing: its [`Self::changed`] returns `false`.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Announce that local state affecting this capability changed:
     /// pull every live observation path on it forward to now,
     /// min-gapped at the provider's cadence floor.
@@ -647,25 +701,17 @@ mod tests {
     /// Refusals must be readable without a debugger — each carries the
     /// action the caller has to take, or says plainly that the state is
     /// terminal.
+    ///
+    /// The per-variant check now lives in
+    /// `class::tests::every_message_names_its_remedy`, over every variant
+    /// through an exhaustive match. This test was a hand-kept sample of five
+    /// (consumer-SDK review §3); it remains as a smoke check that the
+    /// classification module is wired in.
     #[test]
     fn every_refusal_names_the_remedy() {
-        assert!(SensingError::Disabled
-            .to_string()
-            .contains("MeshBuilder::enable_sensing"));
-        assert!(SensingError::IncarnationRequired
-            .to_string()
-            .contains("next_incarnation"));
-        assert!(SensingError::DurableIdentityRequired
-            .to_string()
-            .contains("MeshBuilder::identity"));
-        assert!(SensingError::AlreadyProviding {
-            capability: "gpu.infer".into(),
+        for error in class::canonical_instances() {
+            assert!(!error.to_string().is_empty(), "{}", error.kind());
         }
-        .to_string()
-        .contains("gpu.infer"));
-        assert!(SensingError::RegistrationIdentityExhausted
-            .to_string()
-            .contains("exhausted"));
     }
 
     /// The core refusal maps onto exactly one SDK refusal each, and the
@@ -721,6 +767,9 @@ mod tests {
         let sources = [
             include_str!("sensing.rs"),
             include_str!("sensing/consumer.rs"),
+            include_str!("sensing/class.rs"),
+            include_str!("sensing/value.rs"),
+            include_str!("sensing/incarnation_file.rs"),
         ];
         // WHOLE declarations, not first lines: every `pub use` statement
         // up to its `;`, and every public function signature — `pub fn`,
@@ -913,7 +962,7 @@ mod tests {
             .filter(|block| block.lines().any(|line| line.trim() == "retries = 0"))
             .collect();
         assert!(!zero_retry.is_empty(), "a zero-retry override must exist");
-        for binary in ["sensing_provider", "sensing_consumer"] {
+        for binary in ["sensing_provider", "sensing_consumer", "sensed_nrpc"] {
             assert!(
                 zero_retry
                     .iter()

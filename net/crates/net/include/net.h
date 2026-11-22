@@ -4,9 +4,9 @@
  * Network Event Transport — a latency-first encrypted mesh protocol.
  *
  * The narrow event-bus surface: init / ingest / poll / stats / shutdown.
- * It is one of eleven headers, NOT the entire C SDK — mesh, capabilities,
+ * It is one of twelve headers, NOT the entire C SDK — mesh, capabilities,
  * nRPC, CortEX, MCP and the rest have their own headers. See include/README.md
- * for the map. All eleven resolve against one shared library: libnet.so
+ * for the map. All twelve resolve against one shared library: libnet.so
  * (Linux), libnet.dylib (macOS), or net.dll (Windows). Link `-lnet` and
  * nothing else.
  *

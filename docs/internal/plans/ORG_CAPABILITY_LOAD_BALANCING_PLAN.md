@@ -921,16 +921,26 @@ membership current
 + interest capability matches grant
 ```
 
-**Invalidation, stated honestly (OA §D1).** There is no floor, denylist,
-or CRL keyed on `grant_id` — a cross-org grant dies only at `not_after`.
-What "immediately invalidates" a granted sensing interest is therefore:
-the acting org's membership floors (revoked member fails the
-membership-current recheck), grant expiry at its window edge, and
-provider/rendezvous-local refusal on the next validation. Issuer-side
-grant revocation remains unbuilt; a SENSE right inherits that exact gap
-and must not be documented as closing it. Per the structural
-DISCOVER⇔binding precedent, a SENSE right needs its own
-issue-and-decode structural rule decided at its review.
+**Invalidation, stated honestly (OA §D1; rewritten 2026-11-21 for what is
+built, completion plan D6.8).** A granted sensing registration is re-checked
+in full at every refresh, at the provider, and is cut off at the next
+refresh by:
+- **issuer-side grant revocation**: the provider org revokes the grant it
+  issued (`org_grant_revocation.rs`); the granted gate checks
+  `is_grant_revoked` for both the capability grant and the dispatcher grant,
+  and a revocation published between the gate and the row creates no row
+  (the same currentness fence as a floor raise). This cuts off every member
+  of the acting org at once;
+- the grant's or the dispatcher grant's window ending;
+- the acting org's membership floors, **but only on a provider that imports
+  that org's floor bundles**: `floor_for` is 0 for an org whose bundles never
+  arrived, so a single removed member of a foreign org is cut off only
+  there. That is the same boundary cross-org nRPC admission documents, and
+  SENSE does not close it.
+
+An already-accepted row lives until its soft-state TTL. The structural rule
+decided for the right is `SENSE ⇒ INVOKE ∧ DISCOVER` (completion plan D6.1),
+enforced at issue, decode and verify.
 
 Audience isolation is structural: the `AudienceScopeCommitment` is bound
 into the interest digest (`identity.rs:779-795`, the audience at `:793`), so the same semantic
@@ -2477,18 +2487,27 @@ Not merely:
 sensing snapshot changed
 ```
 
-### OLB-6 — granted sensing, separately activated
+### OLB-6 — granted sensing (delivered)
 
-Only after a named cross-organization load-balancing consumer:
+**Status (2026-11-21): built and awaiting review, by owner decision WITHOUT a
+named consumer** (completion plan Phase 6: 6a `d9f395f55`, 6b `b11282753`,
+6c `36b312f83`, 6d `9cd600ecb`; review fixes `f1ba2675a`). The originally
+gated requirements, each with what delivers it:
 
-- define explicit `GrantRights::SENSE` with its own structural
-  issue/decode rule;
-- bind it into sensing registration (§5.3 field list);
-- enforce membership floors, grant windows, and target scope at
-  provider/rendezvous acceptance — documenting the §D1 revocation gap
-  honestly;
-- keep audience-specific observations isolated (digest-bound);
-- add a cross-org multi-provider proof.
+- explicit `GrantRights::SENSE` with its own structural rule:
+  `SENSE ⇒ INVOKE ∧ DISCOVER` at issue, decode and verify, with a golden
+  vector (completion plan D6.1);
+- bound into sensing registration: frame variant 5,
+  `GrantedProviderRegistration`, carrying the membership, the dispatcher
+  grant and the SENSE grant, direct only (D6.3);
+- membership floors, grant windows, target scope and issuer-side revocation
+  enforced at provider acceptance, with the §D1 floor-import boundary
+  documented at the line (D6.4, §5.3 above);
+- audience-specific observations isolated: a per-grant audience bound into
+  the interest digest (D6.2);
+- the cross-org multi-provider proof:
+  `a_cross_org_call_lands_on_the_sensed_provider_under_a_sense_grant`, three
+  providers in another organization over real transport, pinned in CI.
 
 This slice does not block same-org load balancing.
 
@@ -2503,10 +2522,11 @@ conflating them would be its own defect (Kyra, 2026-09-11):
 
 | Disposition | Rows | Meaning |
 |---|---|---|
-| **Operational visibility owed** | `org_sensing_truncated_total`, `org_sensing_fallback_total` | The bounded behaviour and the fallback exist and are witnessed; what is missing is a counter an operator can read. A debt to pay, **not** evidence the behaviour is absent. |
+| **Implemented, awaiting sign-off** (was: operational visibility owed) | `org_sensing_truncated_total`, `org_sensing_fallback_total` | The bounded behaviour, the fallback and production-readable counters exist and are witnessed. Implemented by completion plan C2 (design D8.4a) on 2026-11-21; not covered by the 2026-09-11 signature. |
 | **Excluded from this gate** | reordered-`Deregister` repair | Removed from this release's completion promise, because the governing exact design lists closing that race among its own §15 non-goals. An excluded behaviour must not sit in a gate as an implied promise: if it is wanted, it needs a named slice with a repair and a witness, and the row returns then. |
 | **Waived by decision** | the independent RED mutation pass (recorded in the status block at the top) | Waived by the owner's sign-off, **not verified**. Reopening it takes an explicit decision, not a re-reading of this plan. |
-| **Unimplemented product slices** | P2C sampler (OLB-3), `NoViableProvider` (OLB-4) | Unbuilt product work on the unsensed lane. Not administrative closure work, and not something a documentation pass can discharge. |
+| **Implemented, awaiting sign-off** | P2C load spreading (OLB-3) | Delivered as the per-call design of completion plan Phase 4 (this node's outstanding org calls per provider; the deterministic choice on a flat signal; only genuinely unsensed calls are spread), not the warmed `ArcSwap` pool §9 sketched. |
+| **Not wanted (owner decision)** | `NoViableProvider` (OLB-4) | Missing readiness evidence never refuses a call (completion plan Phase 4, 2026-11-21). |
 
 Nothing below is claimed of the provider-free leader arm, which is dark.
 
@@ -2549,8 +2569,13 @@ The plan is complete when all are true:
   the remote row is repaired by the node-global lease's ttl/2 refresh; the
   observation is `Unknown`/`Potential` until repair and no `org.call` fails;
   a last-holder close disarms the refresh owner (no ghost demand)."
-- [ ] **NOT CLAIMED — unsensed warmed-pool lane; no P2C sampler exists in
-      tree.** The warmed **unsensed** org.call path is: ArcSwap route-set load →
+- [ ] **NOT CLAIMED AS WRITTEN; superseded 2026-11-21 (completion plan
+      Phase 4, owner decision).** Unsensed load spreading landed as a
+      per-call P2C inside `plan` over the already-derived authorized, direct
+      pool (`OrgClient::select_spread` / `p2c_spread_choice`), using this
+      node's outstanding org calls per provider as the cost signal. It is not
+      the ArcSwap warmed route-set path described here. The historical text
+      follows. The warmed **unsensed** org.call path is: ArcSwap route-set load →
       two-index P2C → proof → send — no rediscovery, no candidate
       revalidation scan, no observation scan, no sorting, no interest
       reconciliation, no registration wait. Cold behavior is likewise
@@ -2614,10 +2639,14 @@ The plan is complete when all are true:
 - [x] The per-call temporal recheck of membership/dispatcher/grant
       remains on the hot path — the route cache is never an authority
       cache.
-- [ ] **PARTIAL — the bound and its deterministic truncation are implemented
-      and witnessed; `org_sensing_truncated_total` does NOT exist (the exact
-      design authorized no new counter, and `MAX_SENSED_POPULATION` clamping is
-      observed through behaviour instead).**
+- [x] **IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` C2). Awaits
+      sign-off; not covered by the 2026-09-11 signature.** The exact design's
+      D8.4a amendment authorizes the counter. It is readable in production
+      through `MeshNode::org_sensing_routing_counters().truncated_total` and
+      `prometheus_text()`, and witnessed by
+      `a_population_over_the_cap_is_clamped_and_counted_once_per_derivation`.
+      *(Was: PARTIAL. The bound was implemented, but the count was readable
+      only by fixtures-gated witnesses.)*
       Sensed fan-out is bounded (32 sensed providers per capability /
       **64 authority-scoped demands per clone family**, `MAX_HANDLES_PER_FAMILY`
       at `org_routing_registry.rs:52`) with
@@ -2638,12 +2667,15 @@ The plan is complete when all are true:
       NonViable. *(Corrected 2026-08-30.)*
 - [x] Cold/unavailable sensing preserves the current call path
       byte-for-byte, including `ProviderNotDirect`.
-- [ ] **OPEN — `org_sensing_fallback_total` does NOT exist. Every degradation
-      is witnessed behaviourally instead (it lands on the deterministic
-      unsensed order), which is weaker than a counter an operator can read.**
+- [x] **IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` C2). Awaits
+      sign-off; not covered by the 2026-09-11 signature.**
+      `org_sensing_fallback_total{reason="contended|refused|unretained"}`, one
+      reason per exit of `apply_sensed_order`, is specified in design D8.4a.
+      That section maps these reasons onto this plan's §7 sketch and lists the
+      witnesses. *(Was: OPEN, behaviour-only.)*
       Sensing capacity fallback is observable
       (`org_sensing_fallback_total`).
-- [ ] **NOT CLAIMED — unsensed OLB-4 lane only; superseded for this release.**
+- [ ] **NOT WANTED (owner decision 2026-11-21, completion plan Phase 4): no `NoViableProvider`. Missing readiness evidence is never a reason to refuse a call.** Historical row:
       No-viable is distinct from no-authority, local-only, counts
       `non_viable`, and is pinned in the regenerated X1 fixture across
       all four binding suites. **SUPERSEDED FOR ORGANIZATION EXACT
@@ -2654,9 +2686,10 @@ The plan is complete when all are true:
       classify, no X1 fixture to regenerate and **no language-binding
       change in any of the four suites**. See
       [`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`](ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md)
-      §OA-6 and D7.3. This row remains live for the unsensed OLB-4
-      balancing release only.
-- [ ] **NOT CLAIMED — unsensed warmed-pool lane.**
+      §OA-6 and D7.3. *(Historical: this row was live for the unsensed
+      OLB-4 release, which the owner decision above rules out. No lane
+      requires it.)*
+- [ ] **NOT CLAIMED AS WRITTEN; superseded by the Phase 4 per-call design.** The delivered contract: `p2c_spread_choice` / `p2c_pair` take a process-random seed and a monotonic nonce, are pure and reproducible under a fixed pair, keep the deterministic choice on a flat signal, and run only for genuinely unsensed calls; it is not a warmed-pool sampler. The historical requirement follows:
       The P2C sampler contract (seed + nonce) is pinned, reproducible
       under a fixed seed, and non-stampeding — on the **unsensed
       warmed-pool** track. *(Scoped 2026-08-30: the organization-audience

@@ -16,6 +16,8 @@ import types
 import pytest
 
 MODULES = ("net_sdk.blob", "net_sdk.transport")
+# Gated on `org`, not `dataforts`, with the same load-failure rule.
+ORG_MODULES = ("net_sdk.sensing",)
 
 
 @pytest.fixture
@@ -29,7 +31,7 @@ def swap_net(monkeypatch: pytest.MonkeyPatch):
 
     def _install(replacement):
         monkeypatch.setitem(sys.modules, "net", replacement)
-        for name in MODULES:
+        for name in MODULES + ORG_MODULES:
             monkeypatch.delitem(sys.modules, name, raising=False)
 
     return _install
@@ -57,3 +59,19 @@ def test_a_load_failure_is_not_relabelled_as_a_missing_feature(swap_net, module)
         importlib.import_module(module)
     assert "DLL load failed" in str(exc_info.value)
     assert "--features dataforts" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("module", ORG_MODULES)
+def test_a_missing_org_feature_names_the_feature_and_the_symbols(swap_net, module) -> None:
+    swap_net(types.ModuleType("net"))  # loads fine, exports nothing
+    with pytest.raises(ImportError, match=r"`org` feature.*Missing: "):
+        importlib.import_module(module)
+
+
+@pytest.mark.parametrize("module", ORG_MODULES)
+def test_an_org_module_load_failure_is_not_relabelled(swap_net, module) -> None:
+    swap_net(_BrokenNet("net"))
+    with pytest.raises(ImportError) as exc_info:
+        importlib.import_module(module)
+    assert "DLL load failed" in str(exc_info.value)
+    assert "`org` feature" not in str(exc_info.value)

@@ -1,7 +1,7 @@
 /*
  * net_rpc.h — C SDK header for the nRPC C ABI.
  *
- * One of eleven headers, all resolving against a single shared library.
+ * One of twelve headers, all resolving against a single shared library.
  * Mirrors the layout of `net.h` / `net.go.h` next to it. The Go binding's
  * `go/mesh_rpc.go` cgo include block has been the de-facto contract for
  * non-Go consumers since v0.10; this file is the canonical drop-in for

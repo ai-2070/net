@@ -253,6 +253,9 @@ pub enum OrgError {
     /// A grant's rights bitset is empty — a credential that permits
     /// nothing is structurally meaningless.
     EmptyRights,
+    /// A grant carries SENSE without both INVOKE and DISCOVER (OLB-6),
+    /// refused at issue, decode and verify exactly as core refuses it.
+    SenseRequiresInvokeDiscover,
     /// A capability grant's `AnyNodeOwnedBy(org)` target names an org
     /// OTHER than the issuer — a permanently-unusable credential (it
     /// can never admit), refused at issue and decode/verify.
@@ -303,6 +306,9 @@ impl core::fmt::Display for OrgError {
             ),
             Self::UnknownRights => write!(f, "grant rights carry unknown bits"),
             Self::EmptyRights => write!(f, "grant rights are empty"),
+            Self::SenseRequiresInvokeDiscover => {
+                write!(f, "grant SENSE right requires both INVOKE and DISCOVER")
+            }
             Self::TargetOrgNotIssuer => write!(
                 f,
                 "grant AnyNodeOwnedBy target org is not the issuer org (permanently unusable)"

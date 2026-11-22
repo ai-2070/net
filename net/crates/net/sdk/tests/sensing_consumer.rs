@@ -3252,3 +3252,219 @@ async fn a_partial_acquisition_keeps_its_own_state_and_another_owners() {
     let _ = std::fs::remove_dir_all(&first.dir);
     let _ = std::fs::remove_dir_all(&second.dir);
 }
+
+// ---------------------------------------------------------------------------
+// B1-pre: close during a pending wait, and cancellation of a pending wait
+// (SENSING_OLB_COMPLETION_PLAN B.3). The binding wrappers inherit exactly
+// these two behaviours; they define neither.
+// ---------------------------------------------------------------------------
+
+/// A close from ANOTHER task, through a `SensingWatchCloser`, wakes a pending
+/// `changed()` promptly with `WatchClosed`: never `Ok`, and not after the
+/// floor. The floor is widened first, so a floor wake cannot stand in for
+/// the close wake, and the wait is shown to be really parked before the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_from_another_task_ends_a_pending_wait_promptly() {
+    let owner = org();
+    let consumer = mesh_in_org("c-closewait", &owner, true, None).await;
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let _ = observation.snapshot().expect("snapshot");
+    observation.set_population_floor_for_test(Duration::from_secs(120));
+    let closer = observation.closer();
+
+    let waiter = tokio::spawn(async move {
+        let result = observation.changed().await;
+        (result, observation)
+    });
+    tokio::time::sleep(QUIET_BOUND).await;
+    assert!(
+        !waiter.is_finished(),
+        "precondition: the wait must be parked before the close"
+    );
+
+    let closed_at = Instant::now();
+    assert!(closer.close(), "the closer performed the close");
+    let (result, mut observation) = tokio::time::timeout(WAKE_BOUND * 4, waiter)
+        .await
+        .expect("a pending wait must end promptly on close, not at the floor")
+        .expect("join");
+    assert!(closed_at.elapsed() < WAKE_BOUND * 4);
+    assert_eq!(result, Err(SensingError::WatchClosed));
+
+    // One shared close: every route now reports it, and nothing re-closes.
+    assert!(observation.is_closed() && closer.is_closed());
+    assert!(!observation.close(), "the watch's own close is a no-op now");
+    assert!(!closer.clone().close(), "and so is any other closer's");
+    assert_eq!(observation.snapshot(), Err(SensingError::WatchClosed));
+    assert!(
+        !observation.retains_demand_for_test(),
+        "the close released the demand"
+    );
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+}
+
+/// Cancelling a pending `changed()` consumes NO edge. A change that lands
+/// while the wait is pending, followed by dropping that wait, is still unseen,
+/// so the next `changed()` returns at once. The cancellation also leaves the
+/// floor deadline where it was and the watch open.
+///
+/// RED against a wait that acknowledges the generation before it completes
+/// (the next park would then sit out the widened floor), and against one that
+/// re-arms the floor on entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_wait_consumes_no_edge_and_leaves_the_watch_open() {
+    let owner = org();
+    let consumer = mesh_in_org("c-cancelwait", &owner, true, None).await;
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let _ = observation.snapshot().expect("snapshot");
+    observation.set_population_floor_for_test(Duration::from_secs(120));
+    let fallback = observation.fallback_deadline_for_test();
+
+    {
+        let mut pending = Box::pin(observation.changed());
+        assert!(
+            futures::poll!(pending.as_mut()).is_pending(),
+            "precondition: the wait is really pending"
+        );
+        // The edge lands while that wait is registered...
+        publish_unrelated_change(&consumer.node, u64::MAX - 7);
+        // ...and the wait is cancelled before it is polled again.
+    }
+
+    assert!(
+        !observation.is_closed(),
+        "cancellation never closes the watch"
+    );
+    assert_eq!(
+        observation.fallback_deadline_for_test(),
+        fallback,
+        "cancellation never moves the floor"
+    );
+    assert_eq!(
+        tokio::time::timeout(WAKE_BOUND, observation.changed())
+            .await
+            .expect("the edge the cancelled wait saw must still be delivered"),
+        Ok(())
+    );
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+}
+
+/// A close that lands INSIDE a snapshot (after the snapshot passed its own
+/// closed check, before it converged) leaves no demand behind and makes that
+/// snapshot refuse. Without the post-convergence re-check, the convergence
+/// re-installs demand the close already retired, and nothing would release it
+/// until the last closer dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_landing_inside_a_snapshot_leaves_no_demand() {
+    let owner = org();
+    let consumer = mesh_in_org("c-closesnap", &owner, true, None).await;
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    assert!(
+        observation.retains_demand_for_test(),
+        "precondition: watch() retained"
+    );
+    let closer = observation.closer();
+    let inside = closer.clone();
+    observation.set_capture_seam_for_test(Arc::new(move || {
+        inside.close();
+    }));
+
+    assert_eq!(observation.snapshot(), Err(SensingError::WatchClosed));
+    assert!(closer.is_closed());
+    assert!(
+        !observation.retains_demand_for_test(),
+        "no demand may outlive a close, even one a concurrent read re-installed"
+    );
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+}
+
+/// B1: the VALUE-backed provider every language binding wraps. A `set` on the
+/// provider reaches the consumer's snapshot through real signed attestations,
+/// a `Ready` value over the request's signed start bound reads NotReady, and
+/// closing the handle withdraws readiness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_provider_set_reaches_the_snapshot_and_honors_the_start_bound() {
+    use net_sdk::sensing::ReadinessValue;
+    let owner = org();
+    let consumer = mesh_in_org("c-value", &owner, true, None).await;
+    let audience = shared_audience(&consumer);
+    let provider = mesh_in_org("p-value", &owner, true, Some(&audience)).await;
+    let _service = serve(&provider);
+    bring_up(&consumer, &[&provider]).await;
+    converge_population(&consumer, &[&provider], 1).await;
+    let provider_id = provider.node.node_id();
+
+    let value = provider
+        .mesh
+        .sensing()
+        .expect("sensing client")
+        .provide_value(
+            TAG,
+            ReadinessValue::Ready {
+                estimated_start: Some(Duration::from_millis(80)),
+            },
+        )
+        .expect("provide_value");
+
+    let mut observation = watch(&consumer, SensingQuery::new(TAG));
+    let ready = until_snapshot("the value never read Ready", &mut observation, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::Ready)
+    })
+    .await;
+    assert_eq!(
+        row(&ready, provider_id).estimated_start(),
+        Some(Duration::from_millis(80)),
+        "the value's estimate is what the provider signed"
+    );
+
+    // A set publishes, then wakes. The consumer sees the new value.
+    assert_eq!(
+        value.get(),
+        ReadinessValue::Ready {
+            estimated_start: Some(Duration::from_millis(80))
+        }
+    );
+    value.set(ReadinessValue::NotReady { reason: 9 });
+    until_snapshot(
+        "a NotReady set never reached the consumer",
+        &mut observation,
+        |snap| {
+            snap.provider(provider_id)
+                .is_some_and(|p| p.viability() == SensedViability::NotViable)
+        },
+    )
+    .await;
+
+    // A Ready value whose estimate exceeds the signed start bound does NOT
+    // hold the predicate: the consumer reads NotReady, not Ready.
+    let mut strict = watch(
+        &consumer,
+        SensingQuery::new(TAG).start_within(Duration::from_millis(100)),
+    );
+    value.set(ReadinessValue::Ready {
+        estimated_start: Some(Duration::from_millis(400)),
+    });
+    until_snapshot("an over-bound Ready read as Ready", &mut strict, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::NotReady)
+    })
+    .await;
+
+    assert!(value.close(), "the handle removed its registration");
+    let at_close = value.get();
+    assert!(
+        !value.set(ReadinessValue::Unevaluable),
+        "a closed handle stores nothing"
+    );
+    assert_eq!(value.get(), at_close, "and its value did not move");
+    // The close really withdrew the evaluator: the consumer projects Unknown
+    // for the provider, whose row it keeps.
+    until_snapshot("the close never withdrew readiness", &mut strict, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::Unknown)
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&consumer.dir);
+    let _ = std::fs::remove_dir_all(&provider.dir);
+}

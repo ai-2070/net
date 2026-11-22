@@ -7879,6 +7879,83 @@ impl MeshNode {
         payload: Bytes,
         opts: CallOptions,
     ) -> Result<RpcReply, RpcError> {
+        let candidates = self.routable_service_candidates(service, &opts)?;
+        let target = self.select_target(&candidates, &opts.routing_policy);
+        self.call(target, service, payload, opts).await
+    }
+
+    /// [`Self::call_service`] with ONE exact-provider readiness capture
+    /// applied to the choice of target (sensing plan S2;
+    /// SENSING_OLB_COMPLETION_PLAN B.2).
+    ///
+    /// The candidate set is exactly [`Self::call_service`]'s: discovery,
+    /// health filtering, and public `may_execute` or protected exact-proof
+    /// authorization all run first, so sensing can never select a provider
+    /// the caller is not authorized to reach. Sensing then only chooses among
+    /// those candidates (the rule is the private `sensed_service_target`):
+    ///
+    /// 1. the best-ranked `viable_order` provider that is a candidate, if any;
+    /// 2. otherwise the routing policy over the candidates NOT in
+    ///    `not_ready`;
+    /// 3. otherwise (every candidate sensed not-ready) the routing policy over
+    ///    all of them. Readiness evidence is about one instant and never
+    ///    leaves a call without a target.
+    ///
+    /// Exactly one target is invoked, exactly once. A provider-side admission
+    /// denial or any post-dispatch failure is returned as-is, never retried
+    /// against the next candidate: execution may already have happened.
+    ///
+    /// The capture is the caller's, as plain node ids. This derives no
+    /// interest, acquires no lease and reads no sensing state.
+    pub async fn call_service_sensed(
+        self: &Arc<Self>,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+        viable_order: &[u64],
+        not_ready: &std::collections::HashSet<u64>,
+    ) -> Result<RpcReply, RpcError> {
+        let candidates = self.routable_service_candidates(service, &opts)?;
+        let target = sensed_service_target(&candidates, viable_order, not_ready, |pool| {
+            self.select_target(pool, &opts.routing_policy)
+        });
+        self.call(target, service, payload, opts).await
+    }
+
+    /// [`Self::call_service_streaming`] with the target chosen as in
+    /// [`Self::call_service_sensed`]. Same unary-only refusal of an org proof
+    /// intent, raised before any discovery.
+    pub async fn call_service_streaming_sensed(
+        self: &Arc<Self>,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+        viable_order: &[u64],
+        not_ready: &std::collections::HashSet<u64>,
+    ) -> Result<RpcStream, RpcError> {
+        if opts.org_proof_intent.is_some() {
+            return Err(streaming_org_intent_refusal());
+        }
+        let candidates = self.routable_service_candidates(service, &opts)?;
+        let target = sensed_service_target(&candidates, viable_order, not_ready, |pool| {
+            self.select_target(pool, &opts.routing_policy)
+        });
+        self.call_streaming(target, service, payload, opts).await
+    }
+
+    /// The candidate set every service-name call routes over (S2a): the
+    /// nodes advertising `nrpc:<service>`, health-filtered, sorted, and
+    /// authorized for THIS call: protected → the exact pinned provider the
+    /// proof binds; public → the caller-side `may_execute` gate. It is never
+    /// empty on `Ok`.
+    ///
+    /// One helper, so the unsensed and sensed verbs, unary and streaming,
+    /// cannot disagree about who is a legitimate target.
+    fn routable_service_candidates(
+        &self,
+        service: &str,
+        opts: &CallOptions,
+    ) -> Result<Vec<u64>, RpcError> {
         let mut candidates = self.find_service_nodes(service);
         if candidates.is_empty() {
             return Err(RpcError::NoRoute {
@@ -7986,8 +8063,7 @@ impl MeshNode {
             }
         }
 
-        let target = self.select_target(&candidates, &opts.routing_policy);
-        self.call(target, service, payload, opts).await
+        Ok(candidates)
     }
 
     /// Capability-routed server-streaming call. Same routing as
@@ -8024,72 +8100,11 @@ impl MeshNode {
         // the promised unary-only failure — a caller error must not perturb
         // routing.
         if opts.org_proof_intent.is_some() {
-            return Err(RpcError::Codec {
-                direction: CodecDirection::Encode,
-                message: "org admission (org_proof_intent) is unary-only; use `call_service` \
-                          for a protected service"
-                    .to_string(),
-            });
+            return Err(streaming_org_intent_refusal());
         }
-        let mut candidates = self.find_service_nodes(service);
-        if candidates.is_empty() {
-            return Err(RpcError::NoRoute {
-                target: 0,
-                reason: format!(
-                    "no nodes advertise `nrpc:{service}` (have any servers \
-                     for this service called serve_rpc + announce_capabilities?)"
-                ),
-            });
-        }
-
-        // Health filter — mirrors `call_service`. Candidates with no
-        // proximity entry are kept (absence of evidence ≠ evidence of
-        // unhealth); only candidates the proximity graph marks
-        // explicitly unavailable get dropped.
-        if opts.filter_unhealthy {
-            let proximity = self.proximity_graph();
-            candidates.retain(|node_id| match self.entity_id_for_node(*node_id) {
-                Some(entity_id) => match proximity.get_node(&entity_id) {
-                    Some(node) => node.is_available(),
-                    None => true,
-                },
-                None => true,
-            });
-            if candidates.is_empty() {
-                return Err(RpcError::NoRoute {
-                    target: 0,
-                    reason: format!(
-                        "every node advertising `nrpc:{service}` is marked \
-                         unhealthy by the local proximity graph",
-                    ),
-                });
-            }
-        }
-
-        // Deterministic ordering so Sticky / LowestLatency-fallback
-        // pick stably across calls — mirrors `call_service`.
-        candidates.sort_unstable();
-
-        // v0.4 capability-auth caller-side gate. Same as `call_service`:
-        // filter the candidate set BEFORE target selection so the
-        // routing policy never picks a peer the caller can't reach.
-        let tag = format!("nrpc:{service}");
-        use crate::adapter::net::behavior::fold::capability_bridge;
-        let self_id = self.node_id();
-        let any_candidate = candidates[0];
-        let fold = self.capability_fold();
-        // PERF_AUDIT §4.2 — batch the per-candidate gate. See the
-        // mirror site at `:3093`.
-        let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
-        let mut iter = verdicts.into_iter();
-        candidates.retain(|_| iter.next().unwrap_or(false));
-        if candidates.is_empty() {
-            return Err(RpcError::CapabilityDenied {
-                target: any_candidate,
-                capability: service.to_string(),
-            });
-        }
-
+        // Same candidate set as `call_service` (S2a). The org-intent branch
+        // inside the helper is unreachable here: refused above.
+        let candidates = self.routable_service_candidates(service, &opts)?;
         let target = self.select_target(&candidates, &opts.routing_policy);
         self.call_streaming(target, service, payload, opts).await
     }
@@ -9051,6 +9066,165 @@ impl MeshNode {
     }
 }
 
+/// The refusal every service-name STREAMING verb raises for an org proof
+/// intent, before any discovery: org admission is unary-only (E1.8). One
+/// definition so the sensed and unsensed streaming verbs cannot drift.
+fn streaming_org_intent_refusal() -> RpcError {
+    RpcError::Codec {
+        direction: CodecDirection::Encode,
+        message: "org admission (org_proof_intent) is unary-only; use `call_service` \
+                  for a protected service"
+            .to_string(),
+    }
+}
+
+/// The sensed choice of ONE target among already-authorized `candidates`
+/// (sensing plan S2b). `select` is the routing policy over a non-empty pool.
+///
+/// 1. The first `viable_order` provider that is a candidate wins. Rank order
+///    is the capture's, and a viable provider outside `candidates` is skipped:
+///    sensing never adds a target authorization did not admit.
+/// 2. Otherwise the policy chooses among the candidates not in `not_ready`.
+/// 3. Otherwise (every candidate sensed not-ready) the policy chooses among
+///    all of them. Not-ready is ordered last, never removed (design D7.2).
+///
+/// With no evidence at all this is exactly `select(candidates)`, so a sensed
+/// call with an empty capture routes like an unsensed one.
+///
+/// `candidates` must be non-empty (the routing helper guarantees it).
+pub(crate) fn sensed_service_target(
+    candidates: &[u64],
+    viable_order: &[u64],
+    not_ready: &std::collections::HashSet<u64>,
+    select: impl FnOnce(&[u64]) -> u64,
+) -> u64 {
+    if let Some(best) = viable_order
+        .iter()
+        .find(|provider| candidates.contains(provider))
+    {
+        return *best;
+    }
+    if not_ready.is_empty() {
+        return select(candidates);
+    }
+    let potential: Vec<u64> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| !not_ready.contains(candidate))
+        .collect();
+    if potential.is_empty() {
+        select(candidates)
+    } else {
+        select(&potential)
+    }
+}
+
+#[cfg(test)]
+mod sensed_service_target_tests {
+    //! S2b, the selection rule as a pure function (sensing plan §6 nRPC
+    //! witnesses 18-22, the decision half). The live half, which shows the
+    //! call reaching the chosen provider exactly once, is
+    //! `sdk/tests/sensed_nrpc.rs`.
+
+    use super::sensed_service_target;
+    use std::collections::HashSet;
+
+    fn none() -> HashSet<u64> {
+        HashSet::new()
+    }
+
+    /// The policy stand-in: always the FIRST of the pool it is given, and
+    /// records that pool, so a witness can tell which pool the rule handed it.
+    fn first(seen: &mut Vec<Vec<u64>>) -> impl FnOnce(&[u64]) -> u64 + '_ {
+        move |pool| {
+            seen.push(pool.to_vec());
+            pool[0]
+        }
+    }
+
+    /// §6 #18: P1 viable/preferred, P2 viable/second, P3 not-ready → P1,
+    /// without consulting the policy at all.
+    #[test]
+    fn the_best_ranked_viable_candidate_wins_without_the_policy() {
+        let mut seen = Vec::new();
+        let not_ready: HashSet<u64> = [3].into_iter().collect();
+        let target = sensed_service_target(&[1, 2, 3], &[2, 1], &not_ready, first(&mut seen));
+        assert_eq!(target, 2, "rank order, not candidate order");
+        assert!(seen.is_empty(), "a viable winner never consults the policy");
+    }
+
+    /// §6 #19: once the preferred provider is no longer viable, the next
+    /// ranked one is chosen.
+    #[test]
+    fn the_next_ranked_viable_candidate_follows() {
+        let mut seen = Vec::new();
+        let not_ready: HashSet<u64> = [2, 3].into_iter().collect();
+        assert_eq!(
+            sensed_service_target(&[1, 2, 3], &[1], &not_ready, first(&mut seen)),
+            1
+        );
+    }
+
+    /// §6 #20: with no viable provider, Unknown providers stay legitimate and
+    /// not-ready ones are skipped by the policy's pool.
+    #[test]
+    fn with_nothing_viable_the_policy_chooses_among_the_unknown() {
+        let mut seen = Vec::new();
+        let not_ready: HashSet<u64> = [1].into_iter().collect();
+        assert_eq!(
+            sensed_service_target(&[1, 2, 3], &[], &not_ready, first(&mut seen)),
+            2
+        );
+        assert_eq!(
+            seen,
+            vec![vec![2, 3]],
+            "the policy saw only the unverdicted pool"
+        );
+    }
+
+    /// Every candidate not-ready: the call still has a target, and the
+    /// policy sees the WHOLE set. Not-ready demotes; it never removes.
+    #[test]
+    fn every_candidate_not_ready_still_routes_over_all_of_them() {
+        let mut seen = Vec::new();
+        let all: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert_eq!(
+            sensed_service_target(&[1, 2, 3], &[], &all, first(&mut seen)),
+            1
+        );
+        assert_eq!(seen, vec![vec![1, 2, 3]]);
+    }
+
+    /// §6 #22: a provider ranked viable but absent from the AUTHORIZED
+    /// candidates is never selected. Sensing orders; it never admits.
+    #[test]
+    fn a_viable_provider_outside_the_authorized_set_is_never_chosen() {
+        let mut seen = Vec::new();
+        assert_eq!(
+            sensed_service_target(&[1, 2], &[9, 2], &none(), first(&mut seen)),
+            2
+        );
+        let mut seen = Vec::new();
+        assert_eq!(
+            sensed_service_target(&[1, 2], &[9], &none(), first(&mut seen)),
+            1
+        );
+        assert_eq!(seen, vec![vec![1, 2]], "an unadmitted rank is no evidence");
+    }
+
+    /// §6 #21, and the no-evidence identity: an empty capture (which is
+    /// also what an unrelated capability's capture reduces to) is exactly
+    /// the policy over the full candidate set.
+    #[test]
+    fn no_evidence_is_exactly_the_unsensed_policy() {
+        let mut seen = Vec::new();
+        assert_eq!(
+            sensed_service_target(&[4, 5, 6], &[], &none(), first(&mut seen)),
+            4
+        );
+        assert_eq!(seen, vec![vec![4, 5, 6]]);
+    }
+}
 /// Test seam for the reply-subscribe fence: run a hook (once) for a given
 /// caller node right after its subscribe succeeded and before the cache
 /// insert — exactly the window a concurrent session replacement or failure

@@ -1,7 +1,7 @@
 /*
  * net_meshdb.h — C SDK header for the MeshDB query layer C ABI.
  *
- * One of eleven headers, all resolving against a single shared library.
+ * One of twelve headers, all resolving against a single shared library.
  * Mirrors the layout of `net.h` / `net.go.h` / `net_rpc.h` next to it.
  * The Go binding's `go/meshdb.go` cgo include block has been the
  * de-facto contract for non-Go consumers; this file is the canonical

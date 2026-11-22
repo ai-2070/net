@@ -61,6 +61,8 @@ mod delegation;
 mod org;
 #[cfg(feature = "org")]
 mod org_serve;
+#[cfg(feature = "org")]
+mod sensing;
 // The subnet AUTHORITY surface (SSDK S4b): construction conversion, the
 // admin functions, and the named-export serve. Rides the `org` SDK
 // dependency, mirroring the Node binding's `subnet.rs`.
@@ -1514,6 +1516,8 @@ mod mesh_bindings {
             subnet_control_channel=None,
             subnet_exports=None,
             noise_static_key=None,
+            enable_sensing=None,
+            sensing_incarnation_path=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1578,6 +1582,14 @@ mod mesh_bindings {
             // independently of the identity. Unset: derived from
             // `identity_seed`, or fresh per process with no seed.
             noise_static_key: Option<&[u8]>,
+            // enable_sensing: turn the capability-sensing plane on (it
+            // ships dark). Required for sensing_watch / sensing_provide.
+            enable_sensing: Option<bool>,
+            // sensing_incarnation_path: the file holding this node's
+            // sensing boot counter, read, incremented and persisted before
+            // the node exists. Required (with identity_seed) for
+            // sensing_provide. Keep it beside the identity material.
+            sensing_incarnation_path: Option<&str>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1688,6 +1700,31 @@ mod mesh_bindings {
                 Arc::new(GuardedRuntime::new(Runtime::new().map_err(|e| {
                     PyRuntimeError::new_err(format!("runtime: {}", e))
                 })?));
+
+            // Capability sensing (completion plan B1). The boot counter is
+            // persisted BEFORE the node exists, as the Rust SDK's
+            // `MeshBuilder::sensing_incarnation` contract requires.
+            if enable_sensing == Some(true) {
+                config = config.with_sensing_coalescing(true);
+            }
+            #[cfg(not(feature = "org"))]
+            if sensing_incarnation_path.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "sensing_incarnation_path requires an org-feature build",
+                ));
+            }
+            #[cfg(feature = "org")]
+            if let Some(path) = sensing_incarnation_path {
+                let incarnation = net_sdk::sensing::next_incarnation(
+                    &mut net_sdk::sensing::FileIncarnation::new(path),
+                )
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "sensing incarnation at {path:?} is unavailable: {e}"
+                    ))
+                })?;
+                config = config.with_sensing_incarnation(incarnation);
+            }
 
             // Derive the mesh's keypair from the caller-supplied
             // seed when present — lets a caller-side `Identity.
@@ -4393,6 +4430,14 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<org::PyOrgClient>()?;
         m.add_class::<org::PyAsyncOrgClient>()?;
         m.add_class::<org_serve::PyOrgServeHandle>()?;
+        // Capability sensing (completion plan B1).
+        m.add_class::<sensing::PyReadinessProvider>()?;
+        m.add_class::<sensing::PySensingSnapshot>()?;
+        m.add_class::<sensing::PySensingWatch>()?;
+        m.add_function(wrap_pyfunction!(sensing::sensing_provide, m)?)?;
+        m.add_function(wrap_pyfunction!(sensing::sensing_watch, m)?)?;
+        m.add_function(wrap_pyfunction!(sensing::sensing_error_class, m)?)?;
+        m.add("SensingError", m.py().get_type::<sensing::SensingError>())?;
         m.add_function(wrap_pyfunction!(org_serve::serve_org, m)?)?;
         m.add_function(wrap_pyfunction!(org_serve::serve_org_streaming, m)?)?;
         m.add_function(wrap_pyfunction!(org_serve::serve_org_client_stream, m)?)?;

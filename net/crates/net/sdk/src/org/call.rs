@@ -42,6 +42,7 @@
 //! fresh call id and a fresh signature. Cross-call idempotency is the
 //! application's.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -52,12 +53,15 @@ use net::adapter::net::behavior::org_cold_plan::{
     OrgColdAuthority, OrgColdDiscovery, OrgColdRefusal,
 };
 use net::adapter::net::behavior::org_scoped_store::PrivateCapabilityProvider;
-use net::adapter::net::behavior::org_sensing_demand::org_sensed_bucket_permutation;
+use net::adapter::net::behavior::org_sensing_demand::{
+    org_sensed_bucket_permutation, OrgSensedOrderFallback, OrgSensedProjection,
+};
 use net::adapter::net::behavior::sensing::ConsumerLatencyBudget;
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{
     CallOptions, ClientStreamCallRaw, DuplexCallRaw, RpcError, RpcStream,
 };
+use net::adapter::net::OrgCallInFlight;
 
 use super::error::{hex32, hex_capability, OrgCredentialError, OrgDiscoveryError, OrgSdkError};
 use super::types::{CapabilityAuthorityId, OrgCapabilityGrant, OrgProofIntent};
@@ -222,6 +226,9 @@ fn protected_call_options(
 /// [`RpcStream`]: net::adapter::net::mesh_rpc::RpcStream
 pub struct OrgStream<Resp> {
     inner: RpcStreamTyped<Resp>,
+    /// Counts this stream as outstanding toward its provider until dropped
+    /// (the Phase 4 load signal).
+    _in_flight: OrgCallInFlight,
 }
 
 impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgStream<Resp> {
@@ -249,6 +256,8 @@ impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgStream<Resp> {
 /// contract, unchanged).
 pub struct OrgStreamRaw {
     inner: RpcStream,
+    /// Counts this stream as outstanding toward its provider until dropped.
+    _in_flight: OrgCallInFlight,
 }
 
 impl futures::Stream for OrgStreamRaw {
@@ -299,6 +308,9 @@ struct PinnedOpening {
 pub struct OrgClientStreamCall<Req, Resp> {
     pinned: PinnedOpening,
     inner: Option<ClientStreamCallTyped<Req, Resp>>,
+    /// Counts this call as outstanding toward its pinned provider until it
+    /// finishes or is dropped.
+    _in_flight: OrgCallInFlight,
 }
 
 impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
@@ -361,6 +373,9 @@ impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
 /// synchronous) against the pinned provider.
 pub struct OrgDuplexCall<Req, Resp> {
     inner: DuplexCallTyped<Req, Resp>,
+    /// Counts this call as outstanding toward its provider; both split halves
+    /// share it, so it ends when the last half is dropped.
+    in_flight: Arc<OrgCallInFlight>,
 }
 
 impl<Req: Serialize, Resp: DeserializeOwned + Unpin> OrgDuplexCall<Req, Resp> {
@@ -380,8 +395,14 @@ impl<Req: Serialize, Resp: DeserializeOwned + Unpin> OrgDuplexCall<Req, Resp> {
     pub fn into_split(self) -> (OrgDuplexSink<Req>, OrgDuplexStream<Resp>) {
         let (sink, stream) = self.inner.into_split();
         (
-            OrgDuplexSink { inner: sink },
-            OrgDuplexStream { inner: stream },
+            OrgDuplexSink {
+                inner: sink,
+                _in_flight: Arc::clone(&self.in_flight),
+            },
+            OrgDuplexStream {
+                inner: stream,
+                _in_flight: self.in_flight,
+            },
         )
     }
 }
@@ -407,6 +428,7 @@ impl<Req, Resp: DeserializeOwned + Unpin> futures::Stream for OrgDuplexCall<Req,
 /// The upload half of a split [`OrgDuplexCall`] — the facade's typed sink.
 pub struct OrgDuplexSink<Req> {
     inner: DuplexSinkTyped<Req>,
+    _in_flight: Arc<OrgCallInFlight>,
 }
 
 impl<Req: Serialize> OrgDuplexSink<Req> {
@@ -425,6 +447,7 @@ impl<Req: Serialize> OrgDuplexSink<Req> {
 /// Result<Resp, OrgSdkError>>`.
 pub struct OrgDuplexStream<Resp> {
     inner: DuplexStreamTyped<Resp>,
+    _in_flight: Arc<OrgCallInFlight>,
 }
 
 impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgDuplexStream<Resp> {
@@ -541,6 +564,9 @@ impl OrgClient {
         // The core call mints the call id, computes the canonical request
         // digest, signs the proof, appends exactly one admission header, and
         // pins `peer_entity_id(target) == intent.provider` before sending.
+        // The Phase 4 cost signal: this call is outstanding toward `provider`
+        // until the guard drops, whatever the outcome.
+        let _in_flight = self.node.begin_org_call(provider.node_id());
         let reply = self
             .node
             .call(provider.node_id(), service, request, opts)
@@ -630,6 +656,9 @@ impl OrgClient {
         // One send, ever: the core call mints the call id, digests, signs,
         // pins the peer entity, and the facade never launches a second
         // attempt on any outcome.
+        // The Phase 4 cost signal: this call is outstanding toward `provider`
+        // until the guard drops, whatever the outcome.
+        let _in_flight = self.node.begin_org_call(provider.node_id());
         let reply = self
             .node
             .call(provider.node_id(), service, request, opts)
@@ -716,11 +745,12 @@ impl OrgClient {
             direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
             message: format!("org call_streaming encode: {e}"),
         })?;
-        let inner = self
-            .call_streaming_bytes_deadline(service, Bytes::from(body), 0, 0)
+        let (inner, in_flight) = self
+            .open_streaming_counted(service, Bytes::from(body), 0, 0)
             .await?;
         Ok(OrgStream {
             inner: RpcStreamTyped::from_raw(inner, Codec::Json),
+            _in_flight: in_flight,
         })
     }
 
@@ -732,10 +762,11 @@ impl OrgClient {
         service: &str,
         request: Bytes,
     ) -> Result<OrgStreamRaw, OrgSdkError> {
-        let inner = self
-            .call_streaming_bytes_deadline(service, request, 0, 0)
-            .await?;
-        Ok(OrgStreamRaw { inner })
+        let (inner, in_flight) = self.open_streaming_counted(service, request, 0, 0).await?;
+        Ok(OrgStreamRaw {
+            inner,
+            _in_flight: in_flight,
+        })
     }
 
     /// [`call_streaming_bytes`](Self::call_streaming_bytes) with execution
@@ -760,11 +791,31 @@ impl OrgClient {
         deadline_ms: u64,
         cancel_token: u64,
     ) -> Result<RpcStream, OrgSdkError> {
+        // The raw core stream carries no guard, so for this seam the load
+        // signal counts the opening only; the typed handles count the whole
+        // stream.
+        self.open_streaming_counted(service, request, deadline_ms, cancel_token)
+            .await
+            .map(|(stream, _in_flight)| stream)
+    }
+
+    /// Plan, count, and open one server-streaming call. The returned guard
+    /// keeps the call outstanding toward its provider (Phase 4).
+    async fn open_streaming_counted(
+        &self,
+        service: &str,
+        request: Bytes,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<(RpcStream, OrgCallInFlight), OrgSdkError> {
         let (provider, opening) = self.streaming_opening(service, deadline_ms, cancel_token)?;
-        self.node
+        let in_flight = self.node.begin_org_call(provider.node_id());
+        let stream = self
+            .node
             .call_streaming(provider.node_id(), service, request, opening)
             .await
-            .map_err(map_rpc_error)
+            .map_err(map_rpc_error)?;
+        Ok((stream, in_flight))
     }
 
     /// Call a protected service with a STREAM OF REQUESTS and one typed
@@ -786,7 +837,9 @@ impl OrgClient {
         Resp: DeserializeOwned,
     {
         let (provider, opening) = self.streaming_opening(service, 0, 0)?;
+        let in_flight = self.node.begin_org_call(provider.node_id());
         Ok(OrgClientStreamCall {
+            _in_flight: in_flight,
             pinned: PinnedOpening {
                 client: self.clone(),
                 service: service.to_string(),
@@ -838,9 +891,16 @@ impl OrgClient {
         Resp: DeserializeOwned + Unpin,
     {
         // The typed verb IS the bytes seam plus JSON (one authority path).
-        let inner = self.call_duplex_bytes_deadline(service, 0, 0).await?;
+        let (provider, opening) = self.streaming_opening(service, 0, 0)?;
+        let in_flight = Arc::new(self.node.begin_org_call(provider.node_id()));
+        let inner = self
+            .node
+            .call_duplex(provider.node_id(), service, opening)
+            .await
+            .map_err(map_rpc_error)?;
         Ok(OrgDuplexCall {
             inner: DuplexCallTyped::from_raw(inner, Codec::Json),
+            in_flight,
         })
     }
 
@@ -974,9 +1034,19 @@ impl OrgClient {
                 // remove or authorize a candidate, it mints nothing, and it
                 // runs strictly BEFORE the final currentness comparison below,
                 // which still gates the mint.
-                self.apply_sensed_order(capability, sensed, capture.authority(), &mut candidates);
-                self.select_candidate(capability, &candidates, considered)
-                    .cloned()
+                let outcome = self.apply_sensed_order(capability, sensed, capture, &mut candidates);
+                // Whenever sensing produced ANY verdict, the signed exact lane
+                // decides over the sensed order, unchanged. Only a genuinely
+                // unsensed call (inert, a fallback, or no evidence at all) is
+                // spread within the same authorized, directly reachable pool
+                // (Phase 4).
+                if outcome.evidence {
+                    self.select_candidate(capability, &candidates, considered)
+                        .cloned()
+                } else {
+                    self.select_spread(capability, &candidates, considered)
+                        .cloned()
+                }
             });
         if !self.node.org_cold_authority_is_current(capture.authority()) {
             return Ok(PlanAttempt::Superseded { considered });
@@ -1102,16 +1172,169 @@ impl OrgClient {
         &self,
         capability: &CapabilityAuthorityId,
         sensed: &SensedSelection<'_>,
-        authority: &OrgColdAuthority,
+        capture: &OrgColdDiscovery,
         candidates: &mut Vec<AuthorizedOrgCandidate>,
-    ) {
+    ) -> SensedOutcome {
+        let mut viable: Vec<u64> = Vec::new();
+        let mut not_ready: Vec<u64> = Vec::new();
+        let mut take = |projection: OrgSensedProjection| {
+            viable.extend_from_slice(projection.viable());
+            not_ready.extend_from_slice(projection.non_viable());
+        };
+        // The owner plane first, then each SENSE grant's plane (OLB-6, D6.7).
+        // Each plane is its own demand with its own audience; a provider is
+        // sensed on at most one of them, because the owner plane is
+        // owner-private discovery and a granted plane is another
+        // organization's providers.
+        if let Some(projection) =
+            self.owner_plane_projection(capability, sensed, capture.authority(), candidates)
+        {
+            take(projection);
+        }
+        // The ids a SENSE grant's own plane sensed: the only granted
+        // candidates the permutation may move.
+        let mut granted_sensed: Vec<u64> = Vec::new();
+        for granted in self._sensing.granted() {
+            if let Some(projection) =
+                self.granted_plane_projection(granted, capability, sensed, capture, candidates)
+            {
+                granted_sensed.extend_from_slice(projection.viable());
+                granted_sensed.extend_from_slice(projection.non_viable());
+                take(projection);
+            }
+        }
+        if candidates.len() < 2 || (viable.is_empty() && not_ready.is_empty()) {
+            return SensedOutcome::default();
+        }
+        let permutation =
+            org_sensed_candidate_permutation(candidates, &viable, &not_ready, &granted_sensed);
+        apply_permutation(candidates, permutation);
+        SensedOutcome {
+            // A verdict counts only when it is about one of THIS call's
+            // candidates.
+            evidence: candidates.iter().any(|candidate| {
+                let id = candidate.provider.node_id();
+                viable.contains(&id) || not_ready.contains(&id)
+            }),
+        }
+    }
+
+    /// ONE SENSE grant's plane (OLB-6, completion plan D6.7): reconcile that
+    /// grant's own demand and project it.
+    ///
+    /// The expectation is this derivation's DIRECT candidates that the grant's
+    /// own discovery plane surfaced (owned by its issuer and covered by its
+    /// target scope), the same rows core derives the granted population from
+    /// (`org_sensing_granted_population`), so the two sides can agree. The
+    /// same decide → converge → record section and retry floor as the owner
+    /// plane, on the granted acquisition's own schedule. Advisory in every
+    /// direction: it never adds, removes or authorizes a candidate.
+    fn granted_plane_projection(
+        &self,
+        granted: &super::client::OrgSensingAcquisition,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        capture: &OrgColdDiscovery,
+        candidates: &[AuthorizedOrgCandidate],
+    ) -> Option<OrgSensedProjection> {
+        let family = granted.family();
+        let grant = family.granted_grant()?;
+        if grant.capability != *capability {
+            return None;
+        }
+        let surfaced: std::collections::BTreeSet<&EntityId> = capture
+            .granted_providers(&grant.grant_id)
+            .iter()
+            .filter(|row| {
+                row.owner_org == grant.issuer_org
+                    && grant
+                        .target_scope
+                        .covers(&row.provider, Some(&row.owner_org))
+            })
+            .map(|row| &row.provider)
+            .collect();
+        let mut expected: Vec<u64> = candidates
+            .iter()
+            .filter(|candidate| candidate.direct && surfaced.contains(&candidate.provider))
+            .map(|candidate| candidate.provider.node_id())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let context = super::client::RefusalContext::new(&self.node, capture.authority());
+        let now = Instant::now();
+        // The same fallback accounting as the owner plane (OLB §14
+        // `org_sensing_fallback_total`): only a call this plane could have
+        // reordered counts when it leaves without a sensed order.
+        let could_order = candidates.len() >= 2 && !expected.is_empty();
+        let fall_back = |reason: OrgSensedOrderFallback| {
+            if could_order {
+                family.note_order_fallback(reason);
+            }
+        };
+        {
+            // Decline rather than block, exactly as the owner plane does.
+            let Some(_txn) = granted.try_reconcile_lock() else {
+                fall_back(OrgSensedOrderFallback::Contended);
+                return None;
+            };
+            let installed = family.demand(capability);
+            if expected.is_empty() {
+                if installed.is_some() {
+                    family.retire(sensed.tag);
+                }
+                granted.schedule().forget(capability);
+                return None;
+            }
+            if granted.schedule().needs_convergence(
+                capability,
+                &expected,
+                installed.as_ref(),
+                now,
+                RECONCILE_RETRY_FLOOR,
+                &context,
+            ) {
+                match family.retain(sensed.tag) {
+                    Ok(demand) => granted
+                        .schedule()
+                        .certify(*capability, expected, &demand, now),
+                    Err(_refusal) => {
+                        granted.schedule().record_refusal(
+                            *capability,
+                            expected,
+                            installed.as_ref(),
+                            &context,
+                            now,
+                        );
+                        fall_back(OrgSensedOrderFallback::Refused);
+                        return None;
+                    }
+                }
+            }
+        }
+        let Some(demand) = family.demand(capability) else {
+            fall_back(OrgSensedOrderFallback::Unretained);
+            return None;
+        };
+        if demand.population().is_empty() {
+            return None;
+        }
+        Some(demand.project_sensed_order(now, &sensed.budget))
+    }
+
+    fn owner_plane_projection(
+        &self,
+        capability: &CapabilityAuthorityId,
+        sensed: &SensedSelection<'_>,
+        authority: &OrgColdAuthority,
+        candidates: &[AuthorizedOrgCandidate],
+    ) -> Option<OrgSensedProjection> {
         // The authority observation THIS attempt derives under. A refusal
         // records it, and a later decision asks the node whether it is still
         // the one in force - which is how a restored authority stops being
         // paced by the failure that preceded it.
         let context = super::client::RefusalContext::new(&self.node, authority);
         let Some(acquisition) = self._sensing.acquisition() else {
-            return; // Inert: the deterministic unsensed order, no work at all.
+            return None; // Inert: the deterministic unsensed order, no work at all.
         };
         let family = acquisition.family();
 
@@ -1148,6 +1371,17 @@ impl OrgClient {
         // capture, recorded before anything acts on it.
         acquisition.schedule().note_expectation(&expected);
 
+        // Whether THIS call is one sensing could have reordered: two or more
+        // candidates and an owner-plane population to sense. Only such a call
+        // counts as a FALLBACK when it leaves on the unsensed order (OLB §14,
+        // `org_sensing_fallback_total`). A single candidate, or nothing to
+        // sense, has no order to lose.
+        let could_order = candidates.len() >= 2 && !expected.is_empty();
+        let fall_back = |reason: OrgSensedOrderFallback| {
+            if could_order {
+                family.note_order_fallback(reason);
+            }
+        };
         let now = Instant::now();
         // ONE section: decide, converge, record. `retain` is synchronous and
         // takes core's own transaction lock inside; nothing here awaits.
@@ -1163,7 +1397,8 @@ impl OrgClient {
             // at the price of blocking the runtime inside a synchronous
             // section that authors and sends per provider.
             let Some(_txn) = acquisition.try_reconcile_lock() else {
-                return;
+                fall_back(OrgSensedOrderFallback::Contended);
+                return None;
             };
             // The hold's own ticket, copied out so the steps below can ask
             // whether they are STILL running under it. Losing the hold - to an
@@ -1188,7 +1423,7 @@ impl OrgClient {
                     family.retire(sensed.tag);
                 }
                 acquisition.schedule().forget(capability);
-                return;
+                return None;
             }
             // THE DECISION - read under this caller's own hold.
             acquisition.schedule().verify_holding(held);
@@ -1221,7 +1456,8 @@ impl OrgClient {
                             now,
                         );
                         acquisition.schedule().verify_holding(held);
-                        return;
+                        fall_back(OrgSensedOrderFallback::Refused);
+                        return None;
                     }
                 }
             }
@@ -1231,21 +1467,16 @@ impl OrgClient {
         sensing_planning_seam();
 
         let Some(demand) = family.demand(capability) else {
-            return;
+            fall_back(OrgSensedOrderFallback::Unretained);
+            return None;
         };
         if candidates.len() < 2 || demand.population().is_empty() {
             // Nothing an order could change - but the reconciliation above
             // still ran, so a departure that leaves one candidate is still
             // applied to the retained demand rather than skipped.
-            return;
+            return None;
         }
-        let projection = demand.project_sensed_order(now, &sensed.budget);
-        let permutation = org_sensed_candidate_permutation(
-            candidates,
-            projection.viable(),
-            projection.non_viable(),
-        );
-        apply_permutation(candidates, permutation);
+        Some(demand.project_sensed_order(now, &sensed.budget))
     }
 
     /// The shared selection rule (OA2-E0.3): org-protected RPC is
@@ -1277,6 +1508,41 @@ impl OrgClient {
             considered,
         }
         .into())
+    }
+
+    /// Unsensed load spreading beneath `org.call` (completion plan Phase 4).
+    ///
+    /// Runs only for a GENUINELY UNSENSED call: whenever sensing produced any
+    /// verdict for this call's candidates, the signed exact lane decides through
+    /// [`Self::select_candidate`] instead, unchanged. The pool is the
+    /// already-authorized, DIRECTLY reachable candidates. The choice is
+    /// [`p2c_spread_choice`] over this node's own outstanding org calls to each
+    /// pool member. A flat signal keeps the deterministic first-direct choice
+    /// exactly, so an idle node and sequential traffic behave as before; a
+    /// skewed signal spreads, including on a cold call.
+    ///
+    /// Never a refusal: no direct candidate falls through to
+    /// [`Self::select_candidate`] and its existing errors, and missing
+    /// readiness evidence only means the pool is not narrowed.
+    pub(crate) fn select_spread<'a>(
+        &self,
+        capability: &CapabilityAuthorityId,
+        candidates: &'a [AuthorizedOrgCandidate],
+        considered: usize,
+    ) -> Result<&'a AuthorizedOrgCandidate, OrgSdkError> {
+        let pool: Vec<&AuthorizedOrgCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.direct)
+            .collect();
+        if pool.is_empty() {
+            return self.select_candidate(capability, candidates, considered);
+        }
+        let loads: Vec<u32> = pool
+            .iter()
+            .map(|candidate| self.node.org_call_in_flight(candidate.provider.node_id()))
+            .collect();
+        let index = p2c_spread_choice(&loads, spread_seed(), spread_nonce(), capability.as_bytes());
+        Ok(pool[index])
     }
 
     /// Plan a proof intent for an **exact provider node**, instead of for
@@ -1853,6 +2119,87 @@ fn sensing_planning_seam() {
     }
 }
 
+/// What the sensed step established for one call, as `plan_attempt` needs it
+/// to choose between the sensed lead and unsensed load spreading (completion
+/// plan Phase 4).
+///
+/// `Default` is "sensing established nothing": inert, a fallback exit, or
+/// nothing to order.
+#[derive(Debug, Default)]
+pub(crate) struct SensedOutcome {
+    /// Sensing produced at least one verdict (viable or not-ready) for this
+    /// call's candidates. The signed exact lane then decides over the sensed
+    /// order, exactly as before Phase 4; load spreading never overrides it.
+    pub(crate) evidence: bool,
+}
+
+/// Unsensed load spreading's choice over `loads`: the caller's own outstanding
+/// org calls to each candidate of the spread pool, in the pool's
+/// deterministic order (completion plan Phase 4).
+///
+/// - A FLAT signal (every load equal, including an idle node) returns index 0,
+///   the existing deterministic first-direct choice. A signal that says nothing
+///   changes nothing.
+/// - Otherwise this is power-of-two choices: two distinct indices are drawn
+///   from `seed`, `nonce` and `capability`, the lower load wins, and an exact
+///   tie goes to the earlier index.
+///
+/// Pure once its inputs are given, so tests pin `seed` and `nonce`. `loads`
+/// is non-empty.
+pub(crate) fn p2c_spread_choice(loads: &[u32], seed: u64, nonce: u64, capability: &[u8]) -> usize {
+    if loads.len() < 2 || loads.iter().all(|load| *load == loads[0]) {
+        return 0;
+    }
+    let (low, high) = p2c_pair(loads.len(), seed, nonce, capability);
+    // Strictly lower wins; an exact tie goes to the EARLIER index.
+    if loads[high] < loads[low] {
+        high
+    } else {
+        low
+    }
+}
+
+/// The two DISTINCT indices [`p2c_spread_choice`] compares, as `(lower,
+/// higher)`, for a pool of `n >= 2`. Pure: `DefaultHasher::new()` has FIXED
+/// keys, so the per-process randomness is entirely `seed`.
+pub(crate) fn p2c_pair(n: usize, seed: u64, nonce: u64, capability: &[u8]) -> (usize, usize) {
+    let draw = |salt: u64| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (seed, nonce, salt, capability).hash(&mut hasher);
+        hasher.finish()
+    };
+    let len = n as u64;
+    let first = (draw(0) % len) as usize;
+    // The second draw is over the OTHER n-1 indices, so the pair is distinct.
+    let offset = (draw(1) % (len - 1)) as usize;
+    let second = (first + 1 + offset) % n;
+    if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+/// The process-local seed for [`p2c_spread_choice`]: random per process (the
+/// standard library's randomized hasher keys), so separate nodes never
+/// synchronize onto the same sampled pair.
+fn spread_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0x6e65_745f_7370_7264);
+        hasher.finish()
+    })
+}
+
+/// The monotonic selection counter for [`p2c_spread_choice`].
+fn spread_nonce() -> u64 {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The request-relative half of one planning attempt.
 ///
 /// Exactly one input here is request-relative, by design (D7.5): the latency
@@ -1893,18 +2240,29 @@ impl<'a> SensedSelection<'a> {
 /// sort over the candidate list, no ordering structure, no second rule to
 /// diverge from the first. `Mode::Granted` maps to `false`, which is what
 /// keeps a granted candidate unsensed and unpruned.
+///
+/// The one exception is `granted_sensed` (OLB-6, completion plan D6.7): the
+/// provider ids a held SENSE grant's OWN plane sensed. A granted candidate is
+/// eligible only when its id is there, so an owner-plane projection still can
+/// never reorder or prune a granted candidate, even on an id collision.
 pub(crate) fn org_sensed_candidate_permutation(
     cands: &[AuthorizedOrgCandidate],
     ranked: &[u64],
     pruned: &[u64],
+    granted_sensed: &[u64],
 ) -> Vec<usize> {
     let mut providers: Vec<u64> = Vec::with_capacity(cands.len());
-    let mut same_org: Vec<bool> = Vec::with_capacity(cands.len());
+    // Core names this slice `same_org`; what it means is "may be sensed".
+    let mut sensable: Vec<bool> = Vec::with_capacity(cands.len());
     for candidate in cands {
-        providers.push(candidate.provider.node_id());
-        same_org.push(matches!(candidate.mode, Mode::SameOrg));
+        let id = candidate.provider.node_id();
+        providers.push(id);
+        sensable.push(match &candidate.mode {
+            Mode::SameOrg => true,
+            Mode::Granted(_) => granted_sensed.contains(&id),
+        });
     }
-    org_sensed_bucket_permutation(&same_org, &providers, ranked, pruned)
+    org_sensed_bucket_permutation(&sensable, &providers, ranked, pruned)
 }
 
 /// Reorder `items` by `permutation`, losing nothing.

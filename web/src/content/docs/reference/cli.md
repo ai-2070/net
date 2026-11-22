@@ -461,11 +461,12 @@ Issue a capability grant: "org A holds these rights on this capability over this
 
 ```
 net-mesh org grant-capability --org-key <PATH> --grantee-org <HEX> --capability <TAG> --out <PATH>
-                              (--invoke | --discover --audience-out <PATH>)
+                              (--invoke | --discover --audience-out <PATH>
+                               | --invoke --discover --sense --audience-out <PATH>)
                               (--target-node <HEX> | --target-any-owned-by <HEX>) [--ttl-secs <N>]
 ```
 
-`--discover` mints a fresh audience secret and **requires** `--audience-out`; only the secret's 32-byte commitment rides inside the signed grant, so the raw discovery key never touches the wire. At least one of `--invoke` or `--discover` is required (the parenthesized group marks it); both may be granted together.
+`--discover` mints a fresh audience secret and **requires** `--audience-out`; only the secret's 32-byte commitment rides inside the signed grant, so the raw discovery key never touches the wire. At least one of `--invoke` or `--discover` is required (the parenthesized group marks it); both may be granted together. `--sense` adds the SENSE right, letting the grantee's org calls be ordered by these providers' live readiness; it requires both `--invoke` and `--discover`.
 
 Both grant commands default to a 7-day TTL, hard-capped at 30 days and rejected at issue and at every verifier.
 

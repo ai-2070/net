@@ -2513,7 +2513,7 @@ jobs:
       #     service discovery, plus the refresh-schedule and
       #     authority-clearing observations).
       #   - org_exact_sensing       — production organization
-      #     exact-sensing call edge (22 tests). Needs the SDK's own
+      #     exact-sensing call edge (25 tests, two cross-org). Needs the SDK's own
       #     `fixtures` feature, which is what gates `OrgClient`'s
       #     test-only sensing observation accessors; without it the
       #     binary does not compile, which is loud rather than silent.
@@ -2604,7 +2604,7 @@ jobs:
       # must not disappear silently. This step therefore verifies the RESULT
       # SET that run produced (`$RUNNER_TEMP/sdk-suite-junit.xml`, written by
       # `[profile.default.junit]` in `.config/nextest.toml`) rather than
-      # spending 27 more runner invocations re-proving what already ran.
+      # spending 31 more runner invocations re-proving what already ran.
       #
       # `check-witness-results.py` is fail-closed on every axis and is
       # STRICTER than the loop it replaces:
@@ -2646,7 +2646,7 @@ jobs:
           python3 "$CHECK" \
             --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
             --suite sensing_consumer \
-            --min 27 \
+            --min 31 \
             --required-file - <<'REQUIRED'
           signed_readiness_reaches_the_snapshot_and_an_edge_wakes_the_watcher
           an_already_parked_watcher_is_woken_by_a_provider_edge
@@ -2675,13 +2675,17 @@ jobs:
           a_granted_only_provider_is_never_sensed_and_the_owner_one_is
           a_partial_acquisition_keeps_its_own_state_and_another_owners
           the_population_floor_wakes_a_quiet_parked_consumer
+          a_close_from_another_task_ends_a_pending_wait_promptly
+          a_cancelled_wait_consumes_no_edge_and_leaves_the_watch_open
+          a_close_landing_inside_a_snapshot_leaves_no_demand
+          a_value_provider_set_reaches_the_snapshot_and_honors_the_start_bound
           REQUIRED
 
       # === the PRODUCTION organization exact-sensing call edge =======
       #
       # Same shape and same reasoning as the gate above: the suite step already ran
       # this binary, one process per test, so this gate verifies that run's
-      # result set instead of re-invoking the runner 22 more times. The
+      # result set instead of re-invoking the runner 25 more times. The
       # `<flakyFailure>` rejection matters here in particular — the
       # `.config/nextest.toml` override keeps this binary at `retries = 0`
       # because a retry could turn a lost readiness observation into green,
@@ -2699,13 +2703,16 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py" \
             --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
             --suite org_exact_sensing \
-            --min 22 \
+            --min 25 \
             --required-file - <<'REQUIRED'
           the_production_call_lands_on_the_sensed_provider
+          a_cross_org_call_lands_on_the_sensed_provider_under_a_sense_grant
+          without_sense_a_cross_org_call_keeps_the_deterministic_order
           the_production_call_follows_the_sensed_rank_between_viable_providers
           a_deadline_below_every_estimate_falls_back_to_the_deterministic_order
           a_provider_discovered_after_the_first_call_enters_the_population
           a_departed_provider_leaves_the_warmed_population
+          a_departure_to_zero_retires_the_demand
           a_capacity_refused_holder_is_recovered_by_a_later_call
           a_holder_that_dies_after_convergence_is_reacquired
           unknown_services_strand_no_sensing_capacity

@@ -16,6 +16,9 @@
 //! - [`Mesh::reserve_island`](crate::mesh::Mesh::reserve_island)
 //! - [`Mesh::release_island`](crate::mesh::Mesh::release_island)
 //! - [`Mesh::claim_island`](crate::mesh::Mesh::claim_island)
+//! - `Mesh::match_islands_sensed` / `Mesh::claim_island_sensed`: the
+//!   same, ordered by an exact-provider `sensing::SensingSnapshot`, with
+//!   viable hosts first and not-ready hosts last. Nothing is removed.
 //!
 //! This module re-exports the **value types** those methods take and
 //! return. See [`crate::cortex::workflow`] for the task-lifecycle layer

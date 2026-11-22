@@ -1693,6 +1693,60 @@ impl DaemonRuntime {
             })
     }
 
+    /// Choose a node for a new daemon with `requirements`, ordered by an
+    /// exact-provider readiness capture (sensing plan S3).
+    ///
+    /// The eligible nodes are the runtime scheduler's capability matches,
+    /// exactly as unsensed placement finds them. `readiness` only orders
+    /// them:
+    /// - its viable providers first, in rank order;
+    /// - then nodes it has no verdict for (the local node first among
+    ///   equals);
+    /// - not-ready nodes last.
+    ///
+    /// Nothing is removed. The capture is the caller's: take it from a
+    /// [`SensingWatch`](crate::sensing::SensingWatch) on the interest the
+    /// daemon's readiness is actually evaluated against. No interest is
+    /// derived from `requirements`, because a capability filter is not one
+    /// capability.
+    ///
+    /// This decides only; spawn the daemon where it says.
+    pub fn place_sensed(
+        &self,
+        requirements: &::net::adapter::net::behavior::capability::CapabilityFilter,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        let (viable, not_ready) = readiness.exact_order_inputs();
+        self.inner.scheduler.place_sensed(
+            requirements,
+            false,
+            ::net::adapter::net::compute::SensedOrder {
+                viable_order: viable,
+                not_ready: &not_ready,
+            },
+        )
+    }
+
+    /// Choose a migration target for a daemon with `requirements` currently
+    /// on `source_node`: migration-capable, filter-matching nodes other than
+    /// the source, ordered by `readiness` as in [`Self::place_sensed`].
+    pub fn place_migration_sensed(
+        &self,
+        requirements: &::net::adapter::net::behavior::capability::CapabilityFilter,
+        source_node: u64,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> Result<PlacementDecision, SchedulerError> {
+        let (viable, not_ready) = readiness.exact_order_inputs();
+        self.inner.scheduler.place_migration_sensed(
+            requirements,
+            source_node,
+            ::net::adapter::net::compute::SensedOrder {
+                viable_order: viable,
+                not_ready: &not_ready,
+            },
+        )
+    }
+
     /// Underlying mesh. Exposed read-only so the caller can still
     /// reach the channel / subscribe / publish surface without
     /// reaching around the runtime.
@@ -2355,5 +2409,64 @@ impl std::fmt::Debug for MigrationHandle {
             .field("target_node", &format_args!("{:#x}", self.target_node))
             .field("phase", &self.phase())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod sensed_placement_tests {
+    //! The SDK end of S3b. The banding itself (rank, unverdicted, not-ready,
+    //! vetoes, the local fast path within a band) is witnessed in core,
+    //! `compute::scheduler::tests::sensed_*`. These pin the snapshot→order
+    //! join on a live runtime.
+
+    use super::*;
+    use crate::sensing::{SensedViability, SensingSnapshot};
+    use ::net::adapter::net::behavior::capability::CapabilityFilter;
+
+    async fn runtime() -> (DaemonRuntime, u64) {
+        let mesh = crate::mesh::MeshBuilder::new("127.0.0.1:0", &[0x7au8; 32])
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let id = mesh.inner().node_id();
+        (DaemonRuntime::new(Arc::new(mesh)), id)
+    }
+
+    /// Sensing never ADDS a candidate: a provider ranked viable that is not
+    /// an eligible node is ignored, and the only eligible node (this one)
+    /// is placed.
+    #[tokio::test]
+    async fn a_viable_rank_outside_the_eligible_set_is_ignored() {
+        let (rt, me) = runtime().await;
+        let foreign =
+            SensingSnapshot::for_test("gpu.infer", &[(0xDEAD, SensedViability::Viable)], &[0xDEAD]);
+        let decision = rt
+            .place_sensed(&CapabilityFilter::default(), &foreign)
+            .expect("the local node is eligible");
+        assert_eq!(decision.node_id, me);
+    }
+
+    /// Sensing never REMOVES a candidate: the only eligible node, sensed
+    /// not-ready, is still placed rather than refused.
+    #[tokio::test]
+    async fn a_not_ready_only_candidate_is_demoted_not_refused() {
+        let (rt, me) = runtime().await;
+        let not_ready =
+            SensingSnapshot::for_test("gpu.infer", &[(me, SensedViability::NotViable)], &[]);
+        assert_eq!(
+            rt.place_sensed(&CapabilityFilter::default(), &not_ready)
+                .expect("demoted, not refused")
+                .node_id,
+            me
+        );
+        assert!(
+            matches!(
+                rt.place_migration_sensed(&CapabilityFilter::default(), me, &not_ready),
+                Err(SchedulerError::NoCandidate)
+            ),
+            "migration excludes the source; with no other node there is no target, \
+             and sensing does not invent one"
+        );
     }
 }

@@ -1,11 +1,11 @@
 ---
 title: Headers and Linking
-description: The eleven headers, the one shared library they all resolve against, and the net.h / net.go.h choice you have to make per translation unit.
+description: The twelve headers, the one shared library they all resolve against, and the net.h / net.go.h choice you have to make per translation unit.
 ---
 
 # C — Headers and Linking
 
-The C surface is not one header. It is eleven — and they all resolve out of a
+The C surface is not one header. It is twelve — and they all resolve out of a
 single shared library, `libnet`. One of the header pairings is mutually
 exclusive. This page is the map.
 
@@ -35,6 +35,7 @@ Every other header has its own guard and composes freely.
 | `net_deck.h` | `NET_DECK_H` | Deck operator-side SDK | `libnet` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth — own `NET_ORG_ABI_VERSION`; pair with `net_rpc.h` for the streaming verbs | `libnet` |
 | `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve + gateway provisioning | `libnet` |
+| `net_sensing.h` | `NET_SENSING_H` | Capability sensing — value provider, watch, sensed service call | `libnet` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge helpers, graduated consent / pin surface | `libnet` |
 
 `net_cortex.h` is deliberately self-contained — it depends only on `<stdint.h>`

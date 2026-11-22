@@ -83,6 +83,11 @@ mod enrollment;
 mod gang;
 #[cfg(feature = "groups")]
 mod groups;
+// Same test-target exemption as `org`: napi registration is not a Rust use,
+// so the lib-test build sees `#[napi]` free functions as dead.
+#[cfg(feature = "org")]
+#[cfg_attr(test, allow(dead_code))]
+mod sensing;
 #[cfg(feature = "dataforts")]
 mod transport;
 // nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
@@ -1435,6 +1440,16 @@ mod mesh_bindings {
         /// fail before the node exists. An empty overall list means
         /// every protected subnet assertion fails closed. Requires an
         /// `org`-feature build.
+        /// Turn the capability-sensing plane on (it ships dark). Required
+        /// for `sensingWatch` and `sensingProvide`.
+        pub enable_sensing: Option<bool>,
+        /// Path of the file holding this node's sensing boot counter. Each
+        /// mesh start reads, increments and durably rewrites it before the
+        /// node exists, so a provider never signs two boots under one
+        /// incarnation. Required for `sensingProvide`, which also needs a
+        /// durable `identitySeed`. Keep it beside the identity material.
+        /// Requires an `org`-feature build.
+        pub sensing_incarnation_path: Option<String>,
         pub subnet_authorities: Option<Vec<crate::subnet::SubnetAuthorityConfigJs>>,
         /// This node's own SECURITY attachment point — the local
         /// topology coordinate credentials are checked against.
@@ -1884,6 +1899,37 @@ mod mesh_bindings {
                 Arc::new(construction.exports)
             };
 
+            // Capability sensing (completion plan B1). The boot counter is
+            // persisted BEFORE the node exists, exactly as the Rust SDK's
+            // `MeshBuilder::sensing_incarnation` contract requires.
+            if options.enable_sensing == Some(true) {
+                config = config.with_sensing_coalescing(true);
+            }
+            #[cfg(not(feature = "org"))]
+            if options.sensing_incarnation_path.is_some() {
+                return Err(Error::from_reason(
+                    "sensing_incarnation_path requires an `org`-feature build of @net-mesh/core",
+                ));
+            }
+            #[cfg(feature = "org")]
+            if let Some(path) = options.sensing_incarnation_path.clone() {
+                // The durable counter transaction does blocking file I/O
+                // (read, write, fsync, rename): off the async worker.
+                let worker_path = path.clone();
+                let incarnation = tokio::task::spawn_blocking(move || {
+                    net_sdk::sensing::next_incarnation(&mut net_sdk::sensing::FileIncarnation::new(
+                        worker_path,
+                    ))
+                })
+                .await
+                .map_err(|e| Error::from_reason(format!("sensing incarnation worker failed: {e}")))?
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "sensing incarnation at {path:?} is unavailable: {e}"
+                    ))
+                })?;
+                config = config.with_sensing_incarnation(incarnation);
+            }
             // OSDK-L N: an explicitly supplied seed IS a configured identity.
             // The org facade refuses to bind credentials to a generated
             // fallback, so this provenance must be recorded here exactly as

@@ -26,6 +26,7 @@ crate-type = ["rlib"]
 default = []
 
 [dependencies]
+serde_json = "1"
 # Core mesh types — needed because we expose C-ABI handles that wrap
 # `Arc<MeshNode>` references handed in by the existing Go binding via
 # `net::ffi::mesh::net_mesh_arc_clone`.

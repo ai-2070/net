@@ -2463,6 +2463,10 @@ pub extern "C" fn net_subnet_serve_exported(
     })
 }
 
+// Capability sensing (SENSING_OLB_COMPLETION_PLAN B2). Declared after the
+// `ffi_guard!` macro and the helpers above, which it uses.
+mod sensing;
+pub use sensing::*;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2706,6 +2710,66 @@ mod tests {
     /// `NET_SUBNET_*` value could be changed on one side and silently
     /// mean something else on the other. Go's preamble comment claimed
     /// the mirror covered it; now it does.
+    /// `include/net_sensing.h`'s numeric contract must match the Rust
+    /// `pub const`s (completion plan B2). The constants exist in three places
+    /// (here, the header, and `go/sensing.go`'s cgo preamble); this pins the
+    /// first two, and `go/sensing_test.go` pins the Go preamble against the
+    /// header.
+    #[test]
+    fn sensing_header_numeric_contract_matches_rust() {
+        let header = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../include/net_sensing.h"
+        ))
+        .expect("read include/net_sensing.h");
+        let defines = header_defines(&header, "NET_SENSING_");
+        let want: &[(&str, i64)] = &[
+            ("NET_SENSING_OK", sensing::NET_SENSING_OK as i64),
+            ("NET_SENSING_ERR_NULL", sensing::NET_SENSING_ERR_NULL as i64),
+            (
+                "NET_SENSING_ERR_INVALID_UTF8",
+                sensing::NET_SENSING_ERR_INVALID_UTF8 as i64,
+            ),
+            (
+                "NET_SENSING_ERR_SENSING",
+                sensing::NET_SENSING_ERR_SENSING as i64,
+            ),
+            ("NET_SENSING_TIMEOUT", sensing::NET_SENSING_TIMEOUT as i64),
+            ("NET_SENSING_ERR_RPC", sensing::NET_SENSING_ERR_RPC as i64),
+            (
+                "NET_SENSING_ERR_INCARNATION",
+                sensing::NET_SENSING_ERR_INCARNATION as i64,
+            ),
+            (
+                "NET_SENSING_ERR_INVALID_ARG",
+                sensing::NET_SENSING_ERR_INVALID_ARG as i64,
+            ),
+            (
+                "NET_SENSING_STATE_READY",
+                sensing::NET_SENSING_STATE_READY as i64,
+            ),
+            (
+                "NET_SENSING_STATE_NOT_READY",
+                sensing::NET_SENSING_STATE_NOT_READY as i64,
+            ),
+            (
+                "NET_SENSING_STATE_UNEVALUABLE",
+                sensing::NET_SENSING_STATE_UNEVALUABLE as i64,
+            ),
+            (
+                "NET_SENSING_ABI_VERSION",
+                sensing::NET_SENSING_ABI_VERSION as i64,
+            ),
+        ];
+        assert_defines_match("include/net_sensing.h", &defines, want);
+        assert_eq!(
+            defines.len(),
+            want.len(),
+            "net_sensing.h defines a NET_SENSING_* value Rust does not pin: {:?}",
+            defines.keys().collect::<Vec<_>>(),
+        );
+    }
+
     #[test]
     fn subnet_header_numeric_contract_matches_rust() {
         let header = std::fs::read_to_string(concat!(

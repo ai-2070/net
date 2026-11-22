@@ -20,6 +20,10 @@
     "./deck": {
       "types": "./dist/deck.d.ts",
       "default": "./dist/deck.js"
+    },
+    "./sensing": {
+      "types": "./dist/sensing.d.ts",
+      "default": "./dist/sensing.js"
     }
   },
   "license": "MIT OR Apache-2.0",

@@ -1628,6 +1628,60 @@ impl Mesh {
         Ok(self.node.claim_island(criteria, until_unix_us).await?)
     }
 
+    /// [`Self::match_islands`] reordered by an exact-provider readiness
+    /// capture. Islands of [`readiness`](crate::sensing::SensingSnapshot)'s
+    /// viable providers lead, in its rank order. Islands of hosts it has no
+    /// verdict for keep the selection policy's order. Islands of hosts it saw
+    /// not-ready come last.
+    ///
+    /// **Nothing is removed.** The result is always a permutation of what
+    /// [`Self::match_islands`] returns for the same `criteria`, including
+    /// when every host is not-ready. A readiness observation describes one
+    /// instant. It is an ordering input here, never a filter. That is the
+    /// rule `OrgClient::call` applies to the same snapshots (organization
+    /// exact-sensing design D7.2).
+    ///
+    /// The snapshot is the caller's: take it from a
+    /// [`SensingWatch`](crate::sensing::SensingWatch) whose capability is the
+    /// one these islands serve. This derives no interest from `criteria` and
+    /// opens no observation. **The snapshot's capability is not checked**:
+    /// gang criteria carry a capability QUERY, not one capability, so there is
+    /// nothing exact to compare it with. A snapshot of an unrelated capability
+    /// therefore still orders any host that serves both, by readiness for the
+    /// wrong thing. Pass a snapshot of the capability the islands are being
+    /// claimed for.
+    pub fn match_islands_sensed(
+        &self,
+        criteria: &crate::gang::MatchCriteria,
+        readiness: &crate::sensing::SensingSnapshot,
+    ) -> Vec<crate::gang::IslandId> {
+        let (viable, not_ready) = readiness.exact_order_inputs();
+        self.node
+            .match_islands_exact_sensed(criteria, viable, &not_ready)
+    }
+
+    /// Match with [`Self::match_islands_sensed`] and reserve the first island
+    /// whose reservation this node wins. Returns `None` when nothing matched
+    /// or every match was contended in this node's view.
+    ///
+    /// **Readiness is not a reservation.** A provider sensed ready can still
+    /// lose the claim: its island may already be held, and the next island in
+    /// the sensed order is tried exactly as [`Self::claim_island`] would try
+    /// it.
+    pub async fn claim_island_sensed(
+        &self,
+        criteria: &crate::gang::MatchCriteria,
+        readiness: &crate::sensing::SensingSnapshot,
+        until_unix_us: u64,
+    ) -> Result<Option<crate::gang::IslandId>> {
+        for island in self.match_islands_sensed(criteria, readiness) {
+            if self.reserve_island(island, until_unix_us).await? == crate::gang::ClaimOutcome::Won {
+                return Ok(Some(island));
+            }
+        }
+        Ok(None)
+    }
+
     /// Scoped variant of [`Self::find_nodes`]. Filters candidates
     /// through a [`crate::capabilities::ScopeFilter`] derived from
     /// each node's `scope:*` reserved tags. Untagged nodes resolve
@@ -2221,5 +2275,127 @@ mod rpc_service_channel_registration_tests {
             .channel_configs
             .get_by_name("agg.svc3.replies.00112233445566aa")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod sensed_gang_tests {
+    //! The SDK end of the exact-lane gang join (SENSING_OLB_COMPLETION_PLAN
+    //! C4). The banding itself is witnessed in core
+    //! (`behavior::gang::tests::exact_sensed_match_*`, multi-host). What these
+    //! add is the snapshot→inputs join and the live `Mesh` contract that the
+    //! sensed match is a permutation of the plain one, never a filter.
+
+    use super::*;
+    use crate::capabilities::CapabilitySet;
+    use crate::gang::{
+        CapabilityFilter, CapabilityQuery, IslandRecord, MatchCriteria, NumericFilter,
+        SelectionPolicy, UnitSet,
+    };
+    use crate::sensing::{SensedViability, SensingSnapshot};
+
+    fn now_us() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    }
+
+    fn criteria() -> MatchCriteria {
+        MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            numeric: NumericFilter {
+                min_units: 8,
+                ..Default::default()
+            },
+            selection: SelectionPolicy::LeastLoaded,
+            prefer_capability: None,
+        }
+    }
+
+    /// A single node hosting one matching island.
+    async fn island_host() -> (Mesh, u64) {
+        let mesh = MeshBuilder::new("127.0.0.1:0", &[0x5Cu8; 32])
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        mesh.announce_capabilities(CapabilitySet::new().add_tag("gpu:h100"))
+            .await
+            .unwrap();
+        mesh.publish_island_topology(IslandRecord {
+            id: 0xD0,
+            units: UnitSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            host: 0,
+            capabilities: vec![],
+            load: 0.1,
+            p50_latency_us: 800,
+        })
+        .await
+        .unwrap();
+        let id = mesh.node().node_id();
+        (mesh, id)
+    }
+
+    /// The join reads the snapshot's OWN classes: rank order for viable,
+    /// the not-ready set for `NotViable`, and `Potential` in neither. RED
+    /// against a join that treats `Potential` as not-ready (absence of
+    /// evidence would then demote), or that re-sorts `ranked`.
+    #[test]
+    fn the_join_takes_rank_order_and_only_not_viable_rows_as_demoted() {
+        let snapshot = SensingSnapshot::for_test(
+            "gpu.infer",
+            &[
+                (1, SensedViability::Viable),
+                (2, SensedViability::Potential),
+                (3, SensedViability::NotViable),
+                (4, SensedViability::Viable),
+            ],
+            &[4, 1],
+        );
+        let (viable, not_ready) = snapshot.exact_order_inputs();
+        assert_eq!(viable, &[4, 1], "the snapshot's rank order, verbatim");
+        assert_eq!(
+            not_ready,
+            [3].into_iter().collect(),
+            "only NotViable demotes; Potential is no verdict"
+        );
+    }
+
+    /// A host sensed not-ready keeps its island in the sensed match and can
+    /// still be claimed. RED against an SDK that routes through SI-6's
+    /// pruning matcher, which would return nothing here.
+    #[tokio::test]
+    async fn a_not_ready_host_is_demoted_never_removed() {
+        let (mesh, me) = island_host().await;
+        let not_ready =
+            SensingSnapshot::for_test("gpu.infer", &[(me, SensedViability::NotViable)], &[]);
+
+        assert_eq!(mesh.match_islands(&criteria()), vec![0xD0]);
+        assert_eq!(
+            mesh.match_islands_sensed(&criteria(), &not_ready),
+            vec![0xD0],
+            "the sensed match is a permutation of the plain match",
+        );
+        assert_eq!(
+            mesh.claim_island_sensed(&criteria(), &not_ready, now_us() + 60_000_000)
+                .await
+                .unwrap(),
+            Some(0xD0),
+        );
+    }
+
+    /// An empty capture changes nothing.
+    #[tokio::test]
+    async fn an_empty_snapshot_is_the_plain_match() {
+        let (mesh, _) = island_host().await;
+        let empty = SensingSnapshot::for_test("gpu.infer", &[], &[]);
+        assert_eq!(
+            mesh.match_islands_sensed(&criteria(), &empty),
+            mesh.match_islands(&criteria())
+        );
     }
 }

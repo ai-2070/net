@@ -48,6 +48,8 @@ const FORWARDED_KEYS: (keyof MeshNodeConfig)[] = [
     'tryPortMapping',
     'autoDirectUpgrade',
     'permissiveChannels',
+    'enableSensing',
+    'sensingIncarnationPath',
 ];
 
 describe('MeshNode.create option forwarding', () => {

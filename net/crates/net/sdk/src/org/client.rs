@@ -52,8 +52,9 @@ use crate::mesh::Mesh;
 #[cfg(feature = "cortex")]
 #[derive(Clone)]
 pub(crate) enum OrgSensingBinding {
-    /// The mint succeeded; this client shares one acquisition.
-    Active(OrgSensingAcquisition),
+    /// The mint succeeded; this client shares one acquisition, plus one per
+    /// held SENSE grant (OLB-6, D6.7) — possibly none.
+    Active(OrgSensingAcquisition, Arc<[OrgSensingAcquisition]>),
     /// The mint was refused. Deterministic unsensed planning, no sensing work.
     Inert,
 }
@@ -63,8 +64,17 @@ impl OrgSensingBinding {
     /// The acquisition, when this binding is active.
     pub(crate) fn acquisition(&self) -> Option<&OrgSensingAcquisition> {
         match self {
-            Self::Active(acquisition) => Some(acquisition),
+            Self::Active(acquisition, _) => Some(acquisition),
             Self::Inert => None,
+        }
+    }
+
+    /// The GRANTED acquisitions (OLB-6): one per SENSE grant this binding
+    /// holds credentials for. Empty when inert.
+    pub(crate) fn granted(&self) -> &[OrgSensingAcquisition] {
+        match self {
+            Self::Active(_, granted) => granted,
+            Self::Inert => &[],
         }
     }
 }
@@ -669,6 +679,37 @@ fn population_of(
     population
 }
 
+/// One acquisition per held SENSE grant this node can sense under (OLB-6,
+/// completion plan D6.7), minted once at bind.
+///
+/// A grant qualifies when it carries SENSE, was issued to the acting
+/// organization, and the node accepts the (dispatcher, grant) pair: the node's
+/// owner is the grantee and the dispatcher is this node's own grant for the
+/// acting organization over the capability
+/// (`MeshNode::register_granted_sensing`). Anything else is skipped silently:
+/// a grant this binding cannot sense under only means its providers are not
+/// readiness-ordered, never that a call is refused.
+#[cfg(feature = "cortex")]
+fn granted_sensing_acquisitions(
+    node: &Arc<MeshNode>,
+    dispatcher: &OrgDispatcherGrant,
+    grants: &[OrgCapabilityGrant],
+    acting_org: OrgId,
+) -> Arc<[OrgSensingAcquisition]> {
+    grants
+        .iter()
+        .filter(|grant| grant.permits_sense() && grant.grantee_org == acting_org)
+        .filter_map(|grant| {
+            let registration = node
+                .register_granted_sensing(dispatcher.clone(), grant.clone())
+                .ok()?;
+            OrgSensingFamily::mint_granted(node, registration)
+                .ok()
+                .map(OrgSensingAcquisition::new)
+        })
+        .collect()
+}
+
 #[cfg(feature = "cortex")]
 impl OrgSensingAcquisition {
     pub(crate) fn new(family: OrgSensingFamily) -> Self {
@@ -1014,6 +1055,41 @@ impl OrgClient {
         Some(demand.project_sensed_order(at, budget))
     }
 
+    /// [`Self::sensing_projection`] for the GRANTED plane of the held SENSE
+    /// grant `grant_id` (OLB-6). `None` when this binding holds no granted
+    /// acquisition for that grant, or it retains no demand for `capability`.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn granted_sensing_projection(
+        &self,
+        grant_id: &[u8; 32],
+        capability: &CapabilityAuthorityId,
+        at: Instant,
+        budget: &net::adapter::net::behavior::sensing::ConsumerLatencyBudget,
+    ) -> Option<net::adapter::net::behavior::org_sensing_demand::OrgSensedProjection> {
+        let demand = self
+            ._sensing
+            .granted()
+            .iter()
+            .find(|granted| {
+                granted
+                    .family()
+                    .granted_grant()
+                    .is_some_and(|grant| grant.grant_id == *grant_id)
+            })?
+            .family()
+            .demand(capability)?;
+        Some(demand.project_sensed_order(at, budget))
+    }
+
+    /// How many GRANTED sensing acquisitions this binding holds (OLB-6): one
+    /// per held SENSE grant the node accepted.
+    #[cfg(all(feature = "cortex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn granted_sensing_acquisitions(&self) -> usize {
+        self._sensing.granted().len()
+    }
+
     /// The membership certificate this client calls under.
     pub fn membership(&self) -> &OrgMembershipCert {
         &self.membership
@@ -1207,7 +1283,10 @@ impl OrgClient {
             OrgSensingBinding::Inert
         } else {
             match OrgSensingFamily::mint(&node) {
-                Ok(family) => OrgSensingBinding::Active(OrgSensingAcquisition::new(family)),
+                Ok(family) => OrgSensingBinding::Active(
+                    OrgSensingAcquisition::new(family),
+                    granted_sensing_acquisitions(&node, &dispatcher, &grants, acting_org),
+                ),
                 Err(refusal) => {
                     // `eprintln!` because this crate takes no logging dependency
                     // (the `compute` verbs do the same for their one operator

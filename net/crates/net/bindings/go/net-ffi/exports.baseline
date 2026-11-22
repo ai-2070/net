@@ -4,7 +4,7 @@
 # generated-at: 9f01c24cea6645516ba6ed11f2a91654a0360a01
 # artifact: net.dll (pe, Windows AMD64)
 # build: cargo build --release -p net-ffi --features net-ffi/test-helpers
-# count: 607
+# count: 622
 # edited: net_redex_disable_replication added by hand (intended C-ABI addition, PR #1138)
 # edited: 8 v0.3 blob symbols added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md S6): net_blob_ref_describe, net_mesh_blob_adapter_{new_v2,fetch_range,store_tree,repair_blob,tree_node_cache_stats}, and the fixtures-only seams net_mesh_blob_adapter_test_{drop_data_chunk,chunk_present}
 # edited: net_redex_greedy_cache_for added by hand (intended C-ABI addition, GO_BINDING_CONSOLIDATION_AND_BLOBS_PLAN.md gap G-A)
@@ -13,6 +13,7 @@
 # edited: net_meshdb_decode_payload_json_as added by hand (intended C-ABI addition: decode a meshdb envelope by kind)
 # edited: net_rpc_request_stream_retire added by hand (intended C-ABI addition, SDK audit 2026-10-11 #8: wakes a parked server-side next before the dispatcher returns)
 # edited: net_fold_query_client_query_group_latest + net_fold_query_client_query_group_summarize_now added by hand (intended C-ABI addition, fold.query.v2 Q4, 91664d6dd2)
+# edited: the 15 net_sensing_* entry points added by hand (intended C-ABI addition, SENSING_OLB_COMPLETION_PLAN B2: capability sensing over org-ffi)
 net_blob_adapter_registered
 net_blob_free_buffer
 net_blob_publish
@@ -556,6 +557,21 @@ net_rpc_watch_tools
 net_rpc_watch_tools_close
 net_rpc_watch_tools_free
 net_rpc_watch_tools_next
+net_sensing_abi_version
+net_sensing_call_service
+net_sensing_error_class
+net_sensing_next_incarnation
+net_sensing_provide
+net_sensing_provider_close
+net_sensing_provider_free
+net_sensing_provider_set
+net_sensing_snapshot_free
+net_sensing_snapshot_json
+net_sensing_watch
+net_sensing_watch_changed
+net_sensing_watch_close
+net_sensing_watch_free
+net_sensing_watch_snapshot
 net_serve_blob_transfer
 net_shard_group_free
 net_shard_group_new

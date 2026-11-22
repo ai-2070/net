@@ -1572,7 +1572,7 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // moves nothing. A mapping that called it same-organization would emit it
     // FIRST.
     assert_eq!(
-        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[]),
+        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[], &[]),
         identity_permutation,
         "a Granted id cannot be ranked: the input order is kept"
     );
@@ -1580,7 +1580,7 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // CASE 2 - PRUNED. Same reasoning in the other direction: a mapping that
     // called it same-organization would emit it LAST.
     assert_eq!(
-        super::call::org_sensed_candidate_permutation(&candidates, &[], &[granted_id]),
+        super::call::org_sensed_candidate_permutation(&candidates, &[], &[granted_id], &[]),
         identity_permutation,
         "a Granted id cannot be pruned either"
     );
@@ -1588,7 +1588,12 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // CASE 3 - both at once, which is what the granted plane looks like to a
     // projection that has no row for it at all.
     assert_eq!(
-        super::call::org_sensed_candidate_permutation(&candidates, &[granted_id], &[granted_id]),
+        super::call::org_sensed_candidate_permutation(
+            &candidates,
+            &[granted_id],
+            &[granted_id],
+            &[]
+        ),
         identity_permutation,
     );
 
@@ -1596,7 +1601,8 @@ async fn the_sensed_adapter_never_ranks_or_prunes_a_granted_candidate() {
     // candidate keeps its relative place, nothing is dropped.
     let owner_id = owner_only.entity_id().node_id();
     let mut reordered = candidates.clone();
-    let permutation = super::call::org_sensed_candidate_permutation(&reordered, &[owner_id], &[]);
+    let permutation =
+        super::call::org_sensed_candidate_permutation(&reordered, &[owner_id], &[], &[]);
     assert_eq!(
         permutation,
         vec![2, 0, 1],
@@ -1644,6 +1650,7 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
         &reordered,
         &[higher.entity_id().node_id()],
         &[],
+        &[],
     );
     super::call::apply_permutation(&mut reordered, permutation);
     assert_eq!(&reordered[0].provider, higher.entity_id());
@@ -1680,6 +1687,7 @@ async fn selection_and_its_errors_follow_the_reordered_list() {
     let permutation = super::call::org_sensed_candidate_permutation(
         &reordered,
         &[higher.entity_id().node_id()],
+        &[],
         &[],
     );
     super::call::apply_permutation(&mut reordered, permutation);
@@ -1800,6 +1808,84 @@ async fn a_refused_wave_paces_but_a_restored_authority_does_not_wait() {
         "a restored authority is a NEW context: reconciliation must resume at \
          once rather than wait out the refusal floor"
     );
+    // C2 control: with ONE candidate there is no order to lose, so neither the
+    // refused attempt nor the paced wave is a fallback. RED against a counter
+    // that ignores `could_order`.
+    assert_eq!(
+        mesh.org_sensing_routing_counters().fallback_total,
+        0,
+        "a single-candidate call never counts as an order fallback"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C2 (OLB §14 `org_sensing_fallback_total`): a sensed call that WANTED
+/// sensing and left on the unsensed order is counted once, under its reason.
+/// A converged call is not counted.
+///
+/// Two providers, so every attempt has an order to lose. The node is poisoned
+/// BEFORE the first attempt, so no demand is ever installed until recovery:
+///
+/// 1. the first attempt converges, `retain` refuses → `Refused`;
+/// 2. the next attempt is paced by that refusal and finds no demand →
+///    `Unretained`;
+/// 3. after the authority is restored, the attempt converges and applies the
+///    projection → no new fallback.
+#[tokio::test]
+async fn sensed_order_fallbacks_are_counted_once_by_reason() {
+    let a = org_a();
+    let (mesh, identity, dir) =
+        super::tests::mesh_with_authority_sensing("plan-fallback-reasons", Some(&a), true).await;
+    let tag = "nrpc:internal.reindex";
+    for _ in 0..2 {
+        let provider = EntityKeypair::generate();
+        inject_owner_envelope(&mesh, &a, &provider, &[tag]);
+        mesh.node()
+            .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    }
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap(tag);
+    let sensed = super::call::SensedSelection::new(tag, 0);
+    let attempt = || {
+        let capture = client
+            .capture_private(&capability)
+            .expect("the authority stays installed, so the caller keeps capturing");
+        let _ = client.plan_attempt(&capability, &capture, &sensed);
+    };
+    let counters = || mesh.org_sensing_routing_counters();
+
+    mesh.node()
+        .org_revocation_store()
+        .expect("an installed store")
+        .mark_poisoned_for_test();
+
+    attempt();
+    assert_eq!(
+        client.sensing_last_expectation().map(|e| e.len()),
+        Some(2),
+        "precondition: both providers are in the sensed expectation"
+    );
+    let after_refusal = counters();
+    assert_eq!(after_refusal.fallback_refused, 1, "{after_refusal:?}");
+    assert_eq!(after_refusal.fallback_total, 1, "{after_refusal:?}");
+
+    attempt();
+    let after_wave = counters();
+    assert_eq!(after_wave.fallback_unretained, 1, "{after_wave:?}");
+    assert_eq!(
+        after_wave.fallback_refused, 1,
+        "the paced wave is not a second refusal"
+    );
+    assert_eq!(after_wave.fallback_total, 2, "{after_wave:?}");
+
+    renew_authority_at(&mesh, &a, &identity, &dir, "restored");
+    attempt();
+    assert_eq!(
+        counters().fallback_total,
+        2,
+        "a converged call applied the sensed order and is not a fallback"
+    );
+    assert_eq!(counters().fallback_contended, 0, "no caller ever contended");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2205,5 +2291,137 @@ async fn a_demand_identity_is_never_reused() {
     );
 
     drop(family);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: unsensed load spreading beneath org.call (SENSING_OLB_COMPLETION_PLAN)
+// ---------------------------------------------------------------------------
+
+/// A flat signal (every load equal, an idle node included) keeps the
+/// deterministic first choice. A skewed signal picks the lower-loaded of the
+/// sampled pair, and an exact tie goes to the earlier index. RED against a
+/// sampler that ignores the loads, that spreads even when the signal is flat,
+/// or that breaks ties by draw order.
+#[test]
+fn p2c_spread_choice_keeps_the_flat_default_and_follows_a_skewed_signal() {
+    use super::call::p2c_spread_choice;
+    let cap = [7u8; 32];
+    for nonce in 0..200u64 {
+        assert_eq!(
+            p2c_spread_choice(&[0, 0, 0], 11, nonce, &cap),
+            0,
+            "flat: idle"
+        );
+        assert_eq!(
+            p2c_spread_choice(&[4, 4], 11, nonce, &cap),
+            0,
+            "flat: equal load"
+        );
+        assert_eq!(
+            p2c_spread_choice(&[3, 0], 11, nonce, &cap),
+            1,
+            "the only pair: lower wins"
+        );
+        assert_eq!(p2c_spread_choice(&[0, 3], 11, nonce, &cap), 0);
+        assert_eq!(
+            p2c_spread_choice(&[5], 11, nonce, &cap),
+            0,
+            "a single candidate"
+        );
+    }
+    // Three candidates, the first loaded: every sampled pair avoids index 0,
+    // and the two idle ones tie towards the earlier index, so both still get
+    // chosen across nonces (the pair {0,2} picks 2).
+    let picks: Vec<usize> = (0..400u64)
+        .map(|nonce| p2c_spread_choice(&[2, 0, 0], 11, nonce, &cap))
+        .collect();
+    assert!(
+        !picks.contains(&0),
+        "the loaded candidate is never chosen over an idle one"
+    );
+    assert!(
+        picks.contains(&1) && picks.contains(&2),
+        "load spreads across the idle pair"
+    );
+    // The exact-tie rule, isolated: find a nonce whose sampled pair is (0, 1),
+    // both idle, with index 2 loaded so the signal is not flat. The EARLIER
+    // index must win. RED against a tie broken toward the later index.
+    let tie_nonce = (0..10_000u64)
+        .find(|nonce| super::call::p2c_pair(3, 11, *nonce, &cap) == (0, 1))
+        .expect("some nonce samples the pair (0, 1)");
+    assert_eq!(
+        p2c_spread_choice(&[0, 0, 9], 11, tie_nonce, &cap),
+        0,
+        "a tie goes to the earlier index"
+    );
+    // And every sampled pair is distinct and ordered.
+    for nonce in 0..500u64 {
+        let (low, high) = super::call::p2c_pair(5, 3, nonce, &cap);
+        assert!(low < high && high < 5, "pair ({low}, {high})");
+    }
+    // Pure: the same inputs give the same answer.
+    assert_eq!(
+        p2c_spread_choice(&[2, 0, 1, 0], 99, 7, &cap),
+        p2c_spread_choice(&[2, 0, 1, 0], 99, 7, &cap)
+    );
+}
+
+/// The live planning path: with two authorized, directly reachable providers
+/// and nothing outstanding, `plan` keeps the deterministic choice. While THIS
+/// node holds an outstanding org call to that provider, `plan` chooses the
+/// other one. When the call ends, the deterministic choice returns.
+#[tokio::test]
+async fn unsensed_planning_spreads_by_this_nodes_outstanding_calls() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("plan-spread", Some(&a)).await;
+    let p1 = EntityKeypair::generate();
+    let p2 = EntityKeypair::generate();
+    for provider in [&p1, &p2] {
+        inject_owner_envelope(&mesh, &a, provider, &["nrpc:internal.reindex"]);
+        mesh.node()
+            .test_pin_peer_entity(provider.entity_id().node_id(), provider.entity_id().clone());
+    }
+    let (first, second) = if p1.entity_id() < p2.entity_id() {
+        (&p1, &p2)
+    } else {
+        (&p2, &p1)
+    };
+    let client = bind(&mesh, &a, &identity, vec![]);
+
+    for _ in 0..20 {
+        let intent = client.plan("internal.reindex", 0).expect("plan");
+        assert_eq!(
+            &intent.provider,
+            first.entity_id(),
+            "idle: the deterministic choice"
+        );
+    }
+
+    let held = mesh.node().begin_org_call(first.entity_id().node_id());
+    assert_eq!(
+        mesh.node().org_call_in_flight(first.entity_id().node_id()),
+        1
+    );
+    for _ in 0..20 {
+        let intent = client.plan("internal.reindex", 0).expect("plan");
+        assert_eq!(
+            &intent.provider,
+            second.entity_id(),
+            "an outstanding call to the first provider steers new calls to the second"
+        );
+    }
+
+    drop(held);
+    assert_eq!(
+        mesh.node().org_call_in_flight(first.entity_id().node_id()),
+        0
+    );
+    let intent = client.plan("internal.reindex", 0).expect("plan");
+    assert_eq!(
+        &intent.provider,
+        first.entity_id(),
+        "the signal is flat again"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

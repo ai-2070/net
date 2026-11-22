@@ -25,6 +25,7 @@
 //! ```text
 //! rights ⊇ DISCOVER  ⇔  discovery binding present
 //! one DISCOVER grant ⇔ one unique handle ⇔ one unique key
+//! rights ⊇ SENSE     ⇒  rights ⊇ INVOKE ∧ DISCOVER   (OLB-6, D6.1)
 //! ```
 //!
 //! Issuance ALWAYS mints fresh audience material for a DISCOVER
@@ -134,8 +135,26 @@ impl GrantRights {
     pub const DISCOVER: Self = Self(1);
     /// May invoke this capability (subject to full admission).
     pub const INVOKE: Self = Self(1 << 1);
+    /// May register exact-provider SENSING interest on this capability's
+    /// covered providers (OLB-6, completion plan D6.1). Structurally
+    /// requires INVOKE and DISCOVER, enforced at issue, decode and verify
+    /// (`check_sense_rule`).
+    pub const SENSE: Self = Self(1 << 2);
     /// Every bit this build understands.
-    const KNOWN_MASK: u32 = 0b11;
+    const KNOWN_MASK: u32 = 0b111;
+
+    /// The SENSE structural rule (D6.1): `SENSE ⇒ INVOKE ∧ DISCOVER`. The
+    /// granted sensed population is the grant's OWN discovery plane, and
+    /// sensing a capability the grantee cannot invoke is load disclosure
+    /// with no routing use, so a SENSE grant without both is a permanently
+    /// unusable credential and is refused rather than minted (the
+    /// `TargetOrgNotIssuer` precedent).
+    pub(crate) fn check_sense_rule(self) -> Result<(), OrgError> {
+        if self.contains(Self::SENSE) && !self.contains(Self::INVOKE.union(Self::DISCOVER)) {
+            return Err(OrgError::SenseRequiresInvokeDiscover);
+        }
+        Ok(())
+    }
 
     /// The union of two rights sets.
     pub const fn union(self, other: Self) -> Self {
@@ -174,6 +193,9 @@ impl std::fmt::Debug for GrantRights {
         }
         if self.contains(Self::INVOKE) {
             parts.push("INVOKE");
+        }
+        if self.contains(Self::SENSE) {
+            parts.push("SENSE");
         }
         if self.0 & !Self::KNOWN_MASK != 0 {
             parts.push("UNKNOWN");
@@ -751,7 +773,7 @@ impl std::fmt::Debug for OrgDispatcherGrant {
 /// issuer_org:       32 (OrgId B — the verifying key)
 /// grantee_org:      32 (OrgId A)
 /// capability:       32 (CapabilityAuthorityId)
-/// rights:            4 (u32 LE bitset: DISCOVER=1, INVOKE=2)
+/// rights:            4 (u32 LE bitset: DISCOVER=1, INVOKE=2, SENSE=4)
 /// target_tag:        1 (0x01 = ExactNode, 0x02 = AnyNodeOwnedBy)
 /// target_id:        32 (EntityId or OrgId per tag)
 /// discovery_tag:     1 (0x00 = absent, 0x01 = present)
@@ -852,6 +874,7 @@ impl OrgCapabilityGrant {
         // constructed through the checked API — the bitset is
         // `Copy` and could arrive from a decode path.
         let rights = GrantRights::try_from_bits(rights.bits())?;
+        rights.check_sense_rule()?;
         if duration_secs == 0 {
             return Err(OrgError::ZeroTtl);
         }
@@ -1004,6 +1027,7 @@ impl OrgCapabilityGrant {
             return Err(OrgError::ReservedGrantId);
         }
         let rights = GrantRights::try_from_bits(self.rights.bits())?;
+        rights.check_sense_rule()?;
         if rights.contains(GrantRights::DISCOVER) != self.discovery.is_some() {
             return Err(OrgError::DiscoveryBindingMismatch);
         }
@@ -1037,6 +1061,12 @@ impl OrgCapabilityGrant {
     /// `rights ⊇ DISCOVER`.
     pub fn permits_discover(&self) -> bool {
         self.rights.contains(GrantRights::DISCOVER)
+    }
+
+    /// `rights ⊇ SENSE` (OLB-6): this grant may carry granted sensing
+    /// registrations for its capability on its covered providers.
+    pub fn permits_sense(&self) -> bool {
+        self.rights.contains(GrantRights::SENSE)
     }
 
     /// Serialize to canonical wire format.
@@ -1094,6 +1124,7 @@ impl OrgCapabilityGrant {
             }
             _ => return Err(OrgError::InvalidFormat),
         };
+        rights.check_sense_rule()?;
         if rights.contains(GrantRights::DISCOVER) != discovery.is_some() {
             return Err(OrgError::DiscoveryBindingMismatch);
         }
@@ -1612,6 +1643,141 @@ mod tests {
         ));
     }
 
+    /// OLB-6 D6.1: `SENSE ⇒ INVOKE ∧ DISCOVER`, refused at ISSUE for every
+    /// shape that lacks one of them, and a full SENSE grant issues, verifies,
+    /// round-trips and reports `permits_sense`. RED against a rule dropped
+    /// from `try_issue`.
+    #[test]
+    fn sense_requires_invoke_and_discover_at_issue() {
+        for rights in [
+            GrantRights::SENSE,
+            GrantRights::SENSE.union(GrantRights::INVOKE),
+            GrantRights::SENSE.union(GrantRights::DISCOVER),
+        ] {
+            assert!(
+                matches!(
+                    OrgCapabilityGrant::try_issue(
+                        &org_b(),
+                        org_a().org_id(),
+                        cap(),
+                        rights,
+                        GrantTargetScope::AnyNodeOwnedBy(org_b().org_id()),
+                        3600,
+                    ),
+                    Err(OrgError::SenseRequiresInvokeDiscover)
+                ),
+                "{rights:?} must be refused at issue"
+            );
+        }
+        let full = GrantRights::SENSE
+            .union(GrantRights::INVOKE)
+            .union(GrantRights::DISCOVER);
+        let (grant, secret) = OrgCapabilityGrant::try_issue(
+            &org_b(),
+            org_a().org_id(),
+            cap(),
+            full,
+            GrantTargetScope::AnyNodeOwnedBy(org_b().org_id()),
+            3600,
+        )
+        .expect("a full SENSE grant issues");
+        assert!(secret.is_some(), "DISCOVER still mints the audience secret");
+        assert!(grant.permits_sense() && grant.permits_invoke() && grant.permits_discover());
+        grant.verify().expect("verifies");
+        assert_eq!(
+            OrgCapabilityGrant::from_bytes(&grant.to_bytes()).expect("decodes"),
+            grant
+        );
+        assert_eq!(format!("{:?}", full), "GrantRights(DISCOVER|INVOKE|SENSE)");
+    }
+
+    /// OLB-6 D6.1 at DECODE and VERIFY: a SENSE grant lacking INVOKE, built
+    /// through the raw pin surface, is refused by both. RED against the rule
+    /// dropped from either path.
+    #[test]
+    fn sense_rule_enforced_at_decode_and_verify() {
+        let (_, binding) = OrgAudienceSecret::mint([9u8; 32]);
+        let violating = OrgCapabilityGrant::issue_at(
+            &org_b(),
+            [9u8; 32],
+            org_a().org_id(),
+            cap(),
+            GrantRights::SENSE.union(GrantRights::DISCOVER),
+            GrantTargetScope::ExactNode(provider()),
+            Some(binding),
+            1_000,
+            2_000,
+            7,
+        );
+        assert!(matches!(
+            violating.verify(),
+            Err(OrgError::SenseRequiresInvokeDiscover)
+        ));
+        assert!(matches!(
+            OrgCapabilityGrant::from_bytes(&violating.to_bytes()),
+            Err(OrgError::SenseRequiresInvokeDiscover)
+        ));
+        // SENSE + INVOKE without DISCOVER: no binding, so the DISCOVER rule
+        // is satisfied and the SENSE rule alone refuses it.
+        let violating = OrgCapabilityGrant::issue_at(
+            &org_b(),
+            [9u8; 32],
+            org_a().org_id(),
+            cap(),
+            GrantRights::SENSE.union(GrantRights::INVOKE),
+            GrantTargetScope::ExactNode(provider()),
+            None,
+            1_000,
+            2_000,
+            7,
+        );
+        assert!(matches!(
+            violating.verify(),
+            Err(OrgError::SenseRequiresInvokeDiscover)
+        ));
+        assert!(matches!(
+            OrgCapabilityGrant::from_bytes(&violating.to_bytes()),
+            Err(OrgError::SenseRequiresInvokeDiscover)
+        ));
+    }
+
+    /// OLB-6: the SENSE grant's wire bytes, pinned. SENSE is bit 2 of the
+    /// rights field and nothing else in the layout moves.
+    #[test]
+    fn golden_sense_grant_vector() {
+        let binding = GrantedDiscoveryBinding {
+            audience_handle: [0xAB; 32],
+            key_commitment: audience_key_commitment(&[0xCD; 32]),
+        };
+        let grant = OrgCapabilityGrant::issue_at(
+            &org_b(),
+            [0x11u8; 32],
+            org_a().org_id(),
+            cap(),
+            GrantRights::DISCOVER
+                .union(GrantRights::INVOKE)
+                .union(GrantRights::SENSE),
+            GrantTargetScope::AnyNodeOwnedBy(org_b().org_id()),
+            Some(binding),
+            1_700_000_000,
+            1_700_003_600,
+            0x8877_6655_4433_2211,
+        );
+        let bytes = grant.to_bytes();
+        assert_eq!(
+            &bytes[128..132],
+            &7u32.to_le_bytes(),
+            "rights = DISCOVER|INVOKE|SENSE"
+        );
+        assert_eq!(
+            hex::encode(&bytes),
+            GOLDEN_SENSE_GRANT_HEX,
+            "SENSE grant wire bytes drifted"
+        );
+    }
+
+    const GOLDEN_SENSE_GRANT_HEX: &str = "11111111111111111111111111111111111111111111111111111111111111112152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7b7cf23907dfe3cad1152c9c5e14bec0bbdd0beeaafaff54ee27d5e5974788bab07000000022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1201abababababababababababababababababababababababababababababababab3338c46839907f71578cf4730fcf8eb0ec586ef8b496b453390fa38e38c33aa700f153650000000010ff53650000000011223344556677884c587c4dd1cc5f6242fae758e81e0a0b741de855da2a734f1ae5814d4402da3e1ad8d7ee9174f130c1710fdc5ae5824585e35c81fb61ed39ea09bc90404f6a0b";
+
     #[test]
     fn zero_grant_id_is_reserved_at_decode_and_verify() {
         let violating = OrgCapabilityGrant::issue_at(
@@ -1640,11 +1806,11 @@ mod tests {
             Err(OrgError::EmptyRights)
         ));
         assert!(matches!(
-            GrantRights::try_from_bits(0b100),
+            GrantRights::try_from_bits(0b1000),
             Err(OrgError::UnknownRights)
         ));
         assert!(matches!(
-            GrantRights::try_from_bits(0b111),
+            GrantRights::try_from_bits(0b1111),
             Err(OrgError::UnknownRights)
         ));
 
@@ -1664,7 +1830,7 @@ mod tests {
             OrgCapabilityGrant::from_bytes(&bytes),
             Err(OrgError::EmptyRights)
         ));
-        bytes[128..132].copy_from_slice(&0b100u32.to_le_bytes());
+        bytes[128..132].copy_from_slice(&0b1000u32.to_le_bytes());
         assert!(matches!(
             OrgCapabilityGrant::from_bytes(&bytes),
             Err(OrgError::UnknownRights)

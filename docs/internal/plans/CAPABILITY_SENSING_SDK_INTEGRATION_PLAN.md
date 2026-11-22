@@ -32,8 +32,28 @@ rosters for `sensing_provider` (15), `sensing_consumer` (27) and
 re-executed at `132dbdcff` (15/15, 27/27, 22/22).
 
 What the sign-off does NOT cover: the provider-free leader arm
-(`OrgCapabilityRegistration` stays a dark drop), S2/S3/S4, and language
+(`OrgCapabilityRegistration` stays a dark drop), S2/S3, and language
 bindings. Those remain unbuilt, not merely unsigned.
+
+**S4 reconciliation (2026-11-21, `SENSING_OLB_COMPLETION_PLAN.md` C1).** S4 is
+**delivered** at `a2efc950a` (PR #943), under the OLB sign-off. Earlier
+revisions of this block listed it as unbuilt, and that was stale: each of S4's
+five work items is the OLB exact lane.
+
+1. Owner-private population feeds the exact leases and the projection:
+   `OrgClient::apply_sensed_order`, whose expectation is built from
+   `owner_plane && direct` candidates, plus `OrgSensingFamily::demand` /
+   `retain`.
+2. Unknown is retained: OLB §14, "Unknown never prunes".
+3. One exact provider is selected: OLB §14, "Selection produces one exact
+   provider".
+4. Canonical proof, invoked once: OLB §14, `OrgProofIntent` nine fields
+   unchanged, and "No ambiguous execution is retried".
+5. `Granted` stays unsensed: OLB §14, "`Granted` candidates are never sensed
+   and never pruned".
+
+The end-to-end evidence is `sdk/tests/org_exact_sensing.rs` (22 witnesses,
+CI-pinned). There is no residual S4 slice.
 
 Read this block, not the historical receipt below it, for current state.
 
@@ -90,10 +110,10 @@ Read this block, not the historical receipt below it, for current state.
   / `AnyAuthorized`, tag and group selectors remain unbuilt, and the SDK
   refuses rather than pretends.
 - `Granted` and cross-organization sensing.
-- S2 (a generic sensed nRPC call verb, `call_service_sensed`), S3 (compute and
-  gang adapters), S4 (the thin organization composition beyond the merged
-  `OrgClient` integration), warmed pools / P2C, language bindings, and any
-  rollout or default enablement.
+- Warmed pools / P2C, language bindings, and any rollout or default enablement.
+  (S2, S3 and the gang half of S3 landed 2026-11-21 as completion-plan B.2, B.4 and C4, all awaiting review.)
+  (S4 was listed here until 2026-11-21; it is delivered.
+  See the S4 reconciliation above.)
 
 **Historical receipt (2026-08-30, read at `f9f423e7bfd5b3d90491600af27624a153f5f5bc`) — superseded.**
 At that commit S1 had shipped provider-lifecycle only, and the consumer half
@@ -787,6 +807,13 @@ options.
 
 ### S2 — Sensed nRPC selection
 
+**IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` B.2), awaits review.**
+The shape differs from the work list below on one point, by owner decision:
+the population is the caller's exact-provider `SensingSnapshot` for
+`nrpc:<service>`, joined to the authorized candidates by node id, rather than a
+generic owner-scope watch (which does not exist; see that plan for why).
+Items 1 to 6 are otherwise as written.
+
 **Objective:** Prove generic protocol-native capability load balancing without changing baseline calls.
 
 **Modify:**
@@ -807,6 +834,8 @@ options.
 **Scope boundary:** The first sensed nRPC proof is an owner-authorized same-organization provider pool. Foreign/public and `Granted` providers remain Unknown/unsensed fallback until a separate cross-organization sensing-authority decision exists; ordinary nRPC discovery and invocation continue to work unchanged.
 
 ### S3 — Compute and gang SDK adapters
+
+**IMPLEMENTED 2026-11-21 (`SENSING_OLB_COMPLETION_PLAN.md` C4 for gang, B.4 for compute), awaits review.** One deviation, applied to both halves: a sensed NotReady is demoted to the last band, not removed (exact lane D7.2), so ordinary and gang placement agree (item 5) and §3.3's "fresh-evidence non-viable removed" line is superseded for the exact-provider snapshot.
 
 **Objective:** Reuse the same projection in every scheduler that has a concrete readiness-relative placement decision.
 
@@ -829,6 +858,9 @@ options.
 6. Do not auto-invent an interest from an arbitrary `CapabilityFilter`.
 
 ### S4 — Thin organization composition after the org-required S0/S1 subset
+
+**DELIVERED at `a2efc950a` (PR #943) as the OLB exact lane.** See the S4
+reconciliation in the status block for the item-by-item mapping.
 
 **Objective:** Let same-organization protected calls use the proven owner-scoped selector without changing the organization facade.
 
@@ -904,7 +936,7 @@ This slice is optional for the generic sensing SDK release and gates only on the
 ### Compute and gang
 
 25. Ordinary placement and gang matching consume the same viability classification and order.
-26. NotReady prunes only the exact interest and never suspends capability-fold membership.
+26. NotReady affects only the exact interest and never suspends capability-fold membership. On the exact-provider snapshot path (S3, the delivered gang and compute adapters) a NotReady candidate is **demoted to the last band, never removed** (exact lane D7.2); pruning applies only to the SI-6 provider-free lane.
 27. Potential candidates remain available when no viable provider exists.
 28. Migration/member/promotion placement preserves existing placement vetoes and tie-breakers within sensed classes.
 29. The final gang claim may still fail after a Ready observation; readiness never appears as a reservation.

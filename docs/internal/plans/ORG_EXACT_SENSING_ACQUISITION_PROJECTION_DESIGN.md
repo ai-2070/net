@@ -1678,6 +1678,61 @@ enforced by the rollout rule (OA-6 item 4), not by a test.
 | `org_stale_stamp` | the pinned view went stale between gate and mutation (`A/mesh.rs:25556-25558`) |
 | `org_sensing_local_authority_refused{reason}` | Class-A refusals and the one-shot `family_unavailable` |
 | `org_sensing_truncated_total` | population truncation at the 32 cap |
+| `org_sensing_fallback_total{reason}` | a sensed call that wanted sensing and took the unsensed order (D8.4a) |
+
+#### D8.4a Amendment (2026-11-21, `SENSING_OLB_COMPLETION_PLAN.md` C2): the two operator counters
+
+The signed lane counted truncation (`OrgSensingDemandCounters::truncated`),
+but only fixtures-gated witnesses could read it, and it counted no fallback
+at all. That left OLB §14's two operational-visibility rows open. This
+amendment authorizes exactly two production-readable counters. It changes no
+selection, error or proof behaviour.
+
+- **Read surface.** `MeshNode::org_sensing_routing_counters()` →
+  `OrgSensingRoutingCounters` (also `net_sdk::Mesh::org_sensing_routing_counters`)
+  is a monotonic, diagnostics-only, `Copy` snapshot. `prometheus_text()`
+  renders `org_sensing_truncated_total` and
+  `org_sensing_fallback_total{reason}`. The unlabelled sum is not emitted as a
+  second series.
+- **`org_sensing_truncated_total`** increments once per production derivation
+  (`org_sensing_authorized_population`) whose verified population exceeded
+  `MAX_ORG_SENSING_POPULATION`. The fixtures-only explicit-population seam
+  (`OrgSensingFamily::reconcile`) clamps without counting, because it is not
+  a production path.
+- **`org_sensing_fallback_total{reason}`** counts one sensed `org.call` whose
+  order could have changed (two or more candidates and a nonempty owner-plane
+  expectation) and that left `apply_sensed_order` on the deterministic
+  unsensed order. There are exactly three reasons, one per exit:
+
+  | reason | exit |
+  |---|---|
+  | `contended` | `try_reconcile_lock` declined: another caller holds the capability's convergence |
+  | `refused` | this call's `retain` was refused (authority, family capacity, family identity) |
+  | `unretained` | no demand installed when the order was applied (an earlier refusal still pacing) |
+
+  These replace the reason set sketched in OLB §7
+  (`disabled|capacity|unavailable|not_authorized|cold`), which predates the
+  shipped exits:
+  - `disabled` is **not** a fallback: an inert node never wanted sensing.
+  - `capacity`, `not_authorized` and `unavailable` are all `refused`; the
+    demand counters' existing `refused_*` tallies already split them.
+  - `cold` is `unretained`.
+
+  Also **not** fallbacks: a capability with nothing to sense, and a projection
+  that ran and had no evidence (an `Unknown`-only order is the sensed result).
+
+Witnesses:
+- `behavior::org_sensing_demand::tests::a_population_over_the_cap_is_clamped_and_counted_once_per_derivation`
+  covers truncation, the cap boundary, and the Prometheus text.
+- `org::tests_call::sensed_order_fallbacks_are_counted_once_by_reason` covers
+  `refused`, then `unretained`, then no count after recovery.
+- `org::tests_call::a_refused_wave_paces_but_a_restored_authority_does_not_wait`
+  is the one-candidate control: nothing counted.
+- `org_exact_sensing::contending_clones_produce_exactly_one_convergence` checks
+  that `contended` equals the declined callers, and that it is the only
+  reason.
+- `org_exact_sensing::the_production_call_lands_on_the_sensed_provider`
+  checks that the success path counts nothing.
 
 `SENSING.md`'s `protocol_invalid` row (`net/crates/net/docs/SENSING.md:304`) is
 already stale relative to the code doc and is updated by OA-2 in the same commit.

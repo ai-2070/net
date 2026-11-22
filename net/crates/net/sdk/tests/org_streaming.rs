@@ -532,10 +532,19 @@ async fn live_same_org_streaming_through_the_facade() {
         .call_streaming::<Ping, Item>(service, &Ping { n: 7 })
         .await
         .expect("the protected streaming call is admitted");
+    // Phase 4: an open stream is an outstanding call toward its provider.
+    let provider_node = provider.node_id();
+    assert_eq!(caller.node().org_call_in_flight(provider_node), 1);
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
         items.push(item.expect("item"));
     }
+    drop(stream);
+    assert_eq!(
+        caller.node().org_call_in_flight(provider_node),
+        0,
+        "a finished, dropped stream is no longer outstanding"
+    );
 
     assert_eq!(
         items,
@@ -738,6 +747,9 @@ async fn live_same_org_duplex_through_the_facade() {
         .call_duplex::<Ping, Item>(service)
         .await
         .expect("the protected duplex call is admitted");
+    // Phase 4: an open duplex call is outstanding toward its provider.
+    let provider_node = provider.node_id();
+    assert_eq!(caller.node().org_call_in_flight(provider_node), 1);
     call.send(&Ping { n: 1 }).await.expect("send 1");
     call.send(&Ping { n: 2 }).await.expect("send 2");
     call.finish_sending().await.expect("half-close");
@@ -745,6 +757,8 @@ async fn live_same_org_duplex_through_the_facade() {
     while let Some(item) = call.next().await {
         items.push(item.expect("item"));
     }
+    drop(call);
+    assert_eq!(caller.node().org_call_in_flight(provider_node), 0);
 
     assert_eq!(
         items,
@@ -770,6 +784,22 @@ async fn live_same_org_duplex_through_the_facade() {
         Some(provider.node().entity_id().clone()),
         "planning selected the provider and never re-resolved"
     );
+
+    // Split halves share the in-flight count: it ends with the LAST half.
+    let (sink, rest) = org
+        .call_duplex::<Ping, Item>(service)
+        .await
+        .expect("a second duplex call is admitted")
+        .into_split();
+    assert_eq!(caller.node().org_call_in_flight(provider_node), 1);
+    drop(sink);
+    assert_eq!(
+        caller.node().org_call_in_flight(provider_node),
+        1,
+        "the surviving half keeps the call outstanding"
+    );
+    drop(rest);
+    assert_eq!(caller.node().org_call_in_flight(provider_node), 0);
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&c_dir);
