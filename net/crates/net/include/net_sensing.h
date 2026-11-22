@@ -84,6 +84,11 @@ extern "C" {
 #define NET_SENSING_STATE_NOT_READY    1
 #define NET_SENSING_STATE_UNEVALUABLE  2
 
+/* The ABI this header describes. At init, refuse a library whose
+ * net_sensing_abi_version() differs:
+ *   if (net_sensing_abi_version() != NET_SENSING_ABI_VERSION) { ... } */
+#define NET_SENSING_ABI_VERSION        1
+
 typedef struct NetSensingProvider NetSensingProvider;
 typedef struct NetSensingWatch    NetSensingWatch;
 typedef struct NetSensingSnapshot NetSensingSnapshot;
@@ -123,7 +128,8 @@ void net_sensing_watch_free(NetSensingWatch** watch);
 int  net_sensing_snapshot_json(const NetSensingSnapshot* snapshot, char** out_json);
 void net_sensing_snapshot_free(NetSensingSnapshot** snapshot);
 
-/* timeout_ms == 0 uses the default call deadline. */
+/* timeout_ms == 0 means no deadline, exactly as net_rpc_call_service. A
+ * timeout too large for the platform clock is NET_SENSING_ERR_INVALID_ARG. */
 int net_sensing_call_service(void* mesh_arc,
                              const char* service_ptr, size_t service_len,
                              const uint8_t* req_ptr, size_t req_len,

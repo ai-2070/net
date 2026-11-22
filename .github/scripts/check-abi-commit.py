@@ -26,7 +26,7 @@ triggers. Mentions in comments and prose do not trigger, and neither do
 
 WHAT IT REQUIRES. The same commit must touch all four groups:
 
-  1. the Rust FFI   - net/crates/net/src/ffi/**, bindings/go/net-ffi/**
+  1. the Rust FFI   - net/crates/net/src/ffi/**, bindings/go/*-ffi/**
   2. a C header     - net/crates/net/include/*.h
   3. a Go mirror    - go/net.h, go/net_cortex.h
   4. a Go ABI test  - go/abi_stability*_test.go, go/header_parity_test.go
@@ -65,6 +65,16 @@ ROOT = Path(__file__).resolve().parents[2]
 RUST_FFI_PREFIXES = (
     "net/crates/net/src/ffi/",
     "net/crates/net/bindings/go/net-ffi/",
+    # The C-ABI rlib shims net-ffi links into the one libnet. Their NET_*
+    # consts and externs ARE the Rust FFI for their headers (net_sensing.h's
+    # live in org-ffi), so a change there satisfies this group.
+    "net/crates/net/bindings/go/compute-ffi/",
+    "net/crates/net/bindings/go/deck-ffi/",
+    "net/crates/net/bindings/go/mcp-ffi/",
+    "net/crates/net/bindings/go/meshdb-ffi/",
+    "net/crates/net/bindings/go/meshos-ffi/",
+    "net/crates/net/bindings/go/org-ffi/",
+    "net/crates/net/bindings/go/rpc-ffi/",
 )
 C_HEADER_PREFIX = "net/crates/net/include/"
 # The C headers that have a Go mirror header (go/net.h, go/net_cortex.h).
@@ -98,7 +108,7 @@ _COMMENT_LINE = re.compile(r"^\s*(?://|/\*|\*)")
 _HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 _GROUP_LABELS = {
-    "rust": "the Rust FFI (net/crates/net/src/ffi/**, bindings/go/net-ffi/**)",
+    "rust": "the Rust FFI (net/crates/net/src/ffi/**, bindings/go/*-ffi/**)",
     "headers": "a C header (net/crates/net/include/*.h)",
     "go_headers": "a Go mirror header (go/net.h, go/net_cortex.h)",
     "go_tests": "a Go ABI test (go/abi_stability*_test.go, go/header_parity_test.go)",

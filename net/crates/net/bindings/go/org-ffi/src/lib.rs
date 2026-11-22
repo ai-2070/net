@@ -2756,6 +2756,10 @@ mod tests {
                 "NET_SENSING_STATE_UNEVALUABLE",
                 sensing::NET_SENSING_STATE_UNEVALUABLE as i64,
             ),
+            (
+                "NET_SENSING_ABI_VERSION",
+                sensing::NET_SENSING_ABI_VERSION as i64,
+            ),
         ];
         assert_defines_match("include/net_sensing.h", &defines, want);
         assert_eq!(

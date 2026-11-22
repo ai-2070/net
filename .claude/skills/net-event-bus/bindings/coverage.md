@@ -100,6 +100,7 @@ A mode is written after the status: `supported · core-only`.
 | A2A — paid task admission (prepare → purchase → submit) | supported | supported | supported | not exposed | not exposed |
 | Organization capability auth | supported | supported | supported | supported | supported |
 | Organization-scoped streaming RPC | supported | supported | supported | supported | supported |
+| Capability sensing (value provider, watch, sensed call) | supported | supported | supported | supported | partial |
 | Subnet gateway provisioning | supported | supported | supported | supported | supported |
 | Subnet-exported nRPC serve | supported | supported | supported | supported | supported |
 | Subnet-exported organization call | supported | supported | supported | supported | supported |
@@ -144,6 +145,7 @@ should not infer one binding's API from another's.
 | A2A — paid task admission (prepare → purchase → submit) | `serve_a2a_configured` | `serveA2aConfigured` | `serve_a2a_configured` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
 | Organization-scoped streaming RPC | `call_streaming` | `callStreaming` | `call_streaming` | `CallStreaming` | `net_org_call_streaming` |
+| Capability sensing (value provider, watch, sensed call) | `provide_value` | `sensingProvide` | `sensing_provide` | `ProvideReadiness` | `net_sensing_provide` |
 | Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
 | Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExported` | `net_subnet_serve_exported` |
 | Subnet-exported organization call | `call_exported` | `callExported` | `call_exported` | `CallExportedBytes` | `net_org_call_exported` |
@@ -181,6 +183,7 @@ per-function record behind this is `net/crates/net/tests/c_abi/SURFACE.md`.
 | Gang-claim scheduler | supported | `islands.c` | — |
 | Organization capability auth | supported | `org_call.c` | — |
 | Organization-scoped streaming RPC | supported | `net_org_streaming.c` | — |
+| Capability sensing (value provider, watch, sensed call) | partial | — | Declared in net_sensing.h, exported and audited against Rust, and exercised through the Go binding; no C program CI runs calls it yet. |
 | Subnet gateway provisioning | supported | `subnet.c` | — |
 | Subnet-exported nRPC serve | supported | `subnet.c` | — |
 | Subnet-exported organization call | supported | `subnet.c` | — |

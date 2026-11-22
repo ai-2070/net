@@ -44,6 +44,7 @@ package net
 #define NET_SENSING_STATE_READY        0
 #define NET_SENSING_STATE_NOT_READY    1
 #define NET_SENSING_STATE_UNEVALUABLE  2
+#define NET_SENSING_ABI_VERSION        1
 
 typedef struct NetSensingProvider NetSensingProvider;
 typedef struct NetSensingWatch    NetSensingWatch;
@@ -106,6 +107,14 @@ var sensingCConstants = map[string]int{
 	"NET_SENSING_STATE_READY":       int(C.NET_SENSING_STATE_READY),
 	"NET_SENSING_STATE_NOT_READY":   int(C.NET_SENSING_STATE_NOT_READY),
 	"NET_SENSING_STATE_UNEVALUABLE": int(C.NET_SENSING_STATE_UNEVALUABLE),
+	"NET_SENSING_ABI_VERSION":       int(C.NET_SENSING_ABI_VERSION),
+}
+
+// SensingABIVersion is the sensing ABI the linked library implements. It must
+// equal the header's NET_SENSING_ABI_VERSION; a mismatch means the library and
+// these bindings were built from different sources.
+func SensingABIVersion() uint32 {
+	return uint32(C.net_sensing_abi_version())
 }
 
 // SensingError is a capability-sensing refusal, classified by Rust.
@@ -321,11 +330,32 @@ type SensingQueryOptions struct {
 	StartWithin *time.Duration
 }
 
-func optionalMs(d *time.Duration) C.int64_t {
+// boundMs converts an optional bound to the ABI's milliseconds (-1 = absent).
+// A negative bound is refused rather than read as "absent", and a positive
+// sub-millisecond bound rounds UP to 1 ms: truncating it to 0 would turn a
+// satisfiable bound into Rust's explicitly unsatisfiable zero.
+func boundMs(name string, d *time.Duration) (C.int64_t, error) {
 	if d == nil {
-		return -1
+		return -1, nil
 	}
-	return C.int64_t(d.Milliseconds())
+	ms, err := durationMs(name, *d)
+	if err != nil {
+		return 0, err
+	}
+	return C.int64_t(ms), nil
+}
+
+// durationMs is a non-negative duration in whole milliseconds, rounding a
+// positive sub-millisecond remainder up so no positive duration becomes 0.
+func durationMs(name string, d time.Duration) (int64, error) {
+	if d < 0 {
+		return 0, fmt.Errorf("net: sensing: %s must not be negative, got %v", name, d)
+	}
+	ms := d.Milliseconds()
+	if d > time.Duration(ms)*time.Millisecond {
+		ms++
+	}
+	return ms, nil
 }
 
 // SensingWatch owns one observation of a capability.
@@ -341,6 +371,14 @@ type SensingWatch struct {
 // of capability. The node needs EnableSensing and an installed organization
 // authority.
 func WatchSensing(node *MeshNode, capability string, opts SensingQueryOptions) (*SensingWatch, error) {
+	within, err := boundMs("Within", opts.Within)
+	if err != nil {
+		return nil, err
+	}
+	startWithin, err := boundMs("StartWithin", opts.StartWithin)
+	if err != nil {
+		return nil, err
+	}
 	if node == nil {
 		return nil, errors.New("net.WatchSensing: node must be non-nil")
 	}
@@ -353,7 +391,7 @@ func WatchSensing(node *MeshNode, capability string, opts SensingQueryOptions) (
 	var out *C.NetSensingWatch
 	var errPtr *C.char
 	code := C.net_sensing_watch(arc, cCap, C.size_t(len(capability)),
-		optionalMs(opts.Within), optionalMs(opts.StartWithin), &out, &errPtr)
+		within, startWithin, &out, &errPtr)
 	if err := sensingErrorFromCall(code, errPtr); err != nil {
 		return nil, err
 	}
@@ -466,8 +504,12 @@ func (w *SensingWatch) free() {
 // authorized exactly as an unsensed call authorizes them, the target is chosen
 // from snapshot (a capture of "nrpc:<service>"; any other capability is no
 // evidence), and the target is invoked once and never retried. timeout == 0
-// uses the default call deadline.
+// means no deadline; a negative timeout is refused.
 func CallServiceSensed(node *MeshNode, service string, request []byte, snapshot *SensingSnapshot, timeout time.Duration) ([]byte, error) {
+	timeoutMs, err := durationMs("timeout", timeout)
+	if err != nil {
+		return nil, err
+	}
 	if node == nil || snapshot == nil {
 		return nil, errors.New("net.CallServiceSensed: node and snapshot must be non-nil")
 	}
@@ -491,7 +533,7 @@ func CallServiceSensed(node *MeshNode, service string, request []byte, snapshot 
 	var respLen C.size_t
 	var errPtr *C.char
 	code := C.net_sensing_call_service(arc, cSvc, C.size_t(len(service)), reqPtr, C.size_t(len(request)),
-		snapshot.h, C.uint64_t(timeout.Milliseconds()), &respPtr, &respLen, &errPtr)
+		snapshot.h, C.uint64_t(timeoutMs), &respPtr, &respLen, &errPtr)
 	if err := sensingErrorFromCall(code, errPtr); err != nil {
 		return nil, err
 	}

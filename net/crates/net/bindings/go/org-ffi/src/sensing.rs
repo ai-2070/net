@@ -65,11 +65,17 @@ pub const NET_SENSING_STATE_NOT_READY: c_int = 1;
 /// `state`: the provider cannot currently say (read as Unknown).
 pub const NET_SENSING_STATE_UNEVALUABLE: c_int = 2;
 
-/// ABI version of the sensing surface. Bumped on any incompatible change to
-/// a `net_sensing_*` signature or constant.
+/// The ABI version this build implements, pinned in `include/net_sensing.h`
+/// as `NET_SENSING_ABI_VERSION`. Bumped on any incompatible change to a
+/// `net_sensing_*` signature or constant.
+pub const NET_SENSING_ABI_VERSION: u32 = 1;
+
+/// ABI version of the sensing surface. A C consumer compares it with the
+/// header's `NET_SENSING_ABI_VERSION` at init and refuses a mismatched
+/// library.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_sensing_abi_version() -> u32 {
-    1
+    NET_SENSING_ABI_VERSION
 }
 
 /// An owning handle on one value-backed readiness registration.
@@ -488,7 +494,9 @@ pub extern "C" fn net_sensing_snapshot_free(snapshot: *mut *mut NetSensingSnapsh
 /// authorized exactly as an unsensed call authorizes them, with the target
 /// chosen from `snapshot` (a capture of `nrpc:<service>`; any other capability
 /// is no evidence). The target is invoked once and never retried.
-/// `mesh_arc` is CONSUMED. `timeout_ms == 0` uses the default call deadline.
+/// `mesh_arc` is CONSUMED. `timeout_ms == 0` means no deadline, exactly as
+/// `net_rpc_call_service`. A timeout the platform clock cannot represent is
+/// [`NET_SENSING_ERR_INVALID_ARG`], never a panic.
 /// On success writes the body to `*out_resp`/`*out_len` (free with
 /// `net_org_response_free`).
 #[unsafe(no_mangle)]
@@ -521,7 +529,15 @@ pub extern "C" fn net_sensing_call_service(
         };
         let mut opts = CallOptions::default();
         if timeout_ms > 0 {
-            opts.deadline = Some(std::time::Instant::now() + Duration::from_millis(timeout_ms));
+            // Checked: an unchecked `Instant + Duration` panics on overflow,
+            // which the guard would report as the unrelated NULL code.
+            match std::time::Instant::now().checked_add(Duration::from_millis(timeout_ms)) {
+                Some(deadline) => opts.deadline = Some(deadline),
+                None => {
+                    write_err(out_err, format!("timeout_ms {timeout_ms} is out of range"));
+                    return NET_SENSING_ERR_INVALID_ARG;
+                }
+            }
         }
         let readiness = snapshot.inner.clone();
         let outcome = block_on(async move {

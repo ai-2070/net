@@ -403,6 +403,24 @@ operations:
       anchor: net_org_call_streaming
       evidence:
       - .claude/skills/net-event-bus/examples/net_org_streaming.c
+- operation: Capability sensing (value provider, watch, sensed call)
+  bindings:
+    Rust:
+      status: supported
+      anchor: provide_value
+    Node / TS:
+      status: supported
+      anchor: sensingProvide
+    Python:
+      status: supported
+      anchor: sensing_provide
+    Go:
+      status: supported
+      anchor: ProvideReadiness
+    C:
+      status: partial
+      anchor: net_sensing_provide
+      gap: 'Declared in net_sensing.h, exported and audited against Rust, and exercised through the Go binding; no C program CI runs calls it yet.'
 - operation: Subnet gateway provisioning
   bindings:
     Rust:

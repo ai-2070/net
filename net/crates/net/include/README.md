@@ -163,7 +163,9 @@ the skill-examples job: `hello.c` (the event-bus loop above), `observe.c`,
 `registry.c`, `jobqueue.c`, `objectstore.c`, `liveconfig.c`, `eventlog.c`,
 `tokenchannel.c`, `failover.c` and `net_org_streaming.c`.
 
-Every header now has a C program that calls it.
+Every header but `net_sensing.h` has a C program that calls it; the sensing
+surface is declared, exported and audited against Rust, and is exercised through
+the Go binding, not yet from C.
 `net/crates/net/tests/c_abi/SURFACE.md` lists, for each declared function,
 the programs that call it; a function with none is declared, exported and
 checked against its Rust definition, but not yet exercised from C.

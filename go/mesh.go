@@ -558,7 +558,12 @@ func (m *MeshNode) withHandleForChild(fn func(h unsafe.Pointer)) bool {
 
 // NewMeshNode opens a mesh node. Call Shutdown to cleanly tear down.
 func NewMeshNode(cfg MeshConfig) (*MeshNode, error) {
-	if cfg.SensingIncarnationPath != "" && cfg.SensingIncarnation == 0 {
+	if cfg.SensingIncarnationPath != "" {
+		// Exactly one source of the boot counter: a path that was silently
+		// skipped would let a stale explicit value sign as a later boot.
+		if cfg.SensingIncarnation != 0 {
+			return nil, errors.New("net: SensingIncarnationPath and SensingIncarnation are mutually exclusive")
+		}
 		incarnation, err := SensingNextIncarnation(cfg.SensingIncarnationPath)
 		if err != nil {
 			return nil, err

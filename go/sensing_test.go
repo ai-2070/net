@@ -263,3 +263,52 @@ func TestSensingLiveValueReachesTheConsumerAndCloseEndsAPendingWait(t *testing.T
 		t.Fatal("the provider's Close must report that it removed the registration")
 	}
 }
+
+// A conflicting boot-counter configuration is refused before any node exists:
+// a path silently skipped in favour of an explicit value would let a stale
+// incarnation sign as a later boot.
+func TestSensingIncarnationSourcesAreMutuallyExclusive(t *testing.T) {
+	_, err := NewMeshNode(MeshConfig{
+		BindAddr:               reserveLocalUDPPort(t),
+		PskHex:                 strings.Repeat("42", 32),
+		EnableSensing:          true,
+		SensingIncarnationPath: filepath.Join(t.TempDir(), "incarnation"),
+		SensingIncarnation:     7,
+	})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("both sources must be refused, got %v", err)
+	}
+}
+
+// Negative bounds are refused instead of being read as "absent", and a positive
+// sub-millisecond bound rounds UP so it never becomes Rust's unsatisfiable 0.
+func TestSensingDurationsAreValidatedBeforeTheABI(t *testing.T) {
+	negative := -time.Millisecond
+	if _, err := WatchSensing(nil, "nrpc:x", SensingQueryOptions{Within: &negative}); err == nil ||
+		!strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("a negative Within must be refused, got %v", err)
+	}
+	if _, err := WatchSensing(nil, "nrpc:x", SensingQueryOptions{StartWithin: &negative}); err == nil ||
+		!strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("a negative StartWithin must be refused, got %v", err)
+	}
+	if _, err := CallServiceSensed(nil, "x", nil, nil, -time.Second); err == nil ||
+		!strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("a negative timeout must be refused, got %v", err)
+	}
+	for _, c := range []struct {
+		in   time.Duration
+		want int64
+	}{
+		{0, 0},
+		{500 * time.Microsecond, 1},
+		{time.Millisecond, 1},
+		{1500 * time.Microsecond, 2},
+		{2 * time.Second, 2000},
+	} {
+		got, err := durationMs("bound", c.in)
+		if err != nil || got != c.want {
+			t.Errorf("durationMs(%v) = %d, %v; want %d", c.in, got, err, c.want)
+		}
+	}
+}
