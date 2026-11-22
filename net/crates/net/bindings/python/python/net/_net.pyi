@@ -3771,6 +3771,17 @@ class MeshRpc:
         """Capability-routed streaming call — :meth:`call_service` routing
         with :meth:`call_streaming` result shape."""
         ...
+    def call_service_streaming_sensed(
+        self,
+        service: str,
+        request: bytes,
+        readiness: "SensingSnapshot",
+        opts: Optional[Dict[str, Any]] = None,
+    ) -> RpcStream:
+        """``call_service_streaming`` with the target chosen from an
+        exact-provider readiness capture of ``nrpc:<service>`` (org feature).
+        Nothing is pruned; the target is opened once."""
+        ...
     def call_client_stream(
         self,
         target_node_id: int,

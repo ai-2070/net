@@ -1912,10 +1912,17 @@ mod mesh_bindings {
                 ));
             }
             #[cfg(feature = "org")]
-            if let Some(path) = options.sensing_incarnation_path.as_deref() {
-                let incarnation = net_sdk::sensing::next_incarnation(
-                    &mut net_sdk::sensing::FileIncarnation::new(path),
-                )
+            if let Some(path) = options.sensing_incarnation_path.clone() {
+                // The durable counter transaction does blocking file I/O
+                // (read, write, fsync, rename): off the async worker.
+                let worker_path = path.clone();
+                let incarnation = tokio::task::spawn_blocking(move || {
+                    net_sdk::sensing::next_incarnation(&mut net_sdk::sensing::FileIncarnation::new(
+                        worker_path,
+                    ))
+                })
+                .await
+                .map_err(|e| Error::from_reason(format!("sensing incarnation worker failed: {e}")))?
                 .map_err(|e| {
                     Error::from_reason(format!(
                         "sensing incarnation at {path:?} is unavailable: {e}"

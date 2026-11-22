@@ -73,14 +73,21 @@ impl ReadinessValue {
     }
 }
 
+/// The published value and whether the handle is closed, under ONE lock, so a
+/// `set` racing a `close` either lands before it or stores nothing.
+struct ValueCell {
+    value: ReadinessValue,
+    closed: bool,
+}
+
 /// The evaluator the node holds: a shared cell, read on every beat.
 struct ValueEvaluator {
-    value: Arc<RwLock<ReadinessValue>>,
+    value: Arc<RwLock<ValueCell>>,
 }
 
 impl ReadinessEvaluator for ValueEvaluator {
     fn evaluate(&self, request: &EvaluationRequest<'_>) -> ReadinessEvaluation {
-        self.value.read().answer(request)
+        self.value.read().value.answer(request)
     }
 }
 
@@ -91,7 +98,7 @@ impl ReadinessEvaluator for ValueEvaluator {
 /// (or dropping it) removes the registration exactly as
 /// [`ReadinessRegistration::close`] does.
 pub struct ValueReadiness {
-    value: Arc<RwLock<ReadinessValue>>,
+    value: Arc<RwLock<ValueCell>>,
     registration: ReadinessRegistration,
 }
 
@@ -103,16 +110,21 @@ impl ValueReadiness {
     /// either way. A set after [`Self::close`] stores nothing and returns
     /// `false`.
     pub fn set(&self, value: ReadinessValue) -> bool {
-        if self.registration.is_closed() {
-            return false;
+        {
+            // The closed check and the write are one critical section with
+            // `close`, so a set that loses the race stores nothing.
+            let mut cell = self.value.write();
+            if cell.closed || self.registration.is_closed() {
+                return false;
+            }
+            cell.value = value;
         }
-        *self.value.write() = value;
         self.registration.changed()
     }
 
     /// The value currently published.
     pub fn get(&self) -> ReadinessValue {
-        *self.value.read()
+        self.value.read().value
     }
 
     /// The capability this registration serves.
@@ -122,6 +134,9 @@ impl ValueReadiness {
 
     /// Stop serving readiness. `true` only for the call that removed it.
     pub fn close(&self) -> bool {
+        // Mark the cell closed FIRST, under the lock every `set` takes, so no
+        // set can publish once this returns.
+        self.value.write().closed = true;
         self.registration.close()
     }
 
@@ -154,7 +169,10 @@ impl SensingClient {
         capability: impl Into<CapabilityId>,
         initial: ReadinessValue,
     ) -> Result<ValueReadiness, SensingError> {
-        let value = Arc::new(RwLock::new(initial));
+        let value = Arc::new(RwLock::new(ValueCell {
+            value: initial,
+            closed: false,
+        }));
         let registration = self.provide(
             capability,
             Arc::new(ValueEvaluator {

@@ -42,6 +42,7 @@
 //! fresh call id and a fresh signature. Cross-call idempotency is the
 //! application's.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -60,6 +61,7 @@ use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{
     CallOptions, ClientStreamCallRaw, DuplexCallRaw, RpcError, RpcStream,
 };
+use net::adapter::net::OrgCallInFlight;
 
 use super::error::{hex32, hex_capability, OrgCredentialError, OrgDiscoveryError, OrgSdkError};
 use super::types::{CapabilityAuthorityId, OrgCapabilityGrant, OrgProofIntent};
@@ -224,6 +226,9 @@ fn protected_call_options(
 /// [`RpcStream`]: net::adapter::net::mesh_rpc::RpcStream
 pub struct OrgStream<Resp> {
     inner: RpcStreamTyped<Resp>,
+    /// Counts this stream as outstanding toward its provider until dropped
+    /// (the Phase 4 load signal).
+    _in_flight: OrgCallInFlight,
 }
 
 impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgStream<Resp> {
@@ -251,6 +256,8 @@ impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgStream<Resp> {
 /// contract, unchanged).
 pub struct OrgStreamRaw {
     inner: RpcStream,
+    /// Counts this stream as outstanding toward its provider until dropped.
+    _in_flight: OrgCallInFlight,
 }
 
 impl futures::Stream for OrgStreamRaw {
@@ -301,6 +308,9 @@ struct PinnedOpening {
 pub struct OrgClientStreamCall<Req, Resp> {
     pinned: PinnedOpening,
     inner: Option<ClientStreamCallTyped<Req, Resp>>,
+    /// Counts this call as outstanding toward its pinned provider until it
+    /// finishes or is dropped.
+    _in_flight: OrgCallInFlight,
 }
 
 impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
@@ -363,6 +373,9 @@ impl<Req: Serialize, Resp: DeserializeOwned> OrgClientStreamCall<Req, Resp> {
 /// synchronous) against the pinned provider.
 pub struct OrgDuplexCall<Req, Resp> {
     inner: DuplexCallTyped<Req, Resp>,
+    /// Counts this call as outstanding toward its provider; both split halves
+    /// share it, so it ends when the last half is dropped.
+    in_flight: Arc<OrgCallInFlight>,
 }
 
 impl<Req: Serialize, Resp: DeserializeOwned + Unpin> OrgDuplexCall<Req, Resp> {
@@ -382,8 +395,14 @@ impl<Req: Serialize, Resp: DeserializeOwned + Unpin> OrgDuplexCall<Req, Resp> {
     pub fn into_split(self) -> (OrgDuplexSink<Req>, OrgDuplexStream<Resp>) {
         let (sink, stream) = self.inner.into_split();
         (
-            OrgDuplexSink { inner: sink },
-            OrgDuplexStream { inner: stream },
+            OrgDuplexSink {
+                inner: sink,
+                _in_flight: Arc::clone(&self.in_flight),
+            },
+            OrgDuplexStream {
+                inner: stream,
+                _in_flight: self.in_flight,
+            },
         )
     }
 }
@@ -409,6 +428,7 @@ impl<Req, Resp: DeserializeOwned + Unpin> futures::Stream for OrgDuplexCall<Req,
 /// The upload half of a split [`OrgDuplexCall`] — the facade's typed sink.
 pub struct OrgDuplexSink<Req> {
     inner: DuplexSinkTyped<Req>,
+    _in_flight: Arc<OrgCallInFlight>,
 }
 
 impl<Req: Serialize> OrgDuplexSink<Req> {
@@ -427,6 +447,7 @@ impl<Req: Serialize> OrgDuplexSink<Req> {
 /// Result<Resp, OrgSdkError>>`.
 pub struct OrgDuplexStream<Resp> {
     inner: DuplexStreamTyped<Resp>,
+    _in_flight: Arc<OrgCallInFlight>,
 }
 
 impl<Resp: DeserializeOwned + Unpin> futures::Stream for OrgDuplexStream<Resp> {
@@ -724,11 +745,12 @@ impl OrgClient {
             direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
             message: format!("org call_streaming encode: {e}"),
         })?;
-        let inner = self
-            .call_streaming_bytes_deadline(service, Bytes::from(body), 0, 0)
+        let (inner, in_flight) = self
+            .open_streaming_counted(service, Bytes::from(body), 0, 0)
             .await?;
         Ok(OrgStream {
             inner: RpcStreamTyped::from_raw(inner, Codec::Json),
+            _in_flight: in_flight,
         })
     }
 
@@ -740,10 +762,11 @@ impl OrgClient {
         service: &str,
         request: Bytes,
     ) -> Result<OrgStreamRaw, OrgSdkError> {
-        let inner = self
-            .call_streaming_bytes_deadline(service, request, 0, 0)
-            .await?;
-        Ok(OrgStreamRaw { inner })
+        let (inner, in_flight) = self.open_streaming_counted(service, request, 0, 0).await?;
+        Ok(OrgStreamRaw {
+            inner,
+            _in_flight: in_flight,
+        })
     }
 
     /// [`call_streaming_bytes`](Self::call_streaming_bytes) with execution
@@ -768,11 +791,31 @@ impl OrgClient {
         deadline_ms: u64,
         cancel_token: u64,
     ) -> Result<RpcStream, OrgSdkError> {
+        // The raw core stream carries no guard, so for this seam the load
+        // signal counts the opening only; the typed handles count the whole
+        // stream.
+        self.open_streaming_counted(service, request, deadline_ms, cancel_token)
+            .await
+            .map(|(stream, _in_flight)| stream)
+    }
+
+    /// Plan, count, and open one server-streaming call. The returned guard
+    /// keeps the call outstanding toward its provider (Phase 4).
+    async fn open_streaming_counted(
+        &self,
+        service: &str,
+        request: Bytes,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<(RpcStream, OrgCallInFlight), OrgSdkError> {
         let (provider, opening) = self.streaming_opening(service, deadline_ms, cancel_token)?;
-        self.node
+        let in_flight = self.node.begin_org_call(provider.node_id());
+        let stream = self
+            .node
             .call_streaming(provider.node_id(), service, request, opening)
             .await
-            .map_err(map_rpc_error)
+            .map_err(map_rpc_error)?;
+        Ok((stream, in_flight))
     }
 
     /// Call a protected service with a STREAM OF REQUESTS and one typed
@@ -794,7 +837,9 @@ impl OrgClient {
         Resp: DeserializeOwned,
     {
         let (provider, opening) = self.streaming_opening(service, 0, 0)?;
+        let in_flight = self.node.begin_org_call(provider.node_id());
         Ok(OrgClientStreamCall {
+            _in_flight: in_flight,
             pinned: PinnedOpening {
                 client: self.clone(),
                 service: service.to_string(),
@@ -846,9 +891,16 @@ impl OrgClient {
         Resp: DeserializeOwned + Unpin,
     {
         // The typed verb IS the bytes seam plus JSON (one authority path).
-        let inner = self.call_duplex_bytes_deadline(service, 0, 0).await?;
+        let (provider, opening) = self.streaming_opening(service, 0, 0)?;
+        let in_flight = Arc::new(self.node.begin_org_call(provider.node_id()));
+        let inner = self
+            .node
+            .call_duplex(provider.node_id(), service, opening)
+            .await
+            .map_err(map_rpc_error)?;
         Ok(OrgDuplexCall {
             inner: DuplexCallTyped::from_raw(inner, Codec::Json),
+            in_flight,
         })
     }
 
@@ -983,14 +1035,16 @@ impl OrgClient {
                 // runs strictly BEFORE the final currentness comparison below,
                 // which still gates the mint.
                 let outcome = self.apply_sensed_order(capability, sensed, capture, &mut candidates);
-                // A viable sensed lead decides, exactly as the signed exact
-                // lane does. Otherwise unsensed load spreading chooses within
-                // the same authorized, directly reachable pool (Phase 4).
-                if outcome.viable_lead {
+                // Whenever sensing produced ANY verdict, the signed exact lane
+                // decides over the sensed order, unchanged. Only a genuinely
+                // unsensed call (inert, a fallback, or no evidence at all) is
+                // spread within the same authorized, directly reachable pool
+                // (Phase 4).
+                if outcome.evidence {
                     self.select_candidate(capability, &candidates, considered)
                         .cloned()
                 } else {
-                    self.select_spread(capability, &candidates, considered, &outcome.not_ready)
+                    self.select_spread(capability, &candidates, considered)
                         .cloned()
                 }
             });
@@ -1156,10 +1210,12 @@ impl OrgClient {
             org_sensed_candidate_permutation(candidates, &viable, &not_ready, &granted_sensed);
         apply_permutation(candidates, permutation);
         SensedOutcome {
-            viable_lead: candidates
-                .iter()
-                .any(|candidate| viable.contains(&candidate.provider.node_id())),
-            not_ready,
+            // A verdict counts only when it is about one of THIS call's
+            // candidates.
+            evidence: candidates.iter().any(|candidate| {
+                let id = candidate.provider.node_id();
+                viable.contains(&id) || not_ready.contains(&id)
+            }),
         }
     }
 
@@ -1440,14 +1496,14 @@ impl OrgClient {
 
     /// Unsensed load spreading beneath `org.call` (completion plan Phase 4).
     ///
-    /// Runs only when the sensed step established no viable lead; a viable
-    /// sensed lead still decides through [`Self::select_candidate`]. The pool
-    /// is the already-authorized, DIRECTLY reachable candidates, minus any
-    /// sensed not-ready (kept if nothing else remains). The choice is
+    /// Runs only for a GENUINELY UNSENSED call: whenever sensing produced any
+    /// verdict for this call's candidates, the signed exact lane decides through
+    /// [`Self::select_candidate`] instead, unchanged. The pool is the
+    /// already-authorized, DIRECTLY reachable candidates. The choice is
     /// [`p2c_spread_choice`] over this node's own outstanding org calls to each
     /// pool member. A flat signal keeps the deterministic first-direct choice
-    /// exactly, so an idle node, sequential traffic, and every cold call behave
-    /// as before.
+    /// exactly, so an idle node and sequential traffic behave as before; a
+    /// skewed signal spreads, including on a cold call.
     ///
     /// Never a refusal: no direct candidate falls through to
     /// [`Self::select_candidate`] and its existing errors, and missing
@@ -1457,25 +1513,14 @@ impl OrgClient {
         capability: &CapabilityAuthorityId,
         candidates: &'a [AuthorizedOrgCandidate],
         considered: usize,
-        not_ready: &[u64],
     ) -> Result<&'a AuthorizedOrgCandidate, OrgSdkError> {
-        let direct: Vec<&AuthorizedOrgCandidate> = candidates
+        let pool: Vec<&AuthorizedOrgCandidate> = candidates
             .iter()
             .filter(|candidate| candidate.direct)
             .collect();
-        if direct.is_empty() {
+        if pool.is_empty() {
             return self.select_candidate(capability, candidates, considered);
         }
-        let ready_enough: Vec<&AuthorizedOrgCandidate> = direct
-            .iter()
-            .copied()
-            .filter(|candidate| !not_ready.contains(&candidate.provider.node_id()))
-            .collect();
-        let pool = if ready_enough.is_empty() {
-            direct
-        } else {
-            ready_enough
-        };
         let loads: Vec<u32> = pool
             .iter()
             .map(|candidate| self.node.org_call_in_flight(candidate.provider.node_id()))
@@ -2066,12 +2111,10 @@ fn sensing_planning_seam() {
 /// nothing to order.
 #[derive(Debug, Default)]
 pub(crate) struct SensedOutcome {
-    /// At least one authorized candidate is sensed VIABLE. The sensed order
-    /// then decides, exactly as the signed exact lane does.
-    pub(crate) viable_lead: bool,
-    /// Providers sensed not-ready. They are kept out of the spread pool
-    /// unless nothing else is directly reachable; they are never refused.
-    pub(crate) not_ready: Vec<u64>,
+    /// Sensing produced at least one verdict (viable or not-ready) for this
+    /// call's candidates. The signed exact lane then decides over the sensed
+    /// order, exactly as before Phase 4; load spreading never overrides it.
+    pub(crate) evidence: bool,
 }
 
 /// Unsensed load spreading's choice over `loads`: the caller's own outstanding
@@ -2091,28 +2134,34 @@ pub(crate) fn p2c_spread_choice(loads: &[u32], seed: u64, nonce: u64, capability
     if loads.len() < 2 || loads.iter().all(|load| *load == loads[0]) {
         return 0;
     }
-    // `DefaultHasher::new()` has FIXED keys, so this is a pure function of its
-    // inputs; the per-process randomness is `seed`.
+    let (low, high) = p2c_pair(loads.len(), seed, nonce, capability);
+    // Strictly lower wins; an exact tie goes to the EARLIER index.
+    if loads[high] < loads[low] {
+        high
+    } else {
+        low
+    }
+}
+
+/// The two DISTINCT indices [`p2c_spread_choice`] compares, as `(lower,
+/// higher)`, for a pool of `n >= 2`. Pure: `DefaultHasher::new()` has FIXED
+/// keys, so the per-process randomness is entirely `seed`.
+pub(crate) fn p2c_pair(n: usize, seed: u64, nonce: u64, capability: &[u8]) -> (usize, usize) {
     let draw = |salt: u64| {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (seed, nonce, salt, capability).hash(&mut hasher);
         hasher.finish()
     };
-    let n = loads.len() as u64;
-    let first = (draw(0) % n) as usize;
+    let len = n as u64;
+    let first = (draw(0) % len) as usize;
     // The second draw is over the OTHER n-1 indices, so the pair is distinct.
-    let offset = (draw(1) % (n - 1)) as usize;
-    let second = (first + 1 + offset) % loads.len();
-    let (low, high) = if first < second {
+    let offset = (draw(1) % (len - 1)) as usize;
+    let second = (first + 1 + offset) % n;
+    if first < second {
         (first, second)
     } else {
         (second, first)
-    };
-    if loads[high] < loads[low] {
-        high
-    } else {
-        low
     }
 }
 

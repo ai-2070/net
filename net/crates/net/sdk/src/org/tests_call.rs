@@ -2344,6 +2344,22 @@ fn p2c_spread_choice_keeps_the_flat_default_and_follows_a_skewed_signal() {
         picks.contains(&1) && picks.contains(&2),
         "load spreads across the idle pair"
     );
+    // The exact-tie rule, isolated: find a nonce whose sampled pair is (0, 1),
+    // both idle, with index 2 loaded so the signal is not flat. The EARLIER
+    // index must win. RED against a tie broken toward the later index.
+    let tie_nonce = (0..10_000u64)
+        .find(|nonce| super::call::p2c_pair(3, 11, *nonce, &cap) == (0, 1))
+        .expect("some nonce samples the pair (0, 1)");
+    assert_eq!(
+        p2c_spread_choice(&[0, 0, 9], 11, tie_nonce, &cap),
+        0,
+        "a tie goes to the earlier index"
+    );
+    // And every sampled pair is distinct and ordered.
+    for nonce in 0..500u64 {
+        let (low, high) = super::call::p2c_pair(5, 3, nonce, &cap);
+        assert!(low < high && high < 5, "pair ({low}, {high})");
+    }
     // Pure: the same inputs give the same answer.
     assert_eq!(
         p2c_spread_choice(&[2, 0, 1, 0], 99, 7, &cap),

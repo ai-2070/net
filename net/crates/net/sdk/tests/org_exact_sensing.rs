@@ -2242,6 +2242,22 @@ async fn an_all_not_ready_population_still_calls_in_the_deterministic_order() {
     );
     assert_eq!(cell.served(0) - before, 1);
     assert_eq!(population(&cell.consumer).len(), 2);
+
+    // Sensing produced verdicts, so the signed exact lane decides, NOT Phase 4
+    // load spreading: even with this node holding outstanding calls to the
+    // deterministic first provider (a skewed load signal), the call still
+    // lands on it. RED against spreading whenever no provider is viable.
+    let held: Vec<_> = (0..4)
+        .map(|_| cell.consumer.node.begin_org_call(cell.id(0)))
+        .collect();
+    for _ in 0..4 {
+        assert_eq!(
+            cell.call().await,
+            cell.names[0],
+            "with sensed verdicts the exact lane's order is not load-spread"
+        );
+    }
+    drop(held);
     cell.cleanup();
 }
 

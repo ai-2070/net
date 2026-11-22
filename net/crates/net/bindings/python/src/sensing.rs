@@ -44,7 +44,15 @@ fn sensing_err(error: sdk::SensingError) -> PyErr {
 fn millis(value: Option<f64>, name: &str) -> PyResult<Option<Duration>> {
     match value {
         None => Ok(None),
-        Some(ms) if ms.is_finite() && ms >= 0.0 => Ok(Some(Duration::from_secs_f64(ms / 1000.0))),
+        // Checked: a finite value too large for `Duration` (1e308 ms) is a
+        // refusal, not a panic inside the binding.
+        Some(ms) if ms.is_finite() && ms >= 0.0 => Duration::try_from_secs_f64(ms / 1000.0)
+            .map(Some)
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "{name} is too large to represent as a duration; got {ms}"
+                ))
+            }),
         Some(ms) => Err(PyValueError::new_err(format!(
             "{name} must be a finite, non-negative number of milliseconds; got {ms}"
         ))),

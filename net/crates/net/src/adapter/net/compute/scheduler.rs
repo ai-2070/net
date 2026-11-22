@@ -520,15 +520,16 @@ impl Scheduler {
         tie_break: &TieBreakContext<'_>,
         sensed: SensedOrder<'_>,
     ) -> Option<u64> {
+        let bands = sensed.bands();
         candidates
             .into_iter()
             .filter_map(|n| placement.placement_score(&n, artifact).map(|s| (n, s)))
             .filter(|(_, s)| s.is_finite())
             .max_by(|(a, sa), (b, sb)| {
                 // Lower band wins, so `a` is GREATER when its band is lower.
-                sensed
+                bands
                     .band(*b)
-                    .cmp(&sensed.band(*a))
+                    .cmp(&bands.band(*a))
                     .then_with(|| sa.partial_cmp(sb).unwrap_or(Ordering::Equal))
                     .then_with(|| tie_break_compare(*b, *a, tie_break))
             })
@@ -557,16 +558,18 @@ impl Scheduler {
         sensed: SensedOrder<'_>,
     ) -> Result<PlacementDecision, SchedulerError> {
         let mut eligible: Vec<u64> = Vec::new();
-        if !local_drained && self.can_run_locally(filter) {
+        let local_inserted = !local_drained && self.can_run_locally(filter);
+        if local_inserted {
             eligible.push(self.local_node_id);
         }
+        // `find_nodes_matching` already returns each node once, so the only
+        // possible duplicate is the local node inserted above: one comparison,
+        // not a linear membership scan per result.
         for node in capability_bridge::find_nodes_matching(&self.capability_fold, filter) {
-            if node == self.local_node_id && local_drained {
+            if node == self.local_node_id && (local_drained || local_inserted) {
                 continue;
             }
-            if !eligible.contains(&node) {
-                eligible.push(node);
-            }
+            eligible.push(node);
         }
         if eligible.is_empty() {
             return Err(SchedulerError::NoCandidate);
@@ -606,9 +609,14 @@ impl Scheduler {
             return Err(SchedulerError::NoCandidate);
         }
         if candidates.len() == 1 {
+            // The same reason `place_migration` gives a sole local target.
             return Ok(PlacementDecision {
                 node_id: candidates[0],
-                reason: PlacementReason::OnlyCandidate,
+                reason: if candidates[0] == self.local_node_id {
+                    PlacementReason::LocalPreferred
+                } else {
+                    PlacementReason::OnlyCandidate
+                },
             });
         }
         let node_id = self.best_band_local_first(&candidates, sensed);
@@ -647,6 +655,7 @@ impl Scheduler {
                 .placement_score(&self.local_node_id, artifact)
                 .is_some_and(f32::is_finite)
         {
+            let bands = sensed.bands();
             let best_band = candidates
                 .iter()
                 .filter(|n| {
@@ -654,9 +663,9 @@ impl Scheduler {
                         .placement_score(n, artifact)
                         .is_some_and(f32::is_finite)
                 })
-                .map(|n| sensed.band(*n))
+                .map(|n| bands.band(*n))
                 .min();
-            if best_band == Some(sensed.band(self.local_node_id)) {
+            if best_band == Some(bands.band(self.local_node_id)) {
                 return Some(self.local_node_id);
             }
         }
@@ -698,18 +707,19 @@ impl Scheduler {
     /// The best sensed band among `eligible`. Within it, the local node first,
     /// then `eligible`'s own order. `eligible` is non-empty.
     fn best_band_local_first(&self, eligible: &[u64], sensed: SensedOrder<'_>) -> u64 {
+        let bands = sensed.bands();
         let best = eligible
             .iter()
-            .map(|n| sensed.band(*n))
+            .map(|n| bands.band(*n))
             .min()
             .unwrap_or(SensedOrder::UNVERDICTED);
-        if eligible.contains(&self.local_node_id) && sensed.band(self.local_node_id) == best {
+        if eligible.contains(&self.local_node_id) && bands.band(self.local_node_id) == best {
             return self.local_node_id;
         }
         eligible
             .iter()
             .copied()
-            .find(|n| sensed.band(*n) == best)
+            .find(|n| bands.band(*n) == best)
             .unwrap_or(eligible[0])
     }
 }
@@ -730,7 +740,7 @@ pub struct SensedOrder<'a> {
     pub not_ready: &'a std::collections::HashSet<u64>,
 }
 
-impl SensedOrder<'_> {
+impl<'a> SensedOrder<'a> {
     /// No evidence: every node is unverdicted, and every sensed variant is
     /// its unsensed counterpart.
     pub fn none() -> SensedOrder<'static> {
@@ -743,16 +753,39 @@ impl SensedOrder<'_> {
     /// The band of a node with no verdict.
     const UNVERDICTED: usize = usize::MAX - 1;
 
+    /// The band lookup for ONE selection, built once: a node-to-rank map, so a
+    /// comparator asks in O(1) instead of scanning `viable_order` per
+    /// comparison. A duplicated provider keeps its FIRST rank, exactly as a
+    /// linear `position()` did.
+    fn bands(&self) -> SensedBands<'a> {
+        let mut ranks = std::collections::HashMap::with_capacity(self.viable_order.len());
+        for (rank, node) in self.viable_order.iter().enumerate() {
+            ranks.entry(*node).or_insert(rank);
+        }
+        SensedBands {
+            ranks,
+            not_ready: self.not_ready,
+        }
+    }
+}
+
+/// [`SensedOrder::bands`]' lookup.
+struct SensedBands<'a> {
+    ranks: std::collections::HashMap<u64, usize>,
+    not_ready: &'a std::collections::HashSet<u64>,
+}
+
+impl SensedBands<'_> {
     /// The node's band: its viable rank, then `UNVERDICTED`, then the
     /// not-ready band (`usize::MAX`). Lower is better. A node in both sets
     /// takes its viable rank, because the rank is the positive evidence.
     fn band(&self, node: u64) -> usize {
-        if let Some(rank) = self.viable_order.iter().position(|n| *n == node) {
-            rank
+        if let Some(rank) = self.ranks.get(&node) {
+            *rank
         } else if self.not_ready.contains(&node) {
             usize::MAX
         } else {
-            Self::UNVERDICTED
+            SensedOrder::UNVERDICTED
         }
     }
 }
@@ -955,6 +988,35 @@ mod tests {
             .place_migration(&CapabilityFilter::default(), 0x1111)
             .unwrap();
         assert_eq!(decision.node_id, 0x2222);
+        assert_eq!(decision.reason, PlacementReason::OnlyCandidate);
+    }
+
+    /// A SOLE local migration target is `LocalPreferred` in the sensed variant,
+    /// exactly as `place_migration` reports it, and a sole remote one stays
+    /// `OnlyCandidate`.
+    #[test]
+    fn place_migration_sensed_reports_a_sole_local_target_as_local_preferred() {
+        let fold = make_index_with_nodes(vec![
+            (0x1111, caps_with_migration_tag()),
+            (0x2222, caps_with_migration_tag()),
+        ]);
+        // Local is 0x2222; the source 0x1111 is excluded, so local is the only target.
+        let scheduler = Scheduler::new(fold.clone(), 0x2222, caps_no_gpu());
+        let unsensed = scheduler
+            .place_migration(&CapabilityFilter::default(), 0x1111)
+            .unwrap();
+        let sensed = scheduler
+            .place_migration_sensed(&CapabilityFilter::default(), 0x1111, SensedOrder::none())
+            .unwrap();
+        assert_eq!(sensed.node_id, 0x2222);
+        assert_eq!(sensed.reason, PlacementReason::LocalPreferred);
+        assert_eq!(sensed.reason, unsensed.reason);
+
+        let remote = Scheduler::new(fold.clone(), 0x3333, caps_no_gpu());
+        let decision = remote
+            .place_migration_sensed(&CapabilityFilter::default(), 0x2222, SensedOrder::none())
+            .unwrap();
+        assert_eq!(decision.node_id, 0x1111);
         assert_eq!(decision.reason, PlacementReason::OnlyCandidate);
     }
 

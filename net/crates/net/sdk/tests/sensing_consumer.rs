@@ -3452,10 +3452,19 @@ async fn a_value_provider_set_reaches_the_snapshot_and_honors_the_start_bound() 
     .await;
 
     assert!(value.close(), "the handle removed its registration");
+    let at_close = value.get();
     assert!(
         !value.set(ReadinessValue::Unevaluable),
         "a closed handle stores nothing"
     );
+    assert_eq!(value.get(), at_close, "and its value did not move");
+    // The close really withdrew the evaluator: the consumer projects Unknown
+    // for the provider, whose row it keeps.
+    until_snapshot("the close never withdrew readiness", &mut strict, |snap| {
+        snap.provider(provider_id)
+            .is_some_and(|p| p.readiness() == ProjectedReadiness::Unknown)
+    })
+    .await;
     let _ = std::fs::remove_dir_all(&consumer.dir);
     let _ = std::fs::remove_dir_all(&provider.dir);
 }

@@ -304,7 +304,7 @@ fn band_by_sensing(
 ) -> Vec<IslandId> {
     let hosts: std::collections::HashMap<IslandId, NodeId> =
         candidates.iter().map(|r| (r.id, r.host)).collect();
-    let mut ordered = select_with_affinity(
+    let ordered = select_with_affinity(
         candidates,
         criteria.selection,
         criteria.prefer_capability.clone(),
@@ -323,27 +323,31 @@ fn band_by_sensing(
     // everything. A host that is somehow in both sensed sets takes its viable
     // rank: the rank is the positive evidence, and banding is an ordering, not
     // a filter.
-    const UNVERDICTED: usize = usize::MAX - 1;
-    const DEMOTED: usize = usize::MAX;
-    let bands: std::collections::HashMap<IslandId, usize> = ordered
-        .iter()
-        .map(|island| {
-            let host = hosts.get(island);
-            let band = host
-                .and_then(|host| provider_rank.get(host).copied())
-                .unwrap_or_else(|| match (host, demoted_last) {
-                    (Some(host), Some(demoted)) if demoted.contains(host) => DEMOTED,
-                    // Unsensed / potential hosts form the trailing
-                    // band, in the selection policy's own order.
-                    _ => UNVERDICTED,
-                });
-            (*island, band)
-        })
-        .collect();
-    // Stable: within a band, the [3]-step selection order survives.
-    // No fold queries inside the O(n log n) sort.
-    ordered.sort_by_key(|island| bands.get(island).copied().unwrap_or(UNVERDICTED));
-    ordered
+    // BUCKET emission, one pass over the selection order (D7.2): no
+    // comparison sort over the complete list and no per-call band map. Each
+    // island lands in exactly one bucket, and within a bucket the [3]-step
+    // selection order survives because islands are appended in that order.
+    let mut ranked: Vec<Vec<IslandId>> = vec![Vec::new(); sensed_viable_order.len()];
+    let mut unverdicted: Vec<IslandId> = Vec::new();
+    let mut demoted: Vec<IslandId> = Vec::new();
+    for island in ordered {
+        let host = hosts.get(&island);
+        match host.and_then(|host| provider_rank.get(host).copied()) {
+            Some(rank) => ranked[rank].push(island),
+            None => match (host, demoted_last) {
+                (Some(host), Some(set)) if set.contains(host) => demoted.push(island),
+                // Unsensed / potential hosts form the trailing band, in the
+                // selection policy's own order.
+                _ => unverdicted.push(island),
+            },
+        }
+    }
+    ranked
+        .into_iter()
+        .flatten()
+        .chain(unverdicted)
+        .chain(demoted)
+        .collect()
 }
 
 #[cfg(test)]

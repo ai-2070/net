@@ -7,9 +7,10 @@ are all the Rust SDK's. This module only unwraps a :class:`MeshNode` to its
 native mesh, and adds :func:`snapshots`, a generator over ``changed()`` /
 ``snapshot()``.
 
-Example::
+Example (``provider`` and ``consumer`` are two started, sensing-enabled
+:class:`MeshNode` handles in one organization, e.g.
+``MeshNode(..., enable_sensing=True, sensing_incarnation_path=...)``)::
 
-    from net_sdk import MeshNode
     from net_sdk.sensing import provide, watch, snapshots
 
     readiness = provide(provider, "nrpc:gpu.infer", "ready", estimated_start_ms=40)
@@ -28,20 +29,35 @@ from __future__ import annotations
 
 from typing import Any, Iterator, Optional
 
-try:
-    from net import (
-        ReadinessProvider,
-        SensingError,
-        SensingSnapshot,
-        SensingWatch,
-    )
-    from net import sensing_error_class as _native_class
-    from net import sensing_provide as _native_provide
-    from net import sensing_watch as _native_watch
-except ImportError as e:  # pragma: no cover - exercised by the feature-gate test
+import net  # noqa: E402 - a failure HERE is a real load error (no `_net`,
+# a bad linked library): it surfaces unchanged, never as "missing feature".
+
+_REQUIRED = (
+    "ReadinessProvider",
+    "SensingError",
+    "SensingSnapshot",
+    "SensingWatch",
+    "sensing_error_class",
+    "sensing_provide",
+    "sensing_watch",
+)
+_missing = [name for name in _REQUIRED if not hasattr(net, name)]
+if _missing:  # the extension loaded; the feature did not
     raise ImportError(
         "net_sdk.sensing requires a `net` wheel built with the `org` feature"
-    ) from e
+        " (e.g. `maturin develop --features org`)."
+        f" Missing: {', '.join(_missing)}."
+    )
+
+from net import (  # type: ignore[attr-defined]  # noqa: E402
+    ReadinessProvider,
+    SensingError,
+    SensingSnapshot,
+    SensingWatch,
+)
+from net import sensing_error_class as _native_class  # noqa: E402
+from net import sensing_provide as _native_provide  # noqa: E402
+from net import sensing_watch as _native_watch  # noqa: E402
 
 from net_sdk.mesh import _native_mesh
 

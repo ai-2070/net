@@ -114,6 +114,9 @@ SERVICE = "sensing.py.live"
 TAG = f"nrpc:{SERVICE}"
 
 
+# Live cells can exceed the suite-wide 30 s watchdog during scenario generation
+# and convergence, exactly like the other live cells (test_org_live.py).
+@pytest.mark.timeout(600)
 def test_a_value_set_reaches_the_consumer_and_close_ends_a_blocked_wait() -> None:
     # os.makedirs, NOT tempfile.mkdtemp: on Windows mkdtemp's owner-only ACL is
     # refused by the audience-secret loader (see test_subnet_live.py).
@@ -184,8 +187,9 @@ def test_a_value_set_reaches_the_consumer_and_close_ends_a_blocked_wait() -> Non
             ),
         )
 
-        # B1-pre: a timeout returns False and the watch stays open.
-        assert watch.changed(timeout_ms=50) in (True, False)
+        # A timeout too large for a Duration is a ValueError, never a panic.
+        with pytest.raises(ValueError):
+            watch.changed(timeout_ms=1e308)
         assert not watch.closed
 
         # After close(), every wait raises closed. (A close while a wait is
@@ -206,6 +210,10 @@ def test_a_value_set_reaches_the_consumer_and_close_ends_a_blocked_wait() -> Non
         # thread ends the blocked changed() as closed, never as a wake.
         quiet_watch = net.sensing_watch(quiet, "nrpc:quiet.capability")
         quiet_watch.snapshot()
+        # B1-pre: on a quiet watch (no edges, and the population floor is 1 s)
+        # a short timeout returns False, and the watch stays open.
+        assert quiet_watch.changed(timeout_ms=50) is False
+        assert not quiet_watch.closed
         outcome: list = []
 
         def blocked() -> None:

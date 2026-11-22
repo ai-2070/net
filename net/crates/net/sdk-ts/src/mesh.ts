@@ -383,7 +383,7 @@ export interface MeshNodeConfig {
   permissiveChannels?: boolean;
   /**
    * Turn the capability-sensing plane on (it ships dark). Required for
-   * `-mesh/sdk/sensing`'s `watch` and `provide`.
+   * `@net-mesh/sdk/sensing`'s `watch` and `provide`.
    */
   enableSensing?: boolean;
   /**

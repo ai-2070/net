@@ -2328,8 +2328,8 @@ impl MeshRpc {
         env: &'env Env,
         service: String,
         #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
-        opts: Option<CallOptions>,
         readiness: &crate::sensing::SensingSnapshot,
+        opts: Option<CallOptions>,
     ) -> Result<PromiseRaw<'env, Buffer>> {
         let inner_opts = opts.unwrap_or_default().into_inner()?;
         let payload = request.into_bytes();
@@ -2353,8 +2353,8 @@ impl MeshRpc {
         env: &'env Env,
         service: String,
         #[napi(ts_arg_type = "Buffer")] request: crate::common::JsBytes,
-        opts: Option<CallOptions>,
         readiness: &crate::sensing::SensingSnapshot,
+        opts: Option<CallOptions>,
     ) -> Result<PromiseRaw<'env, RpcStream>> {
         let opts = opts.unwrap_or_default().into_inner()?;
         let payload = request.into_bytes();

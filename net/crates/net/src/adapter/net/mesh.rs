@@ -9176,6 +9176,14 @@ pub enum GrantedSensingUnavailable {
     /// The dispatcher grant is not this node's own, for its owner
     /// organization, over the grant's capability.
     DispatcherMismatch,
+    /// Credentials are already registered under this grant's audience for a
+    /// DIFFERENT grant (same id, issuer, grantee and capability, other
+    /// bytes). Refused rather than mixed: discovery and egress must always
+    /// use one grant.
+    GrantConflict,
+    /// The grant's audience equals this node's configured legacy sensing
+    /// fleet root, so granted and legacy leases would share keys.
+    FleetRootCollision,
 }
 
 /// One holder of a node's granted sensing credentials (OLB-6, D6.5). While any
@@ -18955,13 +18963,24 @@ impl MeshNode {
             return Err(GrantedSensingUnavailable::DispatcherMismatch);
         }
         let audience = sensing::canonical_granted_sensing_commitment(&grant);
+        // The consumer-side twin of the provider's fleet-root refusal: a granted
+        // lease keyed under this node's legacy fleet root would share keys with
+        // legacy leases.
+        if self.config.sensing_owner_root.is_some() && audience == self.sensing_local_root {
+            return Err(GrantedSensingUnavailable::FleetRootCollision);
+        }
         {
             let mut map = self.granted_sensing.lock();
+            if let Some(existing) = map.get(&audience) {
+                if existing.1 != grant {
+                    return Err(GrantedSensingUnavailable::GrantConflict);
+                }
+            }
             let entry = map
                 .entry(audience)
                 .or_insert_with(|| (dispatcher.clone(), grant.clone(), 0));
-            // A re-registration replaces the dispatcher grant (a renewal) but
-            // keeps the holder count.
+            // A re-registration of the SAME grant replaces the dispatcher grant
+            // (a renewal) and keeps the holder count.
             entry.0 = dispatcher;
             entry.2 += 1;
         }
@@ -39794,11 +39813,24 @@ impl MeshNode {
         // An admitted registration clears the window, so an honest peer that
         // occasionally fails (a cert renewal race, a floor moving mid-flight) does
         // not accumulate toward the throttle.
+        let admitted = sensing::AdmittedSensingRegistration::from_validated_org(validated);
+        // A GRANTED root equal to this node's configured sensing FLEET root
+        // would share a `ProviderInterestKey` with legacy rows proven under that
+        // root (the closure-2 class, from the granted side). Refused and
+        // counted; unreachable without already holding the grant.
+        if matches!(
+            admitted.authority(),
+            sensing::RegistrationAuthority::Granted { .. }
+        ) && ctx.sensing_fleet_scope
+            && admitted.proven_root() == ctx.sensing_local_root
+        {
+            ctx.sensing_counters
+                .org_granted_refused
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         Self::clear_auth_failures(from_node, ctx);
-        Some((
-            sensing::AdmittedSensingRegistration::from_validated_org(validated),
-            snapshot,
-        ))
+        Some((admitted, snapshot))
     }
 
     /// OLB org-auth (piece 4, exact-provider): the shared PROVIDER re-authoring
@@ -62063,6 +62095,49 @@ mod sensing_authority_witness_tests {
         );
     }
 
+    // G4 — a granted root equal to this node's configured legacy FLEET root is
+    // refused and counted: granted and legacy rows must never share a key. The
+    // same pair is admitted on an ordinary node.
+    #[tokio::test]
+    async fn a_granted_root_equal_to_the_fleet_root_is_refused() {
+        let sender = EntityKeypair::generate().entity_id().clone();
+        let fixture = granted_fixture(&sender);
+        let granted_root = sensing::canonical_granted_sensing_commitment(&fixture.grant);
+        let node = fleet_node(granted_root).await;
+        node.install_node_authority(adopt(&node, &org(), "g4"))
+            .expect("the fleet root is not the org commitment, so install succeeds");
+        pin_sender(&node, &sender);
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &granted_frame(node.node_id(), &fixture),
+            FROM_NODE,
+            &sender,
+            fixture.at,
+        )
+        .is_none());
+        assert_eq!(
+            ctx.sensing_counters
+                .org_granted_refused
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+
+        let ordinary = org_node("g4-control").await;
+        pin_sender(&ordinary, &sender);
+        assert!(
+            MeshNode::admit_org_registration(
+                &ordinary.dispatch_ctx(),
+                &granted_frame(ordinary.node_id(), &fixture),
+                FROM_NODE,
+                &sender,
+                fixture.at,
+            )
+            .is_some(),
+            "control: the same registration is admitted without the collision"
+        );
+    }
+
     // G3 — the grant is revoked by its issuer AFTER the gate admitted the frame
     // and BEFORE the row: the revocation publish moves the authority stamp, so
     // the fenced register refuses and no row exists. A grant revocation is
@@ -62223,6 +62298,32 @@ mod sensing_authority_witness_tests {
             .register_granted_sensing(own_dispatcher(&node), good.clone())
             .expect("accepted again");
         assert_eq!(first.audience(), audience);
+        // The SAME audience under DIFFERENT grant bytes (same id, issuer,
+        // grantee and capability; another nonce and window) is refused, never
+        // mixed with the registered grant.
+        let (_, binding) =
+            crate::adapter::net::behavior::org_grant::OrgAudienceSecret::mint(good.grant_id);
+        let now = current_timestamp();
+        let twin = crate::adapter::net::behavior::org_grant::OrgCapabilityGrant::issue_at(
+            &issuing_org(),
+            good.grant_id,
+            org().org_id(),
+            good.capability,
+            full_sense(),
+            good.target_scope.clone(),
+            Some(binding),
+            now,
+            now + 600,
+            good.nonce.wrapping_add(1),
+        );
+        assert_eq!(
+            sensing::canonical_granted_sensing_commitment(&twin),
+            audience
+        );
+        assert_eq!(
+            refused(own_dispatcher(&node), twin),
+            Some(GrantedSensingUnavailable::GrantConflict)
+        );
         drop(first);
         assert!(
             node.granted_sensing_credentials(&audience).is_some(),

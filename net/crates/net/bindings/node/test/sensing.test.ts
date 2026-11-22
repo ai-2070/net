@@ -15,8 +15,8 @@
 // like the S4 cell in `org_live.test.ts`. It needs a Rust toolchain and an
 // `org`-feature build, and skips cleanly otherwise.
 
-import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +32,11 @@ const HAS_SENSING =
 
 const here = dirname(fileURLToPath(import.meta.url))
 const crateRoot = resolve(here, '..', '..', '..')
+// The live cell mints its scenario with `cargo run` inside the Rust workspace.
+// A prebuilt binding with no toolchain or no workspace skips it cleanly.
+const HAS_CARGO_WORKSPACE =
+  existsSync(join(crateRoot, 'Cargo.toml')) &&
+  spawnSync('cargo', ['--version'], { stdio: 'ignore' }).status === 0
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 type Vector = { kind: string; terminal: boolean; wire: string; message: string }
@@ -91,7 +96,7 @@ function scenarioDir(tag: string): string {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Mesh = any
 
-describe.skipIf(!HAS_SENSING)('B1 — live sensing through the Node binding', () => {
+describe.skipIf(!HAS_SENSING || !HAS_CARGO_WORKSPACE)('B1 — live sensing through the Node binding', () => {
   const SERVICE = 'sensing.node.live'
   const TAG = `nrpc:${SERVICE}`
   let dir: string

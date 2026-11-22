@@ -33,7 +33,15 @@ fn sensing_err(error: SensingError) -> Error {
 fn millis(value: Option<f64>, name: &str) -> Result<Option<Duration>> {
     match value {
         None => Ok(None),
-        Some(ms) if ms.is_finite() && ms >= 0.0 => Ok(Some(Duration::from_secs_f64(ms / 1000.0))),
+        // Checked: a finite value too large for `Duration` (1e308 ms) is a
+        // refusal, not a panic inside the binding.
+        Some(ms) if ms.is_finite() && ms >= 0.0 => Duration::try_from_secs_f64(ms / 1000.0)
+            .map(Some)
+            .map_err(|_| {
+                Error::from_reason(format!(
+                    "{name} is too large to represent as a duration; got {ms}"
+                ))
+            }),
         Some(ms) => Err(Error::from_reason(format!(
             "{name} must be a finite, non-negative number of milliseconds; got {ms}"
         ))),
@@ -373,5 +381,24 @@ impl NetMesh {
             fallback_refused: BigInt::from(c.fallback_refused),
             fallback_unretained: BigInt::from(c.fallback_unretained),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::millis;
+
+    /// A finite value too large for `Duration` is refused with an error, never a
+    /// panic in the binding; ordinary and invalid inputs keep their meaning.
+    #[test]
+    fn millis_refuses_overflow_instead_of_panicking() {
+        assert!(millis(Some(1e308), "timeoutMs").is_err());
+        assert!(millis(Some(-1.0), "timeoutMs").is_err());
+        assert!(millis(Some(f64::NAN), "timeoutMs").is_err());
+        assert_eq!(
+            millis(Some(1500.0), "timeoutMs").expect("valid"),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        assert_eq!(millis(None, "timeoutMs").expect("absent"), None);
     }
 }

@@ -980,6 +980,11 @@ impl OrgSensingFamily {
             // rather than authoring under a grant issued to another org.
             OrgSensingPlane::Granted(registration) => {
                 if registration.grant().grantee_org != owner_org {
+                    // Release what the OLD owner retained before refusing:
+                    // otherwise its old-audience leases outlive the rotation,
+                    // and every later call refuses here before anything
+                    // could reconcile them away.
+                    self.retire_under_txn(capability);
                     return Err(OrgSensingDemandRefused::CapabilityNotGranted);
                 }
                 registration.audience()
@@ -1155,10 +1160,16 @@ impl OrgSensingFamily {
     pub fn retire(&self, tag: &str) {
         let capability = CapabilityAuthorityId::for_tag(tag);
         let _txn = self.inner.txn_mu.lock();
+        self.retire_under_txn(&capability);
+    }
+
+    /// [`Self::retire`]'s body, for a caller that ALREADY holds the family
+    /// transaction lock. Extract under the map lock, close after it.
+    fn retire_under_txn(&self, capability: &CapabilityAuthorityId) {
         let mut extracted: Vec<Arc<OrgSensingCapabilityDemand>> = Vec::new();
         {
             let mut map = self.inner.demand_mu.lock();
-            extracted.extend(map.remove(&capability));
+            extracted.extend(map.remove(capability));
         }
         for demand in &extracted {
             demand.close();
@@ -2330,6 +2341,76 @@ mod tests {
         node.clear_sensing_phase_two_seam_for_test();
         drop(demand);
         drop(family);
+    }
+
+    /// OLB-6: a GRANTED family whose node's owner rotates away from the grant's
+    /// grantee RELEASES what it retained, then refuses. RED against a refusal
+    /// that returns before releasing: the old-audience lease would then outlive
+    /// the rotation, and every later convergence refuses before anything could
+    /// reconcile it away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_granted_family_releases_its_leases_when_the_owner_rotates_away() {
+        use crate::adapter::net::behavior::org_grant::{
+            DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant, OrgDispatcherGrant,
+        };
+        let node = demand_node("granted-rotation", Duration::from_secs(30)).await;
+        let issuer = OrgKeypair::from_bytes([0x5Au8; 32]);
+        let (grant, _) = OrgCapabilityGrant::try_issue(
+            &issuer,
+            org().org_id(),
+            CapabilityAuthorityId::for_tag(TAG),
+            GrantRights::DISCOVER
+                .union(GrantRights::INVOKE)
+                .union(GrantRights::SENSE),
+            GrantTargetScope::AnyNodeOwnedBy(issuer.org_id()),
+            3600,
+        )
+        .expect("grant");
+        let dispatcher = OrgDispatcherGrant::try_issue(
+            &org(),
+            node.entity_id().clone(),
+            DispatcherScope::Any,
+            3600,
+        )
+        .expect("dispatcher");
+        let registration = node
+            .register_granted_sensing(dispatcher, grant.clone())
+            .expect("credentials accepted");
+        let audience = registration.audience();
+        let family = OrgSensingFamily::mint_granted(&node, registration).expect("mint");
+        let provider = node.node_id().wrapping_add(1);
+
+        let demand = family
+            .reconcile(TAG, &[provider])
+            .expect("retain under the grant");
+        assert_eq!(
+            demand.audience(),
+            audience,
+            "the granted audience, not the owner's"
+        );
+        let key = demand.retained[0].key;
+        assert_eq!(holders(&node, &key), Some(1));
+        drop(demand);
+
+        node.clear_node_authority_for_test();
+        node.install_node_authority(adopt(&node, &other_org(), "granted-rotated"))
+            .expect("install a foreign owner");
+
+        assert!(matches!(
+            family.reconcile(TAG, &[provider]),
+            Err(OrgSensingDemandRefused::CapabilityNotGranted)
+        ));
+        assert!(
+            family
+                .demand(&CapabilityAuthorityId::for_tag(TAG))
+                .is_none(),
+            "the stale granted demand is retired"
+        );
+        assert_eq!(
+            holders(&node, &key),
+            None,
+            "and its old-audience lease is released, not stranded"
+        );
     }
 
     /// An owner-organization ROTATION must not carry retained tickets forward.
@@ -3548,14 +3629,6 @@ mod tests {
         drop(family);
     }
 
-    /// PRODUCTION retention over a NONEMPTY verified discovery population, and
-    /// what floor movement does to it.
-    ///
-    /// The population is not an argument here: it comes from a real
-    /// owner-scoped announcement admitted by `verify_scoped_ingest` and
-    /// projected onto a node id through the TOFU pin map. That chain is what
-    /// `retain` depends on, so it has to be exercised with a record in it —
-    /// stamp movement over an empty query says nothing about provenance.
     /// C2 (OLB §14 `org_sensing_truncated_total`): a verified authorized
     /// population above `MAX_ORG_SENSING_POPULATION` is clamped to the cap,
     /// and the clamp is visible through the PRODUCTION counter accessor, once
@@ -3611,6 +3684,14 @@ mod tests {
         }
     }
 
+    /// PRODUCTION retention over a NONEMPTY verified discovery population, and
+    /// what floor movement does to it.
+    ///
+    /// The population is not an argument here: it comes from a real
+    /// owner-scoped announcement admitted by `verify_scoped_ingest` and
+    /// projected onto a node id through the TOFU pin map. That chain is what
+    /// `retain` depends on, so it has to be exercised with a record in it —
+    /// stamp movement over an empty query says nothing about provenance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_verified_discovery_population_retains_and_follows_floor_movement() {
         let node = demand_node("discovery-population", Duration::from_secs(30)).await;
