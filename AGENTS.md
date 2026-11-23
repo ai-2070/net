@@ -204,7 +204,7 @@ Why these exact flags (documented in CONTRIBUTING.md, learned from real CI incid
 
 ## Clippy discipline
 
-Production code is held at `-D warnings` with `unwrap_used`/`expect_used` denied in some crates (`net-mesh-mcp` lints only `--lib --bins` for this reason). The workspace root keeps panic-hygiene lints (`unwrap_used`, `expect_used`, `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`) at **warn**, not deny, because Cargo applies `[lints]` after CLI flags — a package-level deny can't be relaxed for tests, and there are ~5000 test unwraps. CI splits enforcement: strict on lib/bins, permissive on all-targets. Never "fix" this by blanket-allowing lints, and never "fix" test-target unwrap/expect warnings — the test surface is allowed to panic by design.
+Production code is held at `-D warnings` with `unwrap_used`/`expect_used` denied in some crates. The workspace root keeps panic-hygiene lints (`unwrap_used`, `expect_used`, `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`) at **warn**, not deny, because Cargo applies `[lints]` after CLI flags — a package-level deny can't be relaxed for tests, and there are ~5000 test unwraps. CI splits enforcement: strict on lib/bins, permissive on all-targets. Never "fix" this by blanket-allowing lints, and never "fix" test-target unwrap/expect warnings — the test surface is allowed to panic by design.
 
 ## Toolchain
 

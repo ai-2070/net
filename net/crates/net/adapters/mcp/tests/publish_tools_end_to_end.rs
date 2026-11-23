@@ -536,21 +536,21 @@ const TERMS: &str = r#"{"object":"net.pricing.terms@1"}"#;
 
 /// A payment gate that admits everything and records what it redeemed.
 struct RecordingAdmission {
-    redeemed: std::sync::Mutex<Vec<(String, String, bool)>>,
+    redeemed: parking_lot::Mutex<Vec<(String, String, bool)>>,
     /// Every offer publication / withdrawal, in order.
-    offers: std::sync::Mutex<Vec<String>>,
+    offers: parking_lot::Mutex<Vec<String>>,
 }
 
 impl RecordingAdmission {
     fn new() -> Self {
         Self {
-            redeemed: std::sync::Mutex::new(Vec::new()),
-            offers: std::sync::Mutex::new(Vec::new()),
+            redeemed: parking_lot::Mutex::new(Vec::new()),
+            offers: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     fn offers(&self) -> Vec<String> {
-        self.offers.lock().unwrap().clone()
+        self.offers.lock().clone()
     }
 }
 
@@ -562,27 +562,19 @@ impl net_mcp::serve::PaymentAdmission for RecordingAdmission {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<(), net_sdk::tool_payment::GateDenial> {
-        self.redeemed.lock().unwrap().push((
-            tool_id.to_string(),
-            quote_id.to_string(),
-            binding.is_some(),
-        ));
+        self.redeemed
+            .lock()
+            .push((tool_id.to_string(), quote_id.to_string(), binding.is_some()));
         Ok(())
     }
 
     fn publish_offer(&self, tool_id: &str, _pricing_terms: &str) -> Result<(), String> {
-        self.offers
-            .lock()
-            .unwrap()
-            .push(format!("publish:{tool_id}"));
+        self.offers.lock().push(format!("publish:{tool_id}"));
         Ok(())
     }
 
     fn withdraw_offer(&self, tool_id: &str) {
-        self.offers
-            .lock()
-            .unwrap()
-            .push(format!("withdraw:{tool_id}"));
+        self.offers.lock().push(format!("withdraw:{tool_id}"));
     }
 }
 
@@ -664,7 +656,7 @@ async fn a_priced_local_tool_enforces_payment_before_the_invoker() {
         "the refusal names the missing quote: {err}"
     );
     assert!(
-        gate.redeemed.lock().unwrap().is_empty(),
+        gate.redeemed.lock().is_empty(),
         "nothing was redeemed for an unpaid call"
     );
 
@@ -692,7 +684,7 @@ async fn a_priced_local_tool_enforces_payment_before_the_invoker() {
         serde_json::from_slice(reply.body.as_ref()).expect("decode add result");
     assert_eq!(result.text(), "5");
     {
-        let redeemed = gate.redeemed.lock().unwrap();
+        let redeemed = gate.redeemed.lock();
         assert!(!redeemed.is_empty(), "the gate redeemed the quote");
         assert!(
             redeemed
@@ -903,7 +895,7 @@ async fn a_refreshed_priced_local_tool_still_enforces_payment() {
         "the refusal names the missing quote: {err}"
     );
     assert!(
-        gate.redeemed.lock().unwrap().is_empty(),
+        gate.redeemed.lock().is_empty(),
         "nothing was redeemed for an unpaid call after refresh"
     );
 
@@ -931,7 +923,7 @@ async fn a_refreshed_priced_local_tool_still_enforces_payment() {
         serde_json::from_slice(reply.body.as_ref()).expect("decode add result");
     assert_eq!(result.text(), "5");
     {
-        let redeemed = gate.redeemed.lock().unwrap();
+        let redeemed = gate.redeemed.lock();
         assert!(
             redeemed
                 .iter()

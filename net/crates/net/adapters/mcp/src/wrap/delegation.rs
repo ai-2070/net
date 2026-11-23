@@ -1003,19 +1003,19 @@ mod tests {
 
     #[test]
     fn the_audit_sink_records_the_admitted_leaf() {
-        use std::sync::Mutex as StdMutex;
         let (root, machine, gateway) = identities();
         let chain = chain_for(&root, &machine, &gateway).to_bytes();
-        let seen: Arc<StdMutex<Vec<DelegationAudit>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen: Arc<parking_lot::Mutex<Vec<DelegationAudit>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sink_seen = seen.clone();
         let g = gate(&root, Arc::new(RevocationRegistry::new())).with_audit(Arc::new(
             move |a: &DelegationAudit| {
-                sink_seen.lock().unwrap().push(a.clone());
+                sink_seen.lock().push(a.clone());
             },
         ));
         let env = envelope(&gateway, TOOL, ARGS, now_secs(), 1);
         g.verify(TOOL, ARGS, &chain, &env).unwrap();
-        let recorded = seen.lock().unwrap();
+        let recorded = seen.lock();
         assert_eq!(recorded.len(), 1);
         assert_eq!(&recorded[0].leaf, gateway.entity_id());
         assert_eq!(&recorded[0].root, root.entity_id());

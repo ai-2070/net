@@ -925,7 +925,8 @@ mod tests {
         let entry = schematic.header_entry().expect("fits");
 
         // Exactly one valid header -> decoded, riding the denial.
-        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[entry.clone()]) {
+        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), std::slice::from_ref(&entry))
+        {
             Err(GatewayError::Denied {
                 schematic: Some(s), ..
             }) => assert_eq!(s.reason, "missing_quote"),
@@ -977,7 +978,11 @@ mod tests {
 
         // Title-cased name -> decoded.
         let recased = ("Net-Failure-Schematic".to_string(), bytes.clone());
-        match map_invoke_server_error(ERR_PAYMENT, "no quote".into(), &[recased.clone()]) {
+        match map_invoke_server_error(
+            ERR_PAYMENT,
+            "no quote".into(),
+            std::slice::from_ref(&recased),
+        ) {
             Err(GatewayError::Denied {
                 schematic: Some(s), ..
             }) => assert_eq!(s.reason, "missing_quote"),

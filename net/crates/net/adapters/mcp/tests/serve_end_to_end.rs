@@ -268,8 +268,8 @@ async fn a_delegated_invoke_admits_via_the_chain_and_audits_the_leaf() {
     // Provider: owner-scope admits only an UNRELATED origin (so it excludes the
     // caller), plus a delegation gate anchored at `root`. Only a verified chain
     // can admit the caller — proving the delegation path, not owner-scope.
-    let seen: Arc<std::sync::Mutex<Vec<DelegationAudit>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen: Arc<parking_lot::Mutex<Vec<DelegationAudit>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink_seen = Arc::clone(&seen);
     let gate = Arc::new(
         DelegationGate::new(
@@ -277,7 +277,7 @@ async fn a_delegated_invoke_admits_via_the_chain_and_audits_the_leaf() {
             Arc::new(RevocationRegistry::new()),
         )
         .with_audit(Arc::new(move |a: &DelegationAudit| {
-            sink_seen.lock().expect("audit lock").push(a.clone());
+            sink_seen.lock().push(a.clone());
         })),
     );
     let mut config = WrapConfig::owner_only(client_info(), 0xDEAD_BEEF);
@@ -329,7 +329,7 @@ async fn a_delegated_invoke_admits_via_the_chain_and_audits_the_leaf() {
     assert_eq!(result.text(), "delegated hi");
 
     // The provider audited the admitted LEAF (the gateway), under the root.
-    let recorded = seen.lock().expect("audit lock");
+    let recorded = seen.lock().clone();
     assert!(
         recorded.iter().any(|a| &a.leaf == gateway.entity_id()
             && &a.root == root.entity_id()
@@ -373,8 +373,8 @@ async fn the_gateway_auto_attaches_delegation_and_invokes() {
     // Provider excludes the caller from owner-scope; only the delegation gate
     // (anchored at `root`) can admit — so a successful invoke proves the
     // gateway auto-attached a valid chain + signature.
-    let seen: Arc<std::sync::Mutex<Vec<DelegationAudit>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen: Arc<parking_lot::Mutex<Vec<DelegationAudit>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink_seen = Arc::clone(&seen);
     let gate = Arc::new(
         DelegationGate::new(
@@ -382,7 +382,7 @@ async fn the_gateway_auto_attaches_delegation_and_invokes() {
             Arc::new(RevocationRegistry::new()),
         )
         .with_audit(Arc::new(move |a: &DelegationAudit| {
-            sink_seen.lock().expect("audit lock").push(a.clone());
+            sink_seen.lock().push(a.clone());
         })),
     );
     let mut config = WrapConfig::owner_only(client_info(), 0xDEAD_BEEF);
@@ -408,7 +408,7 @@ async fn the_gateway_auto_attaches_delegation_and_invokes() {
     assert!(!result.is_error, "{result:?}");
     assert_eq!(result.text(), "delegated via gateway");
 
-    let recorded = seen.lock().expect("audit lock");
+    let recorded = seen.lock().clone();
     assert!(
         recorded.iter().any(|a| &a.leaf == gateway_id.entity_id()
             && &a.root == root.entity_id()

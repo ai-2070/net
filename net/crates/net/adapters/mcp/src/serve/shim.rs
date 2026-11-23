@@ -1585,7 +1585,7 @@ mod tests {
         let x = CapabilityId::parse("nodeb/deploy").unwrap();
         let y = CapabilityId::parse("nodeb/delete").unwrap();
         assert_eq!(
-            assigned_name(&[x.clone()], &x),
+            assigned_name(std::slice::from_ref(&x), &x),
             assigned_name(&[x.clone(), y.clone()], &x),
             "x's name must not depend on whether y is approved",
         );
@@ -1600,7 +1600,7 @@ mod tests {
             "precondition: same base"
         );
         assert_eq!(
-            assigned_name(&[a.clone()], &a),
+            assigned_name(std::slice::from_ref(&a), &a),
             assigned_name(&[a.clone(), b.clone()], &a),
             "a's name is stable regardless of b",
         );

@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(msg.kind(), IncomingKind::Request);
         let id = msg.id.expect("id present");
         // Echoing it into a response reproduces the original number verbatim.
-        let echoed = serde_json::to_value(&JsonRpcSuccess::new(id, serde_json::json!({}))).unwrap();
+        let echoed = serde_json::to_value(JsonRpcSuccess::new(id, serde_json::json!({}))).unwrap();
         assert_eq!(echoed["id"], serde_json::json!(12345678901234567890u64));
     }
 

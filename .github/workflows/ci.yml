@@ -6427,13 +6427,18 @@ jobs:
     # `tests/foo.rs` needs a `[[test]] required-features = ["fixture"]`
     # entry in `Cargo.toml`; a non-fixture test is still auto-discovered.
     #
-    # Clippy is `--lib --bins`, NOT `--all-targets`: production code is
-    # held to `-D warnings` with `unwrap_used` / `expect_used` denied
-    # (see the crate's `[lints.clippy]`), but the integration tests
-    # legitimately use `unwrap` / `expect`, so linting test targets
-    # under `-D warnings` would fail by design. This is why the crate
-    # gets a dedicated job rather than a `ffi-clippy` matrix entry
-    # (that matrix hardcodes `--all-targets`).
+    # Clippy runs twice, mirroring the root crate's split: strict
+    # `--lib --bins` for production code, then `--all-targets` with the
+    # panic-hygiene lints relaxed (`-A unwrap_used` etc.) because the
+    # test surface is allowed to panic. The crate's `[lints.clippy]`
+    # keeps those lints at `warn` precisely so the CLI `-A` can relax
+    # them. Every other lint — including `clippy.toml`'s
+    # `disallowed-methods` (std `Mutex::lock`) and
+    # `await_holding_lock` — fails the test targets too. Until the
+    # second step existed the test targets were never linted, and 22
+    # errors had accumulated in them unseen. The crate keeps a
+    # dedicated job rather than a `ffi-clippy` matrix entry because
+    # that matrix's `--all-targets` step has no `-A` relaxations.
     name: MCP adapter tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -6455,6 +6460,16 @@ jobs:
 
       - name: Run clippy (production code, strict)
         run: cargo clippy -p net-mesh-mcp --lib --bins --features fixture -- -D warnings
+
+      - name: Run clippy (all targets, test surface allowed to panic)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo clippy -p net-mesh-mcp --all-targets --features fixture --
+          -D warnings
+          -A clippy::unwrap_used
+          -A clippy::expect_used
+          -A clippy::undocumented_unsafe_blocks
+          -A clippy::multiple_unsafe_ops_per_block
 
       # The `keychain` feature (OS-keychain secret value backend for credential
       # forwarding) is non-default — the published artifact and the tests

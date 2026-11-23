@@ -317,7 +317,7 @@ mod tests {
         // never a co-published server's.
         let mine = build_catalog(&[lowered("echo", CredentialStatus::None)]).unwrap();
         let theirs = build_catalog(&[lowered("add", CredentialStatus::None)]).unwrap();
-        let parts = vec![
+        let parts = [
             CatalogPart {
                 scope: OwnerScope::owner_only(7),
                 catalog: mine,
