@@ -56,6 +56,7 @@ const PROBES = {
   '@net-mesh/sdk/tool': ['serveTool'],
   '@net-mesh/sdk/org': ['OrgClient'],
   '@net-mesh/sdk/deck': ['DeckClient', 'OperatorIdentity'],
+  '@net-mesh/sdk/sensing': ['provide', 'watch', 'sensingErrorClass', 'snapshots'],
 };
 for (const spec of subpaths) {
   if (!PROBES[spec]) fail(`no probe names for exported subpath ${spec}; add some to PROBES`);
