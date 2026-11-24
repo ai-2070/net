@@ -257,7 +257,7 @@ rejected:
 |---|---|---|
 | LS-7a | Core: D-LS14 (role at `start()`, legacy flag); D-LS15 (`MeshNode::org_sensing_leader_for`); D-LS16 (the coalesced demand registry, its refresh task, failover); D-LS17 (`org_coalesced_projection`) | The electorate excludes providers of the capability and is bounded; every observer of one view elects the same leader; a consumer never elects itself; legacy intake stays dark with the org role installed; a real-transport proof with NO `assume_sensing_leader` call; a leader failover re-registers at the next-ranked member within one refresh; a floor raise drops a leader-delivered row on the next read; the last release drops the expectation |
 | LS-7b | Rust SDK: `SensingQuery::coalesced`, `Coalesced`, `SensingSnapshot::is_coalesced`, `NoSensingLeader`, `UnsatisfiableCoalescing`; guard test amended in the same commit; the regenerated error fixture | An SDK coalesced watch end-to-end through an elected leader; close releases only its own hold; `NoSensingLeader` with no electorate; no silent coalesced↔exact fallback; `Top(0)` / `Top(33)` refused |
-| LS-7c | Node and Python bindings forward to the SDK; the TS and Python SDK option; Go through a NEW additive C function (`net_mesh_sensing_watch_coalesced`), so the existing ABI is untouched; the error vectors asserted in every language | Per-language option tests; the shared error-vector fixture; Go ABI stability for the new symbol |
+| LS-7c | Node and Python bindings forward to the SDK; the TS and Python SDK option; Go through a NEW additive C function (`net_sensing_watch_coalesced`), so the existing ABI is untouched; the error vectors asserted in every language | Per-language option tests; the shared error-vector fixture; Go ABI stability for the new symbol |
 
 The wire format does not change in any phase.
 
@@ -395,3 +395,46 @@ The wire format does not change in any phase.
 
     Not run locally: the vitest, pytest and `go test` suites. They need a
     built napi binding, a CPython, and the release cdylibs; CI runs them.
+- **Review follow-up (cubic on #1472).**
+  - **CI-blocking:** `net_sensing_watch_coalesced` added by hand to
+    `bindings/go/net-ffi/exports.baseline` and `exports.shipped.baseline`,
+    with an `edited:` note, as the earlier sensing symbols were. Without it,
+    the export-set check fails.
+  - **Correctness:**
+    - Ticket tokens are process-global (`ORG_COALESCED_TOKENS`), so a ticket
+      handed to another node's registry for the same key releases nothing
+      there. Witness: `a_foreign_ticket_releases_nothing`.
+    - A refresh whose registration races the last release re-checks under
+      the registry lock and retires the expectation it just re-recorded
+      (`retire_org_coalesced_expectation`).
+    - `register_org_capability_interest` encodes BEFORE recording the
+      expectation, and refuses with the new
+      `SensingRegistrationError::FrameTooLarge` instead of returning `Ok` for a
+      frame it could not encode. Acquire maps that to
+      `OrgCoalescedRefused::FrameTooLarge`. The SDK refuses a capability name
+      past `MAX_SENSED_CAPABILITY_BYTES` (1024) up front with the new
+      `SensingError::CapabilityTooLong`, for BOTH watch forms (the exact watch
+      had the same silent gap). The fixture was regenerated (one more
+      vector). Witnesses:
+      - the oversized acquire in
+        `a_coalesced_interest_reaches_the_elected_leader_without_assuming_the_role`;
+      - `an_oversized_capability_name_is_refused_before_any_state`.
+    - A concurrent close during a coalesced read reports `WatchClosed`, not
+      `ObserverNotQualified`.
+  - **Bindings:**
+    - Node reads `top` as `f64` (a `u32` read wraps `4294967297` to 1 and
+      truncates `2.5`).
+    - Python maps ANY `int`, including one past `i64`, to a size.
+    - The `.pyi` and `net_sdk.sensing` signatures say `Literal["best"]`.
+    - The C snapshot JSON doc names `"coalesced"`.
+  - **Docs and tests:**
+    - `project_org_coalesced` emits the same off-lock observations as the
+      exact projection.
+    - The SDK module docs no longer list leader-backed sensing as absent.
+    - `NoSensingLeader` documents the build-without-`cortex` case.
+    - `SENSING.md` says observers share the RANKING, and the winner
+      registers with the next-ranked member.
+    - The clamp witness measures its expiry window from the ingest, not
+      from before mesh setup.
+    - The test-harness doc is corrected, and the plan's LS-7c row names the
+      real symbol.

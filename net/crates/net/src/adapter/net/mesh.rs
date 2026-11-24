@@ -9124,7 +9124,8 @@ impl OrgSensingDemandCounters {
             SensingRegistrationError::Disabled
             | SensingRegistrationError::Scope(_)
             | SensingRegistrationError::Interval { .. }
-            | SensingRegistrationError::ZeroTtl => {
+            | SensingRegistrationError::ZeroTtl
+            | SensingRegistrationError::FrameTooLarge => {
                 self.refused_other.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -10295,6 +10296,11 @@ pub enum SensingRegistrationError {
     /// too many live holders of this one. Nothing was minted, recorded or sent,
     /// so there is nothing to roll back; retry after a holder releases.
     LeaseAtCapacity(sensing::LeaseRefused),
+    /// The registration frame could not be encoded within the sensing frame
+    /// cap (an oversized capability id). Nothing was recorded and nothing
+    /// sent: a registration no frame can carry is refused, never reported as
+    /// sent (SDK plan LS-7, review follow-up).
+    FrameTooLarge,
     /// The requested interest carries an ORGANIZATION-derived audience
     /// commitment that this node cannot author a registration for, because no
     /// live local organization membership could be captured — no installed
@@ -10353,6 +10359,10 @@ impl std::fmt::Display for SensingRegistrationError {
             Self::OrgAudienceUnsupported => f.write_str(
                 "organization-derived sensing audience: this node could not author a \
                  registration for it — nothing acquired, nothing emitted",
+            ),
+            Self::FrameTooLarge => f.write_str(
+                "the sensing registration frame exceeds the frame cap (an oversized \
+                 capability id) — nothing recorded, nothing emitted",
             ),
         }
     }
@@ -20325,6 +20335,21 @@ impl MeshNode {
             crate::adapter::net::behavior::org::current_timestamp(),
         )
         .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        // Encode FIRST. A frame that cannot be encoded (an oversized capability
+        // id) must refuse the registration — not record an expectation and
+        // report success for a registration no frame will ever carry, which is
+        // what a coalesced hold would then keep "refreshing" forever. The ttl is
+        // the same cap the expectation applies.
+        let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
+        let frame = sensing::SensingInterestFrame::org_capability_registration(
+            spec,
+            requested_sample_interval,
+            ttl,
+            self.node_id,
+            membership.owner_cert().clone(),
+        );
+        let bytes = sensing::encode_interest_frame(&frame)
+            .map_err(|_| SensingRegistrationError::FrameTooLarge)?;
         let (ttl, key) = self.record_capability_interest_expectation(
             spec,
             requested_sample_interval,
@@ -20336,27 +20361,18 @@ impl MeshNode {
             *key.interest_digest.as_bytes(),
             sensing_effective_min_gap(ttl),
         ) {
-            let frame = sensing::SensingInterestFrame::org_capability_registration(
-                spec,
-                requested_sample_interval,
-                ttl,
+            spawn_sensing_frame_send(
+                &self.sink,
+                &self.peers,
+                &self.addr_to_node,
+                &self.router,
+                &self.partition_filter,
                 self.node_id,
-                membership.owner_cert().clone(),
+                leader,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                bytes,
             );
-            if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
-                spawn_sensing_frame_send(
-                    &self.sink,
-                    &self.peers,
-                    &self.addr_to_node,
-                    &self.router,
-                    &self.partition_filter,
-                    self.node_id,
-                    leader,
-                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                    sensing::SUBPROTOCOL_SENSING_INTEREST,
-                    bytes,
-                );
-            }
         }
         Ok(())
     }
@@ -20589,6 +20605,7 @@ impl MeshNode {
                 Err(match error {
                     SensingRegistrationError::Disabled => OrgCoalescedRefused::Disabled,
                     SensingRegistrationError::AtCapacity => OrgCoalescedRefused::AtCapacity,
+                    SensingRegistrationError::FrameTooLarge => OrgCoalescedRefused::FrameTooLarge,
                     _ => OrgCoalescedRefused::NoAuthority,
                 })
             }
@@ -20609,23 +20626,33 @@ impl MeshNode {
             sensing::org_coalesced::OrgCoalescedRelease::NotHeld => false,
             sensing::org_coalesced::OrgCoalescedRelease::Survives => true,
             sensing::org_coalesced::OrgCoalescedRelease::Last(key) => {
-                let live: std::collections::HashSet<sensing::CapabilityInterestKey> = {
-                    let mut interests = self.sensing_capability_interests.lock();
-                    interests.remove(&key);
-                    interests.keys().cloned().collect()
-                };
-                reconcile_materialized_consumer_cells(
-                    &self.sensing_local_projection_mu,
-                    &self.sensing_interest_table,
-                    &self.sensing_observations,
-                    &self.sensing_overlay_changed,
-                    &live,
-                    Instant::now(),
-                    None,
-                );
+                self.retire_org_coalesced_expectation(&key);
                 true
             }
         }
+    }
+
+    /// Drop the consumer expectation for a coalesced interest NO holder keeps,
+    /// and reconcile its consumer cells away. Called by the last release, and by
+    /// a refresh pass that registered an interest whose last holder released
+    /// while the registration was in flight (the registration re-records the
+    /// expectation, so the release's own removal can land before it).
+    #[cfg(feature = "redex")]
+    fn retire_org_coalesced_expectation(&self, key: &sensing::CapabilityInterestKey) {
+        let live: std::collections::HashSet<sensing::CapabilityInterestKey> = {
+            let mut interests = self.sensing_capability_interests.lock();
+            interests.remove(key);
+            interests.keys().cloned().collect()
+        };
+        reconcile_materialized_consumer_cells(
+            &self.sensing_local_projection_mu,
+            &self.sensing_interest_table,
+            &self.sensing_observations,
+            &self.sensing_overlay_changed,
+            &live,
+            Instant::now(),
+            None,
+        );
     }
 
     /// Whether `ticket` is still a live coalesced holder.
@@ -20742,9 +20769,20 @@ impl MeshNode {
                 self.org_coalesced_counters
                     .registrations
                     .fetch_add(1, Ordering::Relaxed);
-                self.org_coalesced
-                    .lock()
-                    .note_registered(&key, Some(leader), Some(now));
+                // The snapshot this pass works from can outlive the last
+                // holder: a release that landed while this registration was in
+                // flight removed the entry and the expectation, and the
+                // registration just re-recorded the expectation. Re-check under
+                // the registry lock and retire it again if nobody holds the
+                // key. (A release landing AFTER this check retires it itself.)
+                let still_held = {
+                    let mut registry = self.org_coalesced.lock();
+                    registry.note_registered(&key, Some(leader), Some(now));
+                    registry.contains(&key)
+                };
+                if !still_held {
+                    self.retire_org_coalesced_expectation(&key);
+                }
                 sent += 1;
             }
         }

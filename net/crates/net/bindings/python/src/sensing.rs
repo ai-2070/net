@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict};
+use pyo3::types::{PyBool, PyDict, PyInt};
 
 use net_sdk::sensing::{self as sdk, Coalesced, ReadinessValue, SensedViability, SensingQuery};
 
@@ -263,8 +263,13 @@ fn coalesced_from_py(value: &Bound<'_, PyAny>) -> PyResult<Coalesced> {
             ))),
         };
     }
-    if let Ok(k) = value.extract::<i64>() {
-        return Ok(Coalesced::Top(u16::try_from(k).unwrap_or(0)));
+    if value.is_instance_of::<PyInt>() {
+        // ANY Python int is a size: one no u16 holds — including one past
+        // i64, which Python allows — is Top(0), refused by the SDK.
+        let k = value.extract::<i64>().ok();
+        return Ok(Coalesced::Top(
+            k.and_then(|k| u16::try_from(k).ok()).unwrap_or(0),
+        ));
     }
     Err(PyTypeError::new_err(
         "coalesced must be \"best\" or an int number of providers",

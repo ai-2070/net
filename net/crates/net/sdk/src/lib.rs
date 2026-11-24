@@ -242,8 +242,9 @@ pub mod subnets;
 // request-relative snapshot, missed-wake-safe change notification,
 // explicit close). See CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md
 // §4.1-§4.5. Still absent above it, and named as absent in the module
-// docs: provider-free / leader-backed selection, cross-organization and
-// `Granted` sensing, and any sensed call verb. Rides `net`: every
+// docs: a caller-supplied provider selector, cross-organization and
+// `Granted` sensing, and any sensed call verb. (The coalesced watch observes
+// through an ELECTED leader and is an opt-in, not a selector.) Rides `net`: every
 // operation is node state on a live `MeshNode`.
 #[cfg(feature = "net")]
 pub mod sensing;

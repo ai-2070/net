@@ -100,7 +100,7 @@ describe.skipIf(!HAS_SENSING)('C5 — the Rust-owned sensing error classificatio
       return null
     }
     try {
-      for (const top of [0, 33, 70_000]) {
+      for (const top of [0, 33, 70_000, 4_294_967_297, 2.5]) {
         expect(refusal({ coalesced: { top } }), `top ${top}`).toEqual({
           kind: 'unsatisfiable_coalescing',
           terminal: false,

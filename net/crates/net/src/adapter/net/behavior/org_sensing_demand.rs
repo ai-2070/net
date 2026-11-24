@@ -629,7 +629,10 @@ pub fn project_org_coalesced(
     budget: &sensing::ConsumerLatencyBudget,
 ) -> Option<OrgSensedProjection> {
     let rows = node.org_coalesced_rows(ticket)?;
+    // The same off-lock boundaries, reported the same way, as the exact
+    // projection, so a witness can observe this path's phases too.
     assert_off_sensing_locks("coalesced projection proximity pass");
+    node.observe_sensing_projection_offlock("proximity", rows.len());
     let views: Vec<sensing::BranchView> = rows
         .iter()
         .map(
@@ -642,7 +645,13 @@ pub fn project_org_coalesced(
         )
         .collect();
     assert_off_sensing_locks("coalesced projection classification and ordering");
+    node.observe_sensing_projection_offlock("classification", views.len());
     let delta = project_sensed_candidates(&views, budget);
+    assert_off_sensing_locks("coalesced projection ranked order");
+    node.observe_sensing_projection_offlock(
+        "ranked",
+        delta.viable.len() + delta.potential.len() + delta.non_viable.len(),
+    );
     Some(OrgSensedProjection {
         rows: views
             .iter()

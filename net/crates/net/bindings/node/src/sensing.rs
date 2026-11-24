@@ -120,17 +120,25 @@ pub struct SensingQueryOptions {
 /// A coalesced watch's size. `top` absent asks the leader for the best one
 /// provider; `top: k` (1..32) for up to `k`. Any other `top` is refused with
 /// kind `unsatisfiable_coalescing`.
+///
+/// `top` is a JS `number` read as `f64`, not `u32`: napi's `u32` conversion
+/// wraps modulo 2^32 and truncates fractions, so `4294967297` would silently
+/// become `Top(1)` and `2.5` `Top(2)`.
 #[napi(object)]
 pub struct CoalescedOptions {
-    pub top: Option<u32>,
+    pub top: Option<f64>,
 }
 
-/// The JS coalescing as the SDK's. A `top` no `u16` holds becomes `Top(0)`, so
-/// the SDK refuses it with its OWN kind rather than the binding inventing one.
+/// The JS coalescing as the SDK's. Anything that is not an integer `u16` holds
+/// — a fraction, a negative, NaN, a value past 65535 — becomes `Top(0)`, so the
+/// SDK refuses it with its OWN kind rather than the binding inventing one.
 fn coalesced_from_js(options: &CoalescedOptions) -> Coalesced {
     match options.top {
         None => Coalesced::Best,
-        Some(k) => Coalesced::Top(u16::try_from(k).unwrap_or(0)),
+        Some(k) if k.fract() == 0.0 && (0.0..=f64::from(u16::MAX)).contains(&k) => {
+            Coalesced::Top(k as u16)
+        }
+        Some(_) => Coalesced::Top(0),
     }
 }
 
@@ -423,22 +431,26 @@ mod tests {
     use super::{coalesced_from_js, millis, CoalescedOptions};
     use net_sdk::sensing::Coalesced;
 
-    /// `top` absent is Best, a `u16` is Top(k), and anything larger becomes
-    /// Top(0), which the SDK refuses with its own kind.
+    /// `top` absent is Best, an integer `u16` is Top(k), and anything else —
+    /// past 65535, past 2^32 (which a `u32` read would wrap to 1), a fraction,
+    /// a negative, NaN — becomes Top(0), which the SDK refuses with its own kind.
     #[test]
     fn the_js_coalescing_maps_onto_the_sdk() {
-        assert_eq!(
-            coalesced_from_js(&CoalescedOptions { top: None }),
-            Coalesced::Best
-        );
-        assert_eq!(
-            coalesced_from_js(&CoalescedOptions { top: Some(3) }),
-            Coalesced::Top(3)
-        );
-        assert_eq!(
-            coalesced_from_js(&CoalescedOptions { top: Some(70_000) }),
-            Coalesced::Top(0)
-        );
+        let map = |top: Option<f64>| coalesced_from_js(&CoalescedOptions { top });
+        assert_eq!(map(None), Coalesced::Best);
+        assert_eq!(map(Some(3.0)), Coalesced::Top(3));
+        assert_eq!(map(Some(0.0)), Coalesced::Top(0));
+        assert_eq!(map(Some(65_535.0)), Coalesced::Top(65_535));
+        for refused in [
+            70_000.0,
+            4_294_967_297.0,
+            2.5,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            assert_eq!(map(Some(refused)), Coalesced::Top(0), "{refused}");
+        }
     }
 
     /// A finite value too large for `Duration` is refused with an error, never a

@@ -95,7 +95,7 @@ def test_a_coalesced_watch_is_refused_with_rusts_own_kinds(tmp_path) -> None:
         sensing_incarnation_path=str(tmp_path / "coalesced.incarnation"),
     )
     try:
-        for size in (0, 33, 70_000, -1):
+        for size in (0, 33, 70_000, -1, 2**80):
             with pytest.raises(net.SensingError) as caught:
                 net.sensing_watch(mesh, "nrpc:coalesced.py", coalesced=size)
             assert net.sensing_error_class(str(caught.value)) == {

@@ -91,7 +91,11 @@
 //!   [`SensingClient::watch`], [`SensingQuery`], [`SensingWatch`],
 //!   [`SensingSnapshot`]. See [`consumer`] for what it owns, what it
 //!   reuses from the core's retained demand substrate, and what a
-//!   snapshot deliberately does not promise.
+//!   snapshot deliberately does not promise;
+//! - the same observation COALESCED through the organization's elected
+//!   sensing leader — [`SensingQuery::coalesced`] with [`Coalesced`], and
+//!   [`SensingSnapshot::is_coalesced`]. It reports a subset of the same
+//!   visible providers, never more.
 //!
 //! The consumer half rests on a core path that is fully implemented, not
 //! on a dead end: an OWN-ORGANIZATION exact-provider lease plans and
@@ -109,12 +113,12 @@
 //! side (a commitment is a one-way derivation), so it takes the legacy
 //! path unchanged.
 //!
-//! What is genuinely absent, here and everywhere else in the SDK:
-//! provider-free / leader-backed sensing (no `AnyAuthorized`, tag or
-//! group selector), `Granted` and cross-organization sensing,
-//! warmed pools,
-//! and language bindings. [`SensingQuery`] can express none of them,
-//! and [`SensingClient::watch`] refuses what it cannot mean rather than
+//! What is genuinely absent, here and everywhere else in the SDK: a
+//! caller-supplied provider selector (no `AnyAuthorized`, tag or group
+//! selector, and no leader id — the coalesced watch elects its leader and is
+//! an opt-in, not a selector), `Granted` and cross-organization sensing,
+//! and warmed pools. [`SensingQuery`] can express none of them, and
+//! [`SensingClient::watch`] refuses what it cannot mean rather than
 //! accepting an argument it would ignore.
 //!
 //! Outside `OrgClient`, a snapshot has three consumers, and all apply its
@@ -190,7 +194,7 @@ pub use incarnation_file::FileIncarnation;
 pub use consumer::{
     Coalesced, ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
     SensingWatch, SensingWatchCloser, DEFAULT_PROVIDER_START_WITHIN, MAX_COALESCED_TOP,
-    MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
+    MAX_SENSED_CAPABILITY_BYTES, MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
 };
 
 /// The provider-side evaluator contract. A capability integration
@@ -370,6 +374,13 @@ pub enum SensingError {
     /// provide the capability is reachable right now. Not terminal — a
     /// member can come back — and never answered with an exact watch in
     /// disguise: open one yourself if that is the right answer.
+    ///
+    /// One case IS permanent and is reported the same way: an SDK built
+    /// WITHOUT the `cortex` feature has no leader substrate at all, so every
+    /// coalesced query refuses with this kind on that build. The kind stays
+    /// non-terminal because it describes the mesh's leadership, which a
+    /// build cannot see from a binding; every shipped binding enables
+    /// `cortex`, so for them it is always the recoverable case.
     #[error(
         "no member of this organization can lead sensing for this capability \
          right now — retry later, or open an exact watch (drop \
@@ -385,6 +396,16 @@ pub enum SensingError {
          Coalesced::Best or Coalesced::Top(k) with k in 1..=32"
     )]
     UnsatisfiableCoalescing,
+
+    /// A [`SensingQuery`] capability name longer than
+    /// [`MAX_SENSED_CAPABILITY_BYTES`]. Its registration frame could not be
+    /// carried, so the query is refused instead of holding demand that no
+    /// frame will ever register.
+    #[error(
+        "a sensing capability name may be at most 1024 bytes — \
+         use the provider's own capability id"
+    )]
+    CapabilityTooLong,
 }
 
 /// The provider-side sensing surface bound to one live node.
@@ -773,10 +794,12 @@ mod tests {
     }
 
     /// The SDK sensing surface is the PROVIDER lifecycle plus the
-    /// own-organization EXACT-PROVIDER consumer observation — and
-    /// nothing else. Interest, audience and wire vocabulary must stay
-    /// out, and no provider-free / leader-backed / cross-organization
-    /// selector may appear, because none of them is implemented.
+    /// own-organization consumer observation — exact, or coalesced through
+    /// the organization's elected sensing leader (SDK plan LS-7b) — and
+    /// nothing else. Interest, audience and wire vocabulary must stay out:
+    /// the coalesced opt-in is the SDK's own `Coalesced`, never the core's
+    /// selector, result mode or leader, and no caller-supplied selector or
+    /// cross-organization plane may appear, because none is implemented.
     ///
     /// Non-vacuous by construction: it reads this module's OWN source
     /// and the consumer submodule's, so a re-export or a public method

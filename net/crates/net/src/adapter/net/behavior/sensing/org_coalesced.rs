@@ -34,6 +34,7 @@
 //! other than its own, or the exact-provider lease registry.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::identity::{CapabilityInterestKey, InterestSpec};
@@ -47,6 +48,12 @@ pub const MAX_ORG_LEADER_ELECTORATE: usize = 32;
 /// exact watch's own population cap, so a coalesced watch never reports more
 /// rows than an exact one could.
 pub const MAX_COALESCED_TOP_K: u16 = 32;
+
+/// Mints every [`OrgCoalescedTicket`]'s token. PROCESS-global and monotone, so
+/// no two holds on any node in this process share a token: a ticket handed to
+/// a different node's registry, for the same interest key, holds nothing there
+/// and releases nothing.
+static ORG_COALESCED_TOKENS: AtomicU64 = AtomicU64::new(1);
 
 /// One electorate member: a node id and the verified entity it derives from.
 /// The entity is what the health filter's pin check compares against.
@@ -158,6 +165,9 @@ pub enum OrgCoalescedRefused {
     /// The result mode is not one a coalesced interest supports
     /// (`Any`, or `TopK(1..=32)`).
     UnsupportedMode,
+    /// The registration frame cannot be encoded within the sensing frame cap
+    /// (an oversized capability id). Nothing is held.
+    FrameTooLarge,
 }
 
 /// One held interest.
@@ -189,7 +199,6 @@ pub(crate) enum OrgCoalescedRelease {
 #[derive(Debug, Default)]
 pub(crate) struct OrgCoalescedRegistry {
     entries: HashMap<CapabilityInterestKey, OrgCoalescedEntry>,
-    next_token: u64,
 }
 
 impl OrgCoalescedRegistry {
@@ -206,8 +215,7 @@ impl OrgCoalescedRegistry {
         if created && self.entries.len() >= capacity {
             return Err(OrgCoalescedRefused::AtCapacity);
         }
-        self.next_token = self.next_token.wrapping_add(1);
-        let token = self.next_token;
+        let token = ORG_COALESCED_TOKENS.fetch_add(1, Ordering::Relaxed);
         let entry = self
             .entries
             .entry(key.clone())
@@ -243,6 +251,11 @@ impl OrgCoalescedRegistry {
         self.entries
             .get(&ticket.key)
             .is_some_and(|entry| entry.holders.contains(&ticket.token))
+    }
+
+    /// Whether ANY holder keeps `key`.
+    pub(crate) fn contains(&self, key: &CapabilityInterestKey) -> bool {
+        self.entries.contains_key(key)
     }
 
     /// The leader `ticket`'s interest last registered with.
@@ -470,6 +483,21 @@ mod tests {
         );
         assert!(registry.is_empty());
         assert_eq!(registry.release(&b), OrgCoalescedRelease::NotHeld);
+    }
+
+    /// A ticket from ANOTHER registry (another node) for the same interest key
+    /// holds nothing here and releases nothing: tokens are process-global.
+    #[test]
+    fn a_foreign_ticket_releases_nothing() {
+        let interval = Duration::from_secs(2);
+        let mut ours = OrgCoalescedRegistry::default();
+        let mut theirs = OrgCoalescedRegistry::default();
+        let (held, _) = ours.hold(&spec("nrpc:x"), interval, 8).unwrap();
+        let (foreign, _) = theirs.hold(&spec("nrpc:x"), interval, 8).unwrap();
+        assert_eq!(held.interest(), foreign.interest(), "the same key");
+        assert!(!ours.holds(&foreign));
+        assert_eq!(ours.release(&foreign), OrgCoalescedRelease::NotHeld);
+        assert!(ours.holds(&held), "our hold survives a foreign release");
     }
 
     #[test]

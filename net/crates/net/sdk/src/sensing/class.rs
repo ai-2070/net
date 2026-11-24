@@ -57,6 +57,7 @@ impl SensingError {
             Self::WatchClosed => "watch_closed",
             Self::NoSensingLeader => "no_sensing_leader",
             Self::UnsatisfiableCoalescing => "unsatisfiable_coalescing",
+            Self::CapabilityTooLong => "capability_too_long",
         }
     }
 
@@ -86,7 +87,8 @@ impl SensingError {
             | Self::EmptyCapability
             | Self::UnsatisfiableBudget
             | Self::UnsatisfiableStartBound
-            | Self::UnsatisfiableCoalescing => false,
+            | Self::UnsatisfiableCoalescing
+            | Self::CapabilityTooLong => false,
             // Node state that can move back: authority installed or rotated,
             // membership renewed, a view that settles.
             Self::NoOrganizationAuthority | Self::ObserverNotQualified => false,
@@ -171,6 +173,7 @@ pub(crate) fn canonical_instances() -> Vec<SensingError> {
         SensingError::WatchClosed,
         SensingError::NoSensingLeader,
         SensingError::UnsatisfiableCoalescing,
+        SensingError::CapabilityTooLong,
     ]
 }
 
@@ -336,6 +339,7 @@ mod tests {
                 SensingError::WatchClosed => "SensingClient::watch",
                 SensingError::NoSensingLeader => "open an exact watch",
                 SensingError::UnsatisfiableCoalescing => "Coalesced::Top(k)",
+                SensingError::CapabilityTooLong => "1024 bytes",
             }
         }
         for error in canonical_instances() {

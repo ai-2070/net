@@ -1,5 +1,6 @@
-//! Capability sensing — the **consumer** side, own-organization
-//! exact-provider only.
+//! Capability sensing — the **consumer** side, own-organization: exact
+//! (every visible provider sensed directly), or coalesced through the
+//! organization's elected sensing leader ([`SensingQuery::coalesced`]).
 //!
 //! `docs/internal/plans/CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md` §4.3
 //! (consumer surface). An ordinary application asks one question here —
@@ -134,21 +135,27 @@
 //!
 //! # Unsupported forms are refused, not faked
 //!
-//! [`SensingQuery`] can express exactly what this slice implements: one
-//! capability name, one provider-start bound, and one optional
-//! end-to-end budget. There is deliberately no provider selector,
-//! tag/group predicate, constraint map, result mode, disclosure class or
-//! audience on it — a leader-backed provider-free (`AnyAuthorized`)
-//! path, cross-organization sensing, `Granted` discovery and warmed
-//! pools are not implemented, so this surface declines to name them
-//! rather than accepting an argument it would silently ignore. Canonical
+//! [`SensingQuery`] can express exactly what is implemented: one
+//! capability name, one provider-start bound, one optional end-to-end
+//! budget, and an optional [`Coalesced`] opt-in. There is deliberately no
+//! provider selector (`AnyAuthorized` included), tag/group predicate,
+//! constraint map, result mode, disclosure class, leader or audience on it
+//! — the coalesced watch elects its leader and takes its audience from
+//! installed authority, and cross-organization sensing, `Granted` discovery
+//! and warmed pools are not implemented — so this surface declines to name
+//! them rather than accepting an argument it would silently ignore. Canonical
 //! constraints are fixed EMPTY for the same reason: a constraint map is
 //! provider-evaluated and digest-bound, and nothing here can honestly
 //! populate one yet. The forms a caller can still get wrong are refused
 //! loudly: a blank capability name
 //! ([`SensingError::EmptyCapability`]), a zero end-to-end budget
-//! ([`SensingError::UnsatisfiableBudget`]) and a zero provider-start
-//! bound ([`SensingError::UnsatisfiableStartBound`]).
+//! ([`SensingError::UnsatisfiableBudget`]), a zero provider-start
+//! bound ([`SensingError::UnsatisfiableStartBound`]), a capability name
+//! longer than [`MAX_SENSED_CAPABILITY_BYTES`]
+//! ([`SensingError::CapabilityTooLong`]), and a coalesced size outside
+//! `1..=`[`MAX_COALESCED_TOP`] ([`SensingError::UnsatisfiableCoalescing`]).
+//! A coalesced watch with no member able to lead it refuses with
+//! [`SensingError::NoSensingLeader`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -243,6 +250,12 @@ pub enum Coalesced {
     /// Up to `k` providers, `1 <= k <=` [`MAX_COALESCED_TOP`].
     Top(u16),
 }
+
+/// The longest capability name a [`SensingQuery`] accepts, in bytes. Well
+/// inside what one registration frame carries, so a refused query is the
+/// only way a name too long to register can surface — never a held demand
+/// that no frame registers.
+pub const MAX_SENSED_CAPABILITY_BYTES: usize = 1024;
 
 /// The largest [`Coalesced::Top`] a watch may ask: the exact watch's own
 /// population bound, so a coalesced watch never reports more rows than an
@@ -353,6 +366,9 @@ impl SensingQuery {
     fn validate(&self) -> Result<(), SensingError> {
         if self.capability.trim().is_empty() {
             return Err(SensingError::EmptyCapability);
+        }
+        if self.capability.len() > MAX_SENSED_CAPABILITY_BYTES {
+            return Err(SensingError::CapabilityTooLong);
         }
         if self.budget.end_to_end_within == Some(Duration::ZERO) {
             return Err(SensingError::UnsatisfiableBudget);
@@ -815,6 +831,7 @@ fn coalesced_refusal(refusal: OrgCoalescedRefused) -> SensingError {
         OrgCoalescedRefused::NoLeader => SensingError::NoSensingLeader,
         OrgCoalescedRefused::AtCapacity => SensingError::WatchesAtCapacity,
         OrgCoalescedRefused::UnsupportedMode => SensingError::UnsatisfiableCoalescing,
+        OrgCoalescedRefused::FrameTooLarge => SensingError::CapabilityTooLong,
     }
 }
 
@@ -920,9 +937,18 @@ impl SensingWatch {
         if self.node.org_sensing_leader_for(&self.capability).is_none() {
             return Err(SensingError::NoSensingLeader);
         }
-        let projection =
+        let Some(projection) =
             org_sensing_demand::project_org_coalesced(&self.node, ticket, &self.budget)
-                .ok_or(SensingError::ObserverNotQualified)?;
+        else {
+            // No projection means the ticket is no longer held OR the observer
+            // stopped qualifying. A closer on another task releases the ticket,
+            // and that must read as the terminal close, not as a recoverable
+            // authority refusal.
+            if self.close.is_closed() {
+                return Err(SensingError::WatchClosed);
+            }
+            return Err(SensingError::ObserverNotQualified);
+        };
         if self.close.is_closed() {
             return Err(SensingError::WatchClosed);
         }
@@ -1487,6 +1513,27 @@ mod tests {
         assert_eq!(asked.budget(), None, "asking the provider is not a budget");
     }
 
+    /// A capability name too long for any registration frame is refused up
+    /// front, on BOTH watch forms, instead of holding demand that no frame
+    /// can register; the bound itself is accepted.
+    #[test]
+    fn an_oversized_capability_name_is_refused_before_any_state() {
+        let longest = "c".repeat(MAX_SENSED_CAPABILITY_BYTES);
+        SensingQuery::new(longest.clone())
+            .validate()
+            .expect("the bound itself validates");
+        let over = format!("{longest}c");
+        for query in [
+            SensingQuery::new(over.clone()),
+            SensingQuery::new(over).coalesced(Coalesced::Best),
+        ] {
+            assert_eq!(
+                query.validate().unwrap_err(),
+                SensingError::CapabilityTooLong
+            );
+        }
+    }
+
     /// The coalesced opt-in (SDK plan LS-7b): `Best` and `Top(1..=32)`
     /// validate, `Top(0)` and anything past the exact watch's own bound are
     /// refused with their own kind, and an exact query asks no coalescing.
@@ -1539,6 +1586,10 @@ mod tests {
             (
                 OrgCoalescedRefused::UnsupportedMode,
                 SensingError::UnsatisfiableCoalescing,
+            ),
+            (
+                OrgCoalescedRefused::FrameTooLarge,
+                SensingError::CapabilityTooLong,
             ),
         ];
         for (core, sdk) in mapped {

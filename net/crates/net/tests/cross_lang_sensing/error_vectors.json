@@ -91,6 +91,12 @@
       "message": "a coalesced watch asks for 1 to 32 providers — pass Coalesced::Best or Coalesced::Top(k) with k in 1..=32",
       "terminal": false,
       "wire": "sensing:unsatisfiable_coalescing: a coalesced watch asks for 1 to 32 providers — pass Coalesced::Best or Coalesced::Top(k) with k in 1..=32"
+    },
+    {
+      "kind": "capability_too_long",
+      "message": "a sensing capability name may be at most 1024 bytes — use the provider's own capability id",
+      "terminal": false,
+      "wire": "sensing:capability_too_long: a sensing capability name may be at most 1024 bytes — use the provider's own capability id"
     }
   ],
   "version": 1

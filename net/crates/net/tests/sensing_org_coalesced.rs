@@ -161,12 +161,16 @@ fn start_within() -> WorkLatencyEnvelope {
 
 /// A started, org-authoritative mesh: `leaders` relay nodes between consumer A
 /// and provider P (A — Rᵢ — P), each Rᵢ announcing RELAY_SVC to A, and P
-/// announcing CAP to every Rᵢ and to A until `provider_expiry`. Nothing assumes
-/// a leader role.
+/// announcing CAP to every Rᵢ for an hour. P's announcement to A alone lasts
+/// `provider_ttl_secs`, measured from the moment it is ingested at the end of
+/// the build (so mesh setup does not eat into it), and ends at
+/// `provider_expiry`. Nothing assumes a leader role.
 struct Mesh {
     a: Arc<MeshNode>,
     leaders: Vec<Arc<MeshNode>>,
     p: Arc<MeshNode>,
+    /// When P's announcement to A expires (unix seconds).
+    provider_expiry: u64,
     _dirs: Vec<ScratchDir>,
 }
 
@@ -174,7 +178,7 @@ impl Mesh {
     async fn build(
         tag: &str,
         leaders: usize,
-        provider_expiry: u64,
+        provider_ttl_secs: u64,
         session_timeout: Duration,
         direct_consumer_provider: bool,
     ) -> Self {
@@ -224,11 +228,13 @@ impl Mesh {
             announce(relay, &p, &[CAP], far);
             announce(&a, relay, &[RELAY_SVC], far);
         }
+        let provider_expiry = now_secs() + provider_ttl_secs;
         announce(&a, &p, &[CAP], provider_expiry);
         Self {
             a,
             leaders: relays,
             p,
+            provider_expiry,
             _dirs: dirs,
         }
     }
@@ -264,7 +270,7 @@ impl Mesh {
 /// drops A's expectation and its consumer cells.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_coalesced_interest_reaches_the_elected_leader_without_assuming_the_role() {
-    let mesh = Mesh::build("e2e", 1, now_secs() + 3600, Duration::from_secs(10), false).await;
+    let mesh = Mesh::build("e2e", 1, 3600, Duration::from_secs(10), false).await;
     let (a, r, p) = (&mesh.a, &mesh.leaders[0], &mesh.p);
     assert!(
         !r.serves_legacy_sensing_leader_intake(),
@@ -275,6 +281,17 @@ async fn a_coalesced_interest_reaches_the_elected_leader_without_assuming_the_ro
         Some(r.node_id()),
         "A elects R: the only member that does not provide CAP"
     );
+    // A capability no registration frame can carry is REFUSED, holding
+    // nothing — never a held ticket that silently never registers.
+    let oversized = "c".repeat(5000);
+    assert_eq!(a.org_sensing_leader_for(&oversized), Some(r.node_id()));
+    assert_eq!(
+        a.acquire_org_coalesced_interest(&oversized, start_within(), ResultMode::Any)
+            .unwrap_err(),
+        OrgCoalescedRefused::FrameTooLarge
+    );
+    assert_eq!(a.org_coalesced_metrics().held_interests, 0);
+
     let ticket = a
         .acquire_org_coalesced_interest(CAP, start_within(), ResultMode::Any)
         .expect("the coalesced interest is held");
@@ -321,14 +338,7 @@ async fn a_coalesced_interest_reaches_the_elected_leader_without_assuming_the_ro
 /// capabilities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_electorate_excludes_the_providers_of_the_capability() {
-    let mesh = Mesh::build(
-        "electorate",
-        1,
-        now_secs() + 3600,
-        Duration::from_secs(10),
-        false,
-    )
-    .await;
+    let mesh = Mesh::build("electorate", 1, 3600, Duration::from_secs(10), false).await;
     let (a, r, p) = (&mesh.a, &mesh.leaders[0], &mesh.p);
     assert_eq!(a.org_sensing_leader_for(CAP), Some(r.node_id()));
     assert_eq!(
@@ -345,14 +355,7 @@ async fn the_electorate_excludes_the_providers_of_the_capability() {
 /// out of the electorate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_electable_leader_is_a_typed_refusal_that_holds_nothing() {
-    let mesh = Mesh::build(
-        "noleader",
-        0,
-        now_secs() + 3600,
-        Duration::from_secs(10),
-        true,
-    )
-    .await;
+    let mesh = Mesh::build("noleader", 0, 3600, Duration::from_secs(10), true).await;
     let a = &mesh.a;
     assert_eq!(a.org_sensing_leader_for(CAP), None);
     assert_eq!(
@@ -377,14 +380,7 @@ async fn no_electable_leader_is_a_typed_refusal_that_holds_nothing() {
 /// re-registers at the next member, and P's proofs resume through it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_leader_fails_over_to_the_next_member() {
-    let mesh = Mesh::build(
-        "failover",
-        2,
-        now_secs() + 3600,
-        Duration::from_secs(2),
-        false,
-    )
-    .await;
+    let mesh = Mesh::build("failover", 2, 3600, Duration::from_secs(2), false).await;
     let (a, p) = (&mesh.a, &mesh.p);
     let ticket = a
         .acquire_org_coalesced_interest(CAP, start_within(), ResultMode::Any)
@@ -431,8 +427,8 @@ async fn a_lost_leader_fails_over_to_the_next_member() {
 /// consumer cell for it still exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_provider_leaves_the_coalesced_rows_on_the_next_read() {
-    let expiry = now_secs() + 14;
-    let mesh = Mesh::build("clamp", 1, expiry, Duration::from_secs(10), false).await;
+    let mesh = Mesh::build("clamp", 1, 14, Duration::from_secs(10), false).await;
+    let expiry = mesh.provider_expiry;
     let (a, p) = (&mesh.a, &mesh.p);
     let ticket = a
         .acquire_org_coalesced_interest(CAP, start_within(), ResultMode::Any)

@@ -275,7 +275,8 @@ missed-wake-safe park, and `close()`/drop release the interest. The
 query states BOTH bounds and nothing else: `start_within` is the
 predicate the PROVIDER evaluates and rides the signed interest, while
 `within` is this consumer's own end-to-end budget. Its refusals are
-`EmptyCapability`, `UnsatisfiableStartBound`, `UnsatisfiableBudget`,
+`EmptyCapability`, `CapabilityTooLong` (a name past 1024 bytes, which no
+registration frame could carry), `UnsatisfiableStartBound`, `UnsatisfiableBudget`,
 `NoOrganizationAuthority`, `ObserverNotQualified`, `WatchesAtCapacity`,
 `ObservationIdentityUnavailable` and `WatchClosed` — a watch never
 degrades into a silently empty snapshot. Every read requalifies live
@@ -693,8 +694,10 @@ consumer.release_org_coalesced_interest(&ticket);
 ranks the owner-private announcers this node sees, minus the capability's
 providers (a leader never senses itself), bounded to 32 by rendezvous hash,
 by the existing RedEX closeness election over the shared proximity view. Every
-observer of one view computes the same leader, and a node never registers
-with itself. Every coalescing node holds the org leader role from `start()`,
+observer of one view computes the same RANKING, so every other consumer sends
+to the same winner. The winner itself never registers with itself: it sends
+its own registration to the next-ranked member, and still serves everyone
+else's. Every coalescing node holds the org leader role from `start()`,
 so whichever node is elected can serve. LEGACY provider-free intake stays
 behind the explicit `assume_sensing_leader`.
 

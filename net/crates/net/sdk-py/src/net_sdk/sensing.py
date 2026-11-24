@@ -27,7 +27,7 @@ classification, ``{"kind": ..., "terminal": ...}``.
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Iterator, Literal, Optional, Union
 
 import net  # noqa: E402 - a failure HERE is a real load error (no `_net`,
 # a bad linked library): it surfaces unchanged, never as "missing feature".
@@ -94,7 +94,7 @@ def watch(
     capability: str,
     within_ms: Optional[float] = None,
     start_within_ms: Optional[float] = None,
-    coalesced: Optional[Union[str, int]] = None,
+    coalesced: Optional[Union[Literal["best"], int]] = None,
 ) -> SensingWatch:
     """Observe the readiness of this node's authorized own-organization
     providers of ``capability``. Requires a mesh built with ``enable_sensing``

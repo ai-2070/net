@@ -500,6 +500,7 @@ pub extern "C" fn net_sensing_watch_free(watch: *mut *mut NetSensingWatch) {
 ///
 /// ```json
 /// {"capability": "...", "ranked": [<node_id>...], "preferred": <node_id>|null,
+///  "coalesced": <bool>,
 ///  "providers": [{"node_id": ..., "readiness": "ready|not_ready|unknown",
 ///                 "viability": "viable|potential|not_viable",
 ///                 "estimated_start_ms": <f64>|null, "route_estimate_ms": <f64>|null}]}
