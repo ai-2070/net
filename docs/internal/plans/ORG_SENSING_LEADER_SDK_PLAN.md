@@ -265,4 +265,51 @@ The wire format does not change in any phase.
 
 ## 6. Build log
 
-(Filled in per phase.)
+- **LS-7a (core).**
+  - `behavior/sensing/org_coalesced.rs` (new, `redex`): the pure election
+    (`bound_electorate`, `elect_org_leader`), the demand registry
+    (`OrgCoalescedRegistry`, `OrgCoalescedTicket`, `OrgCoalescedRefused`),
+    and `registration_due`.
+  - `mesh.rs`:
+    - D-LS14: `install_org_sensing_leader_role` at `start()`;
+      `legacy_sensing_leader`, set only by `assume_sensing_leader` and checked
+      by the legacy arm; `serves_legacy_sensing_leader_intake`.
+    - D-LS15: `org_leader_members` (one owner-store scan per pass),
+      `elect_org_sensing_leader`, `org_sensing_leader_for`. Proximity edges
+      are read in the graph's own 32-byte id encoding
+      (`node_id_to_graph_id`).
+    - D-LS16: `acquire_org_coalesced_interest`,
+      `release_org_coalesced_interest`, `org_coalesced_holds`,
+      `org_coalesced_leader`, `org_coalesced_metrics` (`OrgCoalescedMetrics`,
+      exported); the ONE refresh task (`start_org_coalesced_refresher`, tick
+      `clamp(ttl/4, 50 ms, 2 s)`, joined at shutdown).
+    - D-LS17: `org_coalesced_rows`, clamped by the new
+      `org_sensing_current_visibility_unbounded` (the population derivation
+      takes an optional cap; the exact watch keeps its 32).
+  - `org_sensing_demand::project_org_coalesced`: the same classifier as the
+    exact projection, over the clamped rows.
+  - Witnesses: `tests/sensing_org_coalesced.rs` (new, pinned in the CI
+    Sensing group), six tests over real transport with no
+    `assume_sensing_leader` except the legacy positive control:
+    - `a_coalesced_interest_reaches_the_elected_leader_without_assuming_the_role`
+      (and the shared hold, the last release dropping the expectation and
+      its cells);
+    - `the_electorate_excludes_the_providers_of_the_capability`;
+    - `no_electable_leader_is_a_typed_refusal_that_holds_nothing`;
+    - `a_lost_leader_fails_over_to_the_next_member`;
+    - `an_expired_provider_leaves_the_coalesced_rows_on_the_next_read`;
+    - `legacy_intake_stays_dark_until_the_legacy_role_is_assumed`.
+
+    Plus nine unit tests in `org_coalesced`.
+  - RED, each run against its named witness and restored byte-identical:
+    - M20, the legacy arm ignoring the flag;
+    - M21, the electorate keeping the capability's providers;
+    - M22, a consumer electing itself;
+    - M23, the refresh sticking to the old leader;
+    - M24, the read not clamped;
+    - M25, the last release keeping the expectation;
+    - M26, `start` installing no org role.
+
+    M21 first SURVIVED: in that witness the provider was not reachable from
+    the consumer, so it lost the election for health, not for exclusion.
+    The witness now connects consumer and provider directly, and M21 is RED.

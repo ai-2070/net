@@ -2585,6 +2585,10 @@ struct DispatchCtx {
     /// matching field on `MeshNode`.
     #[cfg(feature = "redex")]
     org_leader_counters: Arc<sensing::org_candidates::OrgLeaderCounters>,
+    /// Legacy provider-free leader intake gate (SDK plan D-LS14). See the
+    /// matching field on `MeshNode`.
+    #[cfg(feature = "redex")]
+    legacy_sensing_leader: Arc<AtomicBool>,
     /// SI-6.1 closure: per-capability leading+trailing-edge gate for
     /// fold-driven leader reconciliation. See the matching field on
     /// `MeshNode`.
@@ -10020,6 +10024,62 @@ impl sensing::org_candidates::OrgTopology for MeshOrgTopology<'_> {
     }
 }
 
+/// The sample interval a coalesced org interest asks (SDK plan D-LS16), before
+/// it is clamped to the node's soft-state horizon — the same fixed cadence the
+/// exact-provider retained demand asks.
+#[cfg(feature = "redex")]
+const ORG_COALESCED_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the coalesced refresh task runs a pass: a quarter of the soft-state
+/// ttl, so a `ttl/2` refresh is never late by more than half its slack, and a
+/// leader change is noticed well inside one refresh. Bounded both ways.
+#[cfg(feature = "redex")]
+fn org_coalesced_refresh_tick(ttl: Duration) -> Duration {
+    (ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(2))
+}
+
+/// One election pass's member view (SDK plan D-LS15): taken ONCE per refresh
+/// pass and shared by every capability elected in it.
+#[cfg(feature = "redex")]
+struct OrgLeaderMembers {
+    /// The authority view the members were filtered under.
+    snapshot: sensing::SensingAuthoritySnapshot,
+    /// The instant (unix seconds) the expiry filter used.
+    now_secs: u64,
+    /// Every floor-current owner-private announcer other than this node.
+    members: Vec<sensing::org_coalesced::ElectorateMember<EntityId>>,
+    /// The owner-scoped tags this node announces itself, or `None` when it
+    /// announces none (and so is in no electorate).
+    own_tags: Option<Vec<String>>,
+}
+
+/// The coalesced demand's counters (D-LS16), read through
+/// [`MeshNode::org_coalesced_metrics`].
+#[cfg(feature = "redex")]
+#[derive(Debug, Default)]
+struct OrgCoalescedCounters {
+    registrations: AtomicU64,
+    failovers: AtomicU64,
+    no_leader: AtomicU64,
+}
+
+/// Operator view of this node's coalesced (leader-backed) org sensing demand
+/// (SDK plan D-LS16).
+#[cfg(feature = "redex")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OrgCoalescedMetrics {
+    /// Coalesced interests currently held on this node.
+    pub held_interests: usize,
+    /// Registrations sent to an elected leader (first sends and refreshes).
+    pub registrations_total: u64,
+    /// Registrations that moved an interest to a DIFFERENT leader.
+    pub failovers_total: u64,
+    /// Refresh passes that found no electable leader for a held interest that
+    /// had one.
+    pub no_leader_total: u64,
+}
+
 /// What one org leader intake did (LS-4). Returned so the in-crate witnesses
 /// (and, from LS-6, the dispatch arm's tracing) can name the exact outcome.
 #[cfg(feature = "redex")]
@@ -14332,6 +14392,26 @@ pub struct MeshNode {
     /// shared by the org intake transaction and the org leader reconciler.
     #[cfg(feature = "redex")]
     org_leader_counters: Arc<sensing::org_candidates::OrgLeaderCounters>,
+    /// Whether this node ALSO serves LEGACY provider-free leader intake (SDK
+    /// plan D-LS14). The org leader role is installed on every coalescing node at
+    /// `start`, and the legacy `CapabilityRegistration` arm only checked that a
+    /// role was present — so it is gated on this flag, which only
+    /// [`Self::assume_sensing_leader`] sets. Legacy behavior is unchanged.
+    #[cfg(feature = "redex")]
+    legacy_sensing_leader: Arc<AtomicBool>,
+    /// The node-owned coalesced (leader-backed) org demand registry (SDK plan
+    /// D-LS16). Its own mutex; map work only under it.
+    #[cfg(feature = "redex")]
+    org_coalesced: parking_lot::Mutex<sensing::org_coalesced::OrgCoalescedRegistry>,
+    /// The coalesced demand's counters ([`Self::org_coalesced_metrics`]).
+    #[cfg(feature = "redex")]
+    org_coalesced_counters: OrgCoalescedCounters,
+    /// The ONE coalesced refresh task, joined at shutdown (D-LS16).
+    #[cfg(feature = "redex")]
+    org_coalesced_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// Wakes the coalesced refresh task early.
+    #[cfg(feature = "redex")]
+    org_coalesced_wake: Arc<tokio::sync::Notify>,
     /// The org leader reconciler task (LS-4). Like `routing_task` it is joined
     /// deterministically at shutdown: awaiting it proves the reconciler stopped
     /// and released the exclusive OWNER private-discovery drain.
@@ -16095,6 +16175,16 @@ impl MeshNode {
             #[cfg(feature = "redex")]
             org_leader_counters: Arc::new(sensing::org_candidates::OrgLeaderCounters::default()),
             #[cfg(feature = "redex")]
+            #[cfg(feature = "redex")]
+            legacy_sensing_leader: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "redex")]
+            org_coalesced: parking_lot::Mutex::new(Default::default()),
+            #[cfg(feature = "redex")]
+            org_coalesced_counters: OrgCoalescedCounters::default(),
+            #[cfg(feature = "redex")]
+            org_coalesced_task: parking_lot::Mutex::new(None),
+            #[cfg(feature = "redex")]
+            org_coalesced_wake: Arc::new(tokio::sync::Notify::new()),
             org_leader_task: parking_lot::Mutex::new(None),
             #[cfg(feature = "redex")]
             org_leader_started: AtomicBool::new(false),
@@ -19178,6 +19268,25 @@ impl MeshNode {
         &self,
         capability: &super::behavior::org_grant::CapabilityAuthorityId,
     ) -> Option<Vec<u64>> {
+        self.org_sensing_current_visibility_capped(capability, Some(MAX_ORG_SENSING_POPULATION))
+    }
+
+    /// [`Self::org_sensing_current_visibility`] WITHOUT the sensed-population
+    /// truncation (SDK plan D-LS17): the clamp a coalesced read applies. The
+    /// leader may sense providers beyond the exact watch's lowest-id prefix, and
+    /// clamping them against a truncated set would drop legitimate rows.
+    pub(crate) fn org_sensing_current_visibility_unbounded(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+    ) -> Option<Vec<u64>> {
+        self.org_sensing_current_visibility_capped(capability, None)
+    }
+
+    fn org_sensing_current_visibility_capped(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+        cap: Option<usize>,
+    ) -> Option<Vec<u64>> {
         // Two attempts, then refuse — the same bound the retention transaction
         // uses, and for the same reason: a view republished continuously must
         // not spin, and a population must never be reported under a view that
@@ -19203,7 +19312,7 @@ impl MeshNode {
                 // only ask the same question twice.
                 Err(_) => return None,
             }
-            let population = self.org_sensing_authorized_population(capability);
+            let population = self.org_sensing_authorized_population_capped(capability, cap);
             if self.sensing_authority_snapshot_current(&snapshot) {
                 return Some(population);
             }
@@ -19265,6 +19374,15 @@ impl MeshNode {
         &self,
         capability: &super::behavior::org_grant::CapabilityAuthorityId,
     ) -> Vec<u64> {
+        self.org_sensing_authorized_population_capped(capability, Some(MAX_ORG_SENSING_POPULATION))
+    }
+
+    /// The authorized-population derivation, truncated to `cap` when given.
+    fn org_sensing_authorized_population_capped(
+        &self,
+        capability: &super::behavior::org_grant::CapabilityAuthorityId,
+        cap: Option<usize>,
+    ) -> Vec<u64> {
         let authorized: std::collections::BTreeSet<EntityId> = self
             .owner_private_capability_providers(capability)
             .into_iter()
@@ -19293,8 +19411,8 @@ impl MeshNode {
         }
         population.sort_unstable();
         population.dedup();
-        if population.len() > MAX_ORG_SENSING_POPULATION {
-            population.truncate(MAX_ORG_SENSING_POPULATION);
+        if let Some(cap) = cap.filter(|cap| population.len() > *cap) {
+            population.truncate(cap);
             self.org_sensing_demand_counters
                 .truncated
                 .fetch_add(1, Ordering::Relaxed);
@@ -20241,6 +20359,451 @@ impl MeshNode {
             }
         }
         Ok(())
+    }
+
+    /// LS-7a (SDK plan D-LS14): install the ORGANIZATION leader role on this
+    /// node if it holds none. Every node with coalescing enabled holds it, so a
+    /// node any consumer elects (D-LS15) can serve the registration. It does
+    /// NOT open legacy provider-free intake: that stays behind the explicit
+    /// [`Self::assume_sensing_leader`]. Returns whether a role is now held.
+    #[cfg(feature = "redex")]
+    fn install_org_sensing_leader_role(&self) -> bool {
+        if !self.config.enable_sensing_coalescing {
+            return false;
+        }
+        let mut slot = self.sensing_leader.lock();
+        if slot.is_none() {
+            *slot = Some(sensing::SensingLeader::new(
+                sensing::CandidatePolicy::default(),
+                self.config.continuity_factor,
+                self.config.max_interests_per_peer,
+                self.config.sensing_interest_ttl,
+            ));
+        }
+        true
+    }
+
+    /// Whether this node serves LEGACY provider-free leader intake (D-LS14).
+    /// Only [`Self::assume_sensing_leader`] turns it on.
+    #[cfg(feature = "redex")]
+    pub fn serves_legacy_sensing_leader_intake(&self) -> bool {
+        self.legacy_sensing_leader.load(Ordering::Acquire)
+    }
+
+    /// The owner-scoped service tags (`nrpc:<svc>`) this node announces to its
+    /// own organization, or `None` when it announces none — in which case its
+    /// peers cannot see it as a member and it is not in any electorate.
+    #[cfg(feature = "redex")]
+    fn local_owner_scoped_tags(&self) -> Option<Vec<String>> {
+        #[cfg(feature = "cortex")]
+        {
+            if !self.owner_cert_emission_enabled.load(Ordering::Acquire) {
+                return None;
+            }
+            let tags: Vec<String> = self
+                .rpc_local_services
+                .owner_scoped_snapshot()
+                .into_iter()
+                .map(|svc| format!("nrpc:{svc}"))
+                .collect();
+            (!tags.is_empty()).then_some(tags)
+        }
+        #[cfg(not(feature = "cortex"))]
+        {
+            None
+        }
+    }
+
+    /// The whole-organization member view one election pass reads (D-LS15):
+    /// every floor-current owner-private announcer this node's verified
+    /// discovery holds, under its own owner org, plus this node's own announced
+    /// tags. ONE store scan, taken once per refresh pass and shared by every
+    /// capability's election in it. `None` without a live authority view.
+    #[cfg(feature = "redex")]
+    fn org_leader_members(&self) -> Option<OrgLeaderMembers> {
+        let snapshot = self.capture_sensing_authority_snapshot().ok()?;
+        let owner = snapshot.authority_view().owner_org;
+        let now_secs = super::behavior::org::current_timestamp();
+        let members = self
+            .scoped_discovery
+            .lock()
+            .find_owner_private_providers(None, now_secs, snapshot.floors())
+            .into_iter()
+            .filter(|(record, _)| record.owner_org == owner)
+            .map(|(_, provider)| sensing::org_coalesced::ElectorateMember {
+                node_id: provider.node_id(),
+                entity: provider,
+            })
+            .filter(|member| member.node_id != self.node_id)
+            .collect();
+        Some(OrgLeaderMembers {
+            snapshot,
+            now_secs,
+            members,
+            own_tags: self.local_owner_scoped_tags(),
+        })
+    }
+
+    /// Elect `capability`'s org sensing leader from one member view (D-LS15):
+    /// the members MINUS the capability's providers, bounded by rendezvous
+    /// hash, ranked by shared proximity closeness, health = reachable under
+    /// the pin rule the candidate projection uses. This node is in the
+    /// electorate when it announces and does not provide the capability, and it
+    /// never elects itself.
+    #[cfg(feature = "redex")]
+    fn elect_org_sensing_leader(&self, view: &OrgLeaderMembers, capability: &str) -> Option<u64> {
+        let key = super::behavior::org_grant::CapabilityAuthorityId::for_tag(capability);
+        let owner = view.snapshot.authority_view().owner_org;
+        let providers: std::collections::HashSet<EntityId> = self
+            .scoped_discovery
+            .lock()
+            .find_owner_private_providers(Some(&key), view.now_secs, view.snapshot.floors())
+            .into_iter()
+            .filter(|(record, _)| record.owner_org == owner)
+            .map(|(_, provider)| provider)
+            .collect();
+        let mut candidates: Vec<sensing::org_coalesced::ElectorateMember<EntityId>> = view
+            .members
+            .iter()
+            .filter(|member| !providers.contains(&member.entity))
+            .cloned()
+            .collect();
+        if let Some(tags) = &view.own_tags {
+            if !tags.iter().any(|tag| tag == capability) {
+                candidates.push(sensing::org_coalesced::ElectorateMember {
+                    node_id: self.node_id,
+                    entity: self.entity_id().clone(),
+                });
+            }
+        }
+        let bounded = sensing::org_coalesced::bound_electorate(capability, candidates);
+        let electorate: Vec<u64> = bounded.iter().map(|member| member.node_id).collect();
+        let entity_of: HashMap<u64, &EntityId> = bounded
+            .iter()
+            .map(|member| (member.node_id, &member.entity))
+            .collect();
+        let graph = &self.proximity_graph;
+        sensing::org_coalesced::elect_org_leader(
+            &electorate,
+            self.node_id,
+            |a, b| {
+                let (a, b) = (node_id_to_graph_id(a), node_id_to_graph_id(b));
+                graph
+                    .edge_latency(a, b)
+                    .or_else(|| graph.edge_latency(b, a))
+            },
+            |node| {
+                let Some(entity) = entity_of.get(&node) else {
+                    return false;
+                };
+                let routed = self.router.routing_table().lookup(node).is_some();
+                match self.peer_entity_ids.get(&node) {
+                    // A pin naming a different entity: the session belongs to
+                    // someone else, and so does any route riding it.
+                    Some(pinned) if pinned.value() != *entity => false,
+                    Some(_) => self.peers.contains_key(&node) || routed,
+                    None => routed,
+                }
+            },
+        )
+    }
+
+    /// The org sensing leader THIS node would register a coalesced interest on
+    /// `capability` with, right now (D-LS15). `None` when no member can lead it.
+    #[cfg(feature = "redex")]
+    pub fn org_sensing_leader_for(&self, capability: &str) -> Option<u64> {
+        let view = self.org_leader_members()?;
+        self.elect_org_sensing_leader(&view, capability)
+    }
+
+    /// Hold a COALESCED (leader-backed) organization interest on `capability`
+    /// (SDK plan LS-7a, D-LS16): the `AnyAuthorized` selector under this node's
+    /// own owner-org audience, `result_mode` choosing how many providers the
+    /// elected leader senses for it. Registers with the elected leader before
+    /// returning, then the node's refresh task keeps it registered — re-electing
+    /// and failing over — until the last holder releases.
+    ///
+    /// Refuses, holding nothing, with [`OrgCoalescedRefused`](sensing::org_coalesced::OrgCoalescedRefused): the plane off,
+    /// no live authority, no electable leader, a full registry, or a result
+    /// mode other than `Any` / `TopK(1..=32)`.
+    #[cfg(feature = "redex")]
+    pub fn acquire_org_coalesced_interest(
+        &self,
+        capability: &str,
+        work_latency: sensing::WorkLatencyEnvelope,
+        result_mode: sensing::ResultMode,
+    ) -> Result<
+        sensing::org_coalesced::OrgCoalescedTicket,
+        sensing::org_coalesced::OrgCoalescedRefused,
+    > {
+        use sensing::org_coalesced::{OrgCoalescedRefused, MAX_COALESCED_TOP_K};
+        if !self.config.enable_sensing_coalescing {
+            return Err(OrgCoalescedRefused::Disabled);
+        }
+        match result_mode {
+            sensing::ResultMode::Any => {}
+            sensing::ResultMode::TopK(k) if (1..=MAX_COALESCED_TOP_K).contains(&k) => {}
+            _ => return Err(OrgCoalescedRefused::UnsupportedMode),
+        }
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(OrgCoalescedRefused::NoAuthority)?;
+        let spec = sensing::InterestSpec {
+            capability_id: sensing::CapabilityId::new(capability),
+            constraints: sensing::CanonicalConstraints::default(),
+            work_latency,
+            providers: sensing::ProviderSelector::AnyAuthorized,
+            result_mode,
+            disclosure_class: sensing::DisclosureClass::Owner,
+            audience: sensing::canonical_org_sensing_commitment(&authority.owner_org()),
+        };
+        // The leader FIRST: a refusal holds nothing.
+        let leader = self
+            .org_sensing_leader_for(capability)
+            .ok_or(OrgCoalescedRefused::NoLeader)?;
+        let interval = ORG_COALESCED_SAMPLE_INTERVAL.min(self.config.sensing_interest_ttl);
+        let (ticket, _created) =
+            self.org_coalesced
+                .lock()
+                .hold(&spec, interval, self.config.max_interests_per_peer)?;
+        match self.register_org_capability_interest(
+            &spec,
+            leader,
+            interval,
+            self.config.sensing_interest_ttl,
+        ) {
+            Ok(()) => {
+                self.org_coalesced.lock().note_registered(
+                    ticket.interest(),
+                    Some(leader),
+                    Some(Instant::now()),
+                );
+                self.org_coalesced_counters
+                    .registrations
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(ticket)
+            }
+            Err(error) => {
+                self.release_org_coalesced_interest(&ticket);
+                Err(match error {
+                    SensingRegistrationError::Disabled => OrgCoalescedRefused::Disabled,
+                    SensingRegistrationError::AtCapacity => OrgCoalescedRefused::AtCapacity,
+                    _ => OrgCoalescedRefused::NoAuthority,
+                })
+            }
+        }
+    }
+
+    /// Release one coalesced hold. Idempotent; `false` when the ticket held
+    /// nothing. The LAST holder's release drops the consumer expectation and
+    /// reconciles its consumer cells away. Nothing crosses the wire: the
+    /// leader's row expires by soft-state TTL (D-LS16).
+    #[cfg(feature = "redex")]
+    pub fn release_org_coalesced_interest(
+        &self,
+        ticket: &sensing::org_coalesced::OrgCoalescedTicket,
+    ) -> bool {
+        let released = self.org_coalesced.lock().release(ticket);
+        match released {
+            sensing::org_coalesced::OrgCoalescedRelease::NotHeld => false,
+            sensing::org_coalesced::OrgCoalescedRelease::Survives => true,
+            sensing::org_coalesced::OrgCoalescedRelease::Last(key) => {
+                let live: std::collections::HashSet<sensing::CapabilityInterestKey> = {
+                    let mut interests = self.sensing_capability_interests.lock();
+                    interests.remove(&key);
+                    interests.keys().cloned().collect()
+                };
+                reconcile_materialized_consumer_cells(
+                    &self.sensing_local_projection_mu,
+                    &self.sensing_interest_table,
+                    &self.sensing_observations,
+                    &self.sensing_overlay_changed,
+                    &live,
+                    Instant::now(),
+                    None,
+                );
+                true
+            }
+        }
+    }
+
+    /// Whether `ticket` is still a live coalesced holder.
+    #[cfg(feature = "redex")]
+    pub fn org_coalesced_holds(&self, ticket: &sensing::org_coalesced::OrgCoalescedTicket) -> bool {
+        self.org_coalesced.lock().holds(ticket)
+    }
+
+    /// The leader `ticket`'s interest is currently registered with, if any.
+    #[cfg(feature = "redex")]
+    pub fn org_coalesced_leader(
+        &self,
+        ticket: &sensing::org_coalesced::OrgCoalescedTicket,
+    ) -> Option<u64> {
+        self.org_coalesced.lock().leader_of(ticket)
+    }
+
+    /// The coalesced demand's operator counters (D-LS16).
+    #[cfg(feature = "redex")]
+    pub fn org_coalesced_metrics(&self) -> OrgCoalescedMetrics {
+        let held = self.org_coalesced.lock().len();
+        OrgCoalescedMetrics {
+            held_interests: held,
+            registrations_total: self
+                .org_coalesced_counters
+                .registrations
+                .load(Ordering::Relaxed),
+            failovers_total: self
+                .org_coalesced_counters
+                .failovers
+                .load(Ordering::Relaxed),
+            no_leader_total: self
+                .org_coalesced_counters
+                .no_leader
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// The per-provider readiness rows leader-delivered proofs produced for
+    /// `ticket`'s interest, as `(provider, projection, estimated_start)` at one
+    /// instant, CLAMPED to the providers this node currently sees as authorized
+    /// (D-LS17). `None` when the ticket is not held or this observer does not
+    /// qualify (no live membership, or the view moved twice). The clamp is the
+    /// full, untruncated visible set: the leader may choose providers beyond the
+    /// exact watch's lowest-id prefix.
+    #[cfg(feature = "redex")]
+    pub fn org_coalesced_rows(
+        &self,
+        ticket: &sensing::org_coalesced::OrgCoalescedTicket,
+    ) -> Option<Vec<(u64, sensing::ProjectedReadiness, Option<Duration>)>> {
+        if !self.org_coalesced_holds(ticket) {
+            return None;
+        }
+        let capability = ticket.interest().capability_id.as_str().to_owned();
+        let authority = super::behavior::org_grant::CapabilityAuthorityId::for_tag(&capability);
+        let visible = self.org_sensing_current_visibility_unbounded(&authority)?;
+        let mut rows: Vec<_> = self
+            .sensing_branch_projections(ticket.interest())
+            .into_iter()
+            .filter(|(provider, _, _)| visible.binary_search(provider).is_ok())
+            .collect();
+        rows.sort_by_key(|(provider, _, _)| *provider);
+        Some(rows)
+    }
+
+    /// One coalesced refresh pass (D-LS16): ONE member view, then for every
+    /// held interest an election and — when due (first send, a leader change,
+    /// or `ttl/2` since the last) — a registration with the elected leader.
+    /// Returns how many registrations were sent. Registers with the registry
+    /// lock released.
+    #[cfg(feature = "redex")]
+    fn refresh_org_coalesced(&self, now: Instant) -> usize {
+        let held = self.org_coalesced.lock().snapshot();
+        if held.is_empty() {
+            return 0;
+        }
+        let ttl = self.config.sensing_interest_ttl;
+        let refresh_every = ttl / 2;
+        let view = self.org_leader_members();
+        let mut sent = 0;
+        for (key, spec, interval, registered_with, registered_at) in held {
+            let elected = view
+                .as_ref()
+                .and_then(|view| self.elect_org_sensing_leader(view, spec.capability_id.as_str()));
+            let Some(leader) = elected else {
+                if registered_with.is_some() {
+                    // No leader now: forget the old one, so one reappearing is
+                    // registered with at once. Its row expires by TTL.
+                    self.org_coalesced.lock().note_registered(&key, None, None);
+                    self.org_coalesced_counters
+                        .no_leader
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            };
+            if !sensing::org_coalesced::registration_due(
+                elected,
+                registered_with,
+                registered_at,
+                now,
+                refresh_every,
+            ) {
+                continue;
+            }
+            if self
+                .register_org_capability_interest(&spec, leader, interval, ttl)
+                .is_ok()
+            {
+                if registered_with.is_some_and(|previous| previous != leader) {
+                    self.org_coalesced_counters
+                        .failovers
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.org_coalesced_counters
+                    .registrations
+                    .fetch_add(1, Ordering::Relaxed);
+                self.org_coalesced
+                    .lock()
+                    .note_registered(&key, Some(leader), Some(now));
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// Start the node's ONE coalesced refresh task (D-LS16). It holds the
+    /// node's weak self-handle holder and re-reads it per pass, so it never
+    /// keeps the node alive; joined at shutdown.
+    #[cfg(feature = "redex")]
+    fn start_org_coalesced_refresher(&self) {
+        if !self.config.enable_sensing_coalescing {
+            return;
+        }
+        let mut slot = self.org_coalesced_task.lock();
+        if slot.is_some() || self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let holder = self.self_weak.clone();
+        let wake = self.org_coalesced_wake.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        let tick = org_coalesced_refresh_tick(self.config.sensing_interest_ttl);
+        *slot = Some(tokio::spawn(async move {
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown_notify.notified() => {}
+                    _ = wake.notified() => {}
+                    _ = tokio::time::sleep(tick) => {}
+                }
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some(node) = holder.get().and_then(std::sync::Weak::upgrade) else {
+                    continue;
+                };
+                node.refresh_org_coalesced(Instant::now());
+            }
+        }));
+    }
+
+    /// Join the coalesced refresh task. PRECONDITION: shutdown was signalled.
+    #[cfg(feature = "redex")]
+    async fn join_org_coalesced_refresher(&self) {
+        let handle = self.org_coalesced_task.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    /// Drive one coalesced refresh pass now (fixtures). Returns the number of
+    /// registrations sent.
+    #[cfg(all(feature = "redex", any(test, feature = "fixtures")))]
+    #[doc(hidden)]
+    pub fn refresh_org_coalesced_for_test(&self) -> usize {
+        self.refresh_org_coalesced(Instant::now())
     }
 
     /// SI-3: install the [`sensing::ReadinessEvaluator`] for one
@@ -21377,6 +21940,8 @@ impl MeshNode {
             self.config.sensing_interest_ttl,
         );
         *self.sensing_leader.lock() = Some(leader);
+        // D-LS14: only an explicit assumption serves LEGACY intake.
+        self.legacy_sensing_leader.store(true, Ordering::Release);
         true
     }
 
@@ -27602,6 +28167,13 @@ impl MeshNode {
         // consumer). Joined deterministically at shutdown, like the supervisor.
         #[cfg(feature = "redex")]
         self.start_org_leader_reconciler();
+        // LS-7a: the org leader role on every coalescing node (D-LS14), and the
+        // ONE coalesced refresh task (D-LS16), joined at shutdown.
+        #[cfg(feature = "redex")]
+        {
+            self.install_org_sensing_leader_role();
+            self.start_org_coalesced_refresher();
+        }
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
@@ -29312,6 +29884,8 @@ impl MeshNode {
             sensing_upstream_damper: self.sensing_upstream_damper.clone(),
             #[cfg(feature = "redex")]
             sensing_leader: self.sensing_leader.clone(),
+            #[cfg(feature = "redex")]
+            legacy_sensing_leader: self.legacy_sensing_leader.clone(),
             #[cfg(feature = "redex")]
             org_leader_counters: self.org_leader_counters.clone(),
             #[cfg(feature = "redex")]
@@ -39751,7 +40325,12 @@ impl MeshNode {
                     // (soft state; the consumer re-registers with
                     // the real leader) without paying for a
                     // snapshot.
-                    if ctx.sensing_leader.lock().is_none() {
+                    // D-LS14: every coalescing node holds the ORG leader role,
+                    // so a held role alone no longer means legacy intake —
+                    // only an explicit `assume_sensing_leader` opens it.
+                    if !ctx.legacy_sensing_leader.load(Ordering::Acquire)
+                        || ctx.sensing_leader.lock().is_none()
+                    {
                         return;
                     }
                     // SI-2b: the REAL candidate snapshot, assembled
@@ -56141,6 +56720,8 @@ impl Adapter for MeshNode {
         // was released.
         #[cfg(feature = "redex")]
         self.join_org_leader_reconciler().await;
+        #[cfg(feature = "redex")]
+        self.join_org_coalesced_refresher().await;
 
         // The refresh schedule is closed and JOINED BEFORE the egress: a
         // refresh in flight would otherwise enqueue a datagram behind a

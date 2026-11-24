@@ -1654,6 +1654,7 @@ jobs:
           --test sensing_dispatch
           --test sensing_org_three_node
           --test sensing_org_leader_three_node
+          --test sensing_org_coalesced
           --test sensing_lease
           --test sensing_lease_wire
           --test sensing_failure_plane

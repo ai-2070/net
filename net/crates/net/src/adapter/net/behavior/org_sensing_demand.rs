@@ -609,6 +609,56 @@ impl OrgSensingCapabilityDemand {
     }
 }
 
+/// ONE request-relative projection over a COALESCED (leader-backed) interest
+/// (SDK plan D-LS17), with the same shape and classifier as
+/// [`OrgSensingCapabilityDemand::project_sensed_order`].
+///
+/// The rows are the leader-delivered consumer cells under the ticket's
+/// interest, clamped in core to the FULL set of providers this node currently
+/// sees as authorized ([`MeshNode::org_coalesced_rows`]), at one instant. The
+/// ranking is this node's own route economics plus each provider's signed
+/// start estimate — the leader chose which providers are sensed, never their
+/// order here (D-LS18). `None` when the ticket is not held or the observer no
+/// longer qualifies.
+///
+/// Advisory plain data, exactly as the exact projection is.
+#[cfg(feature = "redex")]
+pub fn project_org_coalesced(
+    node: &MeshNode,
+    ticket: &sensing::org_coalesced::OrgCoalescedTicket,
+    budget: &sensing::ConsumerLatencyBudget,
+) -> Option<OrgSensedProjection> {
+    let rows = node.org_coalesced_rows(ticket)?;
+    assert_off_sensing_locks("coalesced projection proximity pass");
+    let views: Vec<sensing::BranchView> = rows
+        .iter()
+        .map(
+            |&(provider, projection, estimated_start)| sensing::BranchView {
+                provider,
+                projection,
+                estimated_start,
+                route_estimate: node.sensing_route_estimate(provider),
+            },
+        )
+        .collect();
+    assert_off_sensing_locks("coalesced projection classification and ordering");
+    let delta = project_sensed_candidates(&views, budget);
+    Some(OrgSensedProjection {
+        rows: views
+            .iter()
+            .map(|view| OrgSensedRow {
+                provider: view.provider,
+                readiness: view.projection,
+                estimated_start: view.estimated_start,
+                route_estimate: view.route_estimate,
+            })
+            .collect(),
+        viable: delta.viable,
+        potential: delta.potential,
+        non_viable: delta.non_viable,
+    })
+}
+
 /// THE canonical exact-provider interest one retained demand registers.
 ///
 /// One function, so the acquisition, the observation identity it derives, and
