@@ -263,10 +263,19 @@ fn coalesced_from_py(value: &Bound<'_, PyAny>) -> PyResult<Coalesced> {
             ))),
         };
     }
-    if value.is_instance_of::<PyInt>() {
-        // ANY Python int is a size: one no u16 holds — including one past
-        // i64, which Python allows — is Top(0), refused by the SDK.
-        let k = value.extract::<i64>().ok();
+    // ANY integer is a size: a Python `int`, or anything implementing
+    // `__index__` (a numpy integer scalar, say), read the way
+    // `operator.index` reads it. One no u16 holds — including one past i64,
+    // which Python allows — is Top(0), refused by the SDK.
+    let index = if value.is_instance_of::<PyInt>() {
+        Some(value.clone())
+    } else if value.hasattr("__index__")? {
+        Some(value.call_method0("__index__")?)
+    } else {
+        None
+    };
+    if let Some(index) = index {
+        let k = index.extract::<i64>().ok();
         return Ok(Coalesced::Top(
             k.and_then(|k| u16::try_from(k).ok()).unwrap_or(0),
         ));

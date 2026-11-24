@@ -398,12 +398,14 @@ pub enum SensingError {
     UnsatisfiableCoalescing,
 
     /// A [`SensingQuery`] capability name longer than
-    /// [`MAX_SENSED_CAPABILITY_BYTES`]. Its registration frame could not be
-    /// carried, so the query is refused instead of holding demand that no
-    /// frame will ever register.
+    /// [`MAX_SENSED_CAPABILITY_BYTES`] — the SDK's own bound, set well inside
+    /// the 4 KiB sensing frame cap so that every name it accepts fits a
+    /// registration frame. Refused up front instead of holding demand that no
+    /// frame could register.
     #[error(
-        "a sensing capability name may be at most 1024 bytes — \
-         use the provider's own capability id"
+        "a sensing capability name may be at most {max} bytes — \
+         use the provider's own capability id",
+        max = MAX_SENSED_CAPABILITY_BYTES
     )]
     CapabilityTooLong,
 }

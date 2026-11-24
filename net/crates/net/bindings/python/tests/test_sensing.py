@@ -102,7 +102,11 @@ def test_a_coalesced_watch_is_refused_with_rusts_own_kinds(tmp_path) -> None:
                 "kind": "unsatisfiable_coalescing",
                 "terminal": False,
             }, size
-        for coalesced in ("best", 3):
+        class _Index:  # an integer-like object, as a numpy integer scalar is
+            def __index__(self) -> int:
+                return 3
+
+        for coalesced in ("best", 3, _Index()):
             with pytest.raises(net.SensingError) as caught:
                 net.sensing_watch(mesh, "nrpc:coalesced.py", coalesced=coalesced)
             assert net.sensing_error_class(str(caught.value))["kind"] == "observer_not_qualified"
