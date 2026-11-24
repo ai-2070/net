@@ -632,12 +632,15 @@ jobs:
       #
       # FLOOR accounting (verified against `cargo test --lib --features
       # "$UNIT_FEATURES" -- --list`, NOT by hand):
-      #   org_gate                        = 65
+      #   org_gate                        = 61
       #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
       #     + 6 (publication-pinned fence, off-lock relay crypto window)
-      #     + 4 (later slices, landed without raising the floor; counted at the
-      #     provider-free leader LS-6 head) + 1 (leader plan D-LS12: the
-      #     provider-free shapes an org leader re-authors are admitted)
+      #     + 1 (leader plan D-LS12: the provider-free shapes an org leader
+      #     re-authors are admitted)
+      #     The anchored inventory regex below matches DIRECT children of
+      #     `org_gate::tests` only, so the nested `tests::granted::` witnesses
+      #     are not in this count. Counting them once put the floor at 65
+      #     against a real 61.
       #   sensing_authority_witness_tests = 75 (re-derived from `--list` at the
       #     LS-6 head; the groups below sum to 67, and 8 later witnesses landed
       #     without raising the floor. LS-6 replaced the dark
@@ -682,7 +685,7 @@ jobs:
           set -uo pipefail
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
-          GATE_MIN=65
+          GATE_MIN=61
           MESH_MIN=75
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }

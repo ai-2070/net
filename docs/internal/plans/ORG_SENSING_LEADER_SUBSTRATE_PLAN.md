@@ -225,7 +225,9 @@ could not see because the code it describes had not landed yet.
     is renamed `every_incoherent_selector_shape_is_refused_at_intake`.
     `a_provider_free_selector_the_leader_can_resolve_is_admitted_at_intake`
     is pinned beside it. `GATE_MIN` and `MESH_MIN` are re-derived from
-    `--list` (65 / 75).
+    `--list` with CI's anchored regex (61 / 75): the nested
+    `org_gate::tests::granted::` witnesses are not direct children and do
+    not count.
 
 - **D-LS13 (every change wakes the reconciler; 2026-11-24, follow-up on the
   PR).** This supersedes the tick as the mechanism behind D-LS5 and D-LS11.
