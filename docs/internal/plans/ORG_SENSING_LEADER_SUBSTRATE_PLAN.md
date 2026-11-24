@@ -231,7 +231,7 @@ file verified byte-identical.
   - The org capability index and per-interest versions.
   - `org_plan_inputs` / `plan_org_reconciliation` / `apply_org_plan`.
   - RED: an apply that ignores versions; inputs that scan every interest.
-- **LS-4.**
+- **LS-4 (`9f68ff817`).**
   - The org intake transaction (`MeshNode::apply_org_capability_registration`,
     dark).
   - The node-owned reconciler. It mints the OWNER drain at `start`, is joined
@@ -243,6 +243,30 @@ file verified byte-identical.
   - The coalescing witness waits on a PARKING sleep. The reconciler's interval
     only advances when the runtime parks, and a busy-yield version failed under
     a loaded parallel run.
+- **LS-5.**
+  - `MeshNode::dispatch_org_capability_registration`: the whole lit-arm
+    path (the real gate plus the intake), which LS-6's arm calls.
+  - Seven production-coupled witnesses on real encoded frames:
+    - real-gate admission;
+    - a foreign member and a consumer mismatch refused;
+    - `Node` outside the projection;
+    - `Tags`;
+    - the leader's own record;
+    - a floor raised through the real `apply_bundle` path, withdrawing only
+      the revoked provider. The node's own floors-raised subscription moves
+      the owner stream (F2).
+  - The §6 metrics as `OrgLeaderMetrics` (public, `MeshNode::org_leader_metrics`,
+    `prometheus_text`).
+  - D-LS9 counted gates:
+    - over a full 1,024-row owner partition, one bucket visit and ZERO
+      descriptor decodes, read from a per-thread decode count inside
+      `decode_declared_capabilities`, with a live control;
+    - a grant-only mutation builds nothing;
+    - 130 interests on one capability share one projection in 3 batches of
+      ≤ 64.
+  - RED: a decode in the capture; a projection ignoring floors; a clean owner
+    stream treated as `RebuildAll`.
+  - The dark arm still drops every `OrgCapabilityRegistration`.
 
 ---
 

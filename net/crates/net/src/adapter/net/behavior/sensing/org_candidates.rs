@@ -36,6 +36,7 @@
 //! - the local node is never a candidate (Q2, D-LS3).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -328,70 +329,121 @@ impl OrgCapabilityCandidates {
 }
 
 /// The org leader's operational counters (plan §6 "Required metrics"). Shared
-/// by the intake transaction and the node's reconciler; read through
-/// [`OrgLeaderCounters::snapshot`].
+/// by the intake transaction and the node's reconciler; exported through
+/// `MeshNode::org_leader_metrics`. Monotonic except the two gauges.
 #[derive(Default, Debug)]
 pub(crate) struct OrgLeaderCounters {
-    /// A new org interest refused at the D-LS4 cap, before any projection.
-    pub interest_over_cap: std::sync::atomic::AtomicU64,
-    /// Candidate projections built (cold intake + reconciliation misses).
-    pub projection_builds: std::sync::atomic::AtomicU64,
+    /// `org_leader_interest_over_cap_total`: a new org interest refused at the
+    /// D-LS4 cap, before any projection.
+    pub interest_over_cap: AtomicU64,
+    /// `org_candidate_projection_build_total{reason="intake"}`.
+    pub builds_intake: AtomicU64,
+    /// `org_candidate_projection_build_total{reason="reconcile"}`: cache misses.
+    pub builds_reconcile: AtomicU64,
     /// Reconciliation projections served from the bounded cache.
-    pub projection_cache_hits: std::sync::atomic::AtomicU64,
-    /// Plans (or plan entries) discarded because their source moved before
-    /// apply: a stale authority stamp at the fence, or a moved interest version.
-    pub projection_discarded: std::sync::atomic::AtomicU64,
+    pub cache_hits: AtomicU64,
+    /// `org_candidate_projection_discarded_total{reason="stale_authority"}`: the
+    /// captured authority stamp was no longer current at the commit fence.
+    pub discarded_stale_authority: AtomicU64,
+    /// `org_candidate_projection_discarded_total{reason="stale_version"}`: an
+    /// interest moved between plan and apply.
+    pub discarded_stale_version: AtomicU64,
     /// Reconciliation passes run by the node's reconciler.
-    pub reconcile_passes: std::sync::atomic::AtomicU64,
-    /// Apply batches (at most 64 interests each).
-    pub reconcile_batches: std::sync::atomic::AtomicU64,
-    /// Capabilities requeued for one trailing pass.
-    pub reconcile_requeued: std::sync::atomic::AtomicU64,
-    /// Demanded capabilities the most recent pass reconciled (a gauge).
-    pub dirty_capabilities: std::sync::atomic::AtomicU64,
+    pub reconcile_passes: AtomicU64,
+    /// `org_leader_reconcile_batch_total`: apply batches (≤ 64 interests each).
+    pub reconcile_batches: AtomicU64,
+    /// `org_leader_reconcile_requeued_total`: capabilities requeued for one
+    /// trailing pass.
+    pub reconcile_requeued: AtomicU64,
+    /// `org_leader_dirty_capabilities` (gauge): demanded capabilities the most
+    /// recent pass reconciled.
+    pub dirty_capabilities: AtomicU64,
+    /// `org_candidate_projection_cache_entries` (gauge).
+    pub cache_entries: AtomicU64,
     /// Org intakes refused because a Leader row would not be admitted
     /// (all-or-none preflight).
-    pub intake_preflight_refused: std::sync::atomic::AtomicU64,
+    pub intake_preflight_refused: AtomicU64,
     /// Reconciliation fills withdrawn because their Leader row was refused
     /// (D-LS10).
-    pub fill_withdrawn: std::sync::atomic::AtomicU64,
+    pub fill_withdrawn: AtomicU64,
+    /// `org_scoped_index_bucket_visits_total`: indexed owner-bucket lookups the
+    /// leader projection performed (one per projected capability).
+    pub bucket_visits: AtomicU64,
+    /// `org_scoped_state_lock_hold_seconds`: the leader capture's scoped-state
+    /// lock hold, as a nanosecond sum and a count.
+    pub scoped_lock_nanos: AtomicU64,
+    pub scoped_lock_holds: AtomicU64,
+    /// `org_leader_plan_seconds`: off-lock planning, nanosecond sum + count.
+    pub plan_nanos: AtomicU64,
+    pub plans: AtomicU64,
+    /// `org_leader_apply_lock_hold_seconds`: the table+leader critical section of
+    /// a reconciliation commit, nanosecond sum + count.
+    pub apply_lock_nanos: AtomicU64,
+    pub applies: AtomicU64,
 }
 
 /// A point-in-time copy of [`OrgLeaderCounters`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgLeaderCountersSnapshot {
     pub interest_over_cap: u64,
-    pub projection_builds: u64,
-    pub projection_cache_hits: u64,
-    pub projection_discarded: u64,
+    pub builds_intake: u64,
+    pub builds_reconcile: u64,
+    pub cache_hits: u64,
+    pub discarded_stale_authority: u64,
+    pub discarded_stale_version: u64,
     pub reconcile_passes: u64,
     pub reconcile_batches: u64,
     pub reconcile_requeued: u64,
     pub dirty_capabilities: u64,
+    pub cache_entries: u64,
     pub intake_preflight_refused: u64,
     pub fill_withdrawn: u64,
+    pub bucket_visits: u64,
+    pub scoped_lock_nanos: u64,
+    pub scoped_lock_holds: u64,
+    pub plan_nanos: u64,
+    pub plans: u64,
+    pub apply_lock_nanos: u64,
+    pub applies: u64,
 }
 
 impl OrgLeaderCounters {
     /// Bump one counter.
-    pub(crate) fn bump(counter: &std::sync::atomic::AtomicU64) {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one timed section into a `(nanosecond sum, count)` pair.
+    pub(crate) fn record(nanos: &AtomicU64, count: &AtomicU64, started: std::time::Instant) {
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        nanos.fetch_add(elapsed, Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copy every counter.
     pub(crate) fn snapshot(&self) -> OrgLeaderCountersSnapshot {
-        let read = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        let read = |c: &AtomicU64| c.load(Ordering::Relaxed);
         OrgLeaderCountersSnapshot {
             interest_over_cap: read(&self.interest_over_cap),
-            projection_builds: read(&self.projection_builds),
-            projection_cache_hits: read(&self.projection_cache_hits),
-            projection_discarded: read(&self.projection_discarded),
+            builds_intake: read(&self.builds_intake),
+            builds_reconcile: read(&self.builds_reconcile),
+            cache_hits: read(&self.cache_hits),
+            discarded_stale_authority: read(&self.discarded_stale_authority),
+            discarded_stale_version: read(&self.discarded_stale_version),
             reconcile_passes: read(&self.reconcile_passes),
             reconcile_batches: read(&self.reconcile_batches),
             reconcile_requeued: read(&self.reconcile_requeued),
             dirty_capabilities: read(&self.dirty_capabilities),
+            cache_entries: read(&self.cache_entries),
             intake_preflight_refused: read(&self.intake_preflight_refused),
             fill_withdrawn: read(&self.fill_withdrawn),
+            bucket_visits: read(&self.bucket_visits),
+            scoped_lock_nanos: read(&self.scoped_lock_nanos),
+            scoped_lock_holds: read(&self.scoped_lock_holds),
+            plan_nanos: read(&self.plan_nanos),
+            plans: read(&self.plans),
+            apply_lock_nanos: read(&self.apply_lock_nanos),
+            applies: read(&self.applies),
         }
     }
 }

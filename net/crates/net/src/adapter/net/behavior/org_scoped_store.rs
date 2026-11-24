@@ -711,6 +711,12 @@ pub struct ScopedIngestCounters {
     /// The security view moved between verify and the pre-insert recheck, so a
     /// valid envelope was refused rather than landing against a stale view.
     race_refused: AtomicU64,
+    /// Descriptor decodes the ingest path performed (`org_scoped_descriptor_decode_total`,
+    /// leader plan §6). Exactly one per verified envelope; nothing downstream of
+    /// the store — no query, projection or reconciliation — ever decodes, which is
+    /// what a witness reads this to prove. Kept out of [`Self::snapshot`] so that
+    /// array's shape is unchanged.
+    descriptor_decodes: AtomicU64,
 }
 
 impl ScopedIngestCounters {
@@ -740,6 +746,16 @@ impl ScopedIngestCounters {
     /// verify and the pre-insert recheck.
     pub fn note_race_refused(&self) {
         self.race_refused.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record one descriptor decode (the ingest path's `prepare`).
+    pub fn note_descriptor_decode(&self) {
+        self.descriptor_decodes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Descriptor decodes recorded so far.
+    pub fn descriptor_decodes(&self) -> u64 {
+        self.descriptor_decodes.load(Ordering::Acquire)
     }
 
     /// `[inserted, updated, stale, rejected_public, at_capacity,
