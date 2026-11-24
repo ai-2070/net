@@ -226,6 +226,10 @@ pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
+/// The coalesced (leader-backed) org sensing demand's operator view (SDK plan
+/// D-LS16), returned by `MeshNode::org_coalesced_metrics`.
+#[cfg(feature = "redex")]
+pub use mesh::OrgCoalescedMetrics;
 /// Exported for the same reason: the sensed-projection off-lock observations
 /// need a nameable type in the projection witnesses. `#[doc(hidden)]` and
 /// fixtures-gated at its definition.

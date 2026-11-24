@@ -65,6 +65,9 @@ extern void net_sensing_provider_free(NetSensingProvider** provider);
 extern int  net_sensing_watch(void* mesh_arc, const char* capability_ptr, size_t capability_len,
                               int64_t within_ms, int64_t start_within_ms,
                               NetSensingWatch** out_watch, char** out_err);
+extern int  net_sensing_watch_coalesced(void* mesh_arc, const char* capability_ptr, size_t capability_len,
+                                        int64_t within_ms, int64_t start_within_ms, int32_t top,
+                                        NetSensingWatch** out_watch, char** out_err);
 extern int  net_sensing_watch_snapshot(const NetSensingWatch* watch,
                                        NetSensingSnapshot** out_snapshot, char** out_err);
 extern int  net_sensing_watch_changed(const NetSensingWatch* watch, int64_t timeout_ms, char** out_err);
@@ -86,6 +89,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"time"
@@ -307,6 +311,10 @@ type SensingSnapshot struct {
 	Ranked []uint64 `json:"ranked"`
 	// Preferred is the provider to try first, or nil when nothing is viable.
 	Preferred *uint64 `json:"preferred"`
+	// Coalesced reports whether this capture came from a coalesced watch:
+	// its rows are the providers the organization's sensing leader chose to
+	// sense, clamped to what this node sees. The ranking is this node's own.
+	Coalesced bool `json:"coalesced"`
 
 	mu sync.Mutex
 	h  *C.NetSensingSnapshot
@@ -321,13 +329,27 @@ func (s *SensingSnapshot) Release() {
 	}
 }
 
-// SensingQueryOptions are a watch's two optional bounds.
+// SensingQueryOptions are a watch's two optional bounds, and its optional
+// coalescing.
 type SensingQueryOptions struct {
 	// Within is the consumer-local end-to-end budget.
 	Within *time.Duration
 	// StartWithin is the provider-start predicate that rides the signed
 	// interest.
 	StartWithin *time.Duration
+	// Coalesced, when set, observes THROUGH the organization's elected
+	// sensing leader instead of sensing every visible provider directly. It
+	// never widens what this node sees, and it never falls back to an exact
+	// watch: with no member able to lead, WatchSensing fails with kind
+	// "no_sensing_leader".
+	Coalesced *SensingCoalesced
+}
+
+// SensingCoalesced is a coalesced watch's size: Top 0 asks the leader for
+// the best one provider, Top k (1..32) for up to k. Any other Top is refused
+// with kind "unsatisfiable_coalescing".
+type SensingCoalesced struct {
+	Top int
 }
 
 // boundMs converts an optional bound to the ABI's milliseconds (-1 = absent).
@@ -390,8 +412,20 @@ func WatchSensing(node *MeshNode, capability string, opts SensingQueryOptions) (
 	defer C.free(unsafe.Pointer(cCap))
 	var out *C.NetSensingWatch
 	var errPtr *C.char
-	code := C.net_sensing_watch(arc, cCap, C.size_t(len(capability)),
-		within, startWithin, &out, &errPtr)
+	var code C.int
+	if opts.Coalesced != nil {
+		// Out-of-range values (including ones no int32 holds) reach Rust as
+		// -1, which the SDK refuses with its own kind.
+		top := C.int32_t(-1)
+		if opts.Coalesced.Top >= 0 && opts.Coalesced.Top <= math.MaxInt32 {
+			top = C.int32_t(opts.Coalesced.Top)
+		}
+		code = C.net_sensing_watch_coalesced(arc, cCap, C.size_t(len(capability)),
+			within, startWithin, top, &out, &errPtr)
+	} else {
+		code = C.net_sensing_watch(arc, cCap, C.size_t(len(capability)),
+			within, startWithin, &out, &errPtr)
+	}
 	if err := sensingErrorFromCall(code, errPtr); err != nil {
 		return nil, err
 	}

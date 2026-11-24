@@ -255,7 +255,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -6087,6 +6087,8 @@ class SensingSnapshot:
     def ranked(self) -> list[int]: ...
     @property
     def preferred(self) -> Optional[int]: ...
+    @property
+    def coalesced(self) -> bool: ...
 
 class SensingWatch:
     """An owning observation of one capability's authorized exact-provider
@@ -6115,4 +6117,5 @@ def sensing_watch(
     capability: str,
     within_ms: Optional[float] = None,
     start_within_ms: Optional[float] = None,
+    coalesced: Optional[Union[Literal["best"], int]] = None,
 ) -> SensingWatch: ...

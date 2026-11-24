@@ -16,6 +16,13 @@
  *
  * // Consumer: observe the own organization's authorized providers.
  * const w = watch(consumer, 'nrpc:gpu.infer', { withinMs: 500 })
+ *
+ * // Or through the organization's elected sensing leader: one registration,
+ * // the leader senses the best provider for every consumer asking the same
+ * // question. It never widens what this node sees, and never falls back to
+ * // an exact watch (`no_sensing_leader` when no member can lead).
+ * const c = watch(consumer, 'nrpc:gpu.infer', { coalesced: {} })      // best one
+ * const top3 = watch(consumer, 'nrpc:gpu.infer', { coalesced: { top: 3 } })
  * for await (const snap of snapshots(w)) {
  *   console.log(snap.preferred, snap.providers)
  * }
@@ -27,6 +34,7 @@
  */
 import { sensingErrorClass as nativeSensingErrorClass } from '@net-mesh/core';
 import type {
+  CoalescedOptions,
   ReadinessProvider,
   ReadinessValueJs,
   SensedProviderJs,
@@ -39,6 +47,7 @@ import { napiMeshOf } from './_internal';
 import type { MeshNode } from './mesh';
 
 export type {
+  CoalescedOptions,
   ReadinessProvider,
   ReadinessValueJs as ReadinessValue,
   SensedProviderJs as SensedProvider,
