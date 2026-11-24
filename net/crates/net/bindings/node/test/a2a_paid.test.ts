@@ -987,7 +987,12 @@ describe.skipIf(!HAS_PAID_A2A)('paid a2a — caller flow (WS-D)', () => {
     await withTopology({}, async (provider, [caller]) => {
       const env = await caller.prepare('summarize this', 'paid-1')
       const prepared = Caller.prepared(env)
-      if (BigInt(Number(caller.providerNode)) !== caller.providerNode) {
+      // Guard on the DECIMAL a lossy round trip prints, not on the double:
+      // `JSON.stringify` writes the shortest decimal that names the rounded
+      // double, and for about 1 id in 500 that decimal IS the original id
+      // (e.g. 856567573533357400), so `BigInt(Number(id)) !== id` held while
+      // the round trip changed nothing and the control failed spuriously.
+      if (BigInt(String(Number(caller.providerNode))) !== caller.providerNode) {
         // The negative control: the ordinary JS round trip names another
         // node in `provider_node` (the copy inside the `capability` string
         // survives, which is why the field itself is compared).
