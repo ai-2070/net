@@ -1577,17 +1577,15 @@ impl ScopedDiscoveryState {
 /// global stream carries every private partition (owner or grant); the owner
 /// stream carries the owner partition only.
 ///
-/// OLB consumes the GLOBAL stream; the owner stream stays unclaimed for the
-/// provider-free leader track (Kyra OLB-2B, Q4).
+/// OLB consumes the GLOBAL stream; the provider-free org leader reconciler
+/// (leader plan LS-4) consumes the OWNER stream, through its own independent
+/// lease, so neither competes with the other (Kyra OLB-2B, Q4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateDiscoveryStream {
     Global,
-    /// RESERVED, deliberately unclaimed. Not a pending-consumer allowance: the
-    /// owner stream exists so the provider-free leader track can take an
-    /// independent lease WITHOUT competing with OLB for the global one, and the
-    /// variant must stay nameable for `lease_for` to be exhaustive over both
-    /// streams. Removing it would erase the reservation the lease split encodes.
-    #[allow(dead_code)]
+    /// The owner partition only. Claimed by the node's org leader reconciler
+    /// (`MeshNode::start_org_leader_reconciler`), so valid grant-audience churn
+    /// never rebuilds the owner-private leader projection.
     Owner,
 }
 

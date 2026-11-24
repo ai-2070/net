@@ -104,6 +104,8 @@ pub use rendezvous::{
     closeness_score, sensing_leader, FrameRejection, LeaderReconciliation, LeaderRefusalPartition,
     LeaderRegistration, SensingLeader, SensingLeaderLoad,
 };
+#[cfg(feature = "redex")]
+pub(crate) use rendezvous::{plan_org_reconciliation, OrgReconcilePlan};
 pub use scope::{validate_subscriber_scope, ScopeError};
 pub use wire::{
     decode_attestation, decode_interest_frame, encode_attestation, encode_interest_frame,

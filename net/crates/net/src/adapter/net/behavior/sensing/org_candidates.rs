@@ -327,6 +327,84 @@ impl OrgCapabilityCandidates {
     }
 }
 
+/// The org leader's operational counters (plan §6 "Required metrics"). Shared
+/// by the intake transaction and the node's reconciler; read through
+/// [`OrgLeaderCounters::snapshot`].
+#[derive(Default, Debug)]
+pub(crate) struct OrgLeaderCounters {
+    /// A new org interest refused at the D-LS4 cap, before any projection.
+    pub interest_over_cap: std::sync::atomic::AtomicU64,
+    /// Candidate projections built (cold intake + reconciliation misses).
+    pub projection_builds: std::sync::atomic::AtomicU64,
+    /// Reconciliation projections served from the bounded cache.
+    pub projection_cache_hits: std::sync::atomic::AtomicU64,
+    /// Plans (or plan entries) discarded because their source moved before
+    /// apply: a stale authority stamp at the fence, or a moved interest version.
+    pub projection_discarded: std::sync::atomic::AtomicU64,
+    /// Reconciliation passes run by the node's reconciler.
+    pub reconcile_passes: std::sync::atomic::AtomicU64,
+    /// Apply batches (at most 64 interests each).
+    pub reconcile_batches: std::sync::atomic::AtomicU64,
+    /// Capabilities requeued for one trailing pass.
+    pub reconcile_requeued: std::sync::atomic::AtomicU64,
+    /// Demanded capabilities the most recent pass reconciled (a gauge).
+    pub dirty_capabilities: std::sync::atomic::AtomicU64,
+    /// Org intakes refused because a Leader row would not be admitted
+    /// (all-or-none preflight).
+    pub intake_preflight_refused: std::sync::atomic::AtomicU64,
+    /// Reconciliation fills withdrawn because their Leader row was refused
+    /// (D-LS10).
+    pub fill_withdrawn: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`OrgLeaderCounters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OrgLeaderCountersSnapshot {
+    pub interest_over_cap: u64,
+    pub projection_builds: u64,
+    pub projection_cache_hits: u64,
+    pub projection_discarded: u64,
+    pub reconcile_passes: u64,
+    pub reconcile_batches: u64,
+    pub reconcile_requeued: u64,
+    pub dirty_capabilities: u64,
+    pub intake_preflight_refused: u64,
+    pub fill_withdrawn: u64,
+}
+
+impl OrgLeaderCounters {
+    /// Bump one counter.
+    pub(crate) fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Copy every counter.
+    pub(crate) fn snapshot(&self) -> OrgLeaderCountersSnapshot {
+        let read = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        OrgLeaderCountersSnapshot {
+            interest_over_cap: read(&self.interest_over_cap),
+            projection_builds: read(&self.projection_builds),
+            projection_cache_hits: read(&self.projection_cache_hits),
+            projection_discarded: read(&self.projection_discarded),
+            reconcile_passes: read(&self.reconcile_passes),
+            reconcile_batches: read(&self.reconcile_batches),
+            reconcile_requeued: read(&self.reconcile_requeued),
+            dirty_capabilities: read(&self.dirty_capabilities),
+            intake_preflight_refused: read(&self.intake_preflight_refused),
+            fill_withdrawn: read(&self.fill_withdrawn),
+        }
+    }
+}
+
+/// The reconciler's bounded route-refresh tick (D-LS5): every demanded
+/// capability is re-ranked at least this often, so route estimates and
+/// reachability cannot go stale indefinitely with no topology wake seam.
+pub(crate) const ORG_LEADER_ROUTE_REFRESH: Duration = Duration::from_secs(5);
+
+/// The most org interests one apply batch commits before the reconciler yields
+/// (plan §6), so a 512-interest leader cannot monopolize the runtime.
+pub(crate) const ORG_LEADER_APPLY_BATCH: usize = 64;
+
 /// The complete source vector a cached projection was built under (D-LS1). A
 /// cached set is reused only when EVERY component still matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

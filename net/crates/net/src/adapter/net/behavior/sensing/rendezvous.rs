@@ -54,6 +54,7 @@ use super::org_candidates::{
 use super::scope::{validate_subscriber_scope, ScopeError};
 use super::table::{DownstreamId, RegisterOutcome, UpstreamAction};
 use super::{AdmittedSensingRegistration, RegistrationAuthority, RegistrationLeg};
+use crate::adapter::net::behavior::org::OrgId;
 
 /// Observer id fed to [`elect`]: never a member, so the
 /// self-RTT-zero bias can't fire and the ranking is identical for
@@ -132,7 +133,6 @@ pub(crate) enum LeaderCandidates<'a> {
     /// The legacy plaintext-fold snapshot.
     Legacy(&'a [CandidateProvider]),
     /// The owner-private projection for the interest's capability.
-    #[allow(dead_code)] // constructed by the org intake + reconciler (LS-4)
     Org(&'a OrgCapabilityCandidates),
 }
 
@@ -410,6 +410,9 @@ pub struct SensingLeader {
 pub(crate) struct OrgInterestPlanInput {
     key: CapabilityInterestKey,
     version: u64,
+    /// The organization the interest was admitted under (its retained seed's
+    /// immutable `RegistrationAuthority::Org { org_id }`).
+    org_id: OrgId,
     providers: ProviderSelector,
     result_mode: ResultMode,
 }
@@ -427,14 +430,6 @@ pub(crate) struct OrgReconcilePlan {
     )>,
 }
 
-impl OrgReconcilePlan {
-    /// Planned interests.
-    #[allow(dead_code)] // the reconciler's batch accounting (LS-4)
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
 /// What applying an [`OrgReconcilePlan`] did.
 #[derive(Debug, Default)]
 pub(crate) struct OrgPlanApplied {
@@ -448,19 +443,32 @@ pub(crate) struct OrgPlanApplied {
 /// Plan the reconciliation of `inputs` against `candidates`, OFF-LOCK (LS-3):
 /// pure, allocation-bounded by the inputs, and never sorting — the projection is
 /// already route-ranked (D-LS2) and `resolve_org_candidates` filters it in order.
+///
+/// `candidates` is the projection of `owner`'s owner-private partition. An
+/// interest admitted under any OTHER organization — the installed owner org
+/// rotated, or no authority could be captured (`owner == None`) — resolves
+/// against the EMPTY set, so the apply withdraws its branches (plan §3 standing
+/// reconciliation: never project through an old owner, never fall back).
 pub(crate) fn plan_org_reconciliation(
     inputs: &[OrgInterestPlanInput],
     candidates: &OrgCapabilityCandidates,
+    owner: Option<&OrgId>,
     policy: &CandidatePolicy,
 ) -> OrgReconcilePlan {
+    let empty = OrgCapabilityCandidates::default();
     OrgReconcilePlan {
         entries: inputs
             .iter()
             .map(|input| {
+                let universe = if owner == Some(&input.org_id) {
+                    candidates
+                } else {
+                    &empty
+                };
                 (
                     input.key.clone(),
                     input.version,
-                    resolve_org_candidates(&input.providers, input.result_mode, candidates, policy),
+                    resolve_org_candidates(&input.providers, input.result_mode, universe, policy),
                 )
             })
             .collect(),
@@ -491,7 +499,6 @@ impl SensingLeader {
 
     /// The candidate policy every resolution of this leader runs under — the
     /// off-lock planner needs it without the leader lock.
-    #[allow(dead_code)] // the off-lock planner in the org reconciler (LS-4)
     pub(crate) fn policy(&self) -> CandidatePolicy {
         self.policy
     }
@@ -499,6 +506,61 @@ impl SensingLeader {
     fn mint_version(&mut self) -> u64 {
         self.next_version = self.next_version.wrapping_add(1);
         self.next_version
+    }
+
+    /// The branches an ORG registration would sense, computed WITHOUT mutating
+    /// anything (LS-4) — so the dispatch layer can preflight every mesh Leader
+    /// row under its held table guard before the leader commits, making the
+    /// intake all-or-none. The same leg, authority, join and D-LS4 checks as
+    /// [`Self::register_org_capability_interest`], in the same order: a NEW
+    /// interest previews its fresh resolution's active set; a JOIN previews the
+    /// interest's current active set. The committed registration may be admitted
+    /// on a SUBSET (per-consumer relay caps), never on a branch outside this set.
+    pub(crate) fn preview_org_registration(
+        &self,
+        admitted: &AdmittedSensingRegistration,
+        candidates: &OrgCapabilityCandidates,
+    ) -> Result<Vec<u64>, ResolutionRefusal> {
+        if !matches!(admitted.leg(), RegistrationLeg::Capability { .. }) {
+            return Err(ResolutionRefusal::AdmittedLegMismatch);
+        }
+        if !LeaderCandidates::Org(candidates).serves(admitted.authority()) {
+            return Err(ResolutionRefusal::AuthorityMismatch);
+        }
+        match self.interests.get(&admitted.spec().key()) {
+            Some(entry) if entry.admitted_seed.authority() != admitted.authority() => {
+                Err(ResolutionRefusal::AuthorityMismatch)
+            }
+            Some(entry) => Ok(entry.active.clone()),
+            None if self.org_interest_count() >= MAX_ORG_LEADER_INTERESTS => {
+                Err(ResolutionRefusal::AllBranchesRefused)
+            }
+            None => Ok(self
+                .resolve_for_seed(admitted, LeaderCandidates::Org(candidates))?
+                .active),
+        }
+    }
+
+    /// Withdraw ONE branch whose mesh Leader row the table refused during an org
+    /// reconciliation apply (D-LS10): its relay rows and private state go, the
+    /// provider leaves the active set, and an interest left with no active
+    /// branch drains — so the leader never holds a branch the mesh table does
+    /// not. Runs inside the same critical section as the refused register.
+    pub(crate) fn withdraw_branch(&mut self, branch: &ProviderInterestKey) {
+        self.relay.table.remove_branch(branch);
+        self.relay.reclaim_branch(branch);
+        let drained = match self.interests.get_mut(&branch.interest) {
+            Some(entry) => {
+                entry.active.retain(|provider| *provider != branch.provider);
+                entry.active.is_empty()
+            }
+            None => return,
+        };
+        if drained {
+            self.remove_interest(&branch.interest);
+        } else {
+            self.touch_interest(&branch.interest);
+        }
     }
 
     /// The ONLY insertion point for an interest: assigns its version and, for an
@@ -554,10 +616,14 @@ impl SensingLeader {
                 #[cfg(test)]
                 self.org_plan_visits.set(self.org_plan_visits.get() + 1);
                 let entry = self.interests.get(key)?;
+                let RegistrationAuthority::Org { org_id } = entry.admitted_seed.authority() else {
+                    return None;
+                };
                 let spec = entry.admitted_seed.spec();
                 Some(OrgInterestPlanInput {
                     key: key.clone(),
                     version: entry.version,
+                    org_id: *org_id,
                     providers: spec.providers.clone(),
                     result_mode: spec.result_mode,
                 })
@@ -677,7 +743,6 @@ impl SensingLeader {
     /// [`ResolutionRefusal::AllBranchesRefused`] (D-LS4) — the dispatch layer
     /// refuses it before projecting, and this is the defensive second line. A
     /// registration joining an existing interest is never capacity-gated.
-    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
     pub(crate) fn register_org_capability_interest(
         &mut self,
         admitted: &AdmittedSensingRegistration,
@@ -719,13 +784,11 @@ impl SensingLeader {
     }
 
     /// Whether an interest is currently held under `key`.
-    #[allow(dead_code)] // the LS-4 intake's pre-projection D-LS4 cap check
     pub(crate) fn has_interest(&self, key: &CapabilityInterestKey) -> bool {
         self.interests.contains_key(key)
     }
 
     /// Live ORGANIZATION interests (the D-LS4 cap's population).
-    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
     pub(crate) fn org_interest_count(&self) -> usize {
         self.interests
             .values()
@@ -1273,17 +1336,20 @@ impl SensingLeader {
     /// every provider left — therefore withdraws every branch and drains the
     /// interest, with no fallback to the legacy universe (§3 standing
     /// reconciliation).
-    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
+    // The production reconciler runs the three steps with the leader lock
+    // released between them; this in-lock composition serves the witnesses.
+    #[cfg(test)]
     pub(crate) fn reconcile_org_capability(
         &mut self,
         capability_id: &super::identity::CapabilityId,
         candidates: &OrgCapabilityCandidates,
+        owner: Option<&OrgId>,
         now: Instant,
     ) -> LeaderReconciliation {
         // The in-lock composition of the LS-3 pipeline: inputs → plan → apply.
         // Nothing can move between the three steps here, so nothing is stale.
         let inputs = self.org_plan_inputs(capability_id);
-        let plan = plan_org_reconciliation(&inputs, candidates, &self.policy);
+        let plan = plan_org_reconciliation(&inputs, candidates, owner, &self.policy);
         self.apply_org_plan(plan, now).reconciliation
     }
 
@@ -1576,7 +1642,6 @@ impl SensingLeader {
 
     /// Distinct capability ids with live ORGANIZATION interests — the org
     /// reconciler's demanded set (plan §6 trigger 6).
-    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
     pub(crate) fn org_interest_capability_ids(&self) -> Vec<super::identity::CapabilityId> {
         self.capability_ids_where(is_org_seed)
     }
@@ -3080,8 +3145,12 @@ mod tests {
         // RED coupling: if reconciliation stopped retaining the admitted seed
         // (the interest reset/reconstructed as legacy on the B1 teardown), this
         // added-branch witness fails — interest_seed would be absent or legacy.
-        let reconciliation =
-            leader.reconcile_org_capability(&org_spec().capability_id, &org_set(&[(0xB2, 6)]), now);
+        let reconciliation = leader.reconcile_org_capability(
+            &org_spec().capability_id,
+            &org_set(&[(0xB2, 6)]),
+            Some(&org_kp().org_id()),
+            now,
+        );
         assert!(
             reconciliation
                 .added
@@ -3447,6 +3516,7 @@ mod tests {
         let reconciliation = leader.reconcile_org_capability(
             &spec().capability_id,
             &OrgCapabilityCandidates::default(),
+            Some(&org_kp().org_id()),
             now,
         );
         assert!(reconciliation.torn_down.is_empty() && !reconciliation.changed);
@@ -3466,6 +3536,7 @@ mod tests {
         let reconciliation = leader.reconcile_org_capability(
             &org_spec().capability_id,
             &OrgCapabilityCandidates::default(),
+            Some(&org_kp().org_id()),
             now,
         );
         assert_eq!(
@@ -3615,7 +3686,12 @@ mod tests {
             .expect("admitted");
         let inputs = leader.org_plan_inputs(&org_spec().capability_id);
         // The plan would tear B1 down (only B3 remains eligible).
-        let plan = plan_org_reconciliation(&inputs, &org_set(&[(0xB3, 1)]), &leader.policy());
+        let plan = plan_org_reconciliation(
+            &inputs,
+            &org_set(&[(0xB3, 1)]),
+            Some(&org_kp().org_id()),
+            &leader.policy(),
+        );
         leader
             .expand_to_standby(&reg.interest, DownstreamId::Peer(0xC1), ms(100), TTL, now)
             .expect("B2 promotes");
@@ -3641,12 +3717,14 @@ mod tests {
         let plan = plan_org_reconciliation(
             &leader.org_plan_inputs(&org_spec().capability_id),
             &OrgCapabilityCandidates::default(),
+            Some(&org_kp().org_id()),
             &leader.policy(),
         );
         // Drain, then re-create under the same key.
         leader.reconcile_org_capability(
             &org_spec().capability_id,
             &OrgCapabilityCandidates::default(),
+            Some(&org_kp().org_id()),
             now,
         );
         assert_eq!(leader.interest_count(), 0);
@@ -3680,10 +3758,20 @@ mod tests {
         };
         let fresh = org_set(&[(0xB2, 6)]);
         let mut in_lock = build();
-        let expected = in_lock.reconcile_org_capability(&org_spec().capability_id, &fresh, now);
+        let expected = in_lock.reconcile_org_capability(
+            &org_spec().capability_id,
+            &fresh,
+            Some(&org_kp().org_id()),
+            now,
+        );
         let mut off_lock = build();
         let inputs = off_lock.org_plan_inputs(&org_spec().capability_id);
-        let plan = plan_org_reconciliation(&inputs, &fresh, &off_lock.policy());
+        let plan = plan_org_reconciliation(
+            &inputs,
+            &fresh,
+            Some(&org_kp().org_id()),
+            &off_lock.policy(),
+        );
         let applied = off_lock.apply_org_plan(plan, now);
         assert!(applied.stale.is_empty());
         assert_eq!(applied.reconciliation.torn_down, expected.torn_down);
@@ -3723,5 +3811,79 @@ mod tests {
         leader.on_refusal(&ProviderInterestKey::new(reg.interest, 0xB1), ms(200), now);
         assert_eq!(leader.interest_count(), 0);
         assert!(leader.org_by_capability.is_empty(), "refusal");
+    }
+
+    // ---- LS-4: owner binding, preview, compensation -------------------------
+
+    /// Plan §3 standing reconciliation: a projection of a DIFFERENT owner org (the
+    /// installed owner rotated) is never served to an interest admitted under the
+    /// old one — the plan resolves it against the empty set and the apply
+    /// withdraws it.
+    ///
+    /// RED coupling: planning every input against the supplied projection
+    /// regardless of owner keeps the branch.
+    #[test]
+    fn a_plan_under_another_owner_withdraws_the_interest() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let reg = leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
+            .expect("admitted");
+        let rotated = OrgKeypair::from_bytes([0x77u8; 32]).org_id();
+        let plan = plan_org_reconciliation(
+            &leader.org_plan_inputs(&org_spec().capability_id),
+            &org_set(&[(0xB1, 5)]),
+            Some(&rotated),
+            &leader.policy(),
+        );
+        let applied = leader.apply_org_plan(plan, now);
+        assert_eq!(
+            applied.reconciliation.torn_down,
+            vec![ProviderInterestKey::new(reg.interest, 0xB1)]
+        );
+        assert_eq!(leader.interest_count(), 0);
+    }
+
+    /// The preview is exactly what the commit then senses, and mutates nothing.
+    #[test]
+    fn preview_matches_the_committed_branches_and_mutates_nothing() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let members = org_set(&[(0xB1, 5), (0xB2, 9)]);
+        let seed = org_seed(0xC1, ms(100));
+        let preview = leader
+            .preview_org_registration(&seed, &members)
+            .expect("previews");
+        assert_eq!(leader.interest_count(), 0, "the preview mutates nothing");
+        let reg = leader
+            .register_org_capability_interest(&seed, &members, now)
+            .expect("admitted");
+        assert_eq!(preview, reg.branches);
+        assert_eq!(
+            leader.preview_org_registration(&org_seed(0xC2, ms(100)), &members),
+            Ok(reg.branches.clone()),
+            "a join previews the live active set"
+        );
+    }
+
+    /// D-LS10: withdrawing a branch removes it from the active set and the relay,
+    /// and drains an interest left with no branch.
+    #[test]
+    fn withdrawing_a_branch_keeps_the_leader_consistent() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let reg = leader
+            .register_org_capability_interest(
+                &org_seed(0xC1, ms(100)),
+                &org_set(&[(0xB1, 5), (0xB2, 9)]),
+                now,
+            )
+            .expect("admitted");
+        // Any → one active (B1), B2 standby.
+        let branch = ProviderInterestKey::new(reg.interest.clone(), 0xB1);
+        leader.withdraw_branch(&branch);
+        assert!(leader.relay.table.aggregate(&branch, now).is_none());
+        assert_eq!(leader.interest_count(), 0, "no active branch left: drained");
+        assert!(leader.org_by_capability.is_empty());
     }
 }

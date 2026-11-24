@@ -187,6 +187,22 @@ could not see because the code it describes had not landed yet.
   because timings are environment-qualified (§6 says so itself) and a counted
   witness is the stronger, portable form of the same property.
 
+- **D-LS10 (reconciliation fills, LS-4).** The intake is strictly
+  all-or-none: the leader previews its branches, the table preflights every
+  Leader row (`InterestTable::would_admit`) under the held guard, and only then
+  do both commit. Reconciliation is different: its TEARDOWNS always commit,
+  because a revoked or expired provider must never stay sensed because a
+  sibling fill could not be admitted. A fill whose Leader row the table refuses
+  is withdrawn from the leader in the same critical section
+  (`SensingLeader::withdraw_branch`), counted `fill_withdrawn`, so the leader
+  never holds a branch the table does not.
+- **D-LS11 (poison reaches reconciliation by the tick).** A store poison
+  advances no generation. The reconciler reaches it within one D-LS5 tick
+  (≤ 5 s): its fresh capture then fails, and every org interest reconciles
+  empty. An install, removal or rotation is wake-driven through
+  `org_install_generation`; a floor raise and an expiry through the owner
+  stream (F2).
+
 ### 0.5 Phases as built
 
 | Phase | Delivers | Exit |
@@ -197,6 +213,36 @@ could not see because the code it describes had not landed yet.
 | LS-4 | the atomic org intake transaction (F4, F5); the node-owned org leader reconciler (mints the `Owner` drain; wakes on the scoped watch, install generation, session generation, and the D-LS5 tick; 64-interest batches; shutdown-joined) | all-or-none apply; lock-order witness; authority loss/rotation reconciles empty; one active pass plus at most one trailing pass |
 | LS-5 | a production-coupled dark proof: real encoded frames through the real admission and apply, bypassing only the dark arm; the §6 metrics; D-LS9 counted witnesses | the dark-slice rows of §8; the arm still dark |
 | LS-6 | lighting: the dispatch arm, D-LS6, D-LS7, D-LS8, the three-node real-transport proof, CI pins, `docs/SENSING.md` | the lighting rows of §8; the dark witness replaced by lit witnesses in the same module (`MESH_MIN` holds) |
+
+### 0.6 Build log
+
+Each phase is one commit on `LZL0/sensing-leader-track`. Every RED mutation
+below was run against its named witness, failed it, and was reverted with the
+file verified byte-identical.
+
+- **LS-1 (`1f22a433f`).** `sensing/org_candidates.rs`: projection plus the
+  cache; 10 witnesses. RED: trusting a mismatched pin; dropping the owner-org
+  filter.
+- **LS-2 (`06c681079`).** `resolve_org_candidates`; `LeaderCandidates` pairs
+  each universe with one authority; F3 closed. The §2 org witnesses run on the
+  org path. RED: the fold reconciling every seed; the legacy `Node`
+  short-circuit.
+- **LS-3 (`ea763f4f2`).**
+  - The org capability index and per-interest versions.
+  - `org_plan_inputs` / `plan_org_reconciliation` / `apply_org_plan`.
+  - RED: an apply that ignores versions; inputs that scan every interest.
+- **LS-4.**
+  - The org intake transaction (`MeshNode::apply_org_capability_registration`,
+    dark).
+  - The node-owned reconciler. It mints the OWNER drain at `start`, is joined
+    at shutdown, and runs one timer plus coalesced watch wakes.
+  - The owner-org check in the planner, plus D-LS10 and D-LS11.
+  - Witnesses: 10 in `mesh::org_leader_tests`, 3 in the leader.
+  - RED: no intake preflight; the commit taking the leader before the table;
+    the planner ignoring the owner org.
+  - The coalescing witness waits on a PARKING sleep. The reconciler's interval
+    only advances when the runtime parks, and a busy-yield version failed under
+    a loaded parallel run.
 
 ---
 
