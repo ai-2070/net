@@ -1277,6 +1277,26 @@ pub(crate) struct SensingAuthorityStamp {
 }
 
 impl SensingAuthorityStamp {
+    /// Test-only: fabricate a stamp, so modules that key state on a stamp
+    /// (the leader candidate cache) can witness currency movement without
+    /// installing a real authority.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        authority_ptr: usize,
+        store_ptr: usize,
+        store_generation: u64,
+        installation_generation: u64,
+        poisoned: bool,
+    ) -> Self {
+        Self {
+            authority_ptr,
+            store_ptr,
+            store_generation: Some(BarrieredGeneration::from_raw_for_test(store_generation)),
+            installation_generation,
+            poisoned,
+        }
+    }
+
     /// `true` iff `self` (captured before validation) still equals the live
     /// `current` stamp AND the store is not now poisoned — i.e. the security
     /// view the registration was validated against is still live. A poison

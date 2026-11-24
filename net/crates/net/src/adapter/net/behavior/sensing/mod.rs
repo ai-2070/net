@@ -56,6 +56,11 @@ pub mod incarnation;
 // `sensing_lease_apply_mu` field docs on `MeshNode`).
 pub mod lease;
 pub mod negotiation;
+// The owner-private candidate projection for the provider-free org leader
+// (leader plan LS-1). Gated with `rendezvous`, its only consumer.
+#[cfg(feature = "redex")]
+#[allow(dead_code)] // consumed by the org leader intake + reconciler (LS-2..LS-4)
+pub(crate) mod org_candidates;
 // OLB org-auth slice (commit 2): the organization-authenticated sensing
 // registration authority gate — one transaction, attacker-controlled frame →
 // narrow validated object → validated-object-only mutation.
