@@ -32,7 +32,7 @@
 //! Feature note: this module rides the `redex` feature because the
 //! reuse is real, not copied. SI-2 revisits the final layering.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -45,8 +45,8 @@ use super::delivery::{Delivery, SensingRelay};
 use super::evaluator::SensingCounters;
 use super::frames::{FrameSpecError, SensingInterestFrame};
 use super::identity::{
-    AudienceScopeCommitment, CapabilityInterestKey, ConstraintError, InterestSpec,
-    ProviderInterestKey,
+    AudienceScopeCommitment, CapabilityId, CapabilityInterestKey, ConstraintError, InterestSpec,
+    ProviderInterestKey, ProviderSelector, ResultMode,
 };
 use super::org_candidates::{
     resolve_org_candidates, OrgCapabilityCandidates, MAX_ORG_LEADER_INTERESTS,
@@ -173,6 +173,12 @@ struct LeaderInterest {
     admitted_seed: AdmittedSensingRegistration,
     active: Vec<u64>,
     standby: Vec<u64>,
+    /// This interest's version (LS-3): assigned at creation from the leader's
+    /// monotonic counter and re-assigned on every active/standby mutation, so an
+    /// off-lock reconciliation plan built against one version can tell that the
+    /// interest it planned for moved — or drained and was re-created as a new
+    /// lifecycle under the same key — before it applies.
+    version: u64,
 }
 
 /// Why the leader refused one [`SensingInterestFrame`] at intake
@@ -384,6 +390,81 @@ pub struct SensingLeader {
     /// schedules, and the hop-by-hop continuity rule.
     pub relay: SensingRelay,
     interests: HashMap<CapabilityInterestKey, LeaderInterest>,
+    /// ORGANIZATION interests by capability (LS-3, plan §6 "SensingLeader adds
+    /// `capability_id → interest keys`"): the org reconciler reaches exactly the
+    /// interests on a dirty capability without visiting any unrelated interest.
+    /// Maintained only by [`Self::insert_interest`] / [`Self::remove_interest`],
+    /// so it can never disagree with `interests`.
+    org_by_capability: HashMap<CapabilityId, HashSet<CapabilityInterestKey>>,
+    /// The source of every [`LeaderInterest::version`]. Monotonic, never reused.
+    next_version: u64,
+    /// Test-only: interests visited by org planning, for the "reconciling one
+    /// capability visits no unrelated interest" witness.
+    #[cfg(test)]
+    org_plan_visits: std::cell::Cell<u64>,
+}
+
+/// One org interest's planning input (LS-3): captured under a SHORT leader lock,
+/// consumed off-lock by [`plan_org_reconciliation`].
+#[derive(Clone, Debug)]
+pub(crate) struct OrgInterestPlanInput {
+    key: CapabilityInterestKey,
+    version: u64,
+    providers: ProviderSelector,
+    result_mode: ResultMode,
+}
+
+/// An off-lock reconciliation plan for some org interests of ONE capability
+/// (LS-3): each interest's fresh resolution against one shared projection,
+/// tagged with the interest version it was planned for. Applied by
+/// [`SensingLeader::apply_org_plan`] only where that version is still current.
+#[derive(Debug)]
+pub(crate) struct OrgReconcilePlan {
+    entries: Vec<(
+        CapabilityInterestKey,
+        u64,
+        Result<ResolvedCandidates, ResolutionRefusal>,
+    )>,
+}
+
+impl OrgReconcilePlan {
+    /// Planned interests.
+    #[allow(dead_code)] // the reconciler's batch accounting (LS-4)
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// What applying an [`OrgReconcilePlan`] did.
+#[derive(Debug, Default)]
+pub(crate) struct OrgPlanApplied {
+    /// The branch consequences for the mesh caller (as for every reconciliation).
+    pub reconciliation: LeaderReconciliation,
+    /// Interests whose version moved between plan and apply: nothing was applied
+    /// to them, and the caller requeues the capability for one fresh pass.
+    pub stale: Vec<CapabilityInterestKey>,
+}
+
+/// Plan the reconciliation of `inputs` against `candidates`, OFF-LOCK (LS-3):
+/// pure, allocation-bounded by the inputs, and never sorting — the projection is
+/// already route-ranked (D-LS2) and `resolve_org_candidates` filters it in order.
+pub(crate) fn plan_org_reconciliation(
+    inputs: &[OrgInterestPlanInput],
+    candidates: &OrgCapabilityCandidates,
+    policy: &CandidatePolicy,
+) -> OrgReconcilePlan {
+    OrgReconcilePlan {
+        entries: inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.key.clone(),
+                    input.version,
+                    resolve_org_candidates(&input.providers, input.result_mode, candidates, policy),
+                )
+            })
+            .collect(),
+    }
 }
 
 impl SensingLeader {
@@ -401,7 +482,119 @@ impl SensingLeader {
             max_soft_state_ttl,
             relay: SensingRelay::new(continuity_factor, max_interests_per_peer),
             interests: HashMap::new(),
+            org_by_capability: HashMap::new(),
+            next_version: 0,
+            #[cfg(test)]
+            org_plan_visits: std::cell::Cell::new(0),
         }
+    }
+
+    /// The candidate policy every resolution of this leader runs under — the
+    /// off-lock planner needs it without the leader lock.
+    #[allow(dead_code)] // the off-lock planner in the org reconciler (LS-4)
+    pub(crate) fn policy(&self) -> CandidatePolicy {
+        self.policy
+    }
+
+    fn mint_version(&mut self) -> u64 {
+        self.next_version = self.next_version.wrapping_add(1);
+        self.next_version
+    }
+
+    /// The ONLY insertion point for an interest: assigns its version and, for an
+    /// org seed, indexes it under its capability.
+    fn insert_interest(&mut self, key: CapabilityInterestKey, mut interest: LeaderInterest) {
+        interest.version = self.mint_version();
+        if is_org_seed(&interest.admitted_seed) {
+            self.org_by_capability
+                .entry(interest.admitted_seed.spec().capability_id.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.interests.insert(key, interest);
+    }
+
+    /// The ONLY removal point for an interest: drops its org index entry with it.
+    fn remove_interest(&mut self, key: &CapabilityInterestKey) -> Option<LeaderInterest> {
+        let removed = self.interests.remove(key)?;
+        if is_org_seed(&removed.admitted_seed) {
+            let capability = &removed.admitted_seed.spec().capability_id;
+            if let Some(keys) = self.org_by_capability.get_mut(capability) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.org_by_capability.remove(capability);
+                }
+            }
+        }
+        Some(removed)
+    }
+
+    /// Re-version an interest whose active/standby sets just moved.
+    fn touch_interest(&mut self, key: &CapabilityInterestKey) {
+        let version = self.mint_version();
+        if let Some(entry) = self.interests.get_mut(key) {
+            entry.version = version;
+        }
+    }
+
+    /// The planning inputs for every ORG interest on `capability_id` (LS-3) —
+    /// served from the capability index, so an unrelated interest is never
+    /// visited. Taken under the SHORT leader lock; everything expensive happens
+    /// in [`plan_org_reconciliation`] after the lock is released.
+    pub(crate) fn org_plan_inputs(
+        &self,
+        capability_id: &CapabilityId,
+    ) -> Vec<OrgInterestPlanInput> {
+        let Some(keys) = self.org_by_capability.get(capability_id) else {
+            return Vec::new();
+        };
+        let mut inputs: Vec<OrgInterestPlanInput> = keys
+            .iter()
+            .filter_map(|key| {
+                #[cfg(test)]
+                self.org_plan_visits.set(self.org_plan_visits.get() + 1);
+                let entry = self.interests.get(key)?;
+                let spec = entry.admitted_seed.spec();
+                Some(OrgInterestPlanInput {
+                    key: key.clone(),
+                    version: entry.version,
+                    providers: spec.providers.clone(),
+                    result_mode: spec.result_mode,
+                })
+            })
+            .collect();
+        // Deterministic batch order (the index is a hash set).
+        inputs.sort_by_key(|input| *input.key.interest_digest.as_bytes());
+        inputs
+    }
+
+    /// Apply an off-lock [`OrgReconcilePlan`] (LS-3). An entry whose interest is
+    /// gone or whose version moved since planning is NOT applied and is reported
+    /// `stale`, so the caller requeues one fresh pass instead of committing a
+    /// resolution computed for a state that no longer exists. A planned refusal
+    /// (e.g. a now-too-broad `Each`) leaves its interest untouched, exactly as
+    /// the in-lock reconciliation does. The apply does no resolution, sort,
+    /// projection or I/O — only the bounded branch moves.
+    pub(crate) fn apply_org_plan(
+        &mut self,
+        plan: OrgReconcilePlan,
+        now: Instant,
+    ) -> OrgPlanApplied {
+        let mut applied = OrgPlanApplied::default();
+        for (key, version, resolution) in plan.entries {
+            let current = self
+                .interests
+                .get(&key)
+                .is_some_and(|entry| entry.version == version && is_org_seed(&entry.admitted_seed));
+            if !current {
+                applied.stale.push(key);
+                continue;
+            }
+            if let Ok(resolved) = resolution {
+                self.apply_reconciled_resolution(&key, resolved, now, &mut applied.reconciliation);
+            }
+        }
+        applied
     }
 
     /// Register one consumer's provider-free interest under LEGACY authority
@@ -599,12 +792,13 @@ impl SensingLeader {
             // equal the leader's root, so the legacy path is unchanged); an org
             // seed resolves against its owner-private projection (§5).
             let resolved = self.resolve_for_seed(admitted, candidates)?;
-            self.interests.insert(
+            self.insert_interest(
                 key.clone(),
                 LeaderInterest {
                     admitted_seed: admitted.clone(),
                     active: resolved.active,
                     standby: resolved.standby,
+                    version: 0, // assigned by insert_interest
                 },
             );
         } else if self
@@ -665,7 +859,7 @@ impl SensingLeader {
                 self.relay.table.aggregate(&branch, now).is_some()
             });
             if !any_branch_live {
-                self.interests.remove(&key);
+                self.remove_interest(&key);
             }
             return Err(ResolutionRefusal::AllBranchesRefused);
         }
@@ -869,6 +1063,7 @@ impl SensingLeader {
             }
         };
         entry.active.push(promoted);
+        self.touch_interest(key);
         let branch = ProviderInterestKey::new(key.clone(), promoted);
         let (_, warm) = self.relay.register_downstream(
             &branch,
@@ -920,7 +1115,7 @@ impl SensingLeader {
                 })
                 .unwrap_or(false);
             if !any_branch_live {
-                self.interests.remove(&interest);
+                self.remove_interest(&interest);
             }
         } else {
             // Partitioned-out rows leave inert slots — GC on the
@@ -972,7 +1167,7 @@ impl SensingLeader {
                         })
                         .unwrap_or(false);
                     if !any_branch_live {
-                        self.interests.remove(&interest);
+                        self.remove_interest(&interest);
                     }
                 }
                 UpstreamAction::None => {}
@@ -1085,20 +1280,11 @@ impl SensingLeader {
         candidates: &OrgCapabilityCandidates,
         now: Instant,
     ) -> LeaderReconciliation {
-        let mut reconciliation = LeaderReconciliation::default();
-        for key in self.interest_keys(capability_id, is_org_seed) {
-            let Some(entry) = self.interests.get(&key) else {
-                continue;
-            };
-            let spec = entry.admitted_seed.spec();
-            let Ok(resolved) =
-                resolve_org_candidates(&spec.providers, spec.result_mode, candidates, &self.policy)
-            else {
-                continue;
-            };
-            self.apply_reconciled_resolution(&key, resolved, now, &mut reconciliation);
-        }
-        reconciliation
+        // The in-lock composition of the LS-3 pipeline: inputs → plan → apply.
+        // Nothing can move between the three steps here, so nothing is stale.
+        let inputs = self.org_plan_inputs(capability_id);
+        let plan = plan_org_reconciliation(&inputs, candidates, &self.policy);
+        self.apply_org_plan(plan, now).reconciliation
     }
 
     /// The interests on `capability_id` whose retained seed satisfies `class`.
@@ -1284,13 +1470,14 @@ impl SensingLeader {
             // No branch holds live demand: the interest DRAINS —
             // the sweep's own rule — never a ghost active set.
             reconciliation.changed = true;
-            self.interests.remove(&key);
+            self.remove_interest(&key);
             return;
         }
         if let Some(entry) = self.interests.get_mut(&key) {
             entry.active = kept;
             entry.standby = new_standby;
         }
+        self.touch_interest(&key);
     }
 
     /// Sweep soft state: expired downstream rows drop; an interest
@@ -1330,7 +1517,7 @@ impl SensingLeader {
                 })
                 .unwrap_or(false);
             if !any_branch_live {
-                self.interests.remove(&interest);
+                self.remove_interest(&interest);
             }
         }
         self.relay.gc_dead_slots(now);
@@ -3340,5 +3527,201 @@ mod tests {
             "joining an existing interest is never capacity-gated"
         );
         assert_eq!(leader.org_interest_count(), MAX_ORG_LEADER_INTERESTS);
+    }
+
+    // ---- LS-3: indexed off-lock planning ------------------------------------
+
+    use super::{plan_org_reconciliation, OrgPlanApplied};
+
+    fn org_seed_on(capability: &str, consumer: u64) -> AdmittedSensingRegistration {
+        let mut spec = org_spec();
+        spec.capability_id = super::super::identity::CapabilityId::new(capability);
+        AdmittedSensingRegistration::from_validated_org(
+            ValidatedOrgSensingRegistration::capability_for_test(
+                spec,
+                consumer,
+                ms(100),
+                TTL,
+                EntityId::from_bytes([0x24u8; 32]),
+                org_kp().org_id(),
+            ),
+        )
+    }
+
+    /// Plan §6: planning one capability reaches ONLY its org interests through
+    /// the capability index — fifty org interests on other capabilities and a
+    /// legacy interest on the same capability are never visited.
+    ///
+    /// RED coupling: deriving the inputs by scanning every interest (the
+    /// `interest_keys` scan the in-lock reconciliation used) visits all 52.
+    #[test]
+    fn planning_one_capability_visits_no_unrelated_interest() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 1024, TTL);
+        let members = org_set(&[(0xB1, 5)]);
+        for index in 0..50 {
+            leader
+                .register_org_capability_interest(
+                    &org_seed_on(&format!("nrpc:other{index}"), 0xC1),
+                    &members,
+                    now,
+                )
+                .expect("admitted");
+        }
+        leader
+            .register_capability_interest(
+                &spec(),
+                DownstreamId::Peer(0xC2),
+                ms(100),
+                TTL,
+                root(),
+                &[provider(0xB1, 5)],
+                now,
+            )
+            .expect("legacy admitted");
+        leader
+            .register_org_capability_interest(&org_seed(0xC3, ms(100)), &members, now)
+            .expect("the target org interest");
+        leader.org_plan_visits.set(0);
+        let inputs = leader.org_plan_inputs(&org_spec().capability_id);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            leader.org_plan_visits.get(),
+            1,
+            "only the capability's own org interest"
+        );
+    }
+
+    /// LS-3 race discipline: a plan built for one interest version is NOT
+    /// applied once the interest moved — here a standby promotion between plan
+    /// and apply. The entry is reported stale for a requeue, and the promotion
+    /// survives untouched.
+    #[test]
+    fn a_plan_for_a_moved_interest_is_discarded_as_stale() {
+        let now = Instant::now();
+        let policy = CandidatePolicy {
+            initial_fanout: 1,
+            standby_count: 2,
+            maximum_fanout: 1,
+            each_mode_max_providers: 32,
+        };
+        let mut leader = SensingLeader::new(policy, K, 4, TTL);
+        let reg = leader
+            .register_org_capability_interest(
+                &org_seed(0xC1, ms(100)),
+                &org_set(&[(0xB1, 5), (0xB2, 20)]),
+                now,
+            )
+            .expect("admitted");
+        let inputs = leader.org_plan_inputs(&org_spec().capability_id);
+        // The plan would tear B1 down (only B3 remains eligible).
+        let plan = plan_org_reconciliation(&inputs, &org_set(&[(0xB3, 1)]), &leader.policy());
+        leader
+            .expand_to_standby(&reg.interest, DownstreamId::Peer(0xC1), ms(100), TTL, now)
+            .expect("B2 promotes");
+        let OrgPlanApplied {
+            reconciliation,
+            stale,
+        } = leader.apply_org_plan(plan, now);
+        assert_eq!(stale, vec![reg.interest.clone()]);
+        assert!(reconciliation.torn_down.is_empty() && reconciliation.added.is_empty());
+        assert_eq!(leader.branches(&reg.interest), vec![0xB1, 0xB2]);
+    }
+
+    /// A plan for an interest that drained and was RE-CREATED under the same key
+    /// (a new lifecycle) is stale too — versions are never reused.
+    #[test]
+    fn a_plan_for_a_recreated_interest_is_stale() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let members = org_set(&[(0xB1, 5)]);
+        let reg = leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &members, now)
+            .expect("admitted");
+        let plan = plan_org_reconciliation(
+            &leader.org_plan_inputs(&org_spec().capability_id),
+            &OrgCapabilityCandidates::default(),
+            &leader.policy(),
+        );
+        // Drain, then re-create under the same key.
+        leader.reconcile_org_capability(
+            &org_spec().capability_id,
+            &OrgCapabilityCandidates::default(),
+            now,
+        );
+        assert_eq!(leader.interest_count(), 0);
+        leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &members, now)
+            .expect("re-created");
+        let applied = leader.apply_org_plan(plan, now);
+        assert_eq!(applied.stale, vec![reg.interest.clone()]);
+        assert_eq!(
+            leader.branches(&reg.interest),
+            vec![0xB1],
+            "the new lifecycle is untouched"
+        );
+    }
+
+    /// The off-lock pipeline commits exactly what the in-lock composition commits
+    /// when nothing moves in between.
+    #[test]
+    fn off_lock_plan_and_apply_matches_the_in_lock_reconciliation() {
+        let now = Instant::now();
+        let build = || {
+            let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+            leader
+                .register_org_capability_interest(
+                    &org_seed(0xC1, ms(100)),
+                    &org_set(&[(0xB1, 5)]),
+                    now,
+                )
+                .expect("admitted");
+            leader
+        };
+        let fresh = org_set(&[(0xB2, 6)]);
+        let mut in_lock = build();
+        let expected = in_lock.reconcile_org_capability(&org_spec().capability_id, &fresh, now);
+        let mut off_lock = build();
+        let inputs = off_lock.org_plan_inputs(&org_spec().capability_id);
+        let plan = plan_org_reconciliation(&inputs, &fresh, &off_lock.policy());
+        let applied = off_lock.apply_org_plan(plan, now);
+        assert!(applied.stale.is_empty());
+        assert_eq!(applied.reconciliation.torn_down, expected.torn_down);
+        let added = |r: &LeaderReconciliation| -> Vec<ProviderInterestKey> {
+            r.added.iter().map(|(branch, _)| branch.clone()).collect()
+        };
+        assert_eq!(added(&applied.reconciliation), added(&expected));
+        assert!(
+            !added(&expected).is_empty(),
+            "the witness actually adds a branch"
+        );
+        assert_eq!(applied.reconciliation.changed, expected.changed);
+    }
+
+    /// The index never outlives its interests: every removal path (sweep,
+    /// downstream loss, refusal) clears the capability entry.
+    #[test]
+    fn the_org_index_tracks_every_removal_path() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let members = org_set(&[(0xB1, 5)]);
+        leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &members, now)
+            .expect("admitted");
+        leader.sweep(now + TTL * 3);
+        assert_eq!(leader.interest_count(), 0);
+        assert!(leader.org_by_capability.is_empty(), "sweep");
+        leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &members, now)
+            .expect("admitted");
+        leader.remove_downstream(DownstreamId::Peer(0xC1), now);
+        assert_eq!(leader.interest_count(), 0);
+        assert!(leader.org_by_capability.is_empty(), "downstream loss");
+        let reg = leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(50)), &members, now)
+            .expect("admitted");
+        leader.on_refusal(&ProviderInterestKey::new(reg.interest, 0xB1), ms(200), now);
+        assert_eq!(leader.interest_count(), 0);
+        assert!(leader.org_by_capability.is_empty(), "refusal");
     }
 }
