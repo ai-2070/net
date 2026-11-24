@@ -614,6 +614,14 @@ convergence, not receiver-linearized ownership** (§12.2).
 
 ### D2.6 S2 — the selector ↔ target intake invariant, and its source-compatibility cost
 
+> **Amended 2026-11-24 (owner decision; leader plan D-LS12).** Lighting the
+> provider-free org leader required the INBOUND provider leg to also admit
+> the provider-free shapes a leader re-authors to a resolved provider:
+> `AnyAuthorized`, and `Nodes(ids)` containing `target`. `Node(other)`,
+> `Nodes` without the target, and `Tags` / `Group` stay refused, and the
+> local-origin egress keeps the exact rule. The text below is the original,
+> dark-arm decision.
+
 **The gap.** The gate independently reconstructs `spec` and extracts `target`
 from the frame (`S/org_gate.rs:331-344`) and performs **no relation check
 between them**; steps 2–8 (`:348-394`) compare only digest, `sender_entity`,

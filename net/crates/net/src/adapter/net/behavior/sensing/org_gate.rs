@@ -623,7 +623,7 @@ pub(crate) fn validate_org_frame_shape<'a>(
     // deduplicated). The capability leg carries a `consumer`, not a `target`,
     // and is checked by the routed-origin binding in step 3 instead.
     if let Leg::Provider { target, .. } = &leg {
-        if !selector_names_target(&spec, *target) {
+        if !provider_leg_selector_admits(&spec, *target) {
             return Err(OrgSensingRejection::SelectorTargetMismatch);
         }
     }
@@ -886,6 +886,40 @@ fn verify_granted_admission(
 /// interest across two digests (`Nodes` is canonically sorted and deduplicated).
 pub(crate) fn selector_names_target(spec: &InterestSpec, target: u64) -> bool {
     spec.providers == ProviderSelector::Node(target)
+}
+
+/// The INBOUND provider-leg selector rule: design D2.6, as amended for the
+/// provider-free organization leader (leader plan D-LS12, owner decision
+/// 2026-11-24).
+///
+/// D2.6 was frozen while the leader arm was dark, so it admitted only the exact
+/// shape. A lit org leader re-authors each resolved branch to its provider as an
+/// `OrgProviderRegistration` carrying the INTEREST's own provider-free spec —
+/// the spec is digest-bound, so it cannot be rewritten without breaking the proof
+/// identity the leader and its consumers key on. The provider gate cannot tell a
+/// leader continuation from an exact-provider frame, so it admits every shape
+/// the org leader can legitimately resolve to `target`:
+///
+/// - `Node(target)` — the exact-provider shape (unchanged);
+/// - `AnyAuthorized` — an org leader resolves it over its owner-private
+///   projection;
+/// - `Nodes(ids)` with `target ∈ ids` — the leader intersects it with the
+///   projection.
+///
+/// Still refused, as protocol-invalid input: `Node(other)`, `Nodes` not
+/// containing `target`, and `Tags` / `Group` (org v1 resolves both empty, Q6,
+/// so no honest org leader ever re-authors one). The relaxation grants no
+/// authority — membership, floor, audience and the routed-origin rules are
+/// unchanged — and changes no wire bytes. The LOCAL-origin egress keeps the exact
+/// rule ([`selector_names_target`]): this node only ever originates exact-provider
+/// org interests itself.
+pub(crate) fn provider_leg_selector_admits(spec: &InterestSpec, target: u64) -> bool {
+    match &spec.providers {
+        ProviderSelector::Node(id) => *id == target,
+        ProviderSelector::AnyAuthorized => true,
+        ProviderSelector::Nodes(ids) => ids.contains(&target),
+        ProviderSelector::Tags(_) | ProviderSelector::Group(_) => false,
+    }
 }
 
 /// Why a LOCAL-ORIGIN organization egress was refused. Every variant is a hard
@@ -3387,20 +3421,19 @@ mod tests {
         );
     }
 
-    /// Only `Node(target)` is exact. Every other selector shape is refused —
-    /// including a one-element `Nodes([target])`, which "contains" the target
-    /// but hashes to a different interest digest, and the three provider-free
-    /// shapes, which would make `is_provider_free()` true on a leg that
-    /// carries an explicit destination.
+    /// D2.6 as amended (leader plan D-LS12): every selector shape no org leader
+    /// could resolve to this target is refused — another node, a `Nodes` set
+    /// without the target, and the `Group` / `Tags` shapes org v1 resolves
+    /// empty.
     #[test]
-    fn every_non_exact_selector_shape_is_refused_at_intake() {
+    fn every_incoherent_selector_shape_is_refused_at_intake() {
         const TARGET: u64 = 0x77;
         let shapes = [
-            ("AnyAuthorized", ProviderSelector::AnyAuthorized),
-            ("Nodes([target])", ProviderSelector::Nodes(vec![TARGET])),
+            ("Node(other)", ProviderSelector::Node(0x88)),
+            ("Nodes([other])", ProviderSelector::Nodes(vec![0x88])),
             (
-                "Nodes([target, other])",
-                ProviderSelector::Nodes(vec![TARGET, 0x88]),
+                "Nodes([other, other2])",
+                ProviderSelector::Nodes(vec![0x88, 0x99]),
             ),
             (
                 "Group",
@@ -3419,7 +3452,32 @@ mod tests {
             assert_eq!(
                 run(&frame, &member(), Some(authority()), &empty_floors()),
                 Err(OrgSensingRejection::SelectorTargetMismatch),
-                "{label} is not an exact provider selector"
+                "{label} is not a selector any org leader resolves to the target"
+            );
+        }
+    }
+
+    /// D-LS12: the provider-free shapes an org leader re-authors to a resolved
+    /// provider are admitted at that provider — `AnyAuthorized`, and a `Nodes`
+    /// set containing the target (one-element or not). Without this the lit
+    /// leader's every continuation is refused at the provider.
+    ///
+    /// RED coupling: the frozen exact-only rule refuses all three.
+    #[test]
+    fn a_provider_free_selector_the_leader_can_resolve_is_admitted_at_intake() {
+        const TARGET: u64 = 0x77;
+        for (label, selector) in [
+            ("AnyAuthorized", ProviderSelector::AnyAuthorized),
+            ("Nodes([target])", ProviderSelector::Nodes(vec![TARGET])),
+            (
+                "Nodes([target, other])",
+                ProviderSelector::Nodes(vec![TARGET, 0x88]),
+            ),
+        ] {
+            let frame = provider_frame_with(selector, TARGET, org_commit(), cert_gen(5));
+            assert!(
+                run(&frame, &member(), Some(authority()), &empty_floors()).is_ok(),
+                "{label} must be admitted at its resolved provider"
             );
         }
     }
@@ -3431,7 +3489,7 @@ mod tests {
     fn the_selector_target_refusal_bumps_protocol_invalid_and_creates_no_row() {
         let counters = SensingCounters::default();
         let frame = provider_frame_with(
-            ProviderSelector::AnyAuthorized,
+            ProviderSelector::Node(0x88),
             0x77,
             org_commit(),
             cert_gen(5),

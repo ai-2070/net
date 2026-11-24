@@ -20032,6 +20032,53 @@ impl MeshNode {
             &self.sensing_counters,
         )
         .map_err(SensingRegistrationError::Scope)?;
+        let (ttl, key) = self.record_capability_interest_expectation(
+            spec,
+            requested_sample_interval,
+            soft_state_ttl,
+        )?;
+        if sensing_upstream_damper_admits(
+            &self.sensing_upstream_damper,
+            leader,
+            *key.interest_digest.as_bytes(),
+            sensing_effective_min_gap(ttl),
+        ) {
+            let frame = sensing::SensingInterestFrame::capability_registration(
+                spec,
+                requested_sample_interval,
+                ttl,
+                self.node_id,
+            );
+            if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+                spawn_sensing_frame_send(
+                    &self.sink,
+                    &self.peers,
+                    &self.addr_to_node,
+                    &self.router,
+                    &self.partition_filter,
+                    self.node_id,
+                    leader,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                    bytes,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The consumer half shared by both provider-free registrations (legacy
+    /// [`Self::register_capability_interest`] and organization
+    /// [`Self::register_org_capability_interest`]): record the digest-level
+    /// expectation that makes returning leader fan-outs solicited at this hop, and
+    /// re-anchor every overlay cell under the digest to the (possibly refreshed)
+    /// interval. Returns the capped ttl and the interest key.
+    fn record_capability_interest_expectation(
+        &self,
+        spec: &sensing::InterestSpec,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<(Duration, sensing::CapabilityInterestKey), SensingRegistrationError> {
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let key = spec.key();
         {
@@ -20087,17 +20134,79 @@ impl MeshNode {
                 &local_aggregates,
             );
         }
+        Ok((ttl, key))
+    }
+
+    /// LS-6 (leader plan D-LS7): register (or refresh) a provider-free
+    /// ORGANIZATION capability interest — the org twin of
+    /// [`Self::register_capability_interest`], and the consumer half of the lit
+    /// `OrgCapabilityRegistration` arm.
+    ///
+    /// The spec's audience must be the canonical sensing commitment of THIS node's
+    /// installed owner organization; the frame is authored under this node's OWN
+    /// live membership certificate, captured fresh on every call (re-call at
+    /// ttl/2). No authority, a foreign audience, or an unprovable membership is
+    /// refused as [`SensingRegistrationError::OrgAudienceUnsupported`] — never a
+    /// legacy downgrade. Proofs that come back are accepted only from providers
+    /// this node itself sees as current owner-private members (D-LS6).
+    ///
+    /// A core seam for org sensing over a leader, not an SDK surface: the
+    /// provider-free SDK selector (LS-7) is a separate decision.
+    #[cfg(feature = "redex")]
+    pub fn register_org_capability_interest(
+        &self,
+        spec: &sensing::InterestSpec,
+        leader: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<(), SensingRegistrationError> {
+        if !self.config.enable_sensing_coalescing {
+            return Err(SensingRegistrationError::Disabled);
+        }
+        if !sensing_interval_in_bounds(requested_sample_interval, self.config.sensing_interest_ttl)
+        {
+            return Err(SensingRegistrationError::Interval {
+                requested: requested_sample_interval,
+                max: self.config.sensing_interest_ttl,
+            });
+        }
+        if soft_state_ttl.is_zero() {
+            return Err(SensingRegistrationError::ZeroTtl);
+        }
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(SensingRegistrationError::OrgAudienceUnsupported)?;
+        if spec.audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+            return Err(SensingRegistrationError::OrgAudienceUnsupported);
+        }
+        let membership = sensing::capture_live_org_relay_membership(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+            self.entity_id(),
+            authority.owner_org(),
+            crate::adapter::net::behavior::org::current_timestamp(),
+        )
+        .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        let (ttl, key) = self.record_capability_interest_expectation(
+            spec,
+            requested_sample_interval,
+            soft_state_ttl,
+        )?;
         if sensing_upstream_damper_admits(
             &self.sensing_upstream_damper,
             leader,
             *key.interest_digest.as_bytes(),
             sensing_effective_min_gap(ttl),
         ) {
-            let frame = sensing::SensingInterestFrame::capability_registration(
+            let frame = sensing::SensingInterestFrame::org_capability_registration(
                 spec,
                 requested_sample_interval,
                 ttl,
                 self.node_id,
+                membership.owner_cert().clone(),
             );
             if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                 spawn_sensing_frame_send(
@@ -39542,7 +39651,7 @@ impl MeshNode {
             // membership authority gate ([`verify_org_sensing_registration`]), not
             // the legacy session-scope path, so no legacy claimed scope is derived
             // here. The main match routes `OrgProviderRegistration` to the live org
-            // gate and `OrgCapabilityRegistration` to the dark drop.
+            // gate and `OrgCapabilityRegistration` to the org leader intake.
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
             | sensing::SensingInterestFrame::OrgProviderRegistration { .. }
             | sensing::SensingInterestFrame::GrantedProviderRegistration { .. } => None,
@@ -40018,16 +40127,33 @@ impl MeshNode {
                     );
                 }
             }
-            // The organization CAPABILITY (leader-addressed) variant stays
-            // structurally dark: lighting it requires an owner-private candidate
-            // substrate (scoped-discovery projection, per-interest org-root
-            // resolution) that the exact-provider first release deliberately does
-            // not build. Exact-provider org sensing rides OrgProviderRegistration
-            // above, selected upstream by the owner-scoped discovery client.
+            // The organization CAPABILITY (leader-addressed) variant — the
+            // provider-free org leader (leader plan LS-6). The real authority gate
+            // admits the frame, then the intake transaction projects the
+            // capability's owner-private candidates under the SAME pinned floors and
+            // commits leader + mesh Leader rows all-or-none. A node holding no
+            // leader role drops it (soft state: the consumer re-registers with the
+            // real leader).
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. } => {
+                #[cfg(feature = "redex")]
+                {
+                    let outcome = Self::dispatch_org_capability_registration(
+                        ctx,
+                        &frame,
+                        from_node,
+                        &sender_entity,
+                        now,
+                        now_secs,
+                    );
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        ?outcome,
+                        "sensing: org leader intake"
+                    );
+                }
+                #[cfg(not(feature = "redex"))]
                 tracing::debug!(
-                    "sensing: org capability registration dropped \
-                     (exact-provider release: leader path not lit)"
+                    "sensing: org capability registration dropped (no leader role in this build)"
                 );
             }
         }
@@ -40803,7 +40929,14 @@ impl MeshNode {
         // unless a provider-keyed row solicits it independently.
         let digest_watch: Option<Duration> = match watch_candidate {
             Some((interval, audience)) => {
-                if sensing::AudienceScopeCommitment::owner_root(&origin_entity) == audience {
+                if sensing::AudienceScopeCommitment::owner_root(&origin_entity) == audience
+                    || Self::org_watch_admits_signer(
+                        ctx,
+                        &audience,
+                        &attestation.capability_id,
+                        &origin_entity,
+                    )
+                {
                     Some(interval)
                 } else {
                     ctx.sensing_counters
@@ -41628,7 +41761,6 @@ impl MeshNode {
     /// exactly a call to this; until then the production-coupled witnesses drive
     /// it with real encoded frames, bypassing only the dark match arm.
     #[cfg(feature = "redex")]
-    #[allow(dead_code)] // the lit dispatch arm (LS-6)
     fn dispatch_org_capability_registration(
         ctx: &DispatchCtx,
         frame: &sensing::SensingInterestFrame,
@@ -41663,7 +41795,6 @@ impl MeshNode {
     /// and only then do both commit — so neither can be refused after the other
     /// mutated. A stale authority stamp at the fence commits nothing.
     #[cfg(feature = "redex")]
-    #[allow(dead_code)] // reached by the dispatch arm once LS-6 lights it
     fn apply_org_capability_registration(
         ctx: &DispatchCtx,
         admitted: &sensing::AdmittedSensingRegistration,
@@ -41887,11 +42018,11 @@ impl MeshNode {
         }
     }
 
-    /// Author and send the provider continuation for one org leader branch.
-    ///
-    /// Dark until LS-6: the org arm captures NO relay membership (`|_| None`), so
-    /// `plan_provider_continuation` emits nothing — never a legacy downgrade.
-    /// LS-6 replaces the capture with this leader's own live membership (D-LS8).
+    /// Author and send the provider continuation for one org leader branch
+    /// (D-LS8): a FRESH `OrgProviderRegistration` under THIS leader's OWN live
+    /// membership, captured at `now_secs` — exactly what a relay does on the
+    /// provider leg. A leader whose membership is unprovable emits NOTHING; the
+    /// org arm never downgrades to a legacy frame.
     #[cfg(feature = "redex")]
     fn send_org_leader_continuation(
         ctx: &DispatchCtx,
@@ -41901,9 +42032,19 @@ impl MeshNode {
         ttl: Duration,
         now_secs: u64,
     ) {
-        let _ = now_secs;
         let continuation = seed.provider_continuation(provider, strictest, ttl);
-        let Some(upstream) = sensing::plan_provider_continuation(&continuation, |_org| None) else {
+        let Some(upstream) = sensing::plan_provider_continuation(&continuation, |org_id| {
+            sensing::capture_live_org_relay_membership(
+                &ctx.org_install,
+                &ctx.node_authority,
+                &ctx.org_revocation,
+                &ctx.org_install_generation,
+                ctx.signing_identity.entity_id(),
+                org_id,
+                now_secs,
+            )
+            .ok()
+        }) else {
             return;
         };
         if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
@@ -42360,6 +42501,45 @@ impl MeshNode {
                 *generation = generation.wrapping_add(1);
             });
         }
+    }
+
+    /// D-LS6: whether an ORGANIZATION-audience digest watch admits the VERIFIED
+    /// signer `origin` for `capability`. True only when the watch's audience is
+    /// the canonical commitment of THIS node's installed owner org AND `origin`
+    /// is a current owner-private provider of `capability` in this node's OWN
+    /// scoped store — unexpired and floor-current under a coherent authority
+    /// capture. That is the leader's own trust universe applied at the consumer:
+    /// a proof from a provider this node cannot itself see as an authorized
+    /// member is refused exactly as a foreign signer is. Missing or poisoned
+    /// authority admits nothing.
+    fn org_watch_admits_signer(
+        ctx: &DispatchCtx,
+        audience: &sensing::AudienceScopeCommitment,
+        capability: &sensing::CapabilityId,
+        origin: &EntityId,
+    ) -> bool {
+        let Ok(authority) = sensing::capture_sensing_authority_snapshot(
+            &ctx.org_install,
+            &ctx.node_authority,
+            &ctx.org_revocation,
+            &ctx.org_install_generation,
+        ) else {
+            return false;
+        };
+        let owner = authority.authority_view().owner_org;
+        if *audience != sensing::canonical_org_sensing_commitment(&owner) {
+            return false;
+        }
+        let key = super::behavior::org_grant::CapabilityAuthorityId::for_tag(capability.as_str());
+        ctx.scoped_discovery
+            .lock()
+            .find_owner_private_providers(
+                Some(&key),
+                super::behavior::org::current_timestamp(),
+                authority.floors(),
+            )
+            .iter()
+            .any(|(record, provider)| record.owner_org == owner && provider == origin)
     }
 
     /// Leader row was refused at floor M — partition the leader
@@ -63961,27 +64141,82 @@ mod sensing_authority_witness_tests {
         );
     }
 
-    // C7 — production dispatch: an encoded valid OrgCapabilityRegistration is
-    // structurally dark in the exact-provider release; dispatch mutates nothing.
+    // C7 — production dispatch (leader plan LS-6, the lit arm): an encoded valid
+    // OrgCapabilityRegistration from a member of this node's org, arriving on the
+    // REAL 0x0C02 dispatch path, reaches the org leader and lands a mesh Leader
+    // row under the canonical org commitment. On a node holding NO leader role
+    // the same frame creates nothing (soft state). Replaces the exact-provider
+    // release's "stays dark" witness one-for-one.
+    //
+    // RED-coupled: restoring the dark drop leaves no Leader row.
+    #[cfg(feature = "redex")]
     #[tokio::test]
-    async fn dispatched_org_capability_registration_stays_dark() {
-        let node = org_node("op15").await;
+    async fn dispatched_org_capability_registration_reaches_the_org_leader() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::org_scoped_ingest::{
+            CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+        };
+        use crate::adapter::net::behavior::org_scoped_store::NoConsumerGrants;
+
+        let node = sensing_org_node("op15").await;
         let sender = EntityKeypair::generate().entity_id().clone();
         pin_sender(&node, &sender);
-        let ctx = node.dispatch_ctx();
-        // consumer == FROM_NODE (routed-origin binding); dropped before the gate.
-        let cap = sensing::SensingInterestFrame::org_capability_registration(
-            &org_spec(node.node_id(), org_commitment()),
-            D,
-            ORG_TTL,
-            FROM_NODE,
-            member_cert(&sender, 1),
+        let cert = member_cert(&sender, 1);
+        let mut spec = org_spec(node.node_id(), org_commitment());
+        spec.providers = sensing::ProviderSelector::AnyAuthorized;
+        let bytes = sensing::encode_interest_frame(
+            &sensing::SensingInterestFrame::org_capability_registration(
+                &spec, D, ORG_TTL, FROM_NODE, cert,
+            ),
+        )
+        .expect("encode");
+
+        // No leader role: nothing.
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &node.dispatch_ctx());
+        assert!(node.sensing_table_is_empty(), "no leader role, no row");
+
+        // The leader role plus one owner-private provider of the capability.
+        assert!(node.assume_sensing_leader());
+        let provider = EntityId::from_bytes([0xB7; 32]);
+        let now = super::super::behavior::org::current_timestamp();
+        let record = VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: org().org_id(),
+                audience_handle: [0x11; 32],
+            },
+            provider.clone(),
+            org().org_id(),
+            1,
+            now + 3600,
+            1,
+            None,
+            CapabilitySet::new()
+                .add_tag(spec.capability_id.as_str())
+                .to_bytes_compact(),
         );
-        let bytes = sensing::encode_interest_frame(&cap).expect("encode");
-        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
-        assert!(
-            node.sensing_table_is_empty(),
-            "the org capability (leader) variant stays dark — no mutation"
+        node.scoped_discovery.lock().ingest(
+            PreparedScopedCapability::prepare(record),
+            now,
+            &NoConsumerGrants,
+        );
+        node.router.routing_table().add_route(
+            provider.node_id(),
+            PeerAddr::Udp("127.0.0.1:9".parse().unwrap()),
+        );
+
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &node.dispatch_ctx());
+        let row = node
+            .sensing_interest_table
+            .lock()
+            .downstream_entry(
+                &sensing::ProviderInterestKey::new(spec.key(), provider.node_id()),
+                sensing::DownstreamId::Leader,
+            )
+            .map(|row| row.owner_root);
+        assert_eq!(
+            row,
+            Some(org_commitment()),
+            "the lit arm lands the Leader row under the org commitment"
         );
     }
 
@@ -71453,7 +71688,11 @@ mod org_leader_tests {
             FROM,
             &node.dispatch_ctx(),
         );
-        assert_eq!(interest_count(&node), 0, "the arm is still dark");
+        assert_eq!(
+            interest_count(&node),
+            1,
+            "the lit arm reaches the leader (LS-6)"
+        );
 
         let OrgLeaderIntake::Registered { branches, .. } =
             dispatch_frame(&node, &spec, FROM, &org())
@@ -71812,5 +72051,69 @@ mod org_leader_tests {
         ] {
             assert!(text.contains(name), "missing {name}:\n{text}");
         }
+    }
+
+    // ---- LS-6: the consumer's org-watch acceptance rule (D-LS6) -------------
+
+    /// D-LS6: an org-audience digest watch admits a verified signer ONLY when the
+    /// audience is this node's own org commitment AND the signer is a current
+    /// owner-private provider of the watched capability in this node's own store.
+    /// A floor raise or a poisoned store withdraws the admission.
+    #[tokio::test]
+    async fn an_org_watch_admits_only_a_current_owner_private_provider() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use std::collections::BTreeMap;
+        let node = leader_node("watch").await;
+        add_provider(&node, 0xB1);
+        let ctx = node.dispatch_ctx();
+        let cap = sensing::CapabilityId::new(CAP);
+        let b1 = EntityId::from_bytes([0xB1; 32]);
+        let admits = |audience: &sensing::AudienceScopeCommitment,
+                      capability: &sensing::CapabilityId,
+                      signer: &EntityId| {
+            MeshNode::org_watch_admits_signer(&ctx, audience, capability, signer)
+        };
+        assert!(admits(&org_commitment(), &cap, &b1));
+        assert!(
+            !admits(&org_commitment(), &cap, &EntityId::from_bytes([0xB2; 32])),
+            "a signer absent from this node's own store"
+        );
+        assert!(
+            !admits(
+                &sensing::AudienceScopeCommitment::from_bytes([9; 32]),
+                &cap,
+                &b1
+            ),
+            "an audience that is not this node's org commitment"
+        );
+        assert!(
+            !admits(
+                &org_commitment(),
+                &sensing::CapabilityId::new("nrpc:other"),
+                &b1
+            ),
+            "a capability the signer never declared"
+        );
+        let mut floors = BTreeMap::new();
+        floors.insert(b1.clone(), 2u32);
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle"))
+            .expect("floor raise");
+        assert!(
+            !admits(&org_commitment(), &cap, &b1),
+            "a floor-retracted signer"
+        );
+
+        let fresh = leader_node("watch-poison").await;
+        add_provider(&fresh, 0xB1);
+        fresh
+            .org_revocation_store()
+            .expect("store")
+            .mark_poisoned_for_test();
+        assert!(
+            !MeshNode::org_watch_admits_signer(&fresh.dispatch_ctx(), &org_commitment(), &cap, &b1),
+            "a poisoned store admits nothing"
+        );
     }
 }

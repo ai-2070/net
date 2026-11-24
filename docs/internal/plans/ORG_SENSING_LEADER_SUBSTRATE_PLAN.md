@@ -12,6 +12,8 @@ This reverses the 2026-11-21 "not needed" disposition recorded in
   phase, and one PR at the end. The owner waived the per-phase
   stop-and-review. The exact-head review happens on the PR, and
   `SAFE_LIVE_HEAD` is recorded only on that sign-off.
+- **Built (2026-11-24):** LS-1..LS-6 are on the branch, and the arm is lit
+  (§0.6). `SAFE_LIVE_HEAD` awaits the PR's exact-head sign-off.
 - **The current record** is [§0](#0-build-status-and-re-read-2026-11-24),
   re-read against `master` `2259b970d`. Where §0 and a later section
   disagree, §0 wins; the later sections are the original design, kept with
@@ -202,6 +204,28 @@ could not see because the code it describes had not landed yet.
   empty. An install, removal or rotation is wake-driven through
   `org_install_generation`; a floor raise and an expiry through the owner
   stream (F2).
+- **D-LS12 (the provider leg admits leader-resolvable selectors; owner
+  decision 2026-11-24).** Lighting exposed a clash with the exact lane's
+  signed D2.6 (`ORG_EXACT_SENSING_ACQUISITION_PROJECTION_DESIGN.md`): the
+  provider gate admitted only `spec.providers == Node(target)`. An org
+  leader re-authors each resolved branch to its provider with the INTEREST's
+  own provider-free spec. That spec is digest-bound: rewriting it to
+  `Node(provider)` would sign proofs under a different interest digest,
+  which neither the leader's branch key nor the consumer's expectation
+  matches. So every lit continuation would have been refused at the
+  provider.
+  - The inbound provider leg now admits `Node(target)`, `AnyAuthorized`,
+    or `Nodes(ids)` with `target ∈ ids`
+    (`org_gate::provider_leg_selector_admits`).
+  - It still refuses `Node(other)`, `Nodes` without the target, and
+    `Tags` / `Group`.
+  - No authority is granted and no wire byte changes.
+  - The LOCAL-origin egress keeps the exact rule.
+  - The pinned witness `every_non_exact_selector_shape_is_refused_at_intake`
+    is renamed `every_incoherent_selector_shape_is_refused_at_intake`.
+    `a_provider_free_selector_the_leader_can_resolve_is_admitted_at_intake`
+    is pinned beside it. `GATE_MIN` and `MESH_MIN` are re-derived from
+    `--list` (65 / 75).
 
 ### 0.5 Phases as built
 
@@ -243,7 +267,7 @@ file verified byte-identical.
   - The coalescing witness waits on a PARKING sleep. The reconciler's interval
     only advances when the runtime parks, and a busy-yield version failed under
     a loaded parallel run.
-- **LS-5.**
+- **LS-5 (`e90d966e2`).**
   - `MeshNode::dispatch_org_capability_registration`: the whole lit-arm
     path (the real gate plus the intake), which LS-6's arm calls.
   - Seven production-coupled witnesses on real encoded frames:
@@ -267,6 +291,25 @@ file verified byte-identical.
   - RED: a decode in the capture; a projection ignoring floors; a clean owner
     stream treated as `RebuildAll`.
   - The dark arm still drops every `OrgCapabilityRegistration`.
+- **LS-6.**
+  - The arm is lit: `OrgCapabilityRegistration` →
+    `dispatch_org_capability_registration`.
+  - D-LS8: the leader's continuation is under its own live membership.
+  - D-LS7: `MeshNode::register_org_capability_interest`. It shares
+    `record_capability_interest_expectation` with the legacy method.
+  - D-LS6: `org_watch_admits_signer` at the consumer.
+  - D-LS12: the provider-leg selector rule.
+  - The dark C7 witness is replaced one-for-one with
+    `dispatched_org_capability_registration_reaches_the_org_leader`.
+  - The three-node real-transport proof (`tests/sensing_org_leader_three_node.rs`,
+    pinned in the CI Sensing group):
+    - A → R → P, with proofs fanned back and projected Ready, and zero
+      protocol-invalid inputs or scope refusals at every hop;
+    - a negative case: a consumer blind to P refuses P's proofs.
+  - A D-LS6 unit witness, and `docs/SENSING.md` §"Provider-free
+    organization sensing".
+  - RED: D-LS6 refusing all; D-LS6 admitting all; D2.6 exact-only at the
+    provider; the leader continuation dark. Each fails the three-node proof.
 
 ---
 
