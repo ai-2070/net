@@ -55,6 +55,9 @@ impl SensingError {
             Self::WatchesAtCapacity => "watches_at_capacity",
             Self::ObservationIdentityUnavailable => "observation_identity_unavailable",
             Self::WatchClosed => "watch_closed",
+            Self::NoSensingLeader => "no_sensing_leader",
+            Self::UnsatisfiableCoalescing => "unsatisfiable_coalescing",
+            Self::CapabilityTooLong => "capability_too_long",
         }
     }
 
@@ -83,10 +86,14 @@ impl SensingError {
             Self::AlreadyProviding { .. }
             | Self::EmptyCapability
             | Self::UnsatisfiableBudget
-            | Self::UnsatisfiableStartBound => false,
+            | Self::UnsatisfiableStartBound
+            | Self::UnsatisfiableCoalescing
+            | Self::CapabilityTooLong => false,
             // Node state that can move back: authority installed or rotated,
             // membership renewed, a view that settles.
             Self::NoOrganizationAuthority | Self::ObserverNotQualified => false,
+            // A member able to lead the capability can come back.
+            Self::NoSensingLeader => false,
             // Per observation ROOT, and every watch mints its own root: a new
             // watch is not refused by this one's exhaustion.
             Self::WatchesAtCapacity => false,
@@ -164,6 +171,9 @@ pub(crate) fn canonical_instances() -> Vec<SensingError> {
         SensingError::WatchesAtCapacity,
         SensingError::ObservationIdentityUnavailable,
         SensingError::WatchClosed,
+        SensingError::NoSensingLeader,
+        SensingError::UnsatisfiableCoalescing,
+        SensingError::CapabilityTooLong,
     ]
 }
 
@@ -327,6 +337,9 @@ mod tests {
                 SensingError::WatchesAtCapacity => "exhausted",
                 SensingError::ObservationIdentityUnavailable => "no further capability watch",
                 SensingError::WatchClosed => "SensingClient::watch",
+                SensingError::NoSensingLeader => "open an exact watch",
+                SensingError::UnsatisfiableCoalescing => "Coalesced::Top(k)",
+                SensingError::CapabilityTooLong => "1024 bytes",
             }
         }
         for error in canonical_instances() {

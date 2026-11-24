@@ -6,8 +6,10 @@ This reverses the 2026-11-21 "not needed" disposition recorded in
 
 - **Scope:** LS-1..LS-5 build the leader dark. LS-6 lights
   `OrgCapabilityRegistration` dispatch with the three-node transport proof.
-  **LS-7 (the provider-free SDK selector) is NOT authorized**; it remains a
-  separate public-API decision.
+  **LS-7 (the provider-free SDK selector)** was a separate public-API
+  decision. It was authorized on 2026-11-24 and is planned in
+  [`ORG_SENSING_LEADER_SDK_PLAN.md`](ORG_SENSING_LEADER_SDK_PLAN.md),
+  which also wires the leader election (D-LS14, D-LS15).
 - **Cadence:** one branch (`LZL0/sensing-leader-track`), one commit pushed per
   phase, and one PR at the end. The owner waived the per-phase
   stop-and-review. The exact-head review happens on the PR, and
@@ -177,7 +179,8 @@ could not see because the code it describes had not landed yet.
   expectation, and authors `OrgCapabilityRegistration` under this node's own
   live membership (`capture_live_org_relay_membership`). If no membership can be
   captured, it emits nothing. This is a core seam for the transport proof, not
-  an SDK surface; LS-7 stays deferred.
+  an SDK surface. LS-7 builds the SDK surface
+  ([`ORG_SENSING_LEADER_SDK_PLAN.md`](ORG_SENSING_LEADER_SDK_PLAN.md)).
 - **D-LS8 (leader continuation, LS-6).** The leader's provider continuation
   captures the leader's OWN live membership, exactly as a relay does on the
   provider leg (`apply_provider_registration`), so the provider admits the

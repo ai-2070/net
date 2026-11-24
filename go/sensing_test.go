@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -193,6 +194,9 @@ func TestSensingLiveValueReachesTheConsumerAndCloseEndsAPendingWait(t *testing.T
 			if err != nil {
 				t.Fatalf("%s: snapshot: %v", what, err)
 			}
+			if snap.Coalesced {
+				t.Fatalf("%s: an exact watch reported a coalesced snapshot", what)
+			}
 			for _, row := range snap.Providers {
 				if row.NodeID == providerID && predicate(row) {
 					snap.Release()
@@ -277,6 +281,55 @@ func TestSensingIncarnationSourcesAreMutuallyExclusive(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("both sources must be refused, got %v", err)
+	}
+}
+
+// A coalesced watch (SDK plan LS-7c) reaches Rust through its own additive C
+// entry point, and every refusal is RUST'S kind, read from the fixture's own
+// vocabulary: an out-of-range Top (including a negative one and one no int32
+// holds) is "unsatisfiable_coalescing" before any node state is touched, and a
+// meaningful coalescing on a node with no organization authority is refused
+// as "observer_not_qualified" — never served as an exact watch.
+func TestSensingCoalescedRefusalsAreRustsOwnKinds(t *testing.T) {
+	node, err := NewMeshNode(MeshConfig{
+		BindAddr:               reserveLocalUDPPort(t),
+		PskHex:                 strings.Repeat("42", 32),
+		EnableSensing:          true,
+		SensingIncarnationPath: filepath.Join(t.TempDir(), "coalesced.incarnation"),
+	})
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	t.Cleanup(func() { _ = node.Shutdown() })
+	known := map[string]bool{}
+	for _, v := range sensingVectors(t) {
+		known[v.Kind] = true
+	}
+	for _, kind := range []string{"unsatisfiable_coalescing", "no_sensing_leader"} {
+		if !known[kind] {
+			t.Fatalf("the fixture lacks %q: regenerate error_vectors.json", kind)
+		}
+	}
+	refusal := func(opts SensingQueryOptions) *SensingError {
+		t.Helper()
+		_, err := WatchSensing(node, "nrpc:coalesced.go", opts)
+		var se *SensingError
+		if !errors.As(err, &se) {
+			t.Fatalf("want *SensingError, got %v", err)
+		}
+		return se
+	}
+	for _, top := range []int{33, -5, math.MaxInt} {
+		se := refusal(SensingQueryOptions{Coalesced: &SensingCoalesced{Top: top}})
+		if se.Kind != "unsatisfiable_coalescing" || se.Terminal {
+			t.Fatalf("Top %d: got %+v", top, se)
+		}
+	}
+	for _, top := range []int{0, 3} {
+		se := refusal(SensingQueryOptions{Coalesced: &SensingCoalesced{Top: top}})
+		if se.Kind != "observer_not_qualified" {
+			t.Fatalf("Top %d without authority: got %+v", top, se)
+		}
 	}
 }
 

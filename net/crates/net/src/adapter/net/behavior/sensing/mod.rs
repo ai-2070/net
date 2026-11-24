@@ -61,6 +61,10 @@ pub mod negotiation;
 #[cfg(feature = "redex")]
 #[allow(dead_code)] // consumed by the org leader intake + reconciler (LS-2..LS-4)
 pub(crate) mod org_candidates;
+// The consumer half of coalesced (leader-backed) org sensing: the per-capability
+// leader election and the node-owned demand registry (LS-7a, D-LS15/D-LS16).
+#[cfg(feature = "redex")]
+pub mod org_coalesced;
 // OLB org-auth slice (commit 2): the organization-authenticated sensing
 // registration authority gate — one transaction, attacker-controlled frame →
 // narrow validated object → validated-object-only mutation.

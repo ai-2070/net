@@ -20,11 +20,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict, PyInt};
 
-use net_sdk::sensing::{self as sdk, ReadinessValue, SensedViability, SensingQuery};
+use net_sdk::sensing::{self as sdk, Coalesced, ReadinessValue, SensedViability, SensingQuery};
 
 use crate::runtime_guard::GuardedRuntime;
 
@@ -233,6 +233,56 @@ impl PySensingSnapshot {
     fn preferred(&self) -> Option<u64> {
         self.inner.preferred()
     }
+
+    /// Whether this capture came from a coalesced watch: its rows are the
+    /// providers the organization's sensing leader chose to sense, clamped to
+    /// what this node sees. The ranking is this node's own either way.
+    #[getter]
+    fn coalesced(&self) -> bool {
+        self.inner.is_coalesced()
+    }
+}
+
+/// The Python `coalesced` argument as the SDK's [`Coalesced`] (SDK plan LS-7c):
+/// `"best"` is `Best`, an `int` k is `Top(k)`. An int no `u16` holds becomes
+/// `Top(0)`, so the SDK refuses it with its OWN kind
+/// (`unsatisfiable_coalescing`) rather than the binding inventing one. Anything
+/// else — including `True`/`False`, which Python would otherwise read as 1/0 —
+/// is a `TypeError`: a caller who wrote it did not mean a size.
+fn coalesced_from_py(value: &Bound<'_, PyAny>) -> PyResult<Coalesced> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "coalesced must be \"best\" or an int number of providers, not a bool",
+        ));
+    }
+    if let Ok(word) = value.extract::<String>() {
+        return match word.as_str() {
+            "best" => Ok(Coalesced::Best),
+            _ => Err(PyValueError::new_err(format!(
+                "coalesced must be \"best\" or an int number of providers, got {word:?}"
+            ))),
+        };
+    }
+    // ANY integer is a size: a Python `int`, or anything implementing
+    // `__index__` (a numpy integer scalar, say), read the way
+    // `operator.index` reads it. One no u16 holds — including one past i64,
+    // which Python allows — is Top(0), refused by the SDK.
+    let index = if value.is_instance_of::<PyInt>() {
+        Some(value.clone())
+    } else if value.hasattr("__index__")? {
+        Some(value.call_method0("__index__")?)
+    } else {
+        None
+    };
+    if let Some(index) = index {
+        let k = index.extract::<i64>().ok();
+        return Ok(Coalesced::Top(
+            k.and_then(|k| u16::try_from(k).ok()).unwrap_or(0),
+        ));
+    }
+    Err(PyTypeError::new_err(
+        "coalesced must be \"best\" or an int number of providers",
+    ))
 }
 
 /// An owning observation of one capability's authorized exact-provider
@@ -339,14 +389,17 @@ pub fn sensing_provide(
 /// Observe the readiness of this node's authorized own-organization providers
 /// of `capability`. `within_ms` is the consumer-local end-to-end budget;
 /// `start_within_ms` is the provider-start predicate that rides the signed
-/// interest.
+/// interest. `coalesced` (`"best"` or an int k) observes THROUGH the
+/// organization's elected sensing leader; it never widens what this node sees
+/// and never falls back to an exact watch.
 #[pyfunction]
-#[pyo3(signature = (mesh, capability, within_ms=None, start_within_ms=None))]
+#[pyo3(signature = (mesh, capability, within_ms=None, start_within_ms=None, coalesced=None))]
 pub fn sensing_watch(
     mesh: &crate::mesh_bindings::NetMesh,
     capability: String,
     within_ms: Option<f64>,
     start_within_ms: Option<f64>,
+    coalesced: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PySensingWatch> {
     let mut query = SensingQuery::new(capability.clone());
     if let Some(within) = millis(within_ms, "within_ms")? {
@@ -354,6 +407,9 @@ pub fn sensing_watch(
     }
     if let Some(start) = millis(start_within_ms, "start_within_ms")? {
         query = query.start_within(start);
+    }
+    if let Some(coalesced) = &coalesced {
+        query = query.coalesced(coalesced_from_py(coalesced)?);
     }
     let runtime = mesh.runtime_arc();
     let watch = {
