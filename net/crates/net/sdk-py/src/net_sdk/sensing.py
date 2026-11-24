@@ -27,7 +27,7 @@ classification, ``{"kind": ..., "terminal": ...}``.
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Union
 
 import net  # noqa: E402 - a failure HERE is a real load error (no `_net`,
 # a bad linked library): it surfaces unchanged, never as "missing feature".
@@ -94,11 +94,22 @@ def watch(
     capability: str,
     within_ms: Optional[float] = None,
     start_within_ms: Optional[float] = None,
+    coalesced: Optional[Union[str, int]] = None,
 ) -> SensingWatch:
     """Observe the readiness of this node's authorized own-organization
     providers of ``capability``. Requires a mesh built with ``enable_sensing``
-    and an installed organization authority."""
-    return _native_watch(_native_mesh(mesh), capability, within_ms, start_within_ms)
+    and an installed organization authority.
+
+    ``coalesced`` observes THROUGH the organization's elected sensing leader
+    instead of sensing every visible provider directly: ``"best"`` for the one
+    provider the leader ranks best, or an int ``k`` (1..32) for up to ``k``. It
+    never widens what this node sees, and it never falls back to an exact
+    watch: with no member able to lead, the watch is refused with kind
+    ``no_sensing_leader``. A snapshot's ``coalesced`` says which question it
+    answers."""
+    return _native_watch(
+        _native_mesh(mesh), capability, within_ms, start_within_ms, coalesced
+    )
 
 
 def sensing_error_class(error: Any) -> Optional[dict]:

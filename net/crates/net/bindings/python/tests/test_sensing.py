@@ -79,6 +79,41 @@ def test_a_live_refusal_raises_the_rust_wire_string() -> None:
         mesh.shutdown()
 
 
+def test_a_coalesced_watch_is_refused_with_rusts_own_kinds(tmp_path) -> None:
+    """SDK plan LS-7c: the ``coalesced`` argument reaches the SDK, and every
+    refusal is Rust's own kind. An out-of-range size is refused before any node
+    state; a meaningful coalescing on a mesh with no organization authority is
+    refused as ``observer_not_qualified`` — never served as an exact watch. A
+    bool or an unknown word is a Python ``TypeError`` / ``ValueError``: the
+    caller did not mean a size."""
+    kinds = {v["kind"] for v in _vectors()}
+    assert {"unsatisfiable_coalescing", "no_sensing_leader"} <= kinds
+    mesh = net.NetMesh(
+        bind_addr=_free_addr(),
+        psk="42" * 32,
+        enable_sensing=True,
+        sensing_incarnation_path=str(tmp_path / "coalesced.incarnation"),
+    )
+    try:
+        for size in (0, 33, 70_000, -1):
+            with pytest.raises(net.SensingError) as caught:
+                net.sensing_watch(mesh, "nrpc:coalesced.py", coalesced=size)
+            assert net.sensing_error_class(str(caught.value)) == {
+                "kind": "unsatisfiable_coalescing",
+                "terminal": False,
+            }, size
+        for coalesced in ("best", 3):
+            with pytest.raises(net.SensingError) as caught:
+                net.sensing_watch(mesh, "nrpc:coalesced.py", coalesced=coalesced)
+            assert net.sensing_error_class(str(caught.value))["kind"] == "observer_not_qualified"
+        with pytest.raises(TypeError):
+            net.sensing_watch(mesh, "nrpc:coalesced.py", coalesced=True)
+        with pytest.raises(ValueError):
+            net.sensing_watch(mesh, "nrpc:coalesced.py", coalesced="all")
+    finally:
+        mesh.shutdown()
+
+
 def _gen_scenario(outdir: str) -> dict:
     subprocess.run(
         [

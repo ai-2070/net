@@ -1,6 +1,6 @@
 # LS-7: an SDK surface for leader-backed organization sensing
 
-**Status: AUTHORIZED FOR BUILD (owner, 2026-11-24).** This is the "separate
+**Status: BUILT (LS-7a, LS-7b, LS-7c), awaiting review (2026-11-24).** Authorized by the owner the same day. This is the "separate
 public-API decision" that
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
 §0 deferred as LS-7. It builds on the leader track as it stands on PR #1471
@@ -354,3 +354,44 @@ The wire format does not change in any phase.
     - M29, close keeping the hold;
     - M30, any `Top(k)` validating;
     - M31, no leader mapped to no authority.
+- **LS-7c (bindings).** Every binding forwards to the SDK's `coalesced`
+  and maps nothing itself. An out-of-range size is handed to the SDK as
+  `Top(0)`, so the refusal is always Rust's own `unsatisfiable_coalescing`,
+  never a second binding-made one.
+  - **Node** (`bindings/node/src/sensing.rs`):
+    `sensingWatch(cap, { coalesced: {} | { top: k } })`, with
+    `CoalescedOptions` as an `#[napi(object)]`; `SensingSnapshot.isCoalesced`.
+    The TS SDK (`@net-mesh/sdk/sensing`) re-exports `CoalescedOptions` and
+    documents the option.
+  - **Python** (`bindings/python/src/sensing.rs`):
+    `sensing_watch(..., coalesced="best" | k)`, with a `bool` refused as
+    `TypeError` and an unknown word as `ValueError`; `SensingSnapshot.coalesced`.
+    `_net.pyi` and `net_sdk.sensing.watch(..., coalesced=)` updated.
+  - **Go / C**: a NEW additive `net_sensing_watch_coalesced(..., int32_t top,
+    ...)` (`include/net_sensing.h`, the Go preamble).
+    - `net_sensing_watch` is unchanged and both share one body
+      (`open_watch`), so the ABI version stays 1.
+    - Go has `SensingQueryOptions.Coalesced *SensingCoalesced{Top}`, and
+      `SensingSnapshot.Coalesced` from a `"coalesced"` field in the snapshot
+      JSON.
+  - Witnesses:
+    - Rust unit tests for each binding's size mapping
+      (`the_abi_top_maps_onto_the_sdk_coalescing`,
+      `the_js_coalescing_maps_onto_the_sdk`);
+    - per-language refusal tests on a live mesh. Each asserts the new kinds
+      are in the shared fixture, that an out-of-range size is
+      `unsatisfiable_coalescing`, and that a meaningful coalescing with no
+      authority is `observer_not_qualified`, never an exact watch:
+      - Node: `refuses a coalesced watch with Rust's own kinds`;
+      - Python: `test_a_coalesced_watch_is_refused_with_rusts_own_kinds`;
+      - Go: `TestSensingCoalescedRefusalsAreRustsOwnKinds`;
+    - the Go live exact test also asserts `Coalesced == false`.
+  - Local verification:
+    - `cargo clippy -D warnings` for the Node crate (CI's ffi-clippy list),
+      the Python crate (under a pyo3 cross config: no CPython on the dev
+      host) and the Go shim;
+    - the Node and org-ffi Rust unit tests;
+    - `CGO_ENABLED=1 go vet .` and `gofmt -l`, both clean.
+
+    Not run locally: the vitest, pytest and `go test` suites. They need a
+    built napi binding, a CPython, and the release cdylibs; CI runs them.

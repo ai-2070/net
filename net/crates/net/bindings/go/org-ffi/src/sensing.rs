@@ -37,7 +37,9 @@ use std::time::Duration;
 
 use net::adapter::net::mesh_rpc::CallOptions;
 use net::adapter::net::MeshNode;
-use net_sdk::sensing::{self as sdk, ReadinessValue, SensedViability, SensingError, SensingQuery};
+use net_sdk::sensing::{
+    self as sdk, Coalesced, ReadinessValue, SensedViability, SensingError, SensingQuery,
+};
 
 use super::{block_on, cstr_to_string, write_err, write_response};
 
@@ -297,28 +299,101 @@ pub extern "C" fn net_sensing_watch(
         let Some(capability) = cstr_to_string(capability_ptr, capability_len) else {
             return NET_SENSING_ERR_INVALID_UTF8;
         };
-        let mut query = SensingQuery::new(capability);
-        if let Some(within) = optional_ms(within_ms) {
-            query = query.within(within);
-        }
-        if let Some(start) = optional_ms(start_within_ms) {
-            query = query.start_within(start);
-        }
-        let _enter = super::runtime().enter();
-        match client_for(node).and_then(|client| client.watch(query)) {
-            Ok(watch) => {
-                let closer = watch.closer();
-                unsafe {
-                    *out_watch = Box::into_raw(Box::new(NetSensingWatch {
-                        inner: Arc::new(tokio::sync::Mutex::new(watch)),
-                        closer,
-                    }));
-                }
-                NET_SENSING_OK
-            }
-            Err(error) => sensing_refusal(error, out_err),
-        }
+        open_watch(
+            node,
+            capability,
+            within_ms,
+            start_within_ms,
+            None,
+            out_watch,
+            out_err,
+        )
     })
+}
+
+/// [`net_sensing_watch`] for a COALESCED watch (SDK plan LS-7c): observe
+/// through the organization's elected sensing leader instead of sensing every
+/// visible provider directly. `top` is `0` for `Coalesced::Best` and `k` for
+/// `Coalesced::Top(k)`; any `top` outside `0..=32` is refused by the SDK as
+/// `unsatisfiable_coalescing`, and no member able to lead as
+/// `no_sensing_leader`. ADDITIVE: `net_sensing_watch` is unchanged, so the ABI
+/// version does not move. `mesh_arc` is CONSUMED.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_sensing_watch_coalesced(
+    mesh_arc: *mut Arc<MeshNode>,
+    capability_ptr: *const c_char,
+    capability_len: usize,
+    within_ms: i64,
+    start_within_ms: i64,
+    top: i32,
+    out_watch: *mut *mut NetSensingWatch,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_SENSING_ERR_NULL, {
+        if mesh_arc.is_null() || out_watch.is_null() {
+            return NET_SENSING_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        let Some(capability) = cstr_to_string(capability_ptr, capability_len) else {
+            return NET_SENSING_ERR_INVALID_UTF8;
+        };
+        open_watch(
+            node,
+            capability,
+            within_ms,
+            start_within_ms,
+            Some(coalesced_from_top(top)),
+            out_watch,
+            out_err,
+        )
+    })
+}
+
+/// The ABI's `top` as the SDK's [`Coalesced`]: `0` is `Best`, a positive `k` is
+/// `Top(k)`. A value no `u16` holds (negative, or past `u16::MAX`) becomes
+/// `Top(0)` so the SDK refuses it with its OWN kind rather than the shim
+/// inventing a second refusal for the same mistake.
+fn coalesced_from_top(top: i32) -> Coalesced {
+    match top {
+        0 => Coalesced::Best,
+        k => Coalesced::Top(u16::try_from(k).unwrap_or(0)),
+    }
+}
+
+/// The one watch-opening body both entry points share.
+fn open_watch(
+    node: Arc<MeshNode>,
+    capability: String,
+    within_ms: i64,
+    start_within_ms: i64,
+    coalesced: Option<Coalesced>,
+    out_watch: *mut *mut NetSensingWatch,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let mut query = SensingQuery::new(capability);
+    if let Some(within) = optional_ms(within_ms) {
+        query = query.within(within);
+    }
+    if let Some(start) = optional_ms(start_within_ms) {
+        query = query.start_within(start);
+    }
+    if let Some(mode) = coalesced {
+        query = query.coalesced(mode);
+    }
+    let _enter = super::runtime().enter();
+    match client_for(node).and_then(|client| client.watch(query)) {
+        Ok(watch) => {
+            let closer = watch.closer();
+            unsafe {
+                *out_watch = Box::into_raw(Box::new(NetSensingWatch {
+                    inner: Arc::new(tokio::sync::Mutex::new(watch)),
+                    closer,
+                }));
+            }
+            NET_SENSING_OK
+        }
+        Err(error) => sensing_refusal(error, out_err),
+    }
 }
 
 /// Take a snapshot into a new `*out_snapshot` handle (free with
@@ -469,6 +544,7 @@ pub extern "C" fn net_sensing_snapshot_json(
             "providers": providers,
             "ranked": snapshot.inner.ranked(),
             "preferred": snapshot.inner.preferred(),
+            "coalesced": snapshot.inner.is_coalesced(),
         });
         write_err(out_json, doc.to_string());
         NET_SENSING_OK
@@ -604,6 +680,24 @@ mod tests {
 
     /// The incarnation entry point persists before answering, and is
     /// monotonic across calls on one file.
+    /// The C ABI's `top` maps onto the SDK's `Coalesced` without a second
+    /// refusal of its own: 0 is Best, a positive k is Top(k), and a value no
+    /// u16 holds becomes Top(0), which the SDK refuses with its own kind.
+    #[test]
+    fn the_abi_top_maps_onto_the_sdk_coalescing() {
+        assert_eq!(coalesced_from_top(0), Coalesced::Best);
+        assert_eq!(coalesced_from_top(1), Coalesced::Top(1));
+        assert_eq!(coalesced_from_top(32), Coalesced::Top(32));
+        assert_eq!(
+            coalesced_from_top(33),
+            Coalesced::Top(33),
+            "the SDK refuses it"
+        );
+        for out_of_range in [-1, i32::MIN, i32::from(u16::MAX) + 1, i32::MAX] {
+            assert_eq!(coalesced_from_top(out_of_range), Coalesced::Top(0));
+        }
+    }
+
     #[test]
     fn next_incarnation_is_persisted_and_monotonic() {
         let dir = std::env::temp_dir().join(format!(

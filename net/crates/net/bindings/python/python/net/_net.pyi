@@ -6087,6 +6087,8 @@ class SensingSnapshot:
     def ranked(self) -> list[int]: ...
     @property
     def preferred(self) -> Optional[int]: ...
+    @property
+    def coalesced(self) -> bool: ...
 
 class SensingWatch:
     """An owning observation of one capability's authorized exact-provider
@@ -6115,4 +6117,5 @@ def sensing_watch(
     capability: str,
     within_ms: Optional[float] = None,
     start_within_ms: Optional[float] = None,
+    coalesced: Optional[Union[str, int]] = None,
 ) -> SensingWatch: ...

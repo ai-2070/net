@@ -75,6 +75,45 @@ describe.skipIf(!HAS_SENSING)('C5 — the Rust-owned sensing error classificatio
       await mesh.shutdown()
     }
   })
+
+  // SDK plan LS-7c: the coalesced option reaches the SDK and every refusal is
+  // Rust's own kind. An out-of-range `top` is refused before any node state;
+  // a meaningful coalescing on a mesh with no organization authority is
+  // refused as `observer_not_qualified` — never served as an exact watch.
+  it('refuses a coalesced watch with Rust\'s own kinds', async () => {
+    const kinds = new Set(fixture.vectors.map((v) => v.kind))
+    expect(kinds.has('unsatisfiable_coalescing')).toBe(true)
+    expect(kinds.has('no_sensing_leader')).toBe(true)
+    const incarnationDir = scenarioDir('coalesced')
+    const mesh = await NetMesh.create({
+      bindAddr: '127.0.0.1:0',
+      psk: '42'.repeat(32),
+      enableSensing: true,
+      sensingIncarnationPath: join(incarnationDir, 'coalesced.incarnation'),
+    })
+    const refusal = (options: object) => {
+      try {
+        mesh.sensingWatch('nrpc:coalesced.node', options)
+      } catch (e) {
+        return sensingErrorClass(String((e as Error).message))
+      }
+      return null
+    }
+    try {
+      for (const top of [0, 33, 70_000]) {
+        expect(refusal({ coalesced: { top } }), `top ${top}`).toEqual({
+          kind: 'unsatisfiable_coalescing',
+          terminal: false,
+        })
+      }
+      for (const coalesced of [{}, { top: 3 }]) {
+        expect(refusal({ coalesced })?.kind, JSON.stringify(coalesced)).toBe('observer_not_qualified')
+      }
+    } finally {
+      await mesh.shutdown()
+      rmSync(incarnationDir, { recursive: true, force: true })
+    }
+  })
 })
 
 type SameOrgManifest = {

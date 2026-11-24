@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use net_sdk::sensing::{self as sdk, ReadinessValue, SensedViability, SensingError, SensingQuery};
+use net_sdk::sensing::{
+    self as sdk, Coalesced, ReadinessValue, SensedViability, SensingError, SensingQuery,
+};
 
 use crate::NetMesh;
 
@@ -102,13 +104,34 @@ fn value_to_js(value: ReadinessValue) -> ReadinessValueJs {
     }
 }
 
-/// The two bounds a watch can name. `withinMs` is the consumer-local
-/// end-to-end budget. `startWithinMs` is the provider-start predicate that
-/// rides the signed interest.
+/// The two bounds a watch can name, and its optional coalescing.
+/// `withinMs` is the consumer-local end-to-end budget. `startWithinMs` is the
+/// provider-start predicate that rides the signed interest. `coalesced`
+/// observes THROUGH the organization's elected sensing leader (SDK plan
+/// LS-7c); it never widens what this node sees and never falls back to an
+/// exact watch.
 #[napi(object)]
 pub struct SensingQueryOptions {
     pub within_ms: Option<f64>,
     pub start_within_ms: Option<f64>,
+    pub coalesced: Option<CoalescedOptions>,
+}
+
+/// A coalesced watch's size. `top` absent asks the leader for the best one
+/// provider; `top: k` (1..32) for up to `k`. Any other `top` is refused with
+/// kind `unsatisfiable_coalescing`.
+#[napi(object)]
+pub struct CoalescedOptions {
+    pub top: Option<u32>,
+}
+
+/// The JS coalescing as the SDK's. A `top` no `u16` holds becomes `Top(0)`, so
+/// the SDK refuses it with its OWN kind rather than the binding inventing one.
+fn coalesced_from_js(options: &CoalescedOptions) -> Coalesced {
+    match options.top {
+        None => Coalesced::Best,
+        Some(k) => Coalesced::Top(u16::try_from(k).unwrap_or(0)),
+    }
 }
 
 /// One authorized provider's row in a snapshot.
@@ -233,6 +256,14 @@ impl SensingSnapshot {
     #[napi(getter)]
     pub fn preferred(&self) -> Option<BigInt> {
         self.inner.preferred().map(BigInt::from)
+    }
+
+    /// Whether this capture came from a coalesced watch: its rows are the
+    /// providers the organization's sensing leader chose to sense, clamped to
+    /// what this node sees. The ranking is this node's own either way.
+    #[napi(getter)]
+    pub fn is_coalesced(&self) -> bool {
+        self.inner.is_coalesced()
     }
 }
 
@@ -359,6 +390,9 @@ impl NetMesh {
             if let Some(start) = millis(options.start_within_ms, "startWithinMs")? {
                 query = query.start_within(start);
             }
+            if let Some(coalesced) = &options.coalesced {
+                query = query.coalesced(coalesced_from_js(coalesced));
+            }
         }
         let _enter = self.runtime_handle().enter();
         let watch = self.sensing_client()?.watch(query).map_err(sensing_err)?;
@@ -386,7 +420,26 @@ impl NetMesh {
 
 #[cfg(test)]
 mod tests {
-    use super::millis;
+    use super::{coalesced_from_js, millis, CoalescedOptions};
+    use net_sdk::sensing::Coalesced;
+
+    /// `top` absent is Best, a `u16` is Top(k), and anything larger becomes
+    /// Top(0), which the SDK refuses with its own kind.
+    #[test]
+    fn the_js_coalescing_maps_onto_the_sdk() {
+        assert_eq!(
+            coalesced_from_js(&CoalescedOptions { top: None }),
+            Coalesced::Best
+        );
+        assert_eq!(
+            coalesced_from_js(&CoalescedOptions { top: Some(3) }),
+            Coalesced::Top(3)
+        );
+        assert_eq!(
+            coalesced_from_js(&CoalescedOptions { top: Some(70_000) }),
+            Coalesced::Top(0)
+        );
+    }
 
     /// A finite value too large for `Duration` is refused with an error, never a
     /// panic in the binding; ordinary and invalid inputs keep their meaning.

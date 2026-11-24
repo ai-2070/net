@@ -117,6 +117,16 @@ int  net_sensing_watch(void* mesh_arc,
                        const char* capability_ptr, size_t capability_len,
                        int64_t within_ms, int64_t start_within_ms,
                        NetSensingWatch** out_watch, char** out_err);
+/* A COALESCED watch: observe through the organization's elected sensing
+ * leader. top == 0 asks for the best one provider, top == k (1..32) for up
+ * to k; any other top is refused as "unsatisfiable_coalescing", and no member
+ * able to lead as "no_sensing_leader". Additive: net_sensing_watch is
+ * unchanged. Snapshots of either watch carry "coalesced" in their JSON. */
+int  net_sensing_watch_coalesced(void* mesh_arc,
+                                 const char* capability_ptr, size_t capability_len,
+                                 int64_t within_ms, int64_t start_within_ms,
+                                 int32_t top,
+                                 NetSensingWatch** out_watch, char** out_err);
 int  net_sensing_watch_snapshot(const NetSensingWatch* watch,
                                 NetSensingSnapshot** out_snapshot, char** out_err);
 /* timeout_ms < 0 waits without a bound. */
