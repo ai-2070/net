@@ -1,6 +1,24 @@
-# Owner-Private Candidate Substrate — Design for Review (provider-free leader track)
+# Owner-Private Candidate Substrate — Design (provider-free leader track)
 
-**Status:** DESIGN FOR REVIEW — nothing here is authorized for build, and that
+**Status (2026-11-24): AUTHORIZED FOR BUILD, LS-1..LS-6, by owner decision.**
+This reverses the 2026-11-21 "not needed" disposition recorded in
+[`SENSING_OLB_COMPLETION_PLAN.md`](SENSING_OLB_COMPLETION_PLAN.md) Phase 5.
+
+- **Scope:** LS-1..LS-5 build the leader dark. LS-6 lights
+  `OrgCapabilityRegistration` dispatch with the three-node transport proof.
+  **LS-7 (the provider-free SDK selector) is NOT authorized**; it remains a
+  separate public-API decision.
+- **Cadence:** one branch (`LZL0/sensing-leader-track`), one commit pushed per
+  phase, and one PR at the end. The owner waived the per-phase
+  stop-and-review. The exact-head review happens on the PR, and
+  `SAFE_LIVE_HEAD` is recorded only on that sign-off.
+- **The current record** is [§0](#0-build-status-and-re-read-2026-11-24),
+  re-read against `master` `2259b970d`. Where §0 and a later section
+  disagree, §0 wins; the later sections are the original design, kept with
+  their line references repaired.
+
+*Original status (2026-09-11), kept for the record:* DESIGN FOR REVIEW —
+nothing here is authorized for build, and that
 is unchanged by the 2026-09-11 sign-off of the exact-provider track. The
 `OrgCapabilityRegistration` (leader) arm stays dark until (a) this design is
 signed off, (b) the substrate slice is built and reviewed, and (c) a separate
@@ -38,13 +56,157 @@ lighting this arm would need its own SDK decision as well.
 
 ---
 
+## 0. Build status and re-read (2026-11-24)
+
+Re-read against `master` `2259b970d`. The design (§1–§11) is sound; what
+changed is how much of it already exists, plus seven findings the original text
+could not see because the code it describes had not landed yet.
+
+### 0.1 Already on master (built by the OLB track)
+
+| Design item | Where it is now | State |
+|---|---|---|
+| §3 Stage A: transactional scoped index | `ScopedDiscoveryState` / `ScopedCapabilityIndex`, `behavior/org_scoped_store.rs` | built. Owner buckets are keyed by `CapabilityAuthorityId`; a reverse declaration map and a floor-visible set per provider exist. |
+| §6 global + owner revisions, dirty deltas, `RebuildAll` | `ScopedDiscoveryState::{revision, owner_revision, pending_global, pending_owner}` | built |
+| §6 exactly one drainer per stream | `PrivateDiscoveryDrains::mint`, `PrivateDiscoveryStream::{Global, Owner}` | built. OLB mints `Global`; **`Owner` is reserved, unclaimed, for this track**. |
+| §6 change watch | `ScopedMutationPublication` (`mesh.rs`), `tokio::sync::watch<u64>` | built |
+| §6 one exact-expiry timer | the scoped expiry timer beside `ScopedMutationPublication` | built |
+| §6 floor raise → affected rows only | `ScopedDiscoveryState::note_floors_raised`, driven by the `subscribe_floors_raised` subscription in `mesh.rs` | built. A raise retracts floor visibility and dirties the OWNER stream. |
+| §6 peer-session generation | `session_routing.currentness` (`mesh.rs`) | built |
+| §5 owner-private query, no decode | `ScopedDiscoveryState::find_owner_private_providers(Some(cap), now, floors)` | built |
+| §2 sealed intake + seed-anchored leader core | `AdmittedSensingRegistration`, `SensingLeader::register_admitted_capability_interest` (`sensing/rendezvous.rs`) | built. Only unit tests call it. |
+| §7 org gate on the capability leg | `validate_org_frame_shape` / `verify_org_admission` (`sensing/org_gate.rs`): the `Leg::Capability` consumer binding `consumer == from_node` | built and shared with the live provider leg |
+| the dark arm | the `OrgCapabilityRegistration` match arm in `MeshNode::handle_sensing_interest_frame`, plus `dispatched_org_capability_registration_stays_dark` in `mesh::sensing_authority_witness_tests` | dark |
+
+### 0.2 Not built
+
+`sensing/org_candidates.rs` does not exist, and neither does
+`resolve_org_candidates`. Also missing:
+
+- any consumer of the owner stream;
+- leader capability→interest indexes and the plan/apply split;
+- the org leader reconciler;
+- a routing/proximity generation;
+- an org consumer emission path;
+- org-audience proof acceptance at the consumer;
+- the lit dispatch arm.
+
+### 0.3 Findings that change the build
+
+- **F1. The capability key is `CapabilityAuthorityId`.** The shared index keys
+  owner buckets by `CapabilityAuthorityId`, not by the sensing `CapabilityId`
+  string. The projection maps one to the other with
+  `CapabilityAuthorityId::for_tag(capability_id.as_str())`, which is the rule the
+  org gate already applies (`org_gate.rs`, `verify_granted_admission`). No new
+  key derivation is introduced.
+- **F2. Floor raises already reach the owner stream.** The OLB build routes every
+  raise through `ScopedDiscoveryState::note_floors_raised`, which advances
+  `owner_revision` and dirties exactly the affected owner capabilities. §6
+  trigger 2 therefore rides trigger 1. No second `subscribe_floors_raised`
+  subscriber is added.
+- **F3 (correctness, must land with LS-2). Legacy reconciliation would pick up
+  org interests.** `reconcile_sensing_leader_fold_one` calls
+  `SensingLeader::reconcile_with_snapshot` for EVERY interest on a capability,
+  fed the LEGACY plaintext-fold snapshot. Once org interests exist, every legacy
+  fold announcement would reconcile org interests against the wrong universe:
+  owner-private providers would be torn down as ineligible, and plaintext
+  declarers would be offered as fills. The legacy reconcile must skip `Org`
+  seeds, and org interests must reconcile only through `resolve_org_candidates`.
+- **F4. Org Leader rows need the seed's root.** The legacy leader intake
+  registers mesh `Leader` rows with `ctx.sensing_local_root`. An org Leader row
+  must carry the admitted seed's proven root, the canonical org commitment,
+  exactly like the provider leg's `table.register(.., admitted.proven_root(), ..)`.
+- **F5. The legacy intake is not atomic.** It mutates `SensingLeader` first,
+  releases it, and only then registers each mesh Leader row. The org intake uses
+  the §6 transaction instead: `sensing_interest_table` → fenced authority
+  (`with_fenced_current_authority`) → `sensing_leader`, all-or-none. The legacy
+  intake is unchanged. No existing path takes `sensing_interest_table` while
+  holding `sensing_leader` (re-checked at every `sensing_leader.lock()` site), so
+  the new order adds no reverse edge.
+- **F6 (lighting prerequisite). The consumer cannot speak or hear org leader
+  frames.** No code emits `OrgCapabilityRegistration`. At the consumer, a
+  provider-free digest watch admits a proof only when
+  `AudienceScopeCommitment::owner_root(origin) == audience`. That is the legacy
+  single-owner relation, and no org provider can satisfy it for an org-audience
+  watch.
+- **F7. No routing/proximity generation exists**, and there is no election. The
+  leader role is `redex`-gated and installed explicitly
+  (`MeshNode::assume_sensing_leader`). §6 trigger 5 needs a bounded fallback
+  (decision D-LS5), and the LS-6 proof installs the role explicitly, as the
+  legacy leader tests do.
+
+### 0.4 Build decisions
+
+- **D-LS1 (one cache level).** Stage B and Stage C share one bounded
+  per-capability cache. Stage A already holds predecoded, indexed rows, so
+  Stage B's only remaining job (bounding the leader to demanded capabilities)
+  is done by keying the cache on demanded capabilities. Each entry is
+  `Arc<OrgCapabilityCandidates>`, stamped with the complete source vector:
+  `(owner_revision, authority stamp, session generation, route epoch)`. A
+  mismatch is a cold rebuild of that one capability.
+- **D-LS2 (deterministic order).** Candidates rank by `(route_estimate,
+  node_id)`. The legacy resolver sorts stably over declarer order, which has no
+  org counterpart. The explicit tie-break makes the order reproducible
+  everywhere.
+- **D-LS3 (self).** The local node is never a candidate (Q2): the projection
+  drops a record whose `provider.node_id()` equals the local node. A witness
+  pins zero branches for it.
+- **D-LS4 (capacity).** At most 512 live org leader interests per node. A new
+  org interest over the cap is refused before projection, counted
+  `org_leader_interest_over_cap_total`, and takes the existing
+  `AllBranchesRefused` path. Legacy capacity is unchanged.
+- **D-LS5 (topology movement).** There is no routing/proximity generation to
+  subscribe to (F7). The reconciler re-ranks every demanded capability on a
+  bounded node-owned tick, `ORG_LEADER_ROUTE_REFRESH` = 5 s, coalesced with
+  every other wake. Route estimates therefore cannot go stale indefinitely
+  (§6 trigger 5), with no new topology-plane wake seam. The tick is the
+  route-epoch component of the source vector.
+- **D-LS6 (consumer acceptance of org proofs, LS-6).** An org-audience digest
+  watch admits a VERIFIED signer only when that signer's pinned entity is a
+  current owner-private provider of the watched capability in the consumer's
+  OWN scoped store: unexpired, floor-current, under the consumer's own owner
+  org. This is the leader's own trust universe, applied at the consumer.
+  Nothing new crosses the wire, and a proof from a provider the consumer cannot
+  itself see as authorized is refused exactly as a foreign signer is today.
+- **D-LS7 (consumer emission, LS-6).** Core gains
+  `MeshNode::register_org_capability_interest(spec, leader, D, ttl)`, the org
+  twin of `register_capability_interest`. It requires `spec.audience` to be the
+  canonical commitment of this node's installed owner org, records the digest
+  expectation, and authors `OrgCapabilityRegistration` under this node's own
+  live membership (`capture_live_org_relay_membership`). If no membership can be
+  captured, it emits nothing. This is a core seam for the transport proof, not
+  an SDK surface; LS-7 stays deferred.
+- **D-LS8 (leader continuation, LS-6).** The leader's provider continuation
+  captures the leader's OWN live membership, exactly as a relay does on the
+  provider leg (`apply_provider_registration`), so the provider admits the
+  continuation under the leader's membership. The leg is never downgraded to
+  legacy.
+- **D-LS9 (benches as counted witnesses).** The §6 bench gates are enforced as
+  deterministic counted witnesses: decode counts, bucket visits, interest
+  visits, batch counts and task counts. There are no timed criterion benches,
+  because timings are environment-qualified (§6 says so itself) and a counted
+  witness is the stronger, portable form of the same property.
+
+### 0.5 Phases as built
+
+| Phase | Delivers | Exit |
+|---|---|---|
+| LS-1 | `sensing/org_candidates.rs`: `OrgCandidateBase`, `OrgCapabilityCandidates { ranked, by_node }`, the cold projection (one short scoped-state lock, fresh floors, then an off-lock topology join), and the bounded per-capability cache (D-LS1) | §8 projection rows: floor-current owner-scope only; `node_id` derivation; pin-equality reachability; no tags/groups; `authorized` never false; self absent |
+| LS-2 | `resolve_org_candidates`; `SensingLeader` dispatches on seed authority at intake and in reconciliation; F3 closed; the legacy resolver byte-for-byte | org `Node`/`Nodes` intersect and never short-circuit; `Tags`/`Group` resolve empty; F3 witness; legacy equivalence |
+| LS-3 | leader `capability → interests` index and per-interest versions; short-lock snapshot, off-lock resolution, version-checked apply; the D-LS4 cap | a stale plan is discarded and requeued; unrelated interests are not visited; no per-interest sort |
+| LS-4 | the atomic org intake transaction (F4, F5); the node-owned org leader reconciler (mints the `Owner` drain; wakes on the scoped watch, install generation, session generation, and the D-LS5 tick; 64-interest batches; shutdown-joined) | all-or-none apply; lock-order witness; authority loss/rotation reconciles empty; one active pass plus at most one trailing pass |
+| LS-5 | a production-coupled dark proof: real encoded frames through the real admission and apply, bypassing only the dark arm; the §6 metrics; D-LS9 counted witnesses | the dark-slice rows of §8; the arm still dark |
+| LS-6 | lighting: the dispatch arm, D-LS6, D-LS7, D-LS8, the three-node real-transport proof, CI pins, `docs/SENSING.md` | the lighting rows of §8; the dark witness replaced by lit witnesses in the same module (`MESH_MIN` holds) |
+
+---
+
 ## 1. Problem
 
 The leader's candidate snapshot (`sensing_candidate_snapshot_from_parts`,
-`mesh.rs:4810-4865` → `build_candidate_snapshot`, `sensing/snapshot.rs:251-280`)
+`mesh.rs:9798-9853` → `build_candidate_snapshot`, `sensing/snapshot.rs:255-284`)
 resolves from the PLAINTEXT capability fold, and its §4.10 `authorized` gate is
 `declarer's TOFU-pinned entity root == sensing_local_root`
-(`snapshot.rs:266`). For an organization interest that is the wrong universe in
+(`snapshot.rs:270`). For an organization interest that is the wrong universe in
 both directions:
 
 - **Owner-private providers are invisible.** An org provider announces through
@@ -239,7 +401,7 @@ chain exist in the index (outer provider signature; audience AEAD open;
 | `capability_generation` | `record.generation` | the scoped announce generation |
 | `authorized` | `true` — by construction | only ingest-verified, floor-current owner-scope members enter; the projection NEVER emits an unauthorized candidate (the resolver's `authorized` filter keeps working unchanged) |
 | `reachable` | exact direct pin OR routing-table hit | direct requires `peer_entity_ids[node_id] == record.provider`; routed reachability uses the node id derived from that provider; see §4 |
-| `route_estimate` | proximity ladder | same (`snapshot.rs:193-218`; node-id-keyed graph) |
+| `route_estimate` | proximity ladder | same (`snapshot.rs:197-222`; node-id-keyed graph) |
 | `tags` | empty in org v1 | scoped ingest proves a provider-signed member declaration, not an org-root tag assertion; never relabel provider metadata as org authority |
 | `groups` | empty | no org group surface exists |
 
@@ -258,7 +420,7 @@ the owner partition is exactly one org; each apply still asserts
 REMOTE providers' announcements (a node does not ingest its own envelope).
 Rather than invent a second self-projection path, v1 excludes the local node
 from provider-free org leader resolution (mirroring the legacy builder's
-private-self exclusion, `mesh.rs:4852-4854`). The exact-provider sensing path
+private-self exclusion, `mesh.rs:9840-9842`). The exact-provider sensing path
 does NOT repair discovery by itself: it can sense a local provider only after
 some authorized selector has already named it. Therefore a same-node provider
 is not discoverable through this v1 provider-free leader path unless a later
@@ -274,8 +436,8 @@ the pure derivation `EntityId::node_id()` = first 8 bytes of
 domain-separated BLAKE2s over the entity public key
 (`identity/entity.rs:61-64`) — the SAME rule the plaintext CAP-ANN path
 already enforces as authentication (`entity_id.node_id() == node_id`,
-`mesh.rs:19403`), and the same derivation the SDK exact-provider path already
-uses (`candidate.provider.node_id()`, `sdk/src/org/call.rs:300-336`).
+`mesh.rs:43509`), and the same derivation the SDK exact-provider path already
+uses (`provider.node_id()` in `sdk/src/org/call.rs`).
 
 Properties: the authoritative direction is authenticated
 `EntityId → NodeId`, derived from the signature-verified, cert-bound entity.
@@ -284,7 +446,7 @@ The reverse direction is NEVER inferred from a socket address, route, or bare
 the existing exact pin
 `peer_entity_ids[provider.node_id()] == provider`—the same check
 `OrgClient::plan` performs before protected invocation
-(`sdk/src/org/call.rs:206-218`). A missing direct pin does not erase a routed
+(`sdk/src/org/call.rs`, the pinned-provider plan). A missing direct pin does not erase a routed
 candidate, but a mismatching pin must never count as direct reachability. For a
 routed branch, the routing table establishes reachability only to the node id
 cryptographically derived from the verified provider; it contributes no
@@ -332,7 +494,7 @@ admissions keep the existing resolver byte-for-byte.
 ## 6. Shared node-state revision, expiry, and wake sources
 
 **Gap being filled:** the scoped store is a scan-only `BTreeMap` with no change
-signal (`org_scoped_store.rs:110-112`), while both consumers need indexed
+signal (stale since OLB-2A: the indexed `ScopedDiscoveryState` now exists — see §0.1), while both consumers need indexed
 private-discovery buckets plus source generations. These are the ONLY
 implementation primitives shared by the tracks:
 
@@ -488,7 +650,7 @@ per-capability org candidate snapshot, when:
    compare indexed provider generations against one fresh floor snapshot without
    descriptor decode; never blindly rescan/redecode every descriptor;
 3. **`org_install_generation` moves** (authority/store install, removal, or
-   rotation, `mesh.rs:1072`) — reproject ALL org interests through a fresh
+   rotation, `mesh.rs:2425`) — reproject ALL org interests through a fresh
    authority snapshot. If capture fails or the installed owner org differs
    from the retained seed, reconcile empty and withdraw existing branches;
 4. **peer-session generation moves** — recompute reachability for affected/all
