@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use super::super::super::redex::{elect, ElectionOutcome};
 use super::controller::{
-    resolve_candidates, CandidatePolicy, CandidateProvider, ResolutionRefusal,
+    resolve_candidates, CandidatePolicy, CandidateProvider, ResolutionRefusal, ResolvedCandidates,
 };
 use super::delivery::{Delivery, SensingRelay};
 use super::evaluator::SensingCounters;
@@ -48,9 +48,12 @@ use super::identity::{
     AudienceScopeCommitment, CapabilityInterestKey, ConstraintError, InterestSpec,
     ProviderInterestKey,
 };
+use super::org_candidates::{
+    resolve_org_candidates, OrgCapabilityCandidates, MAX_ORG_LEADER_INTERESTS,
+};
 use super::scope::{validate_subscriber_scope, ScopeError};
 use super::table::{DownstreamId, RegisterOutcome, UpstreamAction};
-use super::{AdmittedSensingRegistration, RegistrationLeg};
+use super::{AdmittedSensingRegistration, RegistrationAuthority, RegistrationLeg};
 
 /// Observer id fed to [`elect`]: never a member, so the
 /// self-RTT-zero bias can't fire and the ranking is identical for
@@ -115,6 +118,45 @@ where
         // rendezvous candidate.
         ElectionOutcome::SelfWins | ElectionOutcome::NoEligibleReplica => None,
     }
+}
+
+/// The candidate universe a leader resolution runs against — and, through it,
+/// the resolver (leader plan §5, Q1). Each universe pairs with exactly one
+/// admitted authority: a LEGACY seed resolves against the plaintext-fold
+/// snapshot with the legacy resolver; an ORG seed resolves only against its
+/// owner-private projection with `resolve_org_candidates`. Any other pairing is
+/// refused as [`ResolutionRefusal::AuthorityMismatch`] before resolution or
+/// mutation, so no caller can feed an org interest the wrong universe.
+#[derive(Clone, Copy)]
+pub(crate) enum LeaderCandidates<'a> {
+    /// The legacy plaintext-fold snapshot.
+    Legacy(&'a [CandidateProvider]),
+    /// The owner-private projection for the interest's capability.
+    #[allow(dead_code)] // constructed by the org intake + reconciler (LS-4)
+    Org(&'a OrgCapabilityCandidates),
+}
+
+impl LeaderCandidates<'_> {
+    /// Whether this universe is the one `authority` resolves against.
+    fn serves(&self, authority: &RegistrationAuthority) -> bool {
+        matches!(
+            (self, authority),
+            (Self::Legacy(_), RegistrationAuthority::Legacy { .. })
+                | (Self::Org(_), RegistrationAuthority::Org { .. })
+        )
+    }
+}
+
+/// Whether a retained seed is an organization interest — the partition every
+/// org-only leader operation (the org reconciler, the D-LS4 cap) runs over.
+fn is_org_seed(seed: &AdmittedSensingRegistration) -> bool {
+    matches!(seed.authority(), RegistrationAuthority::Org { .. })
+}
+
+/// Whether a retained seed is a LEGACY interest — the only kind the legacy
+/// plaintext-fold reconciliation may touch (finding F3).
+fn is_legacy_seed(seed: &AdmittedSensingRegistration) -> bool {
+    matches!(seed.authority(), RegistrationAuthority::Legacy { .. })
 }
 
 struct LeaderInterest {
@@ -409,28 +451,60 @@ impl SensingLeader {
             downstream,
             requested_sample_interval,
             soft_state_ttl,
-            snapshot,
+            LeaderCandidates::Legacy(snapshot),
             now,
         )
     }
 
-    /// Register one consumer's provider-free interest from its ADMITTED wrapper —
-    /// the crate-private authority-carrying intake (piece 4's organization
-    /// registration path). The wrapper's leg is the SOLE, immutable source of the
-    /// registering consumer + timing: a non-capability leg is refused BEFORE any
-    /// resolution or table mutation ([`ResolutionRefusal::AdmittedLegMismatch`]),
-    /// so a caller can never admit one leg then register under a different
-    /// downstream or table timing. The seed's authority provenance (org vs legacy)
-    /// is preserved into the [`LeaderInterest`].
-    ///
-    /// Piece 4 consumes this method when organization dispatch is lit atomically;
-    /// until then only the in-crate witnesses exercise it, hence the
-    /// `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// Register one consumer's provider-free interest from its ADMITTED wrapper
+    /// against the LEGACY plaintext-fold snapshot. The wrapper's leg is the SOLE,
+    /// immutable source of the registering consumer + timing: a non-capability
+    /// leg is refused BEFORE any resolution or table mutation
+    /// ([`ResolutionRefusal::AdmittedLegMismatch`]). An ORG seed is refused
+    /// ([`ResolutionRefusal::AuthorityMismatch`]): it resolves only through
+    /// [`Self::register_org_capability_interest`] (Q1).
+    #[allow(dead_code)] // the in-crate witnesses; production legacy intake is `register_from_frame`
     pub(crate) fn register_admitted_capability_interest(
         &mut self,
         admitted: &AdmittedSensingRegistration,
         snapshot: &[CandidateProvider],
+        now: Instant,
+    ) -> Result<LeaderRegistration, ResolutionRefusal> {
+        self.register_admitted_inner(admitted, LeaderCandidates::Legacy(snapshot), now)
+    }
+
+    /// Register one consumer's provider-free ORGANIZATION interest from its
+    /// admitted wrapper, resolved against the interest capability's owner-private
+    /// projection with `resolve_org_candidates` (leader plan §5, Q1). Leg and
+    /// authority are checked before any resolution or mutation, exactly as for
+    /// the legacy admitted intake; a non-org seed is refused as
+    /// [`ResolutionRefusal::AuthorityMismatch`].
+    ///
+    /// A NEW org interest beyond [`MAX_ORG_LEADER_INTERESTS`] is refused as
+    /// [`ResolutionRefusal::AllBranchesRefused`] (D-LS4) — the dispatch layer
+    /// refuses it before projecting, and this is the defensive second line. A
+    /// registration joining an existing interest is never capacity-gated.
+    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
+    pub(crate) fn register_org_capability_interest(
+        &mut self,
+        admitted: &AdmittedSensingRegistration,
+        candidates: &OrgCapabilityCandidates,
+        now: Instant,
+    ) -> Result<LeaderRegistration, ResolutionRefusal> {
+        if !self.interests.contains_key(&admitted.spec().key())
+            && is_org_seed(admitted)
+            && self.org_interest_count() >= MAX_ORG_LEADER_INTERESTS
+        {
+            return Err(ResolutionRefusal::AllBranchesRefused);
+        }
+        self.register_admitted_inner(admitted, LeaderCandidates::Org(candidates), now)
+    }
+
+    /// The shared admitted intake: the leg check, then the coalescing core.
+    fn register_admitted_inner(
+        &mut self,
+        admitted: &AdmittedSensingRegistration,
+        candidates: LeaderCandidates<'_>,
         now: Instant,
     ) -> Result<LeaderRegistration, ResolutionRefusal> {
         let RegistrationLeg::Capability {
@@ -446,9 +520,47 @@ impl SensingLeader {
             DownstreamId::Peer(consumer),
             requested_sample_interval,
             soft_state_ttl.min(self.max_soft_state_ttl),
-            snapshot,
+            candidates,
             now,
         )
+    }
+
+    /// Whether an interest is currently held under `key`.
+    #[allow(dead_code)] // the LS-4 intake's pre-projection D-LS4 cap check
+    pub(crate) fn has_interest(&self, key: &CapabilityInterestKey) -> bool {
+        self.interests.contains_key(key)
+    }
+
+    /// Live ORGANIZATION interests (the D-LS4 cap's population).
+    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
+    pub(crate) fn org_interest_count(&self) -> usize {
+        self.interests
+            .values()
+            .filter(|entry| is_org_seed(&entry.admitted_seed))
+            .count()
+    }
+
+    /// Resolve a seed against its paired candidate universe (Q1) — the ONE
+    /// place a leader resolution chooses its resolver.
+    fn resolve_for_seed(
+        &self,
+        seed: &AdmittedSensingRegistration,
+        candidates: LeaderCandidates<'_>,
+    ) -> Result<ResolvedCandidates, ResolutionRefusal> {
+        let spec = seed.spec();
+        match candidates {
+            LeaderCandidates::Legacy(snapshot) if is_legacy_seed(seed) => resolve_candidates(
+                &spec.providers,
+                spec.result_mode,
+                snapshot,
+                &seed.proven_root(),
+                &self.policy,
+            ),
+            LeaderCandidates::Org(projection) if is_org_seed(seed) => {
+                resolve_org_candidates(&spec.providers, spec.result_mode, projection, &self.policy)
+            }
+            _ => Err(ResolutionRefusal::AuthorityMismatch),
+        }
     }
 
     /// The shared coalescing core: only the FIRST registration resolves
@@ -465,28 +577,28 @@ impl SensingLeader {
         downstream: DownstreamId,
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
-        snapshot: &[CandidateProvider],
+        candidates: LeaderCandidates<'_>,
         now: Instant,
     ) -> Result<LeaderRegistration, ResolutionRefusal> {
+        // Q1: the candidate universe must be the one this seed's authority
+        // resolves against — checked BEFORE the join test, so an org seed can
+        // never enter (or join) through the legacy universe, nor a legacy seed
+        // through an owner-private projection.
+        if !candidates.serves(admitted.authority()) {
+            return Err(ResolutionRefusal::AuthorityMismatch);
+        }
         let spec = admitted.spec();
         let proven_root = admitted.proven_root();
         let key = spec.key();
         let newly_resolved = !self.interests.contains_key(&key);
         if newly_resolved {
             // Review §2 (leader authority provenance): candidate resolution's
-            // trust anchor is the ADMITTED SEED's proven root, never the leader's
-            // own `owner_root` — a Tags assertion enters an org interest's
-            // candidate set only when asserted by the org commitment. For a
-            // legacy seed the two coincide (`validate_subscriber_scope` forces
-            // the session root == the leader's root), so the legacy path is
-            // unchanged by construction.
-            let resolved = resolve_candidates(
-                &spec.providers,
-                spec.result_mode,
-                snapshot,
-                &proven_root,
-                &self.policy,
-            )?;
+            // trust anchor is the ADMITTED SEED, never the leader's own
+            // `owner_root`. A legacy seed resolves against the fold snapshot
+            // under its proven root (which `validate_subscriber_scope` forces to
+            // equal the leader's root, so the legacy path is unchanged); an org
+            // seed resolves against its owner-private projection (§5).
+            let resolved = self.resolve_for_seed(admitted, candidates)?;
             self.interests.insert(
                 key.clone(),
                 LeaderInterest {
@@ -925,13 +1037,12 @@ impl SensingLeader {
         now: Instant,
     ) -> LeaderReconciliation {
         let mut reconciliation = LeaderReconciliation::default();
-        let keys: Vec<CapabilityInterestKey> = self
-            .interests
-            .iter()
-            .filter(|(_, entry)| entry.admitted_seed.spec().capability_id == *capability_id)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in keys {
+        // Finding F3: the plaintext-fold snapshot is the LEGACY universe, so it
+        // reconciles legacy interests only. An org interest on the same
+        // capability is never torn down for being absent from the fold, nor
+        // filled from a plaintext declarer — it reconciles through
+        // `reconcile_org_capability` alone.
+        for key in self.interest_keys(capability_id, is_legacy_seed) {
             let Some(entry) = self.interests.get(&key) else {
                 continue;
             };
@@ -940,7 +1051,7 @@ impl SensingLeader {
             // under the leader lock), never `self.owner_root` — reconciliation
             // must select candidates under the same authority the interest was
             // admitted with. Legacy seeds coincide with the leader root by
-            // construction; org seeds anchor to the canonical org commitment.
+            // construction.
             let seed_root = entry.admitted_seed.proven_root();
             let Ok(resolved) = resolve_candidates(
                 &entry.admitted_seed.spec().providers,
@@ -951,74 +1062,197 @@ impl SensingLeader {
             ) else {
                 continue;
             };
-            let eligible: Vec<u64> = resolved
-                .active
-                .iter()
-                .chain(resolved.standby.iter())
-                .copied()
-                .collect();
-            let spec = entry.admitted_seed.spec().clone();
-            let old_active = entry.active.clone();
-            let old_standby = entry.standby.clone();
-            // SI-6.1 closure: the surviving consumer demand,
-            // deduplicated across ALL old live branches, captured
-            // BEFORE any teardown drops their rows. A consumer
-            // holding rows on several branches (with divergent D/ttl
-            // via partial refusals) keeps its strictest interval and
-            // longest ttl — the same direction the aggregate and the
-            // sweep already resolve toward.
-            let mut consumer_rows: Vec<(DownstreamId, Duration, Duration)> = Vec::new();
-            for provider in &old_active {
-                let branch = ProviderInterestKey::new(key.clone(), *provider);
-                for downstream in self.relay.table.downstreams(&branch, now) {
-                    let Some(row) = self.relay.table.downstream_entry(&branch, downstream) else {
-                        continue;
-                    };
-                    match consumer_rows
-                        .iter_mut()
-                        .find(|(existing, _, _)| *existing == downstream)
-                    {
-                        Some((_, interval, ttl)) => {
-                            *interval = (*interval).min(row.requested_sample_interval);
-                            *ttl = (*ttl).max(row.soft_state_ttl);
-                        }
-                        None => consumer_rows.push((
-                            downstream,
-                            row.requested_sample_interval,
-                            row.soft_state_ttl,
-                        )),
+            self.apply_reconciled_resolution(&key, resolved, now, &mut reconciliation);
+        }
+        reconciliation
+    }
+
+    /// Reconcile every ORGANIZATION interest on `capability_id` against a FRESH
+    /// owner-private projection (leader plan §6), resolving each with
+    /// `resolve_org_candidates` (Q1). The mutation semantics are exactly the
+    /// legacy reconciliation's ([`Self::reconcile_with_snapshot`]): surviving
+    /// demand is captured across every old branch before teardown, fills inherit
+    /// it, orphans re-home, and an interest left with no live branch drains.
+    ///
+    /// An EMPTY projection — the authority was lost, the owner org rotated, or
+    /// every provider left — therefore withdraws every branch and drains the
+    /// interest, with no fallback to the legacy universe (§3 standing
+    /// reconciliation).
+    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
+    pub(crate) fn reconcile_org_capability(
+        &mut self,
+        capability_id: &super::identity::CapabilityId,
+        candidates: &OrgCapabilityCandidates,
+        now: Instant,
+    ) -> LeaderReconciliation {
+        let mut reconciliation = LeaderReconciliation::default();
+        for key in self.interest_keys(capability_id, is_org_seed) {
+            let Some(entry) = self.interests.get(&key) else {
+                continue;
+            };
+            let spec = entry.admitted_seed.spec();
+            let Ok(resolved) =
+                resolve_org_candidates(&spec.providers, spec.result_mode, candidates, &self.policy)
+            else {
+                continue;
+            };
+            self.apply_reconciled_resolution(&key, resolved, now, &mut reconciliation);
+        }
+        reconciliation
+    }
+
+    /// The interests on `capability_id` whose retained seed satisfies `class`.
+    fn interest_keys(
+        &self,
+        capability_id: &super::identity::CapabilityId,
+        class: fn(&AdmittedSensingRegistration) -> bool,
+    ) -> Vec<CapabilityInterestKey> {
+        self.interests
+            .iter()
+            .filter(|(_, entry)| {
+                entry.admitted_seed.spec().capability_id == *capability_id
+                    && class(&entry.admitted_seed)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Apply one interest's fresh resolution — the shared mutation half of both
+    /// reconciliations. Tears down branches whose provider left the eligible
+    /// set, fills an under-filled active set in resolution order (registering
+    /// the surviving consumer union at its captured D/ttl, under the admitted
+    /// seed's proven root), re-homes orphaned consumers, refreshes the standby
+    /// list, and drains the interest when no branch holds live demand.
+    fn apply_reconciled_resolution(
+        &mut self,
+        key: &CapabilityInterestKey,
+        resolved: ResolvedCandidates,
+        now: Instant,
+        reconciliation: &mut LeaderReconciliation,
+    ) {
+        let key = key.clone();
+        let Some(entry) = self.interests.get(&key) else {
+            return;
+        };
+        let seed_root = entry.admitted_seed.proven_root();
+        let eligible: Vec<u64> = resolved
+            .active
+            .iter()
+            .chain(resolved.standby.iter())
+            .copied()
+            .collect();
+        let spec = entry.admitted_seed.spec().clone();
+        let old_active = entry.active.clone();
+        let old_standby = entry.standby.clone();
+        // SI-6.1 closure: the surviving consumer demand,
+        // deduplicated across ALL old live branches, captured
+        // BEFORE any teardown drops their rows. A consumer
+        // holding rows on several branches (with divergent D/ttl
+        // via partial refusals) keeps its strictest interval and
+        // longest ttl — the same direction the aggregate and the
+        // sweep already resolve toward.
+        let mut consumer_rows: Vec<(DownstreamId, Duration, Duration)> = Vec::new();
+        for provider in &old_active {
+            let branch = ProviderInterestKey::new(key.clone(), *provider);
+            for downstream in self.relay.table.downstreams(&branch, now) {
+                let Some(row) = self.relay.table.downstream_entry(&branch, downstream) else {
+                    continue;
+                };
+                match consumer_rows
+                    .iter_mut()
+                    .find(|(existing, _, _)| *existing == downstream)
+                {
+                    Some((_, interval, ttl)) => {
+                        *interval = (*interval).min(row.requested_sample_interval);
+                        *ttl = (*ttl).max(row.soft_state_ttl);
                     }
+                    None => consumer_rows.push((
+                        downstream,
+                        row.requested_sample_interval,
+                        row.soft_state_ttl,
+                    )),
                 }
             }
-            // Tear down branches whose provider fell out of the
-            // eligible set.
-            let mut kept: Vec<u64> = Vec::new();
-            for provider in &old_active {
-                if eligible.contains(provider) {
-                    kept.push(*provider);
-                    continue;
-                }
-                let branch = ProviderInterestKey::new(key.clone(), *provider);
+        }
+        // Tear down branches whose provider fell out of the
+        // eligible set.
+        let mut kept: Vec<u64> = Vec::new();
+        for provider in &old_active {
+            if eligible.contains(provider) {
+                kept.push(*provider);
+                continue;
+            }
+            let branch = ProviderInterestKey::new(key.clone(), *provider);
+            self.relay.table.remove_branch(&branch);
+            self.relay.reclaim_branch(&branch);
+            reconciliation.torn_down.push(branch);
+        }
+        // Fill an under-filled active set from the fresh
+        // resolution, registering the surviving union on the
+        // new branch at its captured D/ttl.
+        for provider in &resolved.active {
+            if kept.len() >= resolved.active.len() {
+                break;
+            }
+            if kept.contains(provider) {
+                continue;
+            }
+            let branch = ProviderInterestKey::new(key.clone(), *provider);
+            for (downstream, interval, ttl) in &consumer_rows {
+                // Review §2: a replacement row carries the admitted seed's
+                // proven root — an org interest's fill rows anchor to the
+                // canonical org commitment, never the leader's entity root.
+                let _ = self.relay.register_downstream(
+                    &branch,
+                    *downstream,
+                    *interval,
+                    *ttl,
+                    seed_root,
+                    now,
+                );
+            }
+            // `added` means "acquired live downstream demand" —
+            // a demandless replacement would be a ghost active
+            // branch the mesh caller skips (`aggregate` None),
+            // recorded as coverage sensing never re-establishes.
+            if self.relay.table.aggregate(&branch, now).is_none() {
                 self.relay.table.remove_branch(&branch);
                 self.relay.reclaim_branch(&branch);
-                reconciliation.torn_down.push(branch);
+                continue;
             }
-            // Fill an under-filled active set from the fresh
-            // resolution, registering the surviving union on the
-            // new branch at its captured D/ttl.
-            for provider in &resolved.active {
-                if kept.len() >= resolved.active.len() {
-                    break;
-                }
-                if kept.contains(provider) {
+            kept.push(*provider);
+            reconciliation.added.push((branch, spec.clone()));
+        }
+        // 2026-07-15 review §6: a consumer that lived ONLY on a
+        // torn-down branch (partial admission makes branch
+        // populations non-identical) can end up with a row on NO
+        // surviving branch — the fill loop adds the union only to
+        // NEW branches, so when `kept` already fills
+        // `resolved.active` no replacement is opened and the
+        // orphan receives no proofs until its own ttl/2 refresh.
+        // Re-register any such orphan onto a surviving branch NOW,
+        // trying each until one admits (cap/floor may refuse some;
+        // soft state retries the rest). Consumers still covered by
+        // a surviving branch — e.g. those the fill loop just placed
+        // on a replacement — are skipped, so this never diverts a
+        // consumer off the branch it already reached.
+        if !kept.is_empty() {
+            for (downstream, interval, ttl) in &consumer_rows {
+                let still_covered = kept.iter().any(|provider| {
+                    let branch = ProviderInterestKey::new(key.clone(), *provider);
+                    self.relay
+                        .table
+                        .downstream_entry(&branch, *downstream)
+                        .is_some()
+                });
+                if still_covered {
                     continue;
                 }
-                let branch = ProviderInterestKey::new(key.clone(), *provider);
-                for (downstream, interval, ttl) in &consumer_rows {
-                    // Review §2: a replacement row carries the admitted seed's
-                    // proven root — an org interest's fill rows anchor to the
-                    // canonical org commitment, never the leader's entity root.
-                    let _ = self.relay.register_downstream(
+                for provider in &kept {
+                    let branch = ProviderInterestKey::new(key.clone(), *provider);
+                    // Review §2: an orphan-restored row carries the admitted
+                    // seed's proven root, exactly like the fill rows above.
+                    let (outcome, _) = self.relay.register_downstream(
                         &branch,
                         *downstream,
                         *interval,
@@ -1026,89 +1260,37 @@ impl SensingLeader {
                         seed_root,
                         now,
                     );
-                }
-                // `added` means "acquired live downstream demand" —
-                // a demandless replacement would be a ghost active
-                // branch the mesh caller skips (`aggregate` None),
-                // recorded as coverage sensing never re-establishes.
-                if self.relay.table.aggregate(&branch, now).is_none() {
-                    self.relay.table.remove_branch(&branch);
-                    self.relay.reclaim_branch(&branch);
-                    continue;
-                }
-                kept.push(*provider);
-                reconciliation.added.push((branch, spec.clone()));
-            }
-            // 2026-07-15 review §6: a consumer that lived ONLY on a
-            // torn-down branch (partial admission makes branch
-            // populations non-identical) can end up with a row on NO
-            // surviving branch — the fill loop adds the union only to
-            // NEW branches, so when `kept` already fills
-            // `resolved.active` no replacement is opened and the
-            // orphan receives no proofs until its own ttl/2 refresh.
-            // Re-register any such orphan onto a surviving branch NOW,
-            // trying each until one admits (cap/floor may refuse some;
-            // soft state retries the rest). Consumers still covered by
-            // a surviving branch — e.g. those the fill loop just placed
-            // on a replacement — are skipped, so this never diverts a
-            // consumer off the branch it already reached.
-            if !kept.is_empty() {
-                for (downstream, interval, ttl) in &consumer_rows {
-                    let still_covered = kept.iter().any(|provider| {
-                        let branch = ProviderInterestKey::new(key.clone(), *provider);
-                        self.relay
-                            .table
-                            .downstream_entry(&branch, *downstream)
-                            .is_some()
-                    });
-                    if still_covered {
-                        continue;
-                    }
-                    for provider in &kept {
-                        let branch = ProviderInterestKey::new(key.clone(), *provider);
-                        // Review §2: an orphan-restored row carries the admitted
-                        // seed's proven root, exactly like the fill rows above.
-                        let (outcome, _) = self.relay.register_downstream(
-                            &branch,
-                            *downstream,
-                            *interval,
-                            *ttl,
-                            seed_root,
-                            now,
-                        );
-                        if matches!(outcome, RegisterOutcome::Registered(_)) {
-                            break;
-                        }
+                    if matches!(outcome, RegisterOutcome::Registered(_)) {
+                        break;
                     }
                 }
-            }
-            // A provider retained in `active` (`kept`) must never also
-            // sit in `standby`: `resolved.standby` is the fresh
-            // resolution's standby, computed independently of the
-            // incumbents we kept, so the two CAN overlap (e.g. a fold
-            // shift re-ranks an active provider into standby while it
-            // stays eligible). Filter `kept` out — otherwise
-            // expand_to_standby would later promote an already-active
-            // provider and duplicate the branch in `active`.
-            let new_standby: Vec<u64> = resolved
-                .standby
-                .into_iter()
-                .filter(|provider| !kept.contains(provider))
-                .collect();
-            reconciliation.changed |= kept != old_active || old_standby != new_standby;
-            if kept.is_empty() {
-                // No branch holds live demand: the interest DRAINS —
-                // the sweep's own rule — never a ghost active set.
-                reconciliation.changed = true;
-                self.interests.remove(&key);
-                continue;
-            }
-            if let Some(entry) = self.interests.get_mut(&key) {
-                entry.active = kept;
-                entry.standby = new_standby;
             }
         }
-        reconciliation
+        // A provider retained in `active` (`kept`) must never also
+        // sit in `standby`: `resolved.standby` is the fresh
+        // resolution's standby, computed independently of the
+        // incumbents we kept, so the two CAN overlap (e.g. a fold
+        // shift re-ranks an active provider into standby while it
+        // stays eligible). Filter `kept` out — otherwise
+        // expand_to_standby would later promote an already-active
+        // provider and duplicate the branch in `active`.
+        let new_standby: Vec<u64> = resolved
+            .standby
+            .into_iter()
+            .filter(|provider| !kept.contains(provider))
+            .collect();
+        reconciliation.changed |= kept != old_active || old_standby != new_standby;
+        if kept.is_empty() {
+            // No branch holds live demand: the interest DRAINS —
+            // the sweep's own rule — never a ghost active set.
+            reconciliation.changed = true;
+            self.interests.remove(&key);
+            return;
+        }
+        if let Some(entry) = self.interests.get_mut(&key) {
+            entry.active = kept;
+            entry.standby = new_standby;
+        }
     }
 
     /// Sweep soft state: expired downstream rows drop; an interest
@@ -1191,6 +1373,33 @@ impl SensingLeader {
     pub fn interest_capability_ids(&self) -> Vec<super::identity::CapabilityId> {
         let mut ids: Vec<super::identity::CapabilityId> = Vec::new();
         for entry in self.interests.values() {
+            if !ids.contains(&entry.admitted_seed.spec().capability_id) {
+                ids.push(entry.admitted_seed.spec().capability_id.clone());
+            }
+        }
+        ids
+    }
+
+    /// Distinct capability ids with live LEGACY interests — the plaintext-fold
+    /// reconciliation's scan input (finding F3: the fold reconciles nothing
+    /// else, so it never even builds a snapshot for an org-only capability).
+    pub fn legacy_interest_capability_ids(&self) -> Vec<super::identity::CapabilityId> {
+        self.capability_ids_where(is_legacy_seed)
+    }
+
+    /// Distinct capability ids with live ORGANIZATION interests — the org
+    /// reconciler's demanded set (plan §6 trigger 6).
+    #[allow(dead_code)] // wired by the org intake + reconciler (LS-4)
+    pub(crate) fn org_interest_capability_ids(&self) -> Vec<super::identity::CapabilityId> {
+        self.capability_ids_where(is_org_seed)
+    }
+
+    fn capability_ids_where(
+        &self,
+        class: fn(&AdmittedSensingRegistration) -> bool,
+    ) -> Vec<super::identity::CapabilityId> {
+        let mut ids: Vec<super::identity::CapabilityId> = Vec::new();
+        for entry in self.interests.values().filter(|e| class(&e.admitted_seed)) {
             if !ids.contains(&entry.admitted_seed.spec().capability_id) {
                 ids.push(entry.admitted_seed.spec().capability_id.clone());
             }
@@ -2628,6 +2837,16 @@ mod tests {
         )
     }
 
+    /// An owner-private projection of reachable members at `(node, route_ms)` —
+    /// the universe an org seed resolves against (Q1).
+    fn org_set(rows: &[(u64, u64)]) -> OrgCapabilityCandidates {
+        let rows: Vec<(u64, Duration)> = rows
+            .iter()
+            .map(|&(node, route)| (node, ms(route)))
+            .collect();
+        OrgCapabilityCandidates::for_test(&rows)
+    }
+
     /// The cached seed's authority-aware upstream continuation for `provider`,
     /// planned with a fail-closed (org-dark) capture: `None` for an org seed
     /// (needs membership; no legacy fallback), `Some` legacy frame for a legacy
@@ -2646,11 +2865,7 @@ mod tests {
         let now = Instant::now();
         let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
         let reg = leader
-            .register_admitted_capability_interest(
-                &org_seed(0xC1, ms(100)),
-                &[provider(0xB1, 5)],
-                now,
-            )
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
             .expect("org interest admitted");
         let seed = leader.interest_seed(&reg.interest).expect("seed cached");
         assert!(matches!(
@@ -2667,11 +2882,7 @@ mod tests {
         let now = Instant::now();
         let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
         let reg = leader
-            .register_admitted_capability_interest(
-                &org_seed(0xC1, ms(100)),
-                &[provider(0xB1, 5)],
-                now,
-            )
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
             .expect("org interest admitted");
         let key = reg.interest.clone();
         // B1 is no longer eligible; the fold offers B2 → B1 torn down, B2 ADDED.
@@ -2683,7 +2894,7 @@ mod tests {
         // (the interest reset/reconstructed as legacy on the B1 teardown), this
         // added-branch witness fails — interest_seed would be absent or legacy.
         let reconciliation =
-            leader.reconcile_with_snapshot(&org_spec().capability_id, &[provider(0xB2, 6)], now);
+            leader.reconcile_org_capability(&org_spec().capability_id, &org_set(&[(0xB2, 6)]), now);
         assert!(
             reconciliation
                 .added
@@ -2723,13 +2934,18 @@ mod tests {
     }
 
     #[test]
-    fn org_tags_resolution_anchors_to_the_admitted_org_root() {
-        // Review §2: for a Tags selector, candidate assertions are checked
-        // against the ADMITTED org root — a candidate tagged by the leader's own
-        // entity root must NOT enter an org interest's candidate set, and one
-        // tagged by the org commitment must. RED coupling: resolving with
-        // `self.owner_root` (the pre-§2 code) selects exactly the wrong
-        // candidate and fails both assertions.
+    fn org_tags_interest_resolves_empty_and_retains_nothing() {
+        // Q6 (superseding the pre-LS-2 tag-anchoring witness): an org interest
+        // never resolves through tags at all. The leader must not even consult
+        // the legacy tag assertions for an org seed — the legacy universe is
+        // refused outright (Q1) — and the org projection carries no tags, so a
+        // Tags selector resolves empty and takes the ordinary
+        // `AllBranchesRefused` path with no immortal rowless interest.
+        //
+        // RED coupling: resolving an org seed through the legacy resolver (the
+        // pre-LS-2 code) admits the org-commitment-tagged candidate and fails
+        // the first assertion; a resolver that honoured provider-authored tags
+        // fails the second.
         let now = Instant::now();
         let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
         let mut spec = org_spec();
@@ -2747,33 +2963,24 @@ mod tests {
                 org_kp().org_id(),
             ),
         );
-        let tagged = |id: u64, by: AudienceScopeCommitment| {
-            let mut candidate = provider(id, 5);
-            candidate.tags = vec![TagAssertion {
-                key: "zone".into(),
-                value: "eu".into(),
-                asserted_by: by,
-            }];
-            candidate
-        };
-        let reg = leader
-            .register_admitted_capability_interest(
-                &seed,
-                &[
-                    // Asserted by the LEADER's entity root — wrong anchor for an
-                    // org interest.
-                    tagged(0xB9, root()),
-                    // Asserted by the canonical org commitment — the admitted
-                    // seed's anchor.
-                    tagged(0xB1, canonical_org_sensing_commitment(&org_kp().org_id())),
-                ],
-                now,
-            )
-            .expect("the org-anchored candidate resolves");
+        let mut tagged = provider(0xB1, 5);
+        tagged.tags = vec![TagAssertion {
+            key: "zone".into(),
+            value: "eu".into(),
+            asserted_by: canonical_org_sensing_commitment(&org_kp().org_id()),
+        }];
+        assert!(matches!(
+            leader.register_admitted_capability_interest(&seed, &[tagged], now),
+            Err(ResolutionRefusal::AuthorityMismatch)
+        ));
+        assert!(matches!(
+            leader.register_org_capability_interest(&seed, &org_set(&[(0xB1, 5)]), now),
+            Err(ResolutionRefusal::AllBranchesRefused)
+        ));
         assert_eq!(
-            reg.branches,
-            vec![0xB1],
-            "only the org-commitment-asserted candidate enters the set"
+            leader.interest_count(),
+            0,
+            "no rowless interest is retained"
         );
     }
 
@@ -2795,9 +3002,9 @@ mod tests {
         };
         let mut leader = SensingLeader::new(policy, K, 4, TTL);
         let reg = leader
-            .register_admitted_capability_interest(
+            .register_org_capability_interest(
                 &org_seed(0xC1, ms(100)),
-                &[provider(0xB1, 5), provider(0xB2, 20)],
+                &org_set(&[(0xB1, 5), (0xB2, 20)]),
                 now,
             )
             .expect("org interest admitted");
@@ -2832,14 +3039,14 @@ mod tests {
     fn refusal_survivor_retains_org_authority() {
         let now = Instant::now();
         let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
-        let snapshot = [provider(0xB1, 5)];
+        let snapshot = org_set(&[(0xB1, 5)]);
         // Two org consumers; a provider floor of 200ms refuses c1 (50 < 200) and
         // survives c2 (400). The leg supplies each consumer + interval.
         let reg = leader
-            .register_admitted_capability_interest(&org_seed(0xC1, ms(50)), &snapshot, now)
+            .register_org_capability_interest(&org_seed(0xC1, ms(50)), &snapshot, now)
             .expect("c1 admitted");
         leader
-            .register_admitted_capability_interest(&org_seed(0xC2, ms(400)), &snapshot, now)
+            .register_org_capability_interest(&org_seed(0xC2, ms(400)), &snapshot, now)
             .expect("c2 admitted");
         let branch = ProviderInterestKey::new(reg.interest.clone(), 0xB1);
         let partition = leader.on_refusal(&branch, ms(200), now);
@@ -2863,7 +3070,7 @@ mod tests {
         let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
         let snapshot = [provider(0xB1, 5)];
         leader
-            .register_admitted_capability_interest(&org_seed(0xC1, ms(100)), &snapshot, now)
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
             .expect("org interest admitted");
         // A LEGACY seed with the SAME spec (hence the SAME ProviderInterestKey) —
         // a computationally-unreachable authority collision the defensive
@@ -2899,7 +3106,7 @@ mod tests {
         // resolution or table mutation, so a mismatched leg can never be cached.
         let provider_leg = org_seed(0xC1, ms(100)).provider_continuation(0xB1, ms(100), TTL);
         assert!(matches!(
-            leader.register_admitted_capability_interest(&provider_leg, &[provider(0xB1, 5)], now),
+            leader.register_org_capability_interest(&provider_leg, &org_set(&[(0xB1, 5)]), now),
             Err(ResolutionRefusal::AdmittedLegMismatch)
         ));
         assert_eq!(leader.interest_count(), 0, "nothing registered");
@@ -2917,7 +3124,7 @@ mod tests {
         let snapshot = [provider(0xB1, 5)];
         // An org interest coalesces first (piece-4-style admitted intake).
         leader
-            .register_admitted_capability_interest(&org_seed(0xC1, ms(100)), &snapshot, now)
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
             .expect("org interest admitted");
         // A legacy CapabilityRegistration on the SAME key (same audience) reaches
         // the WIRE intake. The defensive invariant refuses it AND counts it as
@@ -2971,5 +3178,167 @@ mod tests {
             plan_from_seed(&seed, 0xB1),
             Some(SensingInterestFrame::ProviderRegistration { .. })
         ));
+    }
+
+    // ---- LS-2: authority-paired universes and finding F3 -------------------
+
+    use super::super::org_candidates::{OrgCapabilityCandidates, MAX_ORG_LEADER_INTERESTS};
+
+    /// Q1: each seed resolves only against its own universe. An org seed handed
+    /// the legacy snapshot, or a legacy seed handed an owner-private projection,
+    /// is refused before resolution or mutation.
+    #[test]
+    fn a_seed_is_refused_against_the_other_authoritys_universe() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        assert!(matches!(
+            leader.register_admitted_capability_interest(
+                &org_seed(0xC1, ms(100)),
+                &[provider(0xB1, 5)],
+                now
+            ),
+            Err(ResolutionRefusal::AuthorityMismatch)
+        ));
+        let legacy = AdmittedSensingRegistration::from_validated_legacy(
+            spec(),
+            RegistrationLeg::Capability {
+                consumer: 0xC2,
+                requested_sample_interval: ms(100),
+                soft_state_ttl: TTL,
+            },
+        );
+        assert!(matches!(
+            leader.register_org_capability_interest(&legacy, &org_set(&[(0xB1, 5)]), now),
+            Err(ResolutionRefusal::AuthorityMismatch)
+        ));
+        assert_eq!(leader.interest_count(), 0);
+    }
+
+    /// Finding F3: the plaintext-fold reconciliation never touches an org
+    /// interest. Offered a legacy snapshot that LACKS the org branch's provider
+    /// and names a different one, the org interest keeps its branch and nothing
+    /// is torn down or added.
+    ///
+    /// RED coupling: reconciling every interest on the capability (the pre-LS-2
+    /// code) tears B1 down and adds the plaintext declarer B2.
+    #[test]
+    fn legacy_fold_reconciliation_never_touches_an_org_interest() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let reg = leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
+            .expect("org interest admitted");
+        let reconciliation =
+            leader.reconcile_with_snapshot(&org_spec().capability_id, &[provider(0xB2, 6)], now);
+        assert!(reconciliation.torn_down.is_empty() && reconciliation.added.is_empty());
+        assert!(!reconciliation.changed);
+        assert_eq!(leader.branches(&reg.interest), vec![0xB1]);
+        assert!(leader.legacy_interest_capability_ids().is_empty());
+        assert_eq!(
+            leader.org_interest_capability_ids(),
+            vec![org_spec().capability_id.clone()]
+        );
+    }
+
+    /// The converse: the org reconciliation never touches a LEGACY interest on
+    /// the same capability, even when handed an empty projection.
+    #[test]
+    fn org_reconciliation_never_touches_a_legacy_interest() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let reg = leader
+            .register_capability_interest(
+                &spec(),
+                DownstreamId::Peer(0xC1),
+                ms(100),
+                TTL,
+                root(),
+                &[provider(0xB1, 5)],
+                now,
+            )
+            .expect("legacy interest admitted");
+        let reconciliation = leader.reconcile_org_capability(
+            &spec().capability_id,
+            &OrgCapabilityCandidates::default(),
+            now,
+        );
+        assert!(reconciliation.torn_down.is_empty() && !reconciliation.changed);
+        assert_eq!(leader.branches(&reg.interest), vec![0xB1]);
+    }
+
+    /// §3 standing reconciliation: an EMPTY projection (authority lost, owner org
+    /// rotated, every provider gone) withdraws every org branch and drains the
+    /// interest — no stale projection, no legacy fallback.
+    #[test]
+    fn an_empty_projection_withdraws_every_org_branch() {
+        let now = Instant::now();
+        let mut leader = SensingLeader::new(CandidatePolicy::default(), K, 4, TTL);
+        let reg = leader
+            .register_org_capability_interest(&org_seed(0xC1, ms(100)), &org_set(&[(0xB1, 5)]), now)
+            .expect("org interest admitted");
+        let reconciliation = leader.reconcile_org_capability(
+            &org_spec().capability_id,
+            &OrgCapabilityCandidates::default(),
+            now,
+        );
+        assert_eq!(
+            reconciliation.torn_down,
+            vec![ProviderInterestKey::new(reg.interest.clone(), 0xB1)]
+        );
+        assert!(reconciliation.changed);
+        assert_eq!(leader.interest_count(), 0, "the interest drains");
+        assert!(leader.is_drained());
+    }
+
+    /// D-LS4: a NEW org interest beyond the node-wide cap is refused; a consumer
+    /// joining an existing org interest is not capacity-gated.
+    #[test]
+    fn the_org_interest_cap_refuses_new_interests_only() {
+        let now = Instant::now();
+        // Per-consumer relay rows are capped separately; give the one consumer
+        // headroom so only the org-interest cap is under test.
+        let mut leader = SensingLeader::new(
+            CandidatePolicy::default(),
+            K,
+            2 * MAX_ORG_LEADER_INTERESTS,
+            TTL,
+        );
+        let members = org_set(&[(0xB1, 5)]);
+        let seed_for = |index: usize, consumer: u64| {
+            let mut spec = org_spec();
+            spec.capability_id =
+                super::super::identity::CapabilityId::new(format!("nrpc:c{index}"));
+            AdmittedSensingRegistration::from_validated_org(
+                ValidatedOrgSensingRegistration::capability_for_test(
+                    spec,
+                    consumer,
+                    ms(100),
+                    TTL,
+                    EntityId::from_bytes([0x24u8; 32]),
+                    org_kp().org_id(),
+                ),
+            )
+        };
+        for index in 0..MAX_ORG_LEADER_INTERESTS {
+            leader
+                .register_org_capability_interest(&seed_for(index, 0xC1), &members, now)
+                .expect("under the cap");
+        }
+        assert_eq!(leader.org_interest_count(), MAX_ORG_LEADER_INTERESTS);
+        assert!(matches!(
+            leader.register_org_capability_interest(
+                &seed_for(MAX_ORG_LEADER_INTERESTS, 0xC1),
+                &members,
+                now
+            ),
+            Err(ResolutionRefusal::AllBranchesRefused)
+        ));
+        assert!(
+            leader
+                .register_org_capability_interest(&seed_for(0, 0xC2), &members, now)
+                .is_ok(),
+            "joining an existing interest is never capacity-gated"
+        );
+        assert_eq!(leader.org_interest_count(), MAX_ORG_LEADER_INTERESTS);
     }
 }

@@ -205,7 +205,19 @@ pub fn resolve_candidates(
         })
         .collect();
     eligible.sort_by_key(|candidate| candidate.route_estimate);
+    let eligible: Vec<u64> = eligible.iter().map(|candidate| candidate.node_id).collect();
+    bound_resolution(&eligible, result_mode, policy)
+}
 
+/// Apply the result-mode bounds to an already-filtered, already-ranked eligible
+/// list — the part of resolution both the legacy resolver above and the org
+/// leader's `resolve_org_candidates` share, so the two can never disagree on
+/// fan-out, standby, quorum, or the `Each` amplification guard.
+pub(crate) fn bound_resolution(
+    eligible: &[u64],
+    result_mode: ResultMode,
+    policy: &CandidatePolicy,
+) -> Result<ResolvedCandidates, ResolutionRefusal> {
     let matched = eligible.len();
     let active_bound = match result_mode {
         ResultMode::Any => policy.initial_fanout,
@@ -244,16 +256,12 @@ pub fn resolve_candidates(
         }
     };
 
-    let active: Vec<u64> = eligible
-        .iter()
-        .take(active_bound)
-        .map(|candidate| candidate.node_id)
-        .collect();
+    let active: Vec<u64> = eligible.iter().take(active_bound).copied().collect();
     let standby: Vec<u64> = eligible
         .iter()
         .skip(active.len())
         .take(policy.standby_count)
-        .map(|candidate| candidate.node_id)
+        .copied()
         .collect();
     Ok(ResolvedCandidates { active, standby })
 }

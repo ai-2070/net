@@ -41039,7 +41039,8 @@ impl MeshNode {
         let capability_ids: Vec<sensing::CapabilityId> = {
             let slot = ctx.sensing_leader.lock();
             match slot.as_ref() {
-                Some(leader) => leader.interest_capability_ids(),
+                // F3: the plaintext fold reconciles LEGACY interests only.
+                Some(leader) => leader.legacy_interest_capability_ids(),
                 None => return,
             }
         };

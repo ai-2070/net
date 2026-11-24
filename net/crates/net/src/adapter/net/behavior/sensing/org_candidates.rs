@@ -39,8 +39,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::controller::CandidateProvider;
-use super::identity::CapabilityId;
+use super::controller::{
+    bound_resolution, CandidatePolicy, CandidateProvider, ResolutionRefusal, ResolvedCandidates,
+};
+use super::identity::{CapabilityId, ProviderSelector, ResultMode};
 use super::org_gate::SensingAuthorityStamp;
 use crate::adapter::net::behavior::org::OrgId;
 use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
@@ -235,6 +237,93 @@ pub(crate) fn project_org_candidates(
         ranked: deduped.into(),
         by_node,
         next_expiry,
+    }
+}
+
+/// Resolve an ORGANIZATION-admitted interest against its owner-private
+/// projection (plan §5) — the only resolver an org seed ever reaches, at
+/// intake and in standing reconciliation alike (Q1). Legacy admissions keep
+/// [`resolve_candidates`](super::controller::resolve_candidates) byte-for-byte.
+///
+/// - `AnyAuthorized`: every reachable projected member, in projection order.
+/// - `Node(id)` / `Nodes(ids)`: INTERSECTED with the projection. Unlike the
+///   legacy resolver there is no `Node` short-circuit: a named id outside the
+///   projection opens NO branch. No new refusal distinguishes "not authorized"
+///   from "not yet discovered", "expired" or "unreachable" — that would be an
+///   existence oracle — so the empty result takes the ordinary
+///   `AllBranchesRefused` path at the leader.
+/// - `Tags` / `Group`: resolve EMPTY in org v1 (Q6). A provider-signed
+///   descriptor tag is not an organization assertion, and the projection
+///   carries none.
+///
+/// The projection is already ranked (D-LS2), so this filters in order and never
+/// sorts. The result-mode bounds are the legacy resolver's, shared through
+/// [`bound_resolution`](super::controller::bound_resolution).
+pub(crate) fn resolve_org_candidates(
+    selector: &ProviderSelector,
+    result_mode: ResultMode,
+    candidates: &OrgCapabilityCandidates,
+    policy: &CandidatePolicy,
+) -> Result<ResolvedCandidates, ResolutionRefusal> {
+    let eligible =
+        |entry: &&OrgRankedCandidate| entry.candidate.authorized && entry.candidate.reachable;
+    let node = |entry: &OrgRankedCandidate| entry.candidate.node_id;
+    let matched: Vec<u64> = match selector {
+        ProviderSelector::AnyAuthorized => candidates
+            .ranked()
+            .iter()
+            .filter(eligible)
+            .map(node)
+            .collect(),
+        ProviderSelector::Node(id) => candidates
+            .get(*id)
+            .filter(eligible)
+            .map(node)
+            .into_iter()
+            .collect(),
+        ProviderSelector::Nodes(ids) => candidates
+            .ranked()
+            .iter()
+            .filter(eligible)
+            .filter(|entry| ids.contains(&entry.candidate.node_id))
+            .map(node)
+            .collect(),
+        ProviderSelector::Tags(_) | ProviderSelector::Group(_) => Vec::new(),
+    };
+    bound_resolution(&matched, result_mode, policy)
+}
+
+#[cfg(test)]
+impl OrgCapabilityCandidates {
+    /// Test-only: a projection of reachable, authorized members at the given
+    /// node ids and route estimates — for leader witnesses that exercise the
+    /// org path without building a scoped store.
+    pub(crate) fn for_test(rows: &[(u64, Duration)]) -> Self {
+        let bases = rows
+            .iter()
+            .map(|&(node_id, _)| OrgCandidateBase {
+                provider: EntityId::from_bytes([(node_id & 0xFF) as u8; 32]),
+                node_id,
+                generation: 1,
+                expires_at: u64::MAX,
+            })
+            .collect();
+        struct AllRouted(HashMap<u64, Duration>);
+        impl OrgTopology for AllRouted {
+            fn pinned_entity(&self, _: u64) -> Option<EntityId> {
+                None
+            }
+            fn has_direct_session(&self, _: u64) -> bool {
+                false
+            }
+            fn routed(&self, _: u64) -> bool {
+                true
+            }
+            fn route_estimate(&self, node_id: u64) -> Duration {
+                self.0[&node_id]
+            }
+        }
+        project_org_candidates(bases, &AllRouted(rows.iter().copied().collect()))
     }
 }
 
@@ -734,5 +823,168 @@ mod tests {
         assert!(cache
             .lookup(&CapabilityId::new("nrpc:a"), &src, 0)
             .is_some());
+    }
+
+    // ---- LS-2: the org-only resolver --------------------------------------
+
+    use crate::adapter::net::behavior::sensing::controller::resolve_candidates;
+    use crate::adapter::net::behavior::sensing::identity::{
+        AudienceScopeCommitment, GroupRef, TagMatch,
+    };
+
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
+    fn three() -> OrgCapabilityCandidates {
+        OrgCapabilityCandidates::for_test(&[(0xB1, ms(30)), (0xB2, ms(10)), (0xB3, ms(20))])
+    }
+
+    fn resolve(
+        selector: ProviderSelector,
+        mode: ResultMode,
+    ) -> Result<ResolvedCandidates, ResolutionRefusal> {
+        resolve_org_candidates(&selector, mode, &three(), &CandidatePolicy::default())
+    }
+
+    /// `AnyAuthorized` takes the projection in its precomputed route order, under
+    /// the shared result-mode bounds.
+    #[test]
+    fn any_authorized_takes_the_projection_in_route_order() {
+        let resolved =
+            resolve(ProviderSelector::AnyAuthorized, ResultMode::TopK(3)).expect("resolves");
+        assert_eq!(resolved.active, vec![0xB2, 0xB3, 0xB1]);
+        let resolved = resolve(ProviderSelector::AnyAuthorized, ResultMode::Any).expect("resolves");
+        assert_eq!(resolved.active, vec![0xB2]);
+        assert_eq!(resolved.standby, vec![0xB3]);
+    }
+
+    /// §8 / Q1: an org `Node(id)` OUTSIDE the projection opens no branch, with
+    /// no new refusal. RED coupling: the legacy `Node` short-circuit returns the
+    /// named id unresolved — asserted here against the legacy resolver itself,
+    /// so the two can never be confused.
+    #[test]
+    fn an_org_node_outside_the_projection_opens_no_branch() {
+        let outsider = ProviderSelector::Node(0xEE);
+        let resolved = resolve(outsider.clone(), ResultMode::Any).expect("no new refusal");
+        assert!(resolved.active.is_empty() && resolved.standby.is_empty());
+        let legacy = resolve_candidates(
+            &outsider,
+            ResultMode::Any,
+            &[],
+            &AudienceScopeCommitment::from_bytes([0; 32]),
+            &CandidatePolicy::default(),
+        )
+        .expect("legacy resolves");
+        assert_eq!(
+            legacy.active,
+            vec![0xEE],
+            "the legacy short-circuit this resolver must not take"
+        );
+        assert_eq!(
+            resolve(ProviderSelector::Node(0xB3), ResultMode::Any)
+                .expect("resolves")
+                .active,
+            vec![0xB3]
+        );
+    }
+
+    /// An org `Node(id)` inside the projection but unreachable opens no branch.
+    #[test]
+    fn an_unreachable_member_is_not_resolved_by_name() {
+        let bases = vec![OrgCandidateBase {
+            provider: EntityId::from_bytes([0xB1; 32]),
+            node_id: 0xB1,
+            generation: 1,
+            expires_at: u64::MAX,
+        }];
+        let set = project_org_candidates(bases, &Topology::default());
+        let resolved = resolve_org_candidates(
+            &ProviderSelector::Node(0xB1),
+            ResultMode::Any,
+            &set,
+            &CandidatePolicy::default(),
+        )
+        .expect("resolves");
+        assert!(resolved.active.is_empty());
+    }
+
+    /// `Nodes` intersects with the projection and keeps projection order.
+    #[test]
+    fn nodes_intersect_with_the_projection() {
+        let resolved = resolve(
+            ProviderSelector::nodes(vec![0xB1, 0xEE, 0xB3]),
+            ResultMode::TopK(3),
+        )
+        .expect("resolves");
+        assert_eq!(resolved.active, vec![0xB3, 0xB1]);
+    }
+
+    /// Q6: `Tags` and `Group` resolve empty for an org interest.
+    #[test]
+    fn tags_and_groups_resolve_empty_for_an_org_interest() {
+        let tags = ProviderSelector::tags(vec![TagMatch {
+            key: "zone".into(),
+            value: "eu".into(),
+        }]);
+        assert!(resolve(tags, ResultMode::Each)
+            .expect("resolves")
+            .active
+            .is_empty());
+        let group = ProviderSelector::Group(GroupRef::from_bytes([3; 32]));
+        assert!(resolve(group, ResultMode::Each)
+            .expect("resolves")
+            .active
+            .is_empty());
+    }
+
+    /// The `Each` amplification guard is the shared one.
+    #[test]
+    fn each_mode_keeps_the_amplification_guard() {
+        let policy = CandidatePolicy {
+            each_mode_max_providers: 2,
+            ..CandidatePolicy::default()
+        };
+        let refused = resolve_org_candidates(
+            &ProviderSelector::AnyAuthorized,
+            ResultMode::Each,
+            &three(),
+            &policy,
+        );
+        assert_eq!(
+            refused,
+            Err(ResolutionRefusal::SelectorTooBroad { matched: 3, cap: 2 })
+        );
+    }
+
+    /// Where the semantics overlap (`AnyAuthorized`, every candidate reachable
+    /// and authorized, distinct route estimates) the org resolver returns
+    /// exactly what the legacy resolver returns over the same candidates.
+    #[test]
+    fn org_resolution_matches_legacy_where_semantics_overlap() {
+        let set = three();
+        let snapshot: Vec<CandidateProvider> =
+            set.ranked().iter().map(|e| e.candidate.clone()).collect();
+        for mode in [
+            ResultMode::Any,
+            ResultMode::TopK(2),
+            ResultMode::Quorum(2),
+            ResultMode::Each,
+        ] {
+            let org = resolve_org_candidates(
+                &ProviderSelector::AnyAuthorized,
+                mode,
+                &set,
+                &CandidatePolicy::default(),
+            );
+            let legacy = resolve_candidates(
+                &ProviderSelector::AnyAuthorized,
+                mode,
+                &snapshot,
+                &AudienceScopeCommitment::from_bytes([0; 32]),
+                &CandidatePolicy::default(),
+            );
+            assert_eq!(org, legacy, "{mode:?}");
+        }
     }
 }
