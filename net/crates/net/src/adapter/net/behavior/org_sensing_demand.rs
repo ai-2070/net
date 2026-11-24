@@ -89,8 +89,9 @@
 //!
 //! # What stays dark
 //!
-//! Provider-free `OrgCapabilityRegistration` is not lit here: retention is
-//! exact-provider only (`ProviderSelector::Node(provider)`). This module is not
+//! Provider-free `OrgCapabilityRegistration` is not handled here: retention is
+//! exact-provider only (`ProviderSelector::Node(provider)`). The provider-free
+//! organization path is the sensing leader's (leader plan LS-6). This module is not
 //! wired into `OrgClient::call` and adds no public consumer API; it is the
 //! internal demand/refresh substrate a later slice binds to.
 //!

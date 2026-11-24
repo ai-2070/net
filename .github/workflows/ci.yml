@@ -632,10 +632,20 @@ jobs:
       #
       # FLOOR accounting (verified against `cargo test --lib --features
       # "$UNIT_FEATURES" -- --list`, NOT by hand):
-      #   org_gate                        = 60
+      #   org_gate                        = 61
       #     42 baseline + 7 (selector-target intake) + 5 (local-origin planner)
       #     + 6 (publication-pinned fence, off-lock relay crypto window)
-      #   sensing_authority_witness_tests = 67
+      #     + 1 (leader plan D-LS12: the provider-free shapes an org leader
+      #     re-authors are admitted)
+      #     The anchored inventory regex below matches DIRECT children of
+      #     `org_gate::tests` only, so the nested `tests::granted::` witnesses
+      #     are not in this count. Counting them once put the floor at 65
+      #     against a real 61.
+      #   sensing_authority_witness_tests = 75 (re-derived from `--list` at the
+      #     LS-6 head; the groups below sum to 67, and 8 later witnesses landed
+      #     without raising the floor. LS-6 replaced the dark
+      #     `dispatched_org_capability_registration_stays_dark` one-for-one with
+      #     `dispatched_org_capability_registration_reaches_the_org_leader`.)
       #     28 baseline + 1 (dispatch ordering) + 6 (local org lease egress)
       #     + 4 (lease-egress hold repair) + 10 (transition order, release
       #     coherence, phase-2 coverage, currentness fence)
@@ -655,12 +665,12 @@ jobs:
       #     above: the two manual-wrapper guard witnesses (replaced by the
       #     production-observed ones) and the cached-floor "rollback plane"
       #     witness (replaced by the two destructive-partition witnesses in the
-      #     acquisition-transaction line). The groups sum to 67 = MESH_MIN; keep
-      #     it that way when editing.
+      #     acquisition-transaction line). The groups sum to 67; MESH_MIN is the
+      #     --list count (75). Keep both true when editing.
       # The mesh line previously read 35 while MESH_MIN read 39 — the arithmetic
       # drifted from the pin. Re-derive both from `--list` when you change them.
       #
-      # REQUIRED holds 58 names (18 gate + 40 mesh). Count with the loops below,
+      # REQUIRED holds 59 names (19 gate + 40 mesh). Count with the loops below,
       # not by eye: a prior comment claimed 34, which was neither the roster size
       # nor any derived figure.
       #
@@ -675,8 +685,8 @@ jobs:
           set -uo pipefail
           GATE=adapter::net::behavior::sensing::org_gate::tests
           MESH=adapter::net::mesh::sensing_authority_witness_tests
-          GATE_MIN=60
-          MESH_MIN=67
+          GATE_MIN=61
+          MESH_MIN=75
 
           die() { echo "::error::$1"; shift; [ "$#" -gt 0 ] && printf '%s\n' "$@"; exit 1; }
 
@@ -751,7 +761,8 @@ jobs:
 
           # (2)+(3) anchored existence + exact single-test execution, per name.
           GATE_REQUIRED="local_org_admission_refuses_a_selector_that_does_not_name_the_target
-          every_non_exact_selector_shape_is_refused_at_intake
+          every_incoherent_selector_shape_is_refused_at_intake
+          a_provider_free_selector_the_leader_can_resolve_is_admitted_at_intake
           the_selector_target_refusal_bumps_protocol_invalid_and_creates_no_row
           the_selector_target_check_precedes_every_other_authority_refusal
           an_exact_selector_naming_the_target_is_admitted_unchanged
@@ -1642,6 +1653,7 @@ jobs:
           cargo nextest run --no-fail-fast --no-tests=fail --features "cortex tool fixtures"
           --test sensing_dispatch
           --test sensing_org_three_node
+          --test sensing_org_leader_three_node
           --test sensing_lease
           --test sensing_lease_wire
           --test sensing_failure_plane

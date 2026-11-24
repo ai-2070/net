@@ -592,6 +592,8 @@ fn verify_granted_ingest(
 /// never a security decision). The result is deduplicated and returned in a
 /// stable order.
 pub(crate) fn decode_declared_capabilities(descriptor: &[u8]) -> Vec<CapabilityAuthorityId> {
+    #[cfg(test)]
+    DESCRIPTOR_DECODES_FOR_TEST.with(|count| count.set(count.get() + 1));
     let Some(caps) = CapabilitySet::from_bytes(descriptor) else {
         return Vec::new();
     };
@@ -601,6 +603,16 @@ pub(crate) fn decode_declared_capabilities(descriptor: &[u8]) -> Vec<CapabilityA
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+// Test-only, per THREAD: every descriptor decode on this thread. A witness on a
+// current-thread runtime reads it across a reconciliation pass to prove the
+// pass decodes nothing (leader plan §6 bench gate, D-LS9) — exact, and immune
+// to decodes by tests running on other threads.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DESCRIPTOR_DECODES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// A verified scoped capability with its declared capability-authority ids

@@ -654,6 +654,77 @@ checks. These take effect at the next refresh:
 
 A row already accepted lives until its soft-state TTL.
 
+### Provider-free organization sensing (the org leader)
+
+An organization member can register a **provider-free** interest — "any
+authorized member serving this capability" — with the scope's sensing
+leader instead of naming providers itself:
+
+```rust
+consumer.register_org_capability_interest(&spec, leader_node_id, d, ttl)?;
+```
+
+`spec.audience` must be the canonical sensing commitment of the consumer's
+own organization. The frame (`OrgCapabilityRegistration`) carries the
+consumer's own live membership certificate, captured fresh on every call;
+re-call it at `ttl/2`. No authority, a foreign audience, or an unprovable
+membership is refused as `OrgAudienceUnsupported`, and nothing is sent.
+
+**At the leader.** The organization gate admits the frame (membership,
+floor, audience, and `consumer == ` the routed origin). The leader then
+resolves the interest against its **own owner-private discovery**, never the
+plaintext capability fold:
+- only floor-current, unexpired owner-scope records of its owner org count;
+- the leader itself is never a candidate;
+- an explicit `Node` / `Nodes` selector is intersected with that set, so a
+  named provider outside it opens no branch;
+- `Tags` and `Group` resolve empty (no organization tag proof exists).
+
+The leader's registration and its mesh `Leader` rows commit all-or-none,
+under the organization commitment. Each resolved branch is re-authored to
+its provider as an `OrgProviderRegistration` under the **leader's own**
+membership. The provider admits the interest's provider-free selector when
+the leader could have resolved it to that provider: `AnyAuthorized`, or a
+`Nodes` set containing it.
+
+**At the consumer.** Proofs come back through the leader. The consumer
+accepts one only when its signer is a current owner-private provider of the
+capability in the consumer's **own** store. A proof from a provider the
+consumer cannot itself see is refused (`scope_refusals`).
+
+**Standing reconciliation.** One node-owned task reconciles every org
+interest, and every change wakes it directly:
+- a provider's discovery, update, expiry or floor raise (the owner-private
+  change stream);
+- any authority movement: install, removal, rotation, a store swap, a
+  poisoned or recovered store;
+- a peer-session change.
+
+Route and proximity changes are noticed within 250 ms. A cheap check
+re-joins each capability's cached candidates with live routes and
+reconciles only capabilities whose reachability or ranking moved. A 5 s tick
+remains only as a backstop against a missed wake.
+
+Lost authority, a poisoned store, or a revoked provider withdraws the
+affected branches. Org interests never fall back to the legacy universe, and
+legacy fold reconciliation never touches them.
+
+Limits (v1):
+- at most 512 live org interests per node;
+- no same-node provider;
+- no `Tags` / `Group`;
+- no SDK surface yet (the core `MeshNode` method above is the seam).
+
+Metrics: `MeshNode::org_leader_metrics()` returns `OrgLeaderMetrics`, and
+`OrgLeaderMetrics::prometheus_text()` renders it. It covers:
+- projection builds, cache hits and discards, by reason;
+- reconcile passes, batches and requeues;
+- dirty capabilities;
+- scoped-lock, plan and apply hold times;
+- over-cap refusals;
+- preflight refusals;
+- withdrawn fills.
+
 ## Observability
 
 Read a snapshot through `MeshNode::sensing_counters()` (an
@@ -666,7 +737,7 @@ never load-bearing for any decision.
 | Counter | Fires when |
 |---------|-----------|
 | `invalid_constraints` | any constraint parse/validate rejection |
-| `protocol_invalid` | the security-relevant subset. Complete list of production increments: an unknown sensing subprotocol / stream id; a frame from a peer already inside its auth-failure throttle; a strict interest-frame or attestation decode failure; a constraint-digest or interest-digest mismatch; a wire scope claim the session does not back; a LEGACY registration declaring an organization-derived audience while this node holds organization authority; malformed organization-registration interval / soft-state-TTL bounds; an organization frame that is not an org registration variant, whose leader-leg routed origin does not match `from_node`, or whose interest selector does not name the frame's own `target`; a rendezvous / leader wire-intake authority mismatch; an attestation signature-verification failure; an out-of-bounds promised cadence on an interval-unsupported refusal; and attestation equivocation |
+| `protocol_invalid` | the security-relevant subset. Complete list of production increments: an unknown sensing subprotocol / stream id; a frame from a peer already inside its auth-failure throttle; a strict interest-frame or attestation decode failure; a constraint-digest or interest-digest mismatch; a wire scope claim the session does not back; a LEGACY registration declaring an organization-derived audience while this node holds organization authority; malformed organization-registration interval / soft-state-TTL bounds; an organization frame that is not an org registration variant, whose leader-leg routed origin does not match `from_node`, or whose provider-leg selector no organization leader could resolve to the frame's own `target` (anything but `Node(target)`, `AnyAuthorized`, or a `Nodes` set containing it); a rendezvous / leader wire-intake authority mismatch; an attestation signature-verification failure; an out-of-bounds promised cadence on an interval-unsupported refusal; and attestation equivocation |
 | `cadence_refusals` | a requested interval below the cadence floor was refused |
 | `scope_refusals` | a §4.10 scope-validation refusal (any kind) |
 | `broad_selector_refusals` | an `Each`-mode selector matched more providers than `each_mode_max_providers` (the §4.7 amplification guard) |

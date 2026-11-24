@@ -2209,6 +2209,18 @@ impl OrgRevocationStore {
         self.core.mark_poisoned();
     }
 
+    /// Test-only: poison this path AND issue the authority-changed wake exactly
+    /// as the production durability-uncertain path does for a newly poisoned,
+    /// floor-neutral publication (E3c blockers §1). [`Self::mark_poisoned_for_test`]
+    /// marks silently; a witness of a poison-DRIVEN reaction needs this one.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn mark_poisoned_and_notify_for_test(&self) {
+        if self.core.mark_poisoned() {
+            self.core.notify_authority_changed();
+        }
+    }
+
     /// Test-only: arm the pre-`poison_gate` PLACEMENT hook — fired before a
     /// poison transition attempts the acquisition, whether or not the gate is
     /// held. Fires for marks AND clears, including the ones the production

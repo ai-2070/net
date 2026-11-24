@@ -276,6 +276,39 @@ impl InterestTable {
         RegisterOutcome::Registered(self.action_for(key, now))
     }
 
+    /// Whether [`Self::register`] would admit EVERY one of `rows` for
+    /// `downstream` against the table as it is now — the preflight that lets a
+    /// multi-row transaction (the org leader intake, plan §6) commit
+    /// all-or-none. Pure: nothing is mutated. Mirrors `register`'s two refusals
+    /// exactly — a cached provider floor above the row's interval, and the
+    /// per-downstream row cap, counted CUMULATIVELY across the new rows — so a
+    /// caller holding the table guard across preflight and commit cannot be
+    /// refused between them.
+    pub fn would_admit(
+        &self,
+        rows: &[(ProviderInterestKey, Duration)],
+        downstream: DownstreamId,
+    ) -> bool {
+        let held = self.per_downstream.get(&downstream).copied().unwrap_or(0);
+        let mut new_rows = 0usize;
+        for (key, interval) in rows {
+            let entry = self.entries.get(key);
+            if entry
+                .and_then(|entry| entry.refused_minimum)
+                .is_some_and(|floor| *interval < floor)
+            {
+                return false;
+            }
+            if entry.is_none_or(|entry| !entry.downstreams.contains_key(&downstream)) {
+                new_rows += 1;
+                if held + new_rows > self.max_interests_per_peer {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Drop expired downstream rows everywhere and report the keys
     /// whose upstream aggregate consequently changed. Empty entries
     /// (and their cached floors) are removed entirely.

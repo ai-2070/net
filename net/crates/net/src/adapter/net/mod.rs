@@ -237,8 +237,8 @@ pub use mesh::SensingOffLockObservation;
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, GrantedSensingRegistration, GrantedSensingUnavailable, MeshNode,
-    MeshNodeConfig, NoiseStaticKey, OrgCallInFlight, OrgSensingRoutingCounters, PartitionFilter,
-    PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
+    MeshNodeConfig, NoiseStaticKey, OrgCallInFlight, OrgLeaderMetrics, OrgSensingRoutingCounters,
+    PartitionFilter, PublishChainConflict, SensingLeaseReleaseRefused, SensingReadinessOverlay,
     SensingRegistrationError, SessionPath, StartRefused, StreamInboundEvent, StreamInboundSink,
     StreamInbox, SubnetFloorQueryError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
     NOISE_STATIC_KEY_CONTEXT, TRANSFER_CHUNK_IDLE_TIMEOUT,

@@ -2428,6 +2428,10 @@ struct DispatchCtx {
     /// `org_install` held, before the store publication pin is taken.
     #[cfg(test)]
     sensing_fence_seam: SensingSeamSlot,
+    /// In-crate witness seam for the org leader commit (LS-4 lock-order
+    /// witness): fires immediately BEFORE a commit takes `sensing_interest_table`.
+    #[cfg(all(test, feature = "redex"))]
+    org_leader_commit_seam: SensingSeamSlot,
     /// OA3-5: the private-discovery store verified scoped announcements land in.
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
@@ -2577,6 +2581,10 @@ struct DispatchCtx {
     /// on `MeshNode`.
     #[cfg(feature = "redex")]
     sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>>,
+    /// The provider-free org leader's counters (leader plan §6). See the
+    /// matching field on `MeshNode`.
+    #[cfg(feature = "redex")]
+    org_leader_counters: Arc<sensing::org_candidates::OrgLeaderCounters>,
     /// SI-6.1 closure: per-capability leading+trailing-edge gate for
     /// fold-driven leader reconciliation. See the matching field on
     /// `MeshNode`.
@@ -9295,6 +9303,201 @@ impl OrgSensingRoutingCounters {
     }
 }
 
+/// Operator-readable metrics of the provider-free ORGANIZATION sensing leader
+/// (leader plan §6 "Required metrics"). Monotonic except the two gauges;
+/// diagnostic only — nothing reads them to make a decision. Read through
+/// [`MeshNode::org_leader_metrics`], render with [`Self::prometheus_text`].
+///
+/// Durations are cumulative sums with a count, so a rate of the sum over the
+/// count is the mean hold/plan time over any window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OrgLeaderMetrics {
+    /// Indexed owner-bucket lookups the leader projection performed.
+    pub scoped_index_bucket_visits_total: u64,
+    /// Descriptor decodes on the private-discovery ingest path (one per
+    /// verified envelope; the leader itself never decodes).
+    pub scoped_descriptor_decode_total: u64,
+    /// The leader capture's scoped-state lock hold: total nanoseconds.
+    pub scoped_state_lock_hold_nanos_sum: u64,
+    /// The leader capture's scoped-state lock hold: count.
+    pub scoped_state_lock_hold_count: u64,
+    /// Projections built for an org intake.
+    pub candidate_projection_build_intake_total: u64,
+    /// Projections built by reconciliation (cache misses).
+    pub candidate_projection_build_reconcile_total: u64,
+    /// Reconciliation projections served from the cache.
+    pub candidate_projection_cache_hits_total: u64,
+    /// Plans discarded because the authority moved before the commit fence.
+    pub candidate_projection_discarded_stale_authority_total: u64,
+    /// Plan entries discarded because their interest moved before apply.
+    pub candidate_projection_discarded_stale_version_total: u64,
+    /// Cached projections (gauge).
+    pub candidate_projection_cache_entries: u64,
+    /// Demanded capabilities the most recent pass reconciled (gauge).
+    pub dirty_capabilities: u64,
+    /// Reconciliation passes.
+    pub reconcile_passes_total: u64,
+    /// Apply batches (at most 64 interests each).
+    pub reconcile_batch_total: u64,
+    /// Capabilities requeued for a trailing pass.
+    pub reconcile_requeued_total: u64,
+    /// Off-lock planning: total nanoseconds.
+    pub plan_nanos_sum: u64,
+    /// Off-lock planning: count.
+    pub plan_count: u64,
+    /// The commit's table+leader critical section: total nanoseconds.
+    pub apply_lock_hold_nanos_sum: u64,
+    /// The commit's table+leader critical section: count.
+    pub apply_lock_hold_count: u64,
+    /// New org interests refused at the node-wide cap.
+    pub interest_over_cap_total: u64,
+    /// Org intakes refused because a Leader row would not be admitted.
+    pub intake_preflight_refused_total: u64,
+    /// Reconciliation fills withdrawn because their Leader row was refused.
+    pub fill_withdrawn_total: u64,
+}
+
+impl OrgLeaderMetrics {
+    /// Render as Prometheus text exposition, in the hand-rolled convention of
+    /// [`OrgSensingRoutingCounters::prometheus_text`]. Durations render as
+    /// `_seconds_sum` / `_seconds_count` summary pairs; labelled families carry a
+    /// `reason`.
+    pub fn prometheus_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(2048);
+        let counter = |out: &mut String, name: &str, help: &str, value: u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name} {value}");
+        };
+        counter(
+            &mut out,
+            "org_scoped_index_bucket_visits_total",
+            "Indexed owner-bucket lookups by the org leader projection.",
+            self.scoped_index_bucket_visits_total,
+        );
+        counter(
+            &mut out,
+            "org_scoped_descriptor_decode_total",
+            "Scoped descriptor decodes on the private-discovery ingest path.",
+            self.scoped_descriptor_decode_total,
+        );
+        counter(
+            &mut out,
+            "org_leader_reconcile_passes_total",
+            "Org leader reconciliation passes.",
+            self.reconcile_passes_total,
+        );
+        counter(
+            &mut out,
+            "org_leader_reconcile_batch_total",
+            "Org leader reconciliation apply batches.",
+            self.reconcile_batch_total,
+        );
+        counter(
+            &mut out,
+            "org_leader_reconcile_requeued_total",
+            "Capabilities requeued for one trailing reconciliation pass.",
+            self.reconcile_requeued_total,
+        );
+        counter(
+            &mut out,
+            "org_leader_interest_over_cap_total",
+            "New org leader interests refused at the node-wide cap.",
+            self.interest_over_cap_total,
+        );
+        counter(
+            &mut out,
+            "org_leader_intake_preflight_refused_total",
+            "Org leader intakes refused because a Leader row would not be admitted.",
+            self.intake_preflight_refused_total,
+        );
+        counter(
+            &mut out,
+            "org_leader_fill_withdrawn_total",
+            "Reconciliation fills withdrawn because their Leader row was refused.",
+            self.fill_withdrawn_total,
+        );
+        counter(
+            &mut out,
+            "org_candidate_projection_cache_hits_total",
+            "Reconciliation projections served from the bounded cache.",
+            self.candidate_projection_cache_hits_total,
+        );
+        out.push_str("# HELP org_candidate_projection_build_total Org leader candidate projections built, by reason.\n");
+        out.push_str("# TYPE org_candidate_projection_build_total counter\n");
+        for (reason, value) in [
+            ("intake", self.candidate_projection_build_intake_total),
+            ("reconcile", self.candidate_projection_build_reconcile_total),
+        ] {
+            let _ = writeln!(
+                out,
+                "org_candidate_projection_build_total{{reason=\"{reason}\"}} {value}"
+            );
+        }
+        out.push_str("# HELP org_candidate_projection_discarded_total Org leader plans discarded before apply, by reason.\n");
+        out.push_str("# TYPE org_candidate_projection_discarded_total counter\n");
+        for (reason, value) in [
+            (
+                "stale_authority",
+                self.candidate_projection_discarded_stale_authority_total,
+            ),
+            (
+                "stale_version",
+                self.candidate_projection_discarded_stale_version_total,
+            ),
+        ] {
+            let _ = writeln!(
+                out,
+                "org_candidate_projection_discarded_total{{reason=\"{reason}\"}} {value}"
+            );
+        }
+        for (name, help, value) in [
+            (
+                "org_candidate_projection_cache_entries",
+                "Cached org leader candidate projections.",
+                self.candidate_projection_cache_entries,
+            ),
+            (
+                "org_leader_dirty_capabilities",
+                "Demanded capabilities the most recent org leader pass reconciled.",
+                self.dirty_capabilities,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            let _ = writeln!(out, "{name} {value}");
+        }
+        for (name, help, nanos, count) in [
+            (
+                "org_scoped_state_lock_hold_seconds",
+                "Scoped-state lock hold by the org leader projection.",
+                self.scoped_state_lock_hold_nanos_sum,
+                self.scoped_state_lock_hold_count,
+            ),
+            (
+                "org_leader_plan_seconds",
+                "Off-lock org leader reconciliation planning.",
+                self.plan_nanos_sum,
+                self.plan_count,
+            ),
+            (
+                "org_leader_apply_lock_hold_seconds",
+                "The org leader commit's table+leader critical section.",
+                self.apply_lock_hold_nanos_sum,
+                self.apply_lock_hold_count,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} summary");
+            let _ = writeln!(out, "{name}_sum {:.9}", nanos as f64 / 1e9);
+            let _ = writeln!(out, "{name}_count {count}");
+        }
+        out
+    }
+}
+
 /// The observable organization sensing demand/refresh state.
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
@@ -9774,6 +9977,133 @@ fn spawn_sensing_frame_send(
             debit.commit();
         }
     });
+}
+
+/// The mesh's live topology as the org leader projection sees it (LS-1
+/// [`OrgTopology`](sensing::org_candidates::OrgTopology)): pins, direct
+/// sessions, the routing table and the proximity estimate.
+#[cfg(feature = "redex")]
+struct MeshOrgTopology<'a> {
+    peers: &'a DashMap<u64, PeerInfo>,
+    peer_entity_ids: &'a DashMap<u64, EntityId>,
+    router: &'a NetRouter,
+    proximity_graph: &'a ProximityGraph,
+}
+
+#[cfg(feature = "redex")]
+impl<'a> MeshOrgTopology<'a> {
+    fn of(ctx: &'a DispatchCtx) -> Self {
+        Self {
+            peers: &ctx.peers,
+            peer_entity_ids: &ctx.peer_entity_ids,
+            router: &ctx.router,
+            proximity_graph: &ctx.proximity_graph,
+        }
+    }
+}
+
+#[cfg(feature = "redex")]
+impl sensing::org_candidates::OrgTopology for MeshOrgTopology<'_> {
+    fn pinned_entity(&self, node_id: u64) -> Option<EntityId> {
+        self.peer_entity_ids
+            .get(&node_id)
+            .map(|entry| entry.value().clone())
+    }
+    fn has_direct_session(&self, node_id: u64) -> bool {
+        self.peers.contains_key(&node_id)
+    }
+    fn routed(&self, node_id: u64) -> bool {
+        self.router.routing_table().lookup(node_id).is_some()
+    }
+    fn route_estimate(&self, node_id: u64) -> Duration {
+        sensing::proximity_route_estimate(self.proximity_graph, node_id)
+    }
+}
+
+/// What one org leader intake did (LS-4). Returned so the in-crate witnesses
+/// (and, from LS-6, the dispatch arm's tracing) can name the exact outcome.
+#[cfg(feature = "redex")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrgLeaderIntake {
+    /// Committed: the interest's branches and the ones THIS registration was
+    /// admitted on.
+    Registered {
+        branches: Vec<u64>,
+        admitted: Vec<u64>,
+    },
+    /// The authority gate refused the frame (counted by the gate itself).
+    NotAdmitted,
+    /// This node holds no leader role.
+    NoLeader,
+    /// A NEW org interest over the D-LS4 cap.
+    OverCap,
+    /// The leader refused (leg/authority mismatch, too-broad selector, every
+    /// branch refused).
+    Refused(sensing::ResolutionRefusal),
+    /// A mesh Leader row would have been refused, so nothing committed.
+    PreflightRefused,
+    /// The pinned authority went stale at the fence, so nothing committed.
+    StaleAuthority,
+}
+
+/// A committed org intake's deferred work.
+#[cfg(feature = "redex")]
+struct OrgIntakeCommit {
+    registration: sensing::LeaderRegistration,
+    seed: Option<sensing::AdmittedSensingRegistration>,
+    /// Per admitted branch: the Leader row's demand and the table aggregate.
+    demands: Vec<(sensing::ProviderInterestKey, Duration, Option<Duration>)>,
+}
+
+/// A committed org reconciliation batch's deferred work.
+#[cfg(feature = "redex")]
+#[derive(Default)]
+struct OrgLeaderCommit {
+    /// Interests whose plan went stale before apply.
+    stale: Vec<sensing::CapabilityInterestKey>,
+    /// Mesh removal actions for torn-down branches.
+    removals: Vec<(sensing::ProviderInterestKey, sensing::UpstreamAction)>,
+    /// Fills that committed with their Leader row.
+    added: Vec<(
+        sensing::ProviderInterestKey,
+        Duration,
+        Option<Duration>,
+        sensing::AdmittedSensingRegistration,
+    )>,
+    /// Whether anything scheduler-relevant moved.
+    changed: bool,
+}
+
+/// The org leader reconciler's own state (LS-4): the exclusive OWNER drain, the
+/// bounded projection cache, and the source facts the last pass ran under.
+#[cfg(feature = "redex")]
+struct OrgLeaderReconciler {
+    drain: super::behavior::org_scoped_store::PrivateDiscoveryDrain,
+    cache: sensing::org_candidates::OrgCandidateCache,
+    /// The D-LS5 route-refresh epoch (a source-vector component).
+    route_epoch: u64,
+    last_install: Option<u64>,
+    last_session: Option<Option<u64>>,
+    /// Capabilities requeued by the previous pass.
+    pending: std::collections::HashSet<sensing::CapabilityId>,
+    /// Reconcile every demanded capability on the next pass.
+    force_all: bool,
+}
+
+#[cfg(feature = "redex")]
+impl OrgLeaderReconciler {
+    fn new(drain: super::behavior::org_scoped_store::PrivateDiscoveryDrain) -> Self {
+        Self {
+            drain,
+            cache: sensing::org_candidates::OrgCandidateCache::default(),
+            route_epoch: 0,
+            last_install: None,
+            last_session: None,
+            pending: std::collections::HashSet::new(),
+            // The first pass reconciles everything demanded.
+            force_all: true,
+        }
+    }
 }
 
 /// SI-2b: assemble the Layer-1 candidate snapshot for one
@@ -10719,6 +11049,10 @@ struct NodeSessionRouting {
     /// Republications that produced a new generation. Observable so a witness
     /// can prove a NON-transition published nothing.
     publications: AtomicU64,
+    /// Fired once per published generation, AFTER it is committed — the org
+    /// leader reconciler's session wake (leader plan D-LS13). A `Notify` keeps
+    /// one permit, so a burst of transitions coalesces into one reconciliation.
+    published_wake: tokio::sync::Notify,
     /// Test-only observation of the sample→revalidate window inside the build.
     build_observer: SessionBuildObserver,
     /// Test-only, one-shot: fires immediately BEFORE a transition takes
@@ -10744,6 +11078,7 @@ impl NodeSessionRouting {
             currentness: super::behavior::org_routing_registry::SessionCurrentness::new(),
             gate: parking_lot::Mutex::new(()),
             publications: AtomicU64::new(0),
+            published_wake: tokio::sync::Notify::new(),
             build_observer: SessionBuildObserver::default(),
             #[cfg(test)]
             transition_attempt_hook: parking_lot::Mutex::new(None),
@@ -10857,6 +11192,7 @@ impl NodeSessionRouting {
             .store(Arc::new(SessionProjection { generation, rows }));
         self.currentness.commit(generation);
         self.publications.fetch_add(1, Ordering::AcqRel);
+        self.published_wake.notify_one();
         Some(generation)
     }
 
@@ -11505,6 +11841,8 @@ fn move_routing_authority<R>(
         // that can never complete.
         AuthorityAdvance::AlreadyExhausted => {}
     }
+    // D-LS13: every authority movement wakes the org leader reconciler.
+    authority.moved_wake.notify_one();
     result
 }
 
@@ -11724,6 +12062,14 @@ enum AuthorityAdvance {
 struct RoutingAuthority {
     gate: parking_lot::Mutex<()>,
     epoch: AtomicU64,
+    /// Fired after EVERY authority movement `move_routing_authority` serializes —
+    /// a store or authority install, a floor raise, a grant revocation, and a
+    /// poison mark or recovery (which the store reports as an empty raise) — and
+    /// by the node-authority install paths once their generation has advanced.
+    /// The org leader reconciler's authority wake (leader plan D-LS13): it forces
+    /// a full re-projection, so a poisoned or rotated authority withdraws org
+    /// branches at once instead of at the next backstop tick.
+    moved_wake: tokio::sync::Notify,
     /// Set once the epoch space is exhausted. Terminal: routing serves nothing
     /// and commits nothing from then on.
     exhausted: AtomicBool,
@@ -11781,6 +12127,7 @@ impl RoutingAuthority {
         Self {
             gate: parking_lot::Mutex::new(()),
             epoch: AtomicU64::new(1),
+            moved_wake: tokio::sync::Notify::new(),
             exhausted: AtomicBool::new(false),
             #[cfg(test)]
             contention_hook: parking_lot::Mutex::new(None),
@@ -13349,6 +13696,9 @@ pub struct MeshNode {
     /// have it fire on the dispatch path.
     #[cfg(test)]
     sensing_fence_seam: SensingSeamSlot,
+    /// See the matching `DispatchCtx` field (LS-4 lock-order witness).
+    #[cfg(all(test, feature = "redex"))]
+    org_leader_commit_seam: SensingSeamSlot,
     /// Fixtures-only: fires ONCE PER EMITTING Phase 2, with every sensing guard
     /// released and `org_transition_mu` still held. Lets a witness park one
     /// transition mid-flight and prove a later one cannot overtake it, and lets
@@ -13978,6 +14328,18 @@ pub struct MeshNode {
     /// rides the RedEX election, never a second election subsystem.
     #[cfg(feature = "redex")]
     sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>>,
+    /// The provider-free ORGANIZATION leader's counters (leader plan §6),
+    /// shared by the org intake transaction and the org leader reconciler.
+    #[cfg(feature = "redex")]
+    org_leader_counters: Arc<sensing::org_candidates::OrgLeaderCounters>,
+    /// The org leader reconciler task (LS-4). Like `routing_task` it is joined
+    /// deterministically at shutdown: awaiting it proves the reconciler stopped
+    /// and released the exclusive OWNER private-discovery drain.
+    #[cfg(feature = "redex")]
+    org_leader_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// Guards the single org leader reconciler start (one OWNER drain per node).
+    #[cfg(feature = "redex")]
+    org_leader_started: AtomicBool,
     /// SI-6.1 closure: per-capability leading+trailing-edge gate for
     /// fold-driven leader reconciliation (see [`SensingFoldGate`]).
     /// A DEDICATED map, deliberately not the registration damper: a
@@ -15660,6 +16022,8 @@ impl MeshNode {
             sensing_acquire_pre_restore_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             sensing_fence_seam: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(all(test, feature = "redex"))]
+            org_leader_commit_seam: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(any(test, feature = "fixtures"))]
             sensing_phase_two_seam: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
@@ -15728,6 +16092,12 @@ impl MeshNode {
             sensing_upstream_damper: Arc::new(DashMap::new()),
             #[cfg(feature = "redex")]
             sensing_leader,
+            #[cfg(feature = "redex")]
+            org_leader_counters: Arc::new(sensing::org_candidates::OrgLeaderCounters::default()),
+            #[cfg(feature = "redex")]
+            org_leader_task: parking_lot::Mutex::new(None),
+            #[cfg(feature = "redex")]
+            org_leader_started: AtomicBool::new(false),
             #[cfg(feature = "redex")]
             sensing_fold_coalescer: Arc::new(DashMap::new()),
             sensing_emitter,
@@ -19242,6 +19612,36 @@ impl MeshNode {
         }
     }
 
+    /// The provider-free ORGANIZATION sensing leader's metrics (leader plan §6).
+    /// Production API, not gated to `fixtures`. See [`OrgLeaderMetrics`].
+    #[cfg(feature = "redex")]
+    pub fn org_leader_metrics(&self) -> OrgLeaderMetrics {
+        let c = self.org_leader_counters.snapshot();
+        OrgLeaderMetrics {
+            scoped_index_bucket_visits_total: c.bucket_visits,
+            scoped_descriptor_decode_total: self.scoped_ingest_counters.descriptor_decodes(),
+            scoped_state_lock_hold_nanos_sum: c.scoped_lock_nanos,
+            scoped_state_lock_hold_count: c.scoped_lock_holds,
+            candidate_projection_build_intake_total: c.builds_intake,
+            candidate_projection_build_reconcile_total: c.builds_reconcile,
+            candidate_projection_cache_hits_total: c.cache_hits,
+            candidate_projection_discarded_stale_authority_total: c.discarded_stale_authority,
+            candidate_projection_discarded_stale_version_total: c.discarded_stale_version,
+            candidate_projection_cache_entries: c.cache_entries,
+            dirty_capabilities: c.dirty_capabilities,
+            reconcile_passes_total: c.reconcile_passes,
+            reconcile_batch_total: c.reconcile_batches,
+            reconcile_requeued_total: c.reconcile_requeued,
+            plan_nanos_sum: c.plan_nanos,
+            plan_count: c.plans,
+            apply_lock_hold_nanos_sum: c.apply_lock_nanos,
+            apply_lock_hold_count: c.applies,
+            interest_over_cap_total: c.interest_over_cap,
+            intake_preflight_refused_total: c.intake_preflight_refused,
+            fill_withdrawn_total: c.fill_withdrawn,
+        }
+    }
+
     /// The organization sensing demand/refresh counters and schedule state, for
     /// witnesses and diagnostics. Read-only.
     #[cfg(any(test, feature = "fixtures"))]
@@ -19649,6 +20049,53 @@ impl MeshNode {
             &self.sensing_counters,
         )
         .map_err(SensingRegistrationError::Scope)?;
+        let (ttl, key) = self.record_capability_interest_expectation(
+            spec,
+            requested_sample_interval,
+            soft_state_ttl,
+        )?;
+        if sensing_upstream_damper_admits(
+            &self.sensing_upstream_damper,
+            leader,
+            *key.interest_digest.as_bytes(),
+            sensing_effective_min_gap(ttl),
+        ) {
+            let frame = sensing::SensingInterestFrame::capability_registration(
+                spec,
+                requested_sample_interval,
+                ttl,
+                self.node_id,
+            );
+            if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+                spawn_sensing_frame_send(
+                    &self.sink,
+                    &self.peers,
+                    &self.addr_to_node,
+                    &self.router,
+                    &self.partition_filter,
+                    self.node_id,
+                    leader,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                    bytes,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The consumer half shared by both provider-free registrations (legacy
+    /// [`Self::register_capability_interest`] and organization
+    /// [`Self::register_org_capability_interest`]): record the digest-level
+    /// expectation that makes returning leader fan-outs solicited at this hop, and
+    /// re-anchor every overlay cell under the digest to the (possibly refreshed)
+    /// interval. Returns the capped ttl and the interest key.
+    fn record_capability_interest_expectation(
+        &self,
+        spec: &sensing::InterestSpec,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<(Duration, sensing::CapabilityInterestKey), SensingRegistrationError> {
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let key = spec.key();
         {
@@ -19704,17 +20151,79 @@ impl MeshNode {
                 &local_aggregates,
             );
         }
+        Ok((ttl, key))
+    }
+
+    /// LS-6 (leader plan D-LS7): register (or refresh) a provider-free
+    /// ORGANIZATION capability interest — the org twin of
+    /// [`Self::register_capability_interest`], and the consumer half of the lit
+    /// `OrgCapabilityRegistration` arm.
+    ///
+    /// The spec's audience must be the canonical sensing commitment of THIS node's
+    /// installed owner organization; the frame is authored under this node's OWN
+    /// live membership certificate, captured fresh on every call (re-call at
+    /// ttl/2). No authority, a foreign audience, or an unprovable membership is
+    /// refused as [`SensingRegistrationError::OrgAudienceUnsupported`] — never a
+    /// legacy downgrade. Proofs that come back are accepted only from providers
+    /// this node itself sees as current owner-private members (D-LS6).
+    ///
+    /// A core seam for org sensing over a leader, not an SDK surface: the
+    /// provider-free SDK selector (LS-7) is a separate decision.
+    #[cfg(feature = "redex")]
+    pub fn register_org_capability_interest(
+        &self,
+        spec: &sensing::InterestSpec,
+        leader: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<(), SensingRegistrationError> {
+        if !self.config.enable_sensing_coalescing {
+            return Err(SensingRegistrationError::Disabled);
+        }
+        if !sensing_interval_in_bounds(requested_sample_interval, self.config.sensing_interest_ttl)
+        {
+            return Err(SensingRegistrationError::Interval {
+                requested: requested_sample_interval,
+                max: self.config.sensing_interest_ttl,
+            });
+        }
+        if soft_state_ttl.is_zero() {
+            return Err(SensingRegistrationError::ZeroTtl);
+        }
+        let authority = self
+            .node_authority
+            .load_full()
+            .ok_or(SensingRegistrationError::OrgAudienceUnsupported)?;
+        if spec.audience != sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+            return Err(SensingRegistrationError::OrgAudienceUnsupported);
+        }
+        let membership = sensing::capture_live_org_relay_membership(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+            self.entity_id(),
+            authority.owner_org(),
+            crate::adapter::net::behavior::org::current_timestamp(),
+        )
+        .map_err(|_| SensingRegistrationError::OrgAudienceUnsupported)?;
+        let (ttl, key) = self.record_capability_interest_expectation(
+            spec,
+            requested_sample_interval,
+            soft_state_ttl,
+        )?;
         if sensing_upstream_damper_admits(
             &self.sensing_upstream_damper,
             leader,
             *key.interest_digest.as_bytes(),
             sensing_effective_min_gap(ttl),
         ) {
-            let frame = sensing::SensingInterestFrame::capability_registration(
+            let frame = sensing::SensingInterestFrame::org_capability_registration(
                 spec,
                 requested_sample_interval,
                 ttl,
                 self.node_id,
+                membership.owner_cert().clone(),
             );
             if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
                 spawn_sensing_frame_send(
@@ -22529,6 +23038,7 @@ impl MeshNode {
         let _install = self.org_install.lock();
         if self.install_org_revocation_store_locked(store, false, None, None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+            self.routing_authority.moved_wake.notify_one();
         }
         Ok(())
     }
@@ -22548,6 +23058,7 @@ impl MeshNode {
         let _install = self.org_install.lock();
         if self.install_org_revocation_store_locked(store, false, Some(pause), None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+            self.routing_authority.moved_wake.notify_one();
         }
         Ok(())
     }
@@ -23144,6 +23655,7 @@ impl MeshNode {
         // transaction (never one for the store then one for the authority).
         if authority_changed || store_changed {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+            self.routing_authority.moved_wake.notify_one();
         }
         // No epoch bump: the installed authority's IDENTITY changed,
         // captured directly by the send-path [`SendStamp`]
@@ -27086,6 +27598,10 @@ impl MeshNode {
         // vector: that vector is filled from a spawned task, so a fast shutdown
         // can miss it, and this task must be joined deterministically.
         self.start_org_routing_supervisor();
+        // LS-4: the provider-free org leader reconciler (the OWNER drain's only
+        // consumer). Joined deterministically at shutdown, like the supervisor.
+        #[cfg(feature = "redex")]
+        self.start_org_leader_reconciler();
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
@@ -27186,13 +27702,16 @@ impl MeshNode {
     /// Everything the supervisor needs is node-owned and already built; all this
     /// does is hand it the mint and run it. Two properties matter:
     ///
-    /// - **exactly one mint.** `PrivateDiscoveryDrains::new` is called nowhere else
-    ///   in production, and the `routing_started` latch refuses a second start even
+    /// - **exactly one GLOBAL mint.** This is the only production path that mints
+    ///   the global stream (the org leader reconciler builds its own façade and mints
+    ///   only the OWNER stream; leases live with the source, so the two façades
+    ///   share one namespace and can never both hold a stream), and the
+    ///   `routing_started` latch refuses a second start even
     ///   if `start` is called twice. The drain's own lease would refuse the second
     ///   claim regardless — this makes the refusal loud instead of a fenced actor;
-    /// - **the OWNER stream is never claimed.** The supervisor mints
-    ///   `PrivateDiscoveryStream::Global` only; the owner stream stays available for
-    ///   the provider-free leader track (Kyra OLB-2B, Q4).
+    /// - **the OWNER stream is never claimed here.** The supervisor mints
+    ///   `PrivateDiscoveryStream::Global` only; the owner stream belongs to the
+    ///   provider-free org leader reconciler (Kyra OLB-2B, Q4; leader plan LS-4).
     fn start_org_routing_supervisor(&self) {
         if self.routing_started.swap(true, Ordering::AcqRel) {
             tracing::warn!(
@@ -28794,6 +29313,8 @@ impl MeshNode {
             #[cfg(feature = "redex")]
             sensing_leader: self.sensing_leader.clone(),
             #[cfg(feature = "redex")]
+            org_leader_counters: self.org_leader_counters.clone(),
+            #[cfg(feature = "redex")]
             sensing_fold_coalescer: self.sensing_fold_coalescer.clone(),
             #[cfg(feature = "redex")]
             sensing_local_entity_root: sensing::AudienceScopeCommitment::owner_root(
@@ -28807,6 +29328,8 @@ impl MeshNode {
             org_install_generation: self.org_install_generation.clone(),
             #[cfg(test)]
             sensing_fence_seam: self.sensing_fence_seam.clone(),
+            #[cfg(all(test, feature = "redex"))]
+            org_leader_commit_seam: self.org_leader_commit_seam.clone(),
             signing_identity: self.identity.clone(),
             capability_version: self.capability_version.clone(),
             sensing_observer_gate: self.sensing_observer_gate.clone(),
@@ -39148,7 +39671,7 @@ impl MeshNode {
             // membership authority gate ([`verify_org_sensing_registration`]), not
             // the legacy session-scope path, so no legacy claimed scope is derived
             // here. The main match routes `OrgProviderRegistration` to the live org
-            // gate and `OrgCapabilityRegistration` to the dark drop.
+            // gate and `OrgCapabilityRegistration` to the org leader intake.
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
             | sensing::SensingInterestFrame::OrgProviderRegistration { .. }
             | sensing::SensingInterestFrame::GrantedProviderRegistration { .. } => None,
@@ -39624,16 +40147,33 @@ impl MeshNode {
                     );
                 }
             }
-            // The organization CAPABILITY (leader-addressed) variant stays
-            // structurally dark: lighting it requires an owner-private candidate
-            // substrate (scoped-discovery projection, per-interest org-root
-            // resolution) that the exact-provider first release deliberately does
-            // not build. Exact-provider org sensing rides OrgProviderRegistration
-            // above, selected upstream by the owner-scoped discovery client.
+            // The organization CAPABILITY (leader-addressed) variant — the
+            // provider-free org leader (leader plan LS-6). The real authority gate
+            // admits the frame, then the intake transaction projects the
+            // capability's owner-private candidates under the SAME pinned floors and
+            // commits leader + mesh Leader rows all-or-none. A node holding no
+            // leader role drops it (soft state: the consumer re-registers with the
+            // real leader).
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. } => {
+                #[cfg(feature = "redex")]
+                {
+                    let outcome = Self::dispatch_org_capability_registration(
+                        ctx,
+                        &frame,
+                        from_node,
+                        &sender_entity,
+                        now,
+                        now_secs,
+                    );
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        ?outcome,
+                        "sensing: org leader intake"
+                    );
+                }
+                #[cfg(not(feature = "redex"))]
                 tracing::debug!(
-                    "sensing: org capability registration dropped \
-                     (exact-provider release: leader path not lit)"
+                    "sensing: org capability registration dropped (no leader role in this build)"
                 );
             }
         }
@@ -40409,7 +40949,14 @@ impl MeshNode {
         // unless a provider-keyed row solicits it independently.
         let digest_watch: Option<Duration> = match watch_candidate {
             Some((interval, audience)) => {
-                if sensing::AudienceScopeCommitment::owner_root(&origin_entity) == audience {
+                if sensing::AudienceScopeCommitment::owner_root(&origin_entity) == audience
+                    || Self::org_watch_admits_signer(
+                        ctx,
+                        &audience,
+                        &attestation.capability_id,
+                        &origin_entity,
+                    )
+                {
                     Some(interval)
                 } else {
                     ctx.sensing_counters
@@ -41039,7 +41586,8 @@ impl MeshNode {
         let capability_ids: Vec<sensing::CapabilityId> = {
             let slot = ctx.sensing_leader.lock();
             match slot.as_ref() {
-                Some(leader) => leader.interest_capability_ids(),
+                // F3: the plaintext fold reconciles LEGACY interests only.
+                Some(leader) => leader.legacy_interest_capability_ids(),
                 None => return,
             }
         };
@@ -41207,6 +41755,855 @@ impl MeshNode {
             }
         }
         reconciliation.changed
+    }
+
+    // ---- Provider-free ORGANIZATION leader (leader plan LS-4) ---------------
+    //
+    // The org twin of the legacy leader intake + fold reconciliation above,
+    // built on the owner-private projection (LS-1), the org-only resolver
+    // (LS-2) and the off-lock plan/apply split (LS-3). Two differences from the
+    // legacy path are load-bearing:
+    //
+    // - every leader + mesh-table mutation runs as ONE transaction in the order
+    //   `sensing_interest_table` → fenced authority (`org_install` + publication
+    //   pin) → `sensing_leader` (plan §6, findings F4/F5). No path takes the
+    //   table while holding the leader, so the order adds no reverse edge;
+    // - a mesh `Leader` row carries the admitted seed's proven root (the
+    //   canonical org commitment), never this node's legacy sensing root (F4).
+    //
+    // The intake is dark until LS-6 lights the dispatch arm; until then only the
+    // in-crate witnesses reach it.
+
+    /// The org leader arm's whole intake (LS-5): the REAL authority gate
+    /// ([`Self::admit_org_registration`] — bounds, frame shape, a pinned authority
+    /// snapshot, membership/floor/audience verification, the consumer ↔ routed
+    /// origin binding) followed by the intake transaction. LS-6's dispatch arm is
+    /// exactly a call to this; until then the production-coupled witnesses drive
+    /// it with real encoded frames, bypassing only the dark match arm.
+    #[cfg(feature = "redex")]
+    fn dispatch_org_capability_registration(
+        ctx: &DispatchCtx,
+        frame: &sensing::SensingInterestFrame,
+        from_node: u64,
+        sender_entity: &EntityId,
+        now: Instant,
+        now_secs: u64,
+    ) -> OrgLeaderIntake {
+        if !matches!(
+            frame,
+            sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
+        ) {
+            return OrgLeaderIntake::NotAdmitted;
+        }
+        let Some((admitted, authority)) =
+            Self::admit_org_registration(ctx, frame, from_node, sender_entity, now_secs)
+        else {
+            return OrgLeaderIntake::NotAdmitted;
+        };
+        Self::apply_org_capability_registration(
+            ctx, &admitted, &authority, from_node, now, now_secs,
+        )
+    }
+
+    /// The org intake transaction (LS-4): project the admitted interest's
+    /// capability under the SAME pinned floors the gate validated against, then
+    /// commit leader registration + every mesh Leader row all-or-none.
+    ///
+    /// All-or-none is by PREFLIGHT, not rollback: under the held table guard the
+    /// leader previews the branches it would sense, the table checks that every
+    /// Leader row would be admitted ([`sensing::InterestTable::would_admit`]),
+    /// and only then do both commit — so neither can be refused after the other
+    /// mutated. A stale authority stamp at the fence commits nothing.
+    #[cfg(feature = "redex")]
+    fn apply_org_capability_registration(
+        ctx: &DispatchCtx,
+        admitted: &sensing::AdmittedSensingRegistration,
+        authority: &sensing::SensingAuthoritySnapshot,
+        from_node: u64,
+        now: Instant,
+        now_secs: u64,
+    ) -> OrgLeaderIntake {
+        use sensing::org_candidates::{OrgLeaderCounters, MAX_ORG_LEADER_INTERESTS};
+        let sensing::RegistrationLeg::Capability {
+            requested_sample_interval,
+            soft_state_ttl,
+            ..
+        } = admitted.leg()
+        else {
+            return OrgLeaderIntake::Refused(sensing::ResolutionRefusal::AdmittedLegMismatch);
+        };
+        if !matches!(
+            admitted.authority(),
+            sensing::RegistrationAuthority::Org { .. }
+        ) {
+            return OrgLeaderIntake::Refused(sensing::ResolutionRefusal::AuthorityMismatch);
+        }
+        let spec = admitted.spec();
+        let key = spec.key();
+        // D-LS4: refuse a NEW org interest over the cap BEFORE projecting.
+        {
+            let slot = ctx.sensing_leader.lock();
+            let Some(leader) = slot.as_ref() else {
+                return OrgLeaderIntake::NoLeader;
+            };
+            if !leader.has_interest(&key) && leader.org_interest_count() >= MAX_ORG_LEADER_INTERESTS
+            {
+                OrgLeaderCounters::bump(&ctx.org_leader_counters.interest_over_cap);
+                return OrgLeaderIntake::OverCap;
+            }
+        }
+        // Cold projection through the PINNED floors (plan §3 initial intake), with
+        // no leader or table lock held.
+        let (_, candidates) = Self::project_org_leader_candidates(
+            ctx,
+            &spec.capability_id,
+            &authority.authority_view().owner_org,
+            authority.floors(),
+            now_secs,
+        );
+        OrgLeaderCounters::bump(&ctx.org_leader_counters.builds_intake);
+        let ttl = soft_state_ttl.min(ctx.sensing_interest_ttl);
+        let seam = ctx.sensing_fence_seam_hook();
+        let committed = {
+            let mut table = ctx.sensing_interest_table.lock();
+            sensing::with_fenced_current_authority(
+                &ctx.org_install,
+                &ctx.node_authority,
+                &ctx.org_revocation,
+                &ctx.org_install_generation,
+                authority.stamp(),
+                seam.as_ref().map(|hook| hook.as_ref()),
+                || -> Result<OrgIntakeCommit, OrgLeaderIntake> {
+                    let mut slot = ctx.sensing_leader.lock();
+                    let Some(leader) = slot.as_mut() else {
+                        return Err(OrgLeaderIntake::NoLeader);
+                    };
+                    let preview = leader
+                        .preview_org_registration(admitted, &candidates)
+                        .map_err(OrgLeaderIntake::Refused)?;
+                    // The Leader row each previewed branch would carry: the relay
+                    // aggregate after this registration, which is never stricter
+                    // than min(existing, requested) — so a row that passes here
+                    // passes at commit.
+                    let rows: Vec<(sensing::ProviderInterestKey, Duration)> = preview
+                        .iter()
+                        .map(|provider| {
+                            let branch = sensing::ProviderInterestKey::new(key.clone(), *provider);
+                            let demand = leader
+                                .relay
+                                .table
+                                .aggregate(&branch, now)
+                                .map_or(requested_sample_interval, |existing| {
+                                    existing.min(requested_sample_interval)
+                                });
+                            (branch, demand)
+                        })
+                        .collect();
+                    if !table.would_admit(&rows, sensing::DownstreamId::Leader) {
+                        return Err(OrgLeaderIntake::PreflightRefused);
+                    }
+                    let registration = leader
+                        .register_org_capability_interest(admitted, &candidates, now)
+                        .map_err(OrgLeaderIntake::Refused)?;
+                    let seed = leader.interest_seed(&registration.interest);
+                    let mut demands = Vec::with_capacity(registration.admitted_branches.len());
+                    for provider in &registration.admitted_branches {
+                        let branch = sensing::ProviderInterestKey::new(
+                            registration.interest.clone(),
+                            *provider,
+                        );
+                        let Some(strictest) = leader.relay.table.aggregate(&branch, now) else {
+                            continue;
+                        };
+                        // F4: the row's trust anchor is the seed's org commitment.
+                        let outcome = table.register(
+                            &branch,
+                            sensing::DownstreamId::Leader,
+                            strictest,
+                            ttl,
+                            admitted.proven_root(),
+                            now,
+                        );
+                        if !matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
+                            // Unreachable: the preflight admitted this row under
+                            // the same held guard.
+                            tracing::error!("sensing: org leader row refused after preflight");
+                            continue;
+                        }
+                        demands.push((branch.clone(), strictest, table.aggregate(&branch, now)));
+                    }
+                    Ok(OrgIntakeCommit {
+                        registration,
+                        seed,
+                        demands,
+                    })
+                },
+            )
+        };
+        let commit = match committed {
+            None => {
+                // The pinned view went stale at the linearization point: count it
+                // and commit nothing (the fence refused before any mutation).
+                ctx.sensing_counters
+                    .org_stale_stamp
+                    .fetch_add(1, Ordering::Relaxed);
+                return OrgLeaderIntake::StaleAuthority;
+            }
+            Some(Err(refusal)) => {
+                match &refusal {
+                    OrgLeaderIntake::PreflightRefused => {
+                        OrgLeaderCounters::bump(&ctx.org_leader_counters.intake_preflight_refused);
+                    }
+                    OrgLeaderIntake::Refused(sensing::ResolutionRefusal::SelectorTooBroad {
+                        ..
+                    }) => {
+                        ctx.sensing_counters
+                            .broad_selector_refusals
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    OrgLeaderIntake::Refused(
+                        sensing::ResolutionRefusal::AuthorityMismatch
+                        | sensing::ResolutionRefusal::AdmittedLegMismatch,
+                    ) => {
+                        ctx.sensing_counters
+                            .protocol_invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    ?refusal,
+                    "sensing: org leader intake refused registration"
+                );
+                return refusal;
+            }
+            Some(Ok(commit)) => commit,
+        };
+
+        // ---- deferred consequences: no sensing guard is held from here ----
+        ctx.sensing_counters
+            .interests_registered
+            .fetch_add(1, Ordering::Relaxed);
+        if commit.registration.newly_resolved {
+            ctx.sensing_counters
+                .candidate_fanout_total
+                .fetch_add(commit.registration.branches.len() as u64, Ordering::Relaxed);
+        } else {
+            ctx.sensing_counters
+                .interests_coalesced
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if !commit.registration.warm_starts.is_empty() {
+            dispatch_sensing_leader_deliveries(
+                &ctx.sink,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                &ctx.sensing_observations,
+                &ctx.sensing_overlay_changed,
+                ctx.sensing_continuity_factor,
+                commit.registration.warm_starts.clone(),
+                now,
+            );
+        }
+        for (branch, strictest, aggregate) in &commit.demands {
+            ctx.sensing_observations
+                .lock()
+                .update_upstream_interval(branch, *aggregate);
+            if !sensing_upstream_damper_admits(
+                &ctx.sensing_upstream_damper,
+                branch.provider,
+                *branch.interest.interest_digest.as_bytes(),
+                sensing_effective_min_gap(ttl),
+            ) {
+                continue;
+            }
+            if let Some(seed) = &commit.seed {
+                Self::send_org_leader_continuation(
+                    ctx,
+                    seed,
+                    branch.provider,
+                    *strictest,
+                    ttl,
+                    now_secs,
+                );
+            }
+        }
+        OrgLeaderIntake::Registered {
+            branches: commit.registration.branches,
+            admitted: commit.registration.admitted_branches,
+        }
+    }
+
+    /// Author and send the provider continuation for one org leader branch
+    /// (D-LS8): a FRESH `OrgProviderRegistration` under THIS leader's OWN live
+    /// membership, captured at `now_secs` — exactly what a relay does on the
+    /// provider leg. A leader whose membership is unprovable emits NOTHING; the
+    /// org arm never downgrades to a legacy frame.
+    #[cfg(feature = "redex")]
+    fn send_org_leader_continuation(
+        ctx: &DispatchCtx,
+        seed: &sensing::AdmittedSensingRegistration,
+        provider: u64,
+        strictest: Duration,
+        ttl: Duration,
+        now_secs: u64,
+    ) {
+        let continuation = seed.provider_continuation(provider, strictest, ttl);
+        let Some(upstream) = sensing::plan_provider_continuation(&continuation, |org_id| {
+            sensing::capture_live_org_relay_membership(
+                &ctx.org_install,
+                &ctx.node_authority,
+                &ctx.org_revocation,
+                &ctx.org_install_generation,
+                ctx.signing_identity.entity_id(),
+                org_id,
+                now_secs,
+            )
+            .ok()
+        }) else {
+            return;
+        };
+        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+            spawn_sensing_frame_send(
+                &ctx.sink,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                bytes,
+            );
+        }
+    }
+
+    /// Project `capability`'s owner-private candidates under `owner_org` and
+    /// `floors` (LS-1): one SHORT scoped-state lock for the indexed capture (which
+    /// also reads the owner revision the capture is current at), then the
+    /// topology join with no lock held. Never holds the scoped state together
+    /// with a sensing lock.
+    #[cfg(feature = "redex")]
+    fn project_org_leader_candidates(
+        ctx: &DispatchCtx,
+        capability: &sensing::CapabilityId,
+        owner_org: &super::behavior::org::OrgId,
+        floors: &super::behavior::org_revocation::OrgRevocationState,
+        now_secs: u64,
+    ) -> (u64, sensing::org_candidates::OrgCapabilityCandidates) {
+        let (owner_revision, bases) = {
+            let state = ctx.scoped_discovery.lock();
+            let held = Instant::now();
+            sensing::org_candidates::OrgLeaderCounters::bump(
+                &ctx.org_leader_counters.bucket_visits,
+            );
+            let captured = (
+                state.owner_revision(),
+                sensing::org_candidates::capture_org_candidate_bases(
+                    &state,
+                    capability,
+                    owner_org,
+                    now_secs,
+                    floors,
+                    ctx.local_node_id,
+                ),
+            );
+            sensing::org_candidates::OrgLeaderCounters::record(
+                &ctx.org_leader_counters.scoped_lock_nanos,
+                &ctx.org_leader_counters.scoped_lock_holds,
+                held,
+            );
+            captured
+        };
+        (
+            owner_revision,
+            sensing::org_candidates::project_org_candidates(bases, &MeshOrgTopology::of(ctx)),
+        )
+    }
+
+    /// Start the node's org leader reconciler (LS-4) — the ONE consumer of the
+    /// OWNER private-discovery stream. Started at most once; skipped while the
+    /// sensing plane is dark. The slot lock is held across the shutdown check,
+    /// the spawn and the publication, exactly as for the routing supervisor, so
+    /// a racing shutdown either sees the handle or prevents the spawn.
+    #[cfg(feature = "redex")]
+    fn start_org_leader_reconciler(&self) {
+        if !self.config.enable_sensing_coalescing {
+            return;
+        }
+        if self.org_leader_started.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "sensing: org leader reconciler already running; duplicate start ignored"
+            );
+            return;
+        }
+        let mut slot = self.org_leader_task.lock();
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(drain) = super::behavior::org_scoped_store::PrivateDiscoveryDrains::new(
+            self.scoped_discovery.clone(),
+        )
+        .mint(super::behavior::org_scoped_store::PrivateDiscoveryStream::Owner) else {
+            tracing::warn!("sensing: the OWNER private-discovery drain is already held");
+            return;
+        };
+        let ctx = self.dispatch_ctx();
+        let changed = self.scoped_publication.subscribe();
+        let authority = self.routing_authority.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        *slot = Some(tokio::spawn(async move {
+            Self::run_org_leader_reconciler(
+                ctx,
+                OrgLeaderReconciler::new(drain),
+                changed,
+                authority,
+                shutdown,
+                shutdown_notify,
+            )
+            .await;
+        }));
+    }
+
+    /// Join the org leader reconciler. PRECONDITION: shutdown was signalled.
+    #[cfg(feature = "redex")]
+    async fn join_org_leader_reconciler(&self) {
+        let handle = self.org_leader_task.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    /// The reconciler loop: ONE long-lived task and two node-owned timers, no
+    /// task or timer per provider, capability, interest or client. It wakes on
+    /// (D-LS13):
+    /// - private-discovery movement (the scoped watch): provider discovery,
+    ///   update, expiry, floor retraction;
+    /// - authority movement (`RoutingAuthority::moved_wake`): install, removal,
+    ///   rotation, store swap, poison and recovery — a FULL re-projection;
+    /// - session publication (`NodeSessionRouting::published_wake`);
+    /// - the topology check, every [`ORG_LEADER_TOPOLOGY_CHECK`](sensing::org_candidates::ORG_LEADER_TOPOLOGY_CHECK):
+    ///   cached projections re-joined with live routes and proximity, and only
+    ///   the capabilities that moved reconciled;
+    /// - the backstop tick (D-LS5).
+    ///
+    /// Every wake coalesces (watch value / single `Notify` permit), so a burst
+    /// yields one pass, plus at most one trailing pass for requeued capabilities.
+    #[cfg(feature = "redex")]
+    async fn run_org_leader_reconciler(
+        ctx: DispatchCtx,
+        mut state: OrgLeaderReconciler,
+        mut changed: tokio::sync::watch::Receiver<u64>,
+        authority: Arc<RoutingAuthority>,
+        shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<tokio::sync::Notify>,
+    ) {
+        let mut tick = tokio::time::interval(sensing::org_candidates::ORG_LEADER_ROUTE_REFRESH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the immediate first tick; the first pass is wake-driven
+        let mut topology =
+            tokio::time::interval(sensing::org_candidates::ORG_LEADER_TOPOLOGY_CHECK);
+        topology.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        topology.tick().await;
+        let session = ctx.session_routing.clone();
+        loop {
+            let stop = shutdown_notify.notified();
+            tokio::pin!(stop);
+            stop.as_mut().enable();
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::select! {
+                _ = &mut stop => return,
+                moved = changed.changed() => {
+                    if moved.is_err() {
+                        return;
+                    }
+                }
+                _ = authority.moved_wake.notified() => {
+                    state.force_all = true;
+                }
+                _ = session.published_wake.notified() => {}
+                _ = topology.tick() => {
+                    let mut moved = state.cache.take_topology_moved(&MeshOrgTopology::of(&ctx));
+                    // A demanded capability with no cached projection yet (a new
+                    // interest) is reconciled once to establish one, so the check
+                    // covers it from then on.
+                    let demanded = ctx
+                        .sensing_leader
+                        .lock()
+                        .as_ref()
+                        .map(|leader| leader.org_interest_capability_ids())
+                        .unwrap_or_default();
+                    moved.extend(
+                        demanded
+                            .into_iter()
+                            .filter(|capability| !state.cache.contains(capability)),
+                    );
+                    if moved.is_empty() {
+                        continue;
+                    }
+                    state.pending.extend(moved);
+                }
+                _ = tick.tick() => {
+                    state.route_epoch = state.route_epoch.wrapping_add(1);
+                    state.force_all = true;
+                }
+            }
+            if Self::org_leader_reconcile_pass(&ctx, &mut state).await
+                && !shutdown.load(Ordering::Acquire)
+            {
+                Self::org_leader_reconcile_pass(&ctx, &mut state).await;
+            }
+        }
+    }
+
+    /// One reconciliation pass (plan §6 triggers): drain the OWNER stream, then
+    /// reconcile every demanded capability that is dirty — or ALL demanded
+    /// capabilities on a `RebuildAll`, an authority (`org_install_generation`) or
+    /// peer-session movement, or the route-refresh tick. Returns whether any
+    /// capability had to be requeued for a trailing pass.
+    #[cfg(feature = "redex")]
+    async fn org_leader_reconcile_pass(ctx: &DispatchCtx, state: &mut OrgLeaderReconciler) -> bool {
+        use sensing::org_candidates::{capability_authority_id, OrgLeaderCounters};
+        OrgLeaderCounters::bump(&ctx.org_leader_counters.reconcile_passes);
+        let batch = state.drain.drain();
+        let demanded: Vec<sensing::CapabilityId> = {
+            let slot = ctx.sensing_leader.lock();
+            match slot.as_ref() {
+                Some(leader) => leader.org_interest_capability_ids(),
+                None => return false,
+            }
+        };
+        state
+            .cache
+            .retain_demanded(|capability| demanded.contains(capability));
+        let install = ctx.org_install_generation.load(Ordering::Acquire);
+        let session = ctx.session_routing.currentness.generation();
+        let rebuild_all = state.force_all
+            || matches!(
+                batch.dirty,
+                super::behavior::org_scoped_store::DirtyCapabilities::RebuildAll
+            )
+            || state.last_install != Some(install)
+            || state.last_session != Some(session);
+        state.force_all = false;
+        state.last_install = Some(install);
+        state.last_session = Some(session);
+        let dirty = match &batch.dirty {
+            super::behavior::org_scoped_store::DirtyCapabilities::Caps(caps) => caps.clone(),
+            _ => std::collections::BTreeSet::new(),
+        };
+        let pending = std::mem::take(&mut state.pending);
+        let targets: Vec<sensing::CapabilityId> = demanded
+            .into_iter()
+            .filter(|capability| {
+                rebuild_all
+                    || pending.contains(capability)
+                    || dirty.contains(&capability_authority_id(capability))
+            })
+            .collect();
+        ctx.org_leader_counters
+            .dirty_capabilities
+            .store(targets.len() as u64, Ordering::Relaxed);
+        let mut requeue = false;
+        for capability in targets {
+            if Self::reconcile_org_leader_capability(ctx, &capability, state).await {
+                OrgLeaderCounters::bump(&ctx.org_leader_counters.reconcile_requeued);
+                state.pending.insert(capability);
+                requeue = true;
+            }
+        }
+        requeue
+    }
+
+    /// Reconcile every org interest on ONE capability against a FRESH projection
+    /// (plan §3 standing reconciliation): a fresh authority snapshot (served from
+    /// the cache only while the whole source vector matches), the leader's plan
+    /// inputs under a short lock, the off-lock plan, and the fenced commit — in
+    /// batches of at most [`ORG_LEADER_APPLY_BATCH`](sensing::org_candidates::ORG_LEADER_APPLY_BATCH)
+    /// interests with a yield between. Missing or poisoned authority reconciles
+    /// EMPTY (every branch withdrawn), never through an old snapshot and never
+    /// through the legacy universe. Returns whether the capability must be
+    /// requeued (a plan went stale before it could apply).
+    #[cfg(feature = "redex")]
+    async fn reconcile_org_leader_capability(
+        ctx: &DispatchCtx,
+        capability: &sensing::CapabilityId,
+        state: &mut OrgLeaderReconciler,
+    ) -> bool {
+        use sensing::org_candidates::{
+            OrgCandidateSource, OrgCapabilityCandidates, OrgLeaderCounters, ORG_LEADER_APPLY_BATCH,
+        };
+        let now_secs = super::behavior::org::current_timestamp();
+        let authority = sensing::capture_sensing_authority_snapshot(
+            &ctx.org_install,
+            &ctx.node_authority,
+            &ctx.org_revocation,
+            &ctx.org_install_generation,
+        )
+        .ok();
+        let (candidates, owner) = match &authority {
+            Some(snapshot) => {
+                let owner = snapshot.authority_view().owner_org;
+                let current = OrgCandidateSource {
+                    owner_revision: ctx.scoped_discovery.lock().owner_revision(),
+                    authority: *snapshot.stamp(),
+                    session_generation: ctx.session_routing.currentness.generation(),
+                    route_epoch: state.route_epoch,
+                };
+                let candidates = match state.cache.lookup(capability, &current, now_secs) {
+                    Some(hit) => {
+                        OrgLeaderCounters::bump(&ctx.org_leader_counters.cache_hits);
+                        hit
+                    }
+                    None => {
+                        OrgLeaderCounters::bump(&ctx.org_leader_counters.builds_reconcile);
+                        let (owner_revision, projection) = Self::project_org_leader_candidates(
+                            ctx,
+                            capability,
+                            &owner,
+                            snapshot.floors(),
+                            now_secs,
+                        );
+                        state.cache.store(
+                            capability,
+                            OrgCandidateSource {
+                                owner_revision,
+                                ..current
+                            },
+                            projection,
+                        )
+                    }
+                };
+                ctx.org_leader_counters
+                    .cache_entries
+                    .store(state.cache.len() as u64, Ordering::Relaxed);
+                (candidates, Some(owner))
+            }
+            None => (Arc::new(OrgCapabilityCandidates::default()), None),
+        };
+        let (inputs, policy) = {
+            let slot = ctx.sensing_leader.lock();
+            match slot.as_ref() {
+                Some(leader) => (leader.org_plan_inputs(capability), leader.policy()),
+                None => return false,
+            }
+        };
+        let mut requeue = false;
+        for chunk in inputs.chunks(ORG_LEADER_APPLY_BATCH) {
+            OrgLeaderCounters::bump(&ctx.org_leader_counters.reconcile_batches);
+            let planned = Instant::now();
+            let plan =
+                sensing::plan_org_reconciliation(chunk, &candidates, owner.as_ref(), &policy);
+            OrgLeaderCounters::record(
+                &ctx.org_leader_counters.plan_nanos,
+                &ctx.org_leader_counters.plans,
+                planned,
+            );
+            let now = Instant::now();
+            match Self::commit_org_leader_plan(ctx, plan, authority.as_ref(), now) {
+                None => {
+                    // The authority moved after the capture: discard, requeue.
+                    OrgLeaderCounters::bump(&ctx.org_leader_counters.discarded_stale_authority);
+                    requeue = true;
+                }
+                Some(commit) => {
+                    if !commit.stale.is_empty() {
+                        OrgLeaderCounters::bump(&ctx.org_leader_counters.discarded_stale_version);
+                        requeue = true;
+                    }
+                    Self::run_org_leader_consequences(ctx, commit, now);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        requeue
+    }
+
+    /// Commit one off-lock plan: `sensing_interest_table` → fenced authority →
+    /// `sensing_leader` (plan §6). Teardowns always commit and their mesh Leader
+    /// rows deregister; a fill commits only with its mesh Leader row, and a fill
+    /// the table refuses is WITHDRAWN from the leader in the same critical
+    /// section (D-LS10), so the leader never holds a branch the table does not.
+    /// `None` iff the fence found the captured authority stale — nothing was
+    /// mutated. With NO authority (`None` snapshot) the plan can only withdraw,
+    /// which needs no fence.
+    #[cfg(feature = "redex")]
+    fn commit_org_leader_plan(
+        ctx: &DispatchCtx,
+        plan: sensing::OrgReconcilePlan,
+        authority: Option<&sensing::SensingAuthoritySnapshot>,
+        now: Instant,
+    ) -> Option<OrgLeaderCommit> {
+        let ttl = ctx.sensing_interest_ttl;
+        #[cfg(test)]
+        if let Some(seam) = ctx.org_leader_commit_seam.lock().clone() {
+            seam();
+        }
+        let mut table = ctx.sensing_interest_table.lock();
+        let held = Instant::now();
+        let apply = |table: &mut sensing::InterestTable| -> OrgLeaderCommit {
+            let mut slot = ctx.sensing_leader.lock();
+            let Some(leader) = slot.as_mut() else {
+                return OrgLeaderCommit::default();
+            };
+            let applied = leader.apply_org_plan(plan, now);
+            let mut commit = OrgLeaderCommit {
+                stale: applied.stale,
+                changed: applied.reconciliation.changed,
+                ..OrgLeaderCommit::default()
+            };
+            for branch in applied.reconciliation.torn_down {
+                commit.removals.extend(table.deregister(
+                    &branch.interest.interest_digest,
+                    Some(branch.provider),
+                    sensing::DownstreamId::Leader,
+                    now,
+                ));
+            }
+            for (branch, _spec) in applied.reconciliation.added {
+                let (Some(strictest), Some(seed)) = (
+                    leader.relay.table.aggregate(&branch, now),
+                    leader.interest_seed(&branch.interest),
+                ) else {
+                    continue;
+                };
+                match table.register(
+                    &branch,
+                    sensing::DownstreamId::Leader,
+                    strictest,
+                    ttl,
+                    seed.proven_root(),
+                    now,
+                ) {
+                    sensing::RegisterOutcome::Registered(_) => {
+                        let aggregate = table.aggregate(&branch, now);
+                        commit.added.push((branch, strictest, aggregate, seed));
+                    }
+                    _ => {
+                        leader.withdraw_branch(&branch);
+                        sensing::org_candidates::OrgLeaderCounters::bump(
+                            &ctx.org_leader_counters.fill_withdrawn,
+                        );
+                        commit.changed = true;
+                    }
+                }
+            }
+            commit
+        };
+        let committed = match authority {
+            Some(snapshot) => {
+                let seam = ctx.sensing_fence_seam_hook();
+                sensing::with_fenced_current_authority(
+                    &ctx.org_install,
+                    &ctx.node_authority,
+                    &ctx.org_revocation,
+                    &ctx.org_install_generation,
+                    snapshot.stamp(),
+                    seam.as_ref().map(|hook| hook.as_ref()),
+                    || apply(&mut table),
+                )
+            }
+            None => Some(apply(&mut table)),
+        };
+        drop(table);
+        sensing::org_candidates::OrgLeaderCounters::record(
+            &ctx.org_leader_counters.apply_lock_nanos,
+            &ctx.org_leader_counters.applies,
+            held,
+        );
+        committed
+    }
+
+    /// The deferred consequences of a committed org reconciliation, run with NO
+    /// sensing guard held: retire torn-down branches' upstream demand, re-anchor
+    /// and author the continuation for each fill, and bump the scheduler input.
+    #[cfg(feature = "redex")]
+    fn run_org_leader_consequences(ctx: &DispatchCtx, commit: OrgLeaderCommit, now: Instant) {
+        let emitter_stamp = ctx.sensing_emitter.lock().as_ref().map(|e| e.stamp());
+        for (key, action) in commit.removals {
+            apply_sensing_removal_action(
+                &ctx.sensing_local_projection_mu,
+                &ctx.sensing_interest_table,
+                &ctx.sensing_observations,
+                &ctx.sensing_emitter,
+                emitter_stamp,
+                &ctx.sink,
+                &ctx.peers,
+                &ctx.addr_to_node,
+                &ctx.router,
+                &ctx.partition_filter,
+                ctx.local_node_id,
+                &key,
+                action,
+            );
+        }
+        let now_secs = super::behavior::org::current_timestamp();
+        for (branch, strictest, aggregate, seed) in commit.added {
+            ctx.sensing_observations
+                .lock()
+                .update_upstream_interval(&branch, aggregate);
+            Self::send_org_leader_continuation(
+                ctx,
+                &seed,
+                branch.provider,
+                strictest,
+                ctx.sensing_interest_ttl,
+                now_secs,
+            );
+        }
+        let _ = now;
+        if commit.changed {
+            ctx.sensing_overlay_changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+        }
+    }
+
+    /// D-LS6: whether an ORGANIZATION-audience digest watch admits the VERIFIED
+    /// signer `origin` for `capability`. True only when the watch's audience is
+    /// the canonical commitment of THIS node's installed owner org AND `origin`
+    /// is a current owner-private provider of `capability` in this node's OWN
+    /// scoped store — unexpired and floor-current under a coherent authority
+    /// capture. That is the leader's own trust universe applied at the consumer:
+    /// a proof from a provider this node cannot itself see as an authorized
+    /// member is refused exactly as a foreign signer is. Missing or poisoned
+    /// authority admits nothing.
+    fn org_watch_admits_signer(
+        ctx: &DispatchCtx,
+        audience: &sensing::AudienceScopeCommitment,
+        capability: &sensing::CapabilityId,
+        origin: &EntityId,
+    ) -> bool {
+        let Ok(authority) = sensing::capture_sensing_authority_snapshot(
+            &ctx.org_install,
+            &ctx.node_authority,
+            &ctx.org_revocation,
+            &ctx.org_install_generation,
+        ) else {
+            return false;
+        };
+        let owner = authority.authority_view().owner_org;
+        if *audience != sensing::canonical_org_sensing_commitment(&owner) {
+            return false;
+        }
+        let key = super::behavior::org_grant::CapabilityAuthorityId::for_tag(capability.as_str());
+        ctx.scoped_discovery
+            .lock()
+            .find_owner_private_providers(
+                Some(&key),
+                super::behavior::org::current_timestamp(),
+                authority.floors(),
+            )
+            .iter()
+            .any(|(record, provider)| record.owner_org == owner && provider == origin)
     }
 
     /// Leader row was refused at floor M — partition the leader
@@ -41519,6 +42916,7 @@ impl MeshNode {
                 // from cannot diverge from the record the store admits.
                 let prepared =
                     super::behavior::org_scoped_ingest::PreparedScopedCapability::prepare(verified);
+                counters.note_descriptor_decode();
                 // Acquire the publication ordering gate BEFORE the final recheck
                 // (Kyra OLB-2A.3.1): the wait for a concurrent transaction happens
                 // FIRST, so the security view is validated only after it — the
@@ -54739,6 +56137,10 @@ impl Adapter for MeshNode {
         // private-discovery drain, so no incarnation survives this call and a
         // successor node can mint.
         self.join_org_routing_supervisor().await;
+        // LS-4: likewise join the org leader reconciler, proving the OWNER drain
+        // was released.
+        #[cfg(feature = "redex")]
+        self.join_org_leader_reconciler().await;
 
         // The refresh schedule is closed and JOINED BEFORE the egress: a
         // refresh in flight would otherwise enqueue a datagram behind a
@@ -62803,27 +64205,82 @@ mod sensing_authority_witness_tests {
         );
     }
 
-    // C7 — production dispatch: an encoded valid OrgCapabilityRegistration is
-    // structurally dark in the exact-provider release; dispatch mutates nothing.
+    // C7 — production dispatch (leader plan LS-6, the lit arm): an encoded valid
+    // OrgCapabilityRegistration from a member of this node's org, arriving on the
+    // REAL 0x0C02 dispatch path, reaches the org leader and lands a mesh Leader
+    // row under the canonical org commitment. On a node holding NO leader role
+    // the same frame creates nothing (soft state). Replaces the exact-provider
+    // release's "stays dark" witness one-for-one.
+    //
+    // RED-coupled: restoring the dark drop leaves no Leader row.
+    #[cfg(feature = "redex")]
     #[tokio::test]
-    async fn dispatched_org_capability_registration_stays_dark() {
-        let node = org_node("op15").await;
+    async fn dispatched_org_capability_registration_reaches_the_org_leader() {
+        use crate::adapter::net::behavior::capability::CapabilitySet;
+        use crate::adapter::net::behavior::org_scoped_ingest::{
+            CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+        };
+        use crate::adapter::net::behavior::org_scoped_store::NoConsumerGrants;
+
+        let node = sensing_org_node("op15").await;
         let sender = EntityKeypair::generate().entity_id().clone();
         pin_sender(&node, &sender);
-        let ctx = node.dispatch_ctx();
-        // consumer == FROM_NODE (routed-origin binding); dropped before the gate.
-        let cap = sensing::SensingInterestFrame::org_capability_registration(
-            &org_spec(node.node_id(), org_commitment()),
-            D,
-            ORG_TTL,
-            FROM_NODE,
-            member_cert(&sender, 1),
+        let cert = member_cert(&sender, 1);
+        let mut spec = org_spec(node.node_id(), org_commitment());
+        spec.providers = sensing::ProviderSelector::AnyAuthorized;
+        let bytes = sensing::encode_interest_frame(
+            &sensing::SensingInterestFrame::org_capability_registration(
+                &spec, D, ORG_TTL, FROM_NODE, cert,
+            ),
+        )
+        .expect("encode");
+
+        // No leader role: nothing.
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &node.dispatch_ctx());
+        assert!(node.sensing_table_is_empty(), "no leader role, no row");
+
+        // The leader role plus one owner-private provider of the capability.
+        assert!(node.assume_sensing_leader());
+        let provider = EntityId::from_bytes([0xB7; 32]);
+        let now = super::super::behavior::org::current_timestamp();
+        let record = VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: org().org_id(),
+                audience_handle: [0x11; 32],
+            },
+            provider.clone(),
+            org().org_id(),
+            1,
+            now + 3600,
+            1,
+            None,
+            CapabilitySet::new()
+                .add_tag(spec.capability_id.as_str())
+                .to_bytes_compact(),
         );
-        let bytes = sensing::encode_interest_frame(&cap).expect("encode");
-        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
-        assert!(
-            node.sensing_table_is_empty(),
-            "the org capability (leader) variant stays dark — no mutation"
+        node.scoped_discovery.lock().ingest(
+            PreparedScopedCapability::prepare(record),
+            now,
+            &NoConsumerGrants,
+        );
+        node.router.routing_table().add_route(
+            provider.node_id(),
+            PeerAddr::Udp("127.0.0.1:9".parse().unwrap()),
+        );
+
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &node.dispatch_ctx());
+        let row = node
+            .sensing_interest_table
+            .lock()
+            .downstream_entry(
+                &sensing::ProviderInterestKey::new(spec.key(), provider.node_id()),
+                sensing::DownstreamId::Leader,
+            )
+            .map(|row| row.owner_root);
+        assert_eq!(
+            row,
+            Some(org_commitment()),
+            "the lit arm lands the Leader row under the org commitment"
         );
     }
 
@@ -69606,5 +71063,1321 @@ mod cpol01_sweep_tests {
             "the binding admits the owner — it stays"
         );
         assert!(guard.is_authorized_full(subscriber_principal(owner_node), &name));
+    }
+}
+
+/// Provider-free ORGANIZATION leader witnesses (leader plan LS-4/LS-5): the org
+/// intake transaction and the node's org leader reconciler, on a real node with
+/// an adopted org authority, a real indexed private-discovery store and the
+/// leader role assumed. In-crate because the intake and reconciler are private
+/// until LS-6 lights the dispatch arm.
+#[cfg(all(test, feature = "redex"))]
+mod org_leader_tests {
+    use super::*;
+    use crate::adapter::net::behavior::capability::CapabilitySet;
+    use crate::adapter::net::behavior::org::{
+        OrgKeypair, OrgMembershipCert, ORG_CERT_TTL_SECS_RECOMMENDED,
+    };
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::behavior::org_scoped_ingest::{
+        CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+    };
+    use crate::adapter::net::behavior::org_scoped_store::{
+        NoConsumerGrants, PrivateDiscoveryDrains, PrivateDiscoveryStream,
+    };
+    use crate::adapter::net::behavior::sensing::org_candidates::{
+        OrgCapabilityCandidates, MAX_ORG_LEADER_INTERESTS,
+    };
+    use crate::adapter::net::behavior::sensing::ValidatedOrgSensingRegistration;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    const CAP: &str = "nrpc:leader-echo";
+    const D: Duration = Duration::from_millis(100);
+    const TTL: Duration = Duration::from_secs(30);
+    const CONSUMER: u64 = 0x00C0_FFEE;
+
+    fn org() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x42u8; 32])
+    }
+
+    fn org_commitment() -> sensing::AudienceScopeCommitment {
+        sensing::canonical_org_sensing_commitment(&org().org_id())
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("net-org-leader-{tag}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn adopt(node: &MeshNode, tag: &str) -> Arc<NodeAuthority> {
+        let entity = node.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(&org(), entity.clone(), 1, 3600).expect("cert");
+        Arc::new(NodeAuthority::adopt(&scratch(tag), cert, &entity, 0, None).expect("adopt"))
+    }
+
+    /// A sensing-enabled node that adopted `org()` and assumed the leader role.
+    /// Never started, so no background reconciler competes with the witnesses
+    /// for the OWNER drain.
+    async fn leader_node(tag: &str) -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x31u8; 32]).with_sensing_coalescing(true),
+            )
+            .await
+            .expect("MeshNode::new"),
+        );
+        node.install_node_authority(adopt(&node, tag))
+            .expect("install org authority");
+        assert!(node.assume_sensing_leader());
+        node
+    }
+
+    fn descriptor(tags: &[&str]) -> Vec<u8> {
+        let mut caps = CapabilitySet::new();
+        for tag in tags {
+            caps = caps.add_tag(*tag);
+        }
+        caps.to_bytes_compact()
+    }
+
+    /// Ingest a current owner-scope record for provider `seed` declaring CAP into
+    /// the node's private-discovery store, and route its derived node id.
+    fn add_provider(node: &MeshNode, seed: u8) -> u64 {
+        let entity = EntityId::from_bytes([seed; 32]);
+        let now = super::super::behavior::org::current_timestamp();
+        let record = VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: org().org_id(),
+                audience_handle: [0x11; 32],
+            },
+            entity.clone(),
+            org().org_id(),
+            1,
+            now + 3600,
+            1,
+            None,
+            descriptor(&[CAP]),
+        );
+        let outcome = node.scoped_discovery.lock().ingest(
+            PreparedScopedCapability::prepare(record),
+            now,
+            &NoConsumerGrants,
+        );
+        assert_eq!(
+            outcome,
+            super::super::behavior::org_scoped_store::ScopedStoreOutcome::Inserted
+        );
+        let id = entity.node_id();
+        node.router
+            .routing_table()
+            .add_route(id, PeerAddr::Udp("127.0.0.1:9".parse().unwrap()));
+        id
+    }
+
+    fn spec_on(
+        capability: &str,
+        providers: sensing::ProviderSelector,
+        mode: sensing::ResultMode,
+    ) -> sensing::InterestSpec {
+        sensing::InterestSpec {
+            capability_id: sensing::CapabilityId::new(capability),
+            constraints: sensing::CanonicalConstraints::from_entries([("model", "llama")]).unwrap(),
+            work_latency: sensing::WorkLatencyEnvelope::start_within(Duration::from_secs(2)),
+            providers,
+            result_mode: mode,
+            disclosure_class: sensing::DisclosureClass::Owner,
+            audience: org_commitment(),
+        }
+    }
+
+    fn spec(
+        providers: sensing::ProviderSelector,
+        mode: sensing::ResultMode,
+    ) -> sensing::InterestSpec {
+        spec_on(CAP, providers, mode)
+    }
+
+    fn admitted(
+        spec: sensing::InterestSpec,
+        consumer: u64,
+    ) -> sensing::AdmittedSensingRegistration {
+        sensing::AdmittedSensingRegistration::from_validated_org(
+            ValidatedOrgSensingRegistration::capability_for_test(
+                spec,
+                consumer,
+                D,
+                TTL,
+                EntityId::from_bytes([0x24u8; 32]),
+                org().org_id(),
+            ),
+        )
+    }
+
+    fn intake(node: &MeshNode, admitted: &sensing::AdmittedSensingRegistration) -> OrgLeaderIntake {
+        let authority = node
+            .capture_sensing_authority_snapshot()
+            .expect("authority");
+        MeshNode::apply_org_capability_registration(
+            &node.dispatch_ctx(),
+            admitted,
+            &authority,
+            CONSUMER,
+            Instant::now(),
+            super::super::behavior::org::current_timestamp(),
+        )
+    }
+
+    fn leader_row_root(
+        node: &MeshNode,
+        interest: &sensing::CapabilityInterestKey,
+        provider: u64,
+    ) -> Option<sensing::AudienceScopeCommitment> {
+        node.sensing_interest_table
+            .lock()
+            .downstream_entry(
+                &sensing::ProviderInterestKey::new(interest.clone(), provider),
+                sensing::DownstreamId::Leader,
+            )
+            .map(|row| row.owner_root)
+    }
+
+    fn leader_branches(node: &MeshNode, interest: &sensing::CapabilityInterestKey) -> Vec<u64> {
+        let mut branches = node
+            .sensing_leader
+            .lock()
+            .as_ref()
+            .expect("leader")
+            .branches(interest);
+        branches.sort_unstable();
+        branches
+    }
+
+    fn interest_count(node: &MeshNode) -> usize {
+        node.sensing_leader
+            .lock()
+            .as_ref()
+            .expect("leader")
+            .interest_count()
+    }
+
+    fn owner_reconciler(node: &MeshNode) -> OrgLeaderReconciler {
+        OrgLeaderReconciler::new(
+            PrivateDiscoveryDrains::new(node.scoped_discovery.clone())
+                .mint(PrivateDiscoveryStream::Owner)
+                .expect("the OWNER drain is free on an unstarted node"),
+        )
+    }
+
+    fn sorted(mut ids: Vec<u64>) -> Vec<u64> {
+        ids.sort_unstable();
+        ids
+    }
+
+    /// LS-4 / F4: the intake commits the leader interest AND a mesh Leader row
+    /// per admitted branch, each row stamped with the seed's org commitment —
+    /// never this node's legacy sensing root.
+    #[tokio::test]
+    async fn org_intake_commits_leader_and_mesh_rows_under_the_org_root() {
+        let node = leader_node("intake").await;
+        let b1 = add_provider(&node, 0xB1);
+        let b2 = add_provider(&node, 0xB2);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::TopK(2),
+            ),
+            CONSUMER,
+        );
+        let OrgLeaderIntake::Registered { branches, admitted } = intake(&node, &registration)
+        else {
+            panic!("the org intake commits");
+        };
+        assert_eq!(sorted(branches.clone()), sorted(vec![b1, b2]));
+        assert_eq!(sorted(admitted), sorted(vec![b1, b2]));
+        let interest = registration.spec().key();
+        for provider in branches {
+            let root =
+                leader_row_root(&node, &interest, provider).expect("a Leader row per branch");
+            assert_eq!(
+                root,
+                org_commitment(),
+                "F4: the org commitment anchors the row"
+            );
+            assert_ne!(
+                root, node.sensing_local_root,
+                "never the legacy sensing root"
+            );
+        }
+    }
+
+    /// LS-4 all-or-none: when ANY Leader row would be refused (here the
+    /// per-downstream Leader cap is already full), NOTHING commits — no leader
+    /// interest and no mesh row.
+    ///
+    /// RED coupling: committing the leader before checking the table (no
+    /// preflight) leaves a leader interest whose branch has no mesh row.
+    #[tokio::test]
+    async fn org_intake_is_all_or_none_when_a_leader_row_would_be_refused() {
+        let node = leader_node("preflight").await;
+        let b1 = add_provider(&node, 0xB1);
+        {
+            let mut table = node.sensing_interest_table.lock();
+            let now = Instant::now();
+            for index in 0..node.config.max_interests_per_peer {
+                let filler = spec_on(
+                    &format!("nrpc:filler{index}"),
+                    sensing::ProviderSelector::AnyAuthorized,
+                    sensing::ResultMode::Any,
+                );
+                let key = sensing::ProviderInterestKey::new(filler.key(), 0xF00 + index as u64);
+                assert!(matches!(
+                    table.register(
+                        &key,
+                        sensing::DownstreamId::Leader,
+                        D,
+                        TTL,
+                        org_commitment(),
+                        now
+                    ),
+                    sensing::RegisterOutcome::Registered(_)
+                ));
+            }
+        }
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert_eq!(
+            intake(&node, &registration),
+            OrgLeaderIntake::PreflightRefused
+        );
+        assert_eq!(interest_count(&node), 0, "no leader interest committed");
+        assert!(leader_row_root(&node, &registration.spec().key(), b1).is_none());
+        assert_eq!(
+            node.org_leader_counters.snapshot().intake_preflight_refused,
+            1
+        );
+    }
+
+    /// LS-4: an authority that moved after the gate's capture commits nothing.
+    #[tokio::test]
+    async fn org_intake_with_a_stale_authority_commits_nothing() {
+        let node = leader_node("stale").await;
+        add_provider(&node, 0xB1);
+        let authority = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(adopt(&node, "stale-b"))
+            .expect("reinstall");
+        let before = node
+            .sensing_counters
+            .org_stale_stamp
+            .load(Ordering::Relaxed);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        let outcome = MeshNode::apply_org_capability_registration(
+            &node.dispatch_ctx(),
+            &registration,
+            &authority,
+            CONSUMER,
+            Instant::now(),
+            super::super::behavior::org::current_timestamp(),
+        );
+        assert_eq!(outcome, OrgLeaderIntake::StaleAuthority);
+        assert_eq!(interest_count(&node), 0);
+        assert_eq!(
+            node.sensing_counters
+                .org_stale_stamp
+                .load(Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    /// D-LS4: a NEW org interest over the cap is refused BEFORE any projection.
+    #[tokio::test]
+    async fn a_new_org_interest_over_the_cap_is_refused_before_projection() {
+        let node = leader_node("cap").await;
+        {
+            let mut slot = node.sensing_leader.lock();
+            let leader = slot.as_mut().expect("leader");
+            let members = OrgCapabilityCandidates::for_test(&[(0xB1, D)]);
+            for index in 0..MAX_ORG_LEADER_INTERESTS {
+                let seed = admitted(
+                    spec_on(
+                        &format!("nrpc:full{index}"),
+                        sensing::ProviderSelector::AnyAuthorized,
+                        sensing::ResultMode::Any,
+                    ),
+                    0x1000 + index as u64,
+                );
+                leader
+                    .register_org_capability_interest(&seed, &members, Instant::now())
+                    .expect("under the cap");
+            }
+        }
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert_eq!(intake(&node, &registration), OrgLeaderIntake::OverCap);
+        let counters = node.org_leader_counters.snapshot();
+        assert_eq!(counters.interest_over_cap, 1);
+        assert_eq!(counters.builds_intake, 0, "refused before projecting");
+    }
+
+    /// Plan §8: new private discovery dirties the capability on the OWNER stream
+    /// and an under-filled org interest fills through the off-lock plan/apply
+    /// path — with its new Leader row under the org root.
+    #[tokio::test]
+    async fn new_private_discovery_fills_an_underfilled_org_interest() {
+        let node = leader_node("fill").await;
+        let b1 = add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::TopK(2),
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let interest = registration.spec().key();
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(leader_branches(&node, &interest), vec![b1]);
+
+        let b2 = add_provider(&node, 0xB2);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(
+            node.org_leader_counters.snapshot().dirty_capabilities,
+            1,
+            "the owner stream named the one demanded capability"
+        );
+        assert_eq!(leader_branches(&node, &interest), sorted(vec![b1, b2]));
+        assert_eq!(
+            leader_row_root(&node, &interest, b2),
+            Some(org_commitment())
+        );
+    }
+
+    /// Plan §3 standing reconciliation: once the authority cannot be captured
+    /// (a poisoned store), the next reconciliation withdraws every org branch and
+    /// its mesh row — no stale projection, no legacy fallback.
+    #[tokio::test]
+    async fn authority_loss_withdraws_every_org_branch() {
+        let node = leader_node("loss").await;
+        let b1 = add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        node.org_revocation_store()
+            .expect("store")
+            .mark_poisoned_for_test();
+        // This witness drives the pass by hand; the poison WAKE is witnessed by
+        // `a_poison_withdraws_org_branches_without_waiting_for_the_backstop`.
+        reconciler.force_all = true;
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(interest_count(&node), 0, "the interest drains");
+        assert!(leader_row_root(&node, &registration.spec().key(), b1).is_none());
+    }
+
+    /// Plan §6 trigger 3: an authority install reaches reconciliation through
+    /// `org_install_generation` alone — no owner-stream movement, no tick.
+    #[tokio::test]
+    async fn an_authority_install_triggers_reconciliation_without_the_tick() {
+        let node = leader_node("install").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(
+            node.org_leader_counters.snapshot().dirty_capabilities,
+            0,
+            "a quiet pass reconciles nothing"
+        );
+        node.install_node_authority(adopt(&node, "install-b"))
+            .expect("reinstall");
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(node.org_leader_counters.snapshot().dirty_capabilities, 1);
+        assert_eq!(interest_count(&node), 1, "same org: the interest stands");
+    }
+
+    /// Plan §6 publish-if-current: an authority that moves INSIDE the commit
+    /// fence (here a poison winning the fence) discards the plan, mutates
+    /// nothing, and requeues the capability; the trailing pass then reconciles it
+    /// (empty, since the authority is gone).
+    #[tokio::test]
+    async fn a_plan_whose_authority_moves_at_the_fence_is_discarded_and_requeued() {
+        let node = leader_node("fence").await;
+        let b1 = add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        let store = node.org_revocation_store().expect("store");
+        node.set_sensing_fence_seam_for_test(Arc::new(move || store.mark_poisoned_for_test()));
+        reconciler.force_all = true;
+        let before = node.org_leader_counters.snapshot();
+        assert!(
+            MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await,
+            "the stale plan requeues"
+        );
+        let after = node.org_leader_counters.snapshot();
+        assert_eq!(
+            after.discarded_stale_authority,
+            before.discarded_stale_authority + 1
+        );
+        assert_eq!(after.reconcile_requeued, before.reconcile_requeued + 1);
+        assert_eq!(
+            leader_branches(&node, &registration.spec().key()),
+            vec![b1],
+            "nothing applied"
+        );
+        assert!(!MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await);
+        assert_eq!(interest_count(&node), 0, "the trailing pass withdraws");
+    }
+
+    /// Plan §6 lock order: a commit blocked on `sensing_interest_table` holds NO
+    /// `sensing_leader` guard while it waits.
+    ///
+    /// RED coupling: taking the leader before the table (the inverted order)
+    /// holds it at the seam, and `try_lock` fails.
+    #[tokio::test]
+    async fn an_org_commit_never_holds_the_leader_while_waiting_for_the_table() {
+        let node = leader_node("order").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let plan = {
+            let slot = ctx.sensing_leader.lock();
+            let leader = slot.as_ref().expect("leader");
+            sensing::plan_org_reconciliation(
+                &leader.org_plan_inputs(&sensing::CapabilityId::new(CAP)),
+                &OrgCapabilityCandidates::default(),
+                None,
+                &leader.policy(),
+            )
+        };
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = parking_lot::Mutex::new(reached_tx);
+        *node.org_leader_commit_seam.lock() = Some(Arc::new(move || {
+            let _ = reached_tx.lock().send(());
+        }));
+        let table_guard = node.sensing_interest_table.lock();
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            MeshNode::commit_org_leader_plan(&worker_ctx, plan, None, Instant::now()).is_some()
+        });
+        reached_rx.recv().expect("the commit reached the table");
+        assert!(
+            ctx.sensing_leader.try_lock().is_some(),
+            "the blocked commit must not hold the leader"
+        );
+        drop(table_guard);
+        assert!(worker.join().expect("worker"));
+    }
+
+    /// Plan §6: a burst of private-discovery wakes coalesces into ONE pass, and
+    /// shutdown stops the reconciler and releases the OWNER drain (a successor
+    /// can mint it).
+    #[tokio::test]
+    async fn a_burst_of_wakes_runs_one_pass_and_shutdown_releases_the_drain() {
+        let node = leader_node("burst").await;
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(MeshNode::run_org_leader_reconciler(
+            node.dispatch_ctx(),
+            owner_reconciler(&node),
+            rx,
+            node.routing_authority.clone(),
+            shutdown.clone(),
+            notify.clone(),
+        ));
+        // Settle first: an authority install BEFORE the reconciler existed left a
+        // wake permit (D-LS13), and its pass is not part of the burst.
+        let passes = || node.org_leader_counters.snapshot().reconcile_passes;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let baseline = passes();
+        for value in 1..=1000u64 {
+            tx.send_replace(value);
+        }
+        // Wait on a PARKING sleep: the reconciler's interval timers only advance
+        // when the runtime parks, so busy yields could starve it.
+        for _ in 0..400 {
+            if passes() > baseline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Give a second pass every chance to (wrongly) run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(passes(), baseline + 1, "1000 coalesced wakes run one pass");
+        shutdown.store(true, Ordering::Release);
+        notify.notify_waiters();
+        handle.await.expect("the reconciler exits");
+        assert!(
+            PrivateDiscoveryDrains::new(node.scoped_discovery.clone())
+                .mint(PrivateDiscoveryStream::Owner)
+                .is_some(),
+            "the OWNER drain was released"
+        );
+    }
+
+    // ---- LS-5: the production-coupled dark proof ----------------------------
+    //
+    // Real encoded `OrgCapabilityRegistration` frames, decoded and driven through
+    // the REAL authority gate and the intake transaction
+    // (`dispatch_org_capability_registration`) — bypassing ONLY the dark match
+    // arm, which still drops them.
+
+    const FROM: u64 = 0x00A1_1CE5;
+
+    fn member_cert(entity: &EntityId) -> OrgMembershipCert {
+        OrgMembershipCert::try_issue(&org(), entity.clone(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+            .expect("member cert")
+    }
+
+    /// Encode, decode, and admit one org capability frame from `FROM`, signed
+    /// into a membership of `issuer` for a freshly generated sender entity
+    /// pinned behind `FROM`.
+    fn dispatch_frame(
+        node: &MeshNode,
+        spec: &sensing::InterestSpec,
+        consumer: u64,
+        issuer: &OrgKeypair,
+    ) -> OrgLeaderIntake {
+        let sender = EntityKeypair::generate().entity_id().clone();
+        node.peer_entity_ids.insert(FROM, sender.clone());
+        let cert =
+            OrgMembershipCert::try_issue(issuer, sender.clone(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("member cert");
+        let now_secs = cert.not_before;
+        let frame = sensing::SensingInterestFrame::org_capability_registration(
+            spec, D, TTL, consumer, cert,
+        );
+        let bytes = sensing::encode_interest_frame(&frame).expect("encode");
+        let decoded = sensing::decode_interest_frame(&bytes).expect("decode");
+        MeshNode::dispatch_org_capability_registration(
+            &node.dispatch_ctx(),
+            &decoded,
+            FROM,
+            &sender,
+            Instant::now(),
+            now_secs,
+        )
+    }
+
+    /// The whole lit-arm path on a real frame: the gate admits it, the leader
+    /// interest carries ORG authority, and every Leader row is under the org
+    /// root. The same bytes through the still-dark dispatch arm create nothing.
+    #[tokio::test]
+    async fn a_real_org_capability_frame_reaches_the_leader_through_the_real_gate() {
+        let node = leader_node("real-frame").await;
+        let b1 = add_provider(&node, 0xB1);
+        let b2 = add_provider(&node, 0xB2);
+        let spec = spec(
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ResultMode::TopK(2),
+        );
+
+        // Dark arm first: the identical frame is dropped.
+        let sender = EntityKeypair::generate().entity_id().clone();
+        node.peer_entity_ids.insert(FROM, sender.clone());
+        let frame = sensing::SensingInterestFrame::org_capability_registration(
+            &spec,
+            D,
+            TTL,
+            FROM,
+            member_cert(&sender),
+        );
+        MeshNode::handle_sensing_interest_frame(
+            &sensing::encode_interest_frame(&frame).expect("encode"),
+            FROM,
+            &node.dispatch_ctx(),
+        );
+        assert_eq!(
+            interest_count(&node),
+            1,
+            "the lit arm reaches the leader (LS-6)"
+        );
+
+        let OrgLeaderIntake::Registered { branches, .. } =
+            dispatch_frame(&node, &spec, FROM, &org())
+        else {
+            panic!("the real gate admits the frame and the intake commits");
+        };
+        assert_eq!(sorted(branches.clone()), sorted(vec![b1, b2]));
+        let interest = spec.key();
+        let seed = node
+            .sensing_leader
+            .lock()
+            .as_ref()
+            .expect("leader")
+            .interest_seed(&interest)
+            .expect("seed");
+        assert!(matches!(
+            seed.authority(),
+            sensing::RegistrationAuthority::Org { .. }
+        ));
+        for provider in branches {
+            assert_eq!(
+                leader_row_root(&node, &interest, provider),
+                Some(org_commitment())
+            );
+        }
+    }
+
+    /// The real gate refuses a membership of a FOREIGN organization, and a frame
+    /// whose consumer field does not name the routed origin — nothing reaches the
+    /// leader.
+    #[tokio::test]
+    async fn the_real_gate_refuses_a_foreign_member_and_a_consumer_mismatch() {
+        let node = leader_node("gate").await;
+        add_provider(&node, 0xB1);
+        let spec = spec(
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ResultMode::Any,
+        );
+        let foreign = OrgKeypair::from_bytes([0x99u8; 32]);
+        assert_eq!(
+            dispatch_frame(&node, &spec, FROM, &foreign),
+            OrgLeaderIntake::NotAdmitted
+        );
+        assert_eq!(
+            dispatch_frame(&node, &spec, FROM + 1, &org()),
+            OrgLeaderIntake::NotAdmitted,
+            "the consumer field must name the routed origin"
+        );
+        assert_eq!(interest_count(&node), 0);
+    }
+
+    /// §8 / Q1 at the production intake: a real org frame naming a provider
+    /// OUTSIDE the projection opens no branch and retains no rowless interest.
+    #[tokio::test]
+    async fn a_real_node_selector_outside_the_projection_opens_no_branch() {
+        let node = leader_node("outsider").await;
+        add_provider(&node, 0xB1);
+        let spec = spec(
+            sensing::ProviderSelector::Node(0x0BAD_0BAD),
+            sensing::ResultMode::Any,
+        );
+        assert_eq!(
+            dispatch_frame(&node, &spec, FROM, &org()),
+            OrgLeaderIntake::Refused(sensing::ResolutionRefusal::AllBranchesRefused)
+        );
+        assert_eq!(interest_count(&node), 0, "no immortal rowless interest");
+    }
+
+    /// Q6 at the production intake: an org Tags interest resolves empty.
+    #[tokio::test]
+    async fn a_real_tags_interest_resolves_empty() {
+        let node = leader_node("tags").await;
+        add_provider(&node, 0xB1);
+        let spec = spec(
+            sensing::ProviderSelector::tags(vec![sensing::TagMatch {
+                key: "zone".into(),
+                value: "eu".into(),
+            }]),
+            sensing::ResultMode::Any,
+        );
+        assert_eq!(
+            dispatch_frame(&node, &spec, FROM, &org()),
+            OrgLeaderIntake::Refused(sensing::ResolutionRefusal::AllBranchesRefused)
+        );
+    }
+
+    /// Q2 / D-LS3 at the production intake: the leader's OWN owner-scope record is
+    /// never a candidate — with only itself declaring, no branch opens.
+    #[tokio::test]
+    async fn the_leaders_own_record_is_never_a_candidate() {
+        let node = leader_node("self").await;
+        let now = super::super::behavior::org::current_timestamp();
+        let own = VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: org().org_id(),
+                audience_handle: [0x11; 32],
+            },
+            node.entity_id().clone(),
+            org().org_id(),
+            1,
+            now + 3600,
+            1,
+            None,
+            descriptor(&[CAP]),
+        );
+        node.scoped_discovery.lock().ingest(
+            PreparedScopedCapability::prepare(own),
+            now,
+            &NoConsumerGrants,
+        );
+        let spec = spec(
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ResultMode::Any,
+        );
+        assert_eq!(
+            dispatch_frame(&node, &spec, FROM, &org()),
+            OrgLeaderIntake::Refused(sensing::ResolutionRefusal::AllBranchesRefused)
+        );
+    }
+
+    /// §8 dark-slice row "floor raise → fresh snapshot → revoked provider's
+    /// branches torn down", production-coupled: the floor is raised through the
+    /// node's REAL revocation store (`apply_bundle`), the node's own floors-raised
+    /// subscription moves the OWNER stream (F2), and the next pass withdraws only
+    /// the revoked provider.
+    #[tokio::test]
+    async fn a_real_floor_raise_tears_down_only_the_revoked_providers_branch() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use std::collections::BTreeMap;
+        let node = leader_node("floor").await;
+        let b1 = add_provider(&node, 0xB1);
+        let b2 = add_provider(&node, 0xB2);
+        let spec = spec(
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ResultMode::TopK(2),
+        );
+        assert!(matches!(
+            dispatch_frame(&node, &spec, FROM, &org()),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(leader_branches(&node, &spec.key()), sorted(vec![b1, b2]));
+
+        let mut floors = BTreeMap::new();
+        floors.insert(EntityId::from_bytes([0xB1; 32]), 2u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("apply floor raise");
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(
+            leader_branches(&node, &spec.key()),
+            vec![b2],
+            "only the revoked provider goes"
+        );
+        assert!(leader_row_root(&node, &spec.key(), b1).is_none());
+        assert!(leader_row_root(&node, &spec.key(), b2).is_some());
+    }
+
+    // ---- LS-5 counted bench gates (D-LS9) -----------------------------------
+
+    fn decodes_on_this_thread() -> u64 {
+        super::super::behavior::org_scoped_ingest::DESCRIPTOR_DECODES_FOR_TEST
+            .with(|count| count.get())
+    }
+
+    /// §6 bench gate at the v1 maximum Owner partition: with 1,024 owner rows and
+    /// ONE matching provider, a reconciliation pass visits one bucket and decodes
+    /// ZERO descriptors.
+    #[tokio::test]
+    async fn a_pass_over_a_full_owner_partition_visits_one_bucket_and_decodes_nothing() {
+        let node = leader_node("full").await;
+        let now = super::super::behavior::org::current_timestamp();
+        for index in 0..1023u64 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            bytes[31] = 0x5A;
+            let record = VerifiedScopedCapability::for_test(
+                CapabilityAudienceScope::Owner {
+                    org_id: org().org_id(),
+                    audience_handle: [0x11; 32],
+                },
+                EntityId::from_bytes(bytes),
+                org().org_id(),
+                1,
+                now + 3600,
+                1,
+                None,
+                descriptor(&["nrpc:unrelated"]),
+            );
+            node.scoped_discovery.lock().ingest(
+                PreparedScopedCapability::prepare(record),
+                now,
+                &NoConsumerGrants,
+            );
+        }
+        let b1 = add_provider(&node, 0xB1);
+        let spec = spec(
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ResultMode::Any,
+        );
+        assert!(matches!(
+            dispatch_frame(&node, &spec, FROM, &org()),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        let visits = node.org_leader_metrics().scoped_index_bucket_visits_total;
+        let decodes = decodes_on_this_thread();
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        assert_eq!(decodes_on_this_thread(), decodes, "zero descriptor decodes");
+        assert_eq!(
+            node.org_leader_metrics().scoped_index_bucket_visits_total,
+            visits + 1,
+            "one bucket visit for the one capability"
+        );
+        assert_eq!(leader_branches(&node, &spec.key()), vec![b1]);
+        // Control: preparing a record on this thread DOES decode, so the counter
+        // is live (the partition is full, so nothing is ingested).
+        let _ = PreparedScopedCapability::prepare(VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: org().org_id(),
+                audience_handle: [0x11; 32],
+            },
+            EntityId::from_bytes([0xB2; 32]),
+            org().org_id(),
+            1,
+            now + 3600,
+            1,
+            None,
+            descriptor(&[CAP]),
+        ));
+        assert_eq!(decodes_on_this_thread(), decodes + 1);
+    }
+
+    /// §6 / §8: grant-audience movement never rebuilds the owner projection —
+    /// the OWNER stream does not move and no demanded capability is reconciled.
+    #[tokio::test]
+    async fn a_grant_only_mutation_causes_zero_owner_projection_builds() {
+        let node = leader_node("grant").await;
+        add_provider(&node, 0xB1);
+        let spec = spec(
+            sensing::ProviderSelector::AnyAuthorized,
+            sensing::ResultMode::Any,
+        );
+        assert!(matches!(
+            dispatch_frame(&node, &spec, FROM, &org()),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        let before = node.org_leader_metrics();
+        let now = super::super::behavior::org::current_timestamp();
+        let grant = VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Grant {
+                grant_id: [0x44; 32],
+                audience_handle: [0x22; 32],
+            },
+            EntityId::from_bytes([0xC7; 32]),
+            org().org_id(),
+            1,
+            now + 3600,
+            1,
+            Some([0x5A; 64]),
+            descriptor(&[CAP]),
+        );
+        node.scoped_discovery.lock().ingest(
+            PreparedScopedCapability::prepare(grant),
+            now,
+            &NoConsumerGrants,
+        );
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        let after = node.org_leader_metrics();
+        assert_eq!(after.dirty_capabilities, 0);
+        assert_eq!(
+            after.candidate_projection_build_reconcile_total,
+            before.candidate_projection_build_reconcile_total
+        );
+        assert_eq!(
+            after.scoped_index_bucket_visits_total,
+            before.scoped_index_bucket_visits_total
+        );
+    }
+
+    /// §6: many org interests on ONE capability share ONE projection build per
+    /// pass, and apply in batches of at most 64 (130 interests → 3 batches).
+    #[tokio::test]
+    async fn one_capability_shares_one_projection_and_applies_in_64_interest_batches() {
+        let node = leader_node("batch").await;
+        let b1 = add_provider(&node, 0xB1);
+        {
+            let mut slot = node.sensing_leader.lock();
+            let leader = slot.as_mut().expect("leader");
+            let members = OrgCapabilityCandidates::for_test(&[(b1, D)]);
+            for index in 0..130u64 {
+                let mut spec = spec(
+                    sensing::ProviderSelector::AnyAuthorized,
+                    sensing::ResultMode::Any,
+                );
+                spec.constraints = sensing::CanonicalConstraints::from_entries([(
+                    "model",
+                    format!("m{index}").as_str(),
+                )])
+                .unwrap();
+                leader
+                    .register_org_capability_interest(
+                        &admitted(spec, 0x2000 + index),
+                        &members,
+                        Instant::now(),
+                    )
+                    .expect("admitted");
+            }
+        }
+        let ctx = node.dispatch_ctx();
+        let mut reconciler = owner_reconciler(&node);
+        let before = node.org_leader_metrics();
+        MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
+        let after = node.org_leader_metrics();
+        assert_eq!(
+            after.reconcile_batch_total - before.reconcile_batch_total,
+            3
+        );
+        assert_eq!(
+            after.candidate_projection_build_reconcile_total
+                - before.candidate_projection_build_reconcile_total,
+            1,
+            "one projection shared by all 130 interests"
+        );
+        assert_eq!(interest_count(&node), 130, "nothing withdrawn");
+    }
+
+    /// Every §6 metric name renders.
+    #[tokio::test]
+    async fn every_required_metric_renders() {
+        let node = leader_node("metrics").await;
+        let text = node.org_leader_metrics().prometheus_text();
+        for name in [
+            "org_scoped_index_bucket_visits_total",
+            "org_scoped_descriptor_decode_total",
+            "org_scoped_state_lock_hold_seconds_sum",
+            "org_candidate_projection_build_total{reason=\"intake\"}",
+            "org_candidate_projection_build_total{reason=\"reconcile\"}",
+            "org_candidate_projection_discarded_total{reason=\"stale_authority\"}",
+            "org_candidate_projection_discarded_total{reason=\"stale_version\"}",
+            "org_candidate_projection_cache_entries",
+            "org_leader_dirty_capabilities",
+            "org_leader_reconcile_batch_total",
+            "org_leader_reconcile_requeued_total",
+            "org_leader_plan_seconds_sum",
+            "org_leader_apply_lock_hold_seconds_sum",
+            "org_leader_interest_over_cap_total",
+        ] {
+            assert!(text.contains(name), "missing {name}:\n{text}");
+        }
+    }
+
+    // ---- LS-6: the consumer's org-watch acceptance rule (D-LS6) -------------
+
+    /// D-LS6: an org-audience digest watch admits a verified signer ONLY when the
+    /// audience is this node's own org commitment AND the signer is a current
+    /// owner-private provider of the watched capability in this node's own store.
+    /// A floor raise or a poisoned store withdraws the admission.
+    #[tokio::test]
+    async fn an_org_watch_admits_only_a_current_owner_private_provider() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use std::collections::BTreeMap;
+        let node = leader_node("watch").await;
+        add_provider(&node, 0xB1);
+        let ctx = node.dispatch_ctx();
+        let cap = sensing::CapabilityId::new(CAP);
+        let b1 = EntityId::from_bytes([0xB1; 32]);
+        let admits = |audience: &sensing::AudienceScopeCommitment,
+                      capability: &sensing::CapabilityId,
+                      signer: &EntityId| {
+            MeshNode::org_watch_admits_signer(&ctx, audience, capability, signer)
+        };
+        assert!(admits(&org_commitment(), &cap, &b1));
+        assert!(
+            !admits(&org_commitment(), &cap, &EntityId::from_bytes([0xB2; 32])),
+            "a signer absent from this node's own store"
+        );
+        assert!(
+            !admits(
+                &sensing::AudienceScopeCommitment::from_bytes([9; 32]),
+                &cap,
+                &b1
+            ),
+            "an audience that is not this node's org commitment"
+        );
+        assert!(
+            !admits(
+                &org_commitment(),
+                &sensing::CapabilityId::new("nrpc:other"),
+                &b1
+            ),
+            "a capability the signer never declared"
+        );
+        let mut floors = BTreeMap::new();
+        floors.insert(b1.clone(), 2u32);
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle"))
+            .expect("floor raise");
+        assert!(
+            !admits(&org_commitment(), &cap, &b1),
+            "a floor-retracted signer"
+        );
+
+        let fresh = leader_node("watch-poison").await;
+        add_provider(&fresh, 0xB1);
+        fresh
+            .org_revocation_store()
+            .expect("store")
+            .mark_poisoned_for_test();
+        assert!(
+            !MeshNode::org_watch_admits_signer(&fresh.dispatch_ctx(), &org_commitment(), &cap, &b1),
+            "a poisoned store admits nothing"
+        );
+    }
+
+    // ---- D-LS13: every change wakes the reconciler, none waits on the tick ---
+
+    /// Spawn the node's REAL reconciler loop (as `start` would) and return its
+    /// shutdown handles.
+    fn spawn_reconciler(
+        node: &Arc<MeshNode>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicBool>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(MeshNode::run_org_leader_reconciler(
+            node.dispatch_ctx(),
+            owner_reconciler(node),
+            node.scoped_publication.subscribe(),
+            node.routing_authority.clone(),
+            shutdown.clone(),
+            notify.clone(),
+        ));
+        (handle, shutdown, notify)
+    }
+
+    async fn stop_reconciler(
+        (handle, shutdown, notify): (
+            tokio::task::JoinHandle<()>,
+            Arc<AtomicBool>,
+            Arc<tokio::sync::Notify>,
+        ),
+    ) {
+        shutdown.store(true, Ordering::Release);
+        notify.notify_waiters();
+        handle.await.expect("the reconciler exits");
+    }
+
+    /// Poll `done` on PARKING sleeps (timers only advance when the runtime
+    /// parks) for at most `limit` — well inside the 5 s backstop tick, so a pass
+    /// here can only have come from the wake under test.
+    async fn within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    const PROMPT: Duration = Duration::from_millis(1500);
+
+    fn passes(node: &MeshNode) -> u64 {
+        node.org_leader_metrics().reconcile_passes_total
+    }
+
+    /// D-LS13: a store POISON withdraws every org branch at once. The store
+    /// reports the poison as an authority change, the node's subscription moves
+    /// routing authority, and that movement wakes the reconciler.
+    ///
+    /// RED coupling: without the authority wake, nothing reconciles until the
+    /// 5 s backstop and the interest is still held here.
+    #[tokio::test]
+    async fn a_poison_withdraws_org_branches_without_waiting_for_the_backstop() {
+        let node = leader_node("wake-poison").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let reconciler = spawn_reconciler(&node);
+        // Settle: the startup pass (the install permit left before the
+        // reconciler existed) must be spent BEFORE the poison, or it — not the
+        // poison's own wake — would be what withdraws the interest.
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(interest_count(&node), 1, "settled with the interest held");
+        node.org_revocation_store()
+            .expect("store")
+            .mark_poisoned_and_notify_for_test();
+        assert!(
+            within(PROMPT, || interest_count(&node) == 0).await,
+            "the poison withdrew the interest promptly"
+        );
+        stop_reconciler(reconciler).await;
+    }
+
+    /// D-LS13: an authority INSTALL wakes the reconciler and forces a full pass.
+    #[tokio::test]
+    async fn an_authority_install_wakes_the_reconciler() {
+        let node = leader_node("wake-install").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let reconciler = spawn_reconciler(&node);
+        // Let the new interest's first (topology-check) pass settle.
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = passes(&node);
+        node.install_node_authority(adopt(&node, "wake-install-b"))
+            .expect("reinstall");
+        assert!(
+            within(PROMPT, || passes(&node) > before).await,
+            "the install woke the reconciler"
+        );
+        assert_eq!(
+            node.org_leader_metrics().dirty_capabilities,
+            1,
+            "a full pass"
+        );
+        stop_reconciler(reconciler).await;
+    }
+
+    /// D-LS13: losing the route to the sensed provider moves the interest to the
+    /// next member within the topology check — no backstop tick.
+    ///
+    /// RED coupling: with no topology check the branch stays on the unreachable
+    /// provider until the 5 s backstop.
+    #[tokio::test]
+    async fn a_lost_route_moves_the_branch_within_the_topology_check() {
+        let node = leader_node("wake-route").await;
+        let b1 = add_provider(&node, 0xB1);
+        let b2 = add_provider(&node, 0xB2);
+        let (first, second) = (b1.min(b2), b1.max(b2));
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let interest = registration.spec().key();
+        assert_eq!(leader_branches(&node, &interest), vec![first]);
+        let reconciler = spawn_reconciler(&node);
+        // The topology check establishes the capability's cached projection.
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        node.router
+            .routing_table()
+            .remove_destination_all_candidates(first);
+        assert!(
+            within(PROMPT, || leader_branches(&node, &interest) == vec![second]).await,
+            "the branch moved off the unreachable provider"
+        );
+        stop_reconciler(reconciler).await;
+    }
+
+    /// D-LS13: a peer-session publication wakes the reconciler.
+    #[tokio::test]
+    async fn a_session_publication_wakes_the_reconciler() {
+        let node = leader_node("wake-session").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let reconciler = spawn_reconciler(&node);
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = passes(&node);
+        node.note_session_transition();
+        assert!(
+            within(PROMPT, || passes(&node) > before).await,
+            "the session publication woke the reconciler"
+        );
+        stop_reconciler(reconciler).await;
     }
 }

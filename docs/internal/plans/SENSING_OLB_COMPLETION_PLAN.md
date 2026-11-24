@@ -685,6 +685,9 @@ still wants load spreading** before building it.
 
 ### B.6 Phase 5 — the provider-free leader track (LS)
 
+**Reversed 2026-11-24:** the owner authorized LS-1..LS-6, which are built on
+`LZL0/sensing-leader-track`. See `ORG_SENSING_LEADER_SUBSTRATE_PLAN.md` §0.
+
 **Owner decision (2026-11-21): not needed.** The LS design stays unsigned,
 `OrgCapabilityRegistration` stays dark, and `SAFE_LIVE_HEAD` stays
 unestablished. Nothing below is scheduled.
