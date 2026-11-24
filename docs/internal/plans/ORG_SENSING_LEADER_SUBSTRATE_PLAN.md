@@ -227,6 +227,30 @@ could not see because the code it describes had not landed yet.
     is pinned beside it. `GATE_MIN` and `MESH_MIN` are re-derived from
     `--list` (65 / 75).
 
+- **D-LS13 (every change wakes the reconciler; 2026-11-24, follow-up on the
+  PR).** This supersedes the tick as the mechanism behind D-LS5 and D-LS11.
+  The reconciler now wakes on:
+  - **authority movement:** `RoutingAuthority::moved_wake`, fired at the end
+    of `move_routing_authority`. That covers a store or authority install, a
+    floor raise, a grant revocation, and a poison mark or recovery, which the
+    store reports as an empty raise to the node's floors subscription. It also
+    fires at the three install-generation advance sites. It forces a full
+    re-projection;
+  - **session publication:** `NodeSessionRouting::published_wake`, after each
+    committed generation;
+  - **a topology check every 250 ms**
+    (`OrgCandidateCache::take_topology_moved` /
+    `OrgCapabilityCandidates::differs_under`). Each cached projection is
+    re-joined with the live routes, pins and proximity. Only a capability
+    whose member reachability or `(route_estimate, node_id)` order moved is
+    evicted and reconciled. A demanded capability with no cached projection
+    yet is reconciled once to establish one. Route churn that changes nothing
+    the leader decides costs no reconciliation, and nothing hooks the routing
+    table's hot path.
+
+  The 5 s tick stays as a BACKSTOP against a missed wake, not as a detection
+  path.
+
 ### 0.5 Phases as built
 
 | Phase | Delivers | Exit |
@@ -310,6 +334,18 @@ file verified byte-identical.
     organization sensing".
   - RED: D-LS6 refusing all; D-LS6 admitting all; D2.6 exact-only at the
     provider; the leader continuation dark. Each fails the three-node proof.
+- **D-LS13 follow-up.**
+  - The authority and session wakes, and the 250 ms topology check.
+  - `OrgRevocationStore::mark_poisoned_and_notify_for_test`: poison plus the
+    production authority-changed wake.
+  - Witnesses: four on the REAL reconciler loop (poison, install, lost route,
+    session publication), each reached within 1.5 s against the 5 s backstop;
+    plus `differs_under`.
+  - RED: dropping the authority wake fails the poison witness; dropping the
+    session wake fails the session witness; a topology check that finds
+    nothing fails the lost-route witness.
+  - The poison witness first settles the startup pass. Unsettled, a startup
+    wake permit made it pass vacuously; mutation M17 is what caught that.
 
 ---
 

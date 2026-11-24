@@ -11049,6 +11049,10 @@ struct NodeSessionRouting {
     /// Republications that produced a new generation. Observable so a witness
     /// can prove a NON-transition published nothing.
     publications: AtomicU64,
+    /// Fired once per published generation, AFTER it is committed — the org
+    /// leader reconciler's session wake (leader plan D-LS13). A `Notify` keeps
+    /// one permit, so a burst of transitions coalesces into one reconciliation.
+    published_wake: tokio::sync::Notify,
     /// Test-only observation of the sample→revalidate window inside the build.
     build_observer: SessionBuildObserver,
     /// Test-only, one-shot: fires immediately BEFORE a transition takes
@@ -11074,6 +11078,7 @@ impl NodeSessionRouting {
             currentness: super::behavior::org_routing_registry::SessionCurrentness::new(),
             gate: parking_lot::Mutex::new(()),
             publications: AtomicU64::new(0),
+            published_wake: tokio::sync::Notify::new(),
             build_observer: SessionBuildObserver::default(),
             #[cfg(test)]
             transition_attempt_hook: parking_lot::Mutex::new(None),
@@ -11187,6 +11192,7 @@ impl NodeSessionRouting {
             .store(Arc::new(SessionProjection { generation, rows }));
         self.currentness.commit(generation);
         self.publications.fetch_add(1, Ordering::AcqRel);
+        self.published_wake.notify_one();
         Some(generation)
     }
 
@@ -11835,6 +11841,8 @@ fn move_routing_authority<R>(
         // that can never complete.
         AuthorityAdvance::AlreadyExhausted => {}
     }
+    // D-LS13: every authority movement wakes the org leader reconciler.
+    authority.moved_wake.notify_one();
     result
 }
 
@@ -12054,6 +12062,14 @@ enum AuthorityAdvance {
 struct RoutingAuthority {
     gate: parking_lot::Mutex<()>,
     epoch: AtomicU64,
+    /// Fired after EVERY authority movement `move_routing_authority` serializes —
+    /// a store or authority install, a floor raise, a grant revocation, and a
+    /// poison mark or recovery (which the store reports as an empty raise) — and
+    /// by the node-authority install paths once their generation has advanced.
+    /// The org leader reconciler's authority wake (leader plan D-LS13): it forces
+    /// a full re-projection, so a poisoned or rotated authority withdraws org
+    /// branches at once instead of at the next backstop tick.
+    moved_wake: tokio::sync::Notify,
     /// Set once the epoch space is exhausted. Terminal: routing serves nothing
     /// and commits nothing from then on.
     exhausted: AtomicBool,
@@ -12111,6 +12127,7 @@ impl RoutingAuthority {
         Self {
             gate: parking_lot::Mutex::new(()),
             epoch: AtomicU64::new(1),
+            moved_wake: tokio::sync::Notify::new(),
             exhausted: AtomicBool::new(false),
             #[cfg(test)]
             contention_hook: parking_lot::Mutex::new(None),
@@ -23021,6 +23038,7 @@ impl MeshNode {
         let _install = self.org_install.lock();
         if self.install_org_revocation_store_locked(store, false, None, None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+            self.routing_authority.moved_wake.notify_one();
         }
         Ok(())
     }
@@ -23040,6 +23058,7 @@ impl MeshNode {
         let _install = self.org_install.lock();
         if self.install_org_revocation_store_locked(store, false, Some(pause), None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+            self.routing_authority.moved_wake.notify_one();
         }
         Ok(())
     }
@@ -23636,6 +23655,7 @@ impl MeshNode {
         // transaction (never one for the store then one for the authority).
         if authority_changed || store_changed {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+            self.routing_authority.moved_wake.notify_one();
         }
         // No epoch bump: the installed authority's IDENTITY changed,
         // captured directly by the send-path [`SendStamp`]
@@ -42135,6 +42155,7 @@ impl MeshNode {
         };
         let ctx = self.dispatch_ctx();
         let changed = self.scoped_publication.subscribe();
+        let authority = self.routing_authority.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         *slot = Some(tokio::spawn(async move {
@@ -42142,6 +42163,7 @@ impl MeshNode {
                 ctx,
                 OrgLeaderReconciler::new(drain),
                 changed,
+                authority,
                 shutdown,
                 shutdown_notify,
             )
@@ -42158,21 +42180,38 @@ impl MeshNode {
         }
     }
 
-    /// The reconciler loop: ONE long-lived task, one timer (D-LS5), no task or
-    /// timer per provider, capability, interest or client. Wakes coalesce in the
-    /// watch, so a burst of private-discovery movement yields one pass, plus at
-    /// most one trailing pass for capabilities a pass had to requeue.
+    /// The reconciler loop: ONE long-lived task and two node-owned timers, no
+    /// task or timer per provider, capability, interest or client. It wakes on
+    /// (D-LS13):
+    /// - private-discovery movement (the scoped watch): provider discovery,
+    ///   update, expiry, floor retraction;
+    /// - authority movement (`RoutingAuthority::moved_wake`): install, removal,
+    ///   rotation, store swap, poison and recovery — a FULL re-projection;
+    /// - session publication (`NodeSessionRouting::published_wake`);
+    /// - the topology check, every [`ORG_LEADER_TOPOLOGY_CHECK`](sensing::org_candidates::ORG_LEADER_TOPOLOGY_CHECK):
+    ///   cached projections re-joined with live routes and proximity, and only
+    ///   the capabilities that moved reconciled;
+    /// - the backstop tick (D-LS5).
+    ///
+    /// Every wake coalesces (watch value / single `Notify` permit), so a burst
+    /// yields one pass, plus at most one trailing pass for requeued capabilities.
     #[cfg(feature = "redex")]
     async fn run_org_leader_reconciler(
         ctx: DispatchCtx,
         mut state: OrgLeaderReconciler,
         mut changed: tokio::sync::watch::Receiver<u64>,
+        authority: Arc<RoutingAuthority>,
         shutdown: Arc<AtomicBool>,
         shutdown_notify: Arc<tokio::sync::Notify>,
     ) {
         let mut tick = tokio::time::interval(sensing::org_candidates::ORG_LEADER_ROUTE_REFRESH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // the immediate first tick; the first pass is wake-driven
+        let mut topology =
+            tokio::time::interval(sensing::org_candidates::ORG_LEADER_TOPOLOGY_CHECK);
+        topology.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        topology.tick().await;
+        let session = ctx.session_routing.clone();
         loop {
             let stop = shutdown_notify.notified();
             tokio::pin!(stop);
@@ -42186,6 +42225,31 @@ impl MeshNode {
                     if moved.is_err() {
                         return;
                     }
+                }
+                _ = authority.moved_wake.notified() => {
+                    state.force_all = true;
+                }
+                _ = session.published_wake.notified() => {}
+                _ = topology.tick() => {
+                    let mut moved = state.cache.take_topology_moved(&MeshOrgTopology::of(&ctx));
+                    // A demanded capability with no cached projection yet (a new
+                    // interest) is reconciled once to establish one, so the check
+                    // covers it from then on.
+                    let demanded = ctx
+                        .sensing_leader
+                        .lock()
+                        .as_ref()
+                        .map(|leader| leader.org_interest_capability_ids())
+                        .unwrap_or_default();
+                    moved.extend(
+                        demanded
+                            .into_iter()
+                            .filter(|capability| !state.cache.contains(capability)),
+                    );
+                    if moved.is_empty() {
+                        continue;
+                    }
+                    state.pending.extend(moved);
                 }
                 _ = tick.tick() => {
                     state.route_epoch = state.route_epoch.wrapping_add(1);
@@ -71439,7 +71503,8 @@ mod org_leader_tests {
         node.org_revocation_store()
             .expect("store")
             .mark_poisoned_for_test();
-        // Poison moves no generation; the D-LS5 tick is what reaches it.
+        // This witness drives the pass by hand; the poison WAKE is witnessed by
+        // `a_poison_withdraws_org_branches_without_waiting_for_the_backstop`.
         reconciler.force_all = true;
         MeshNode::org_leader_reconcile_pass(&ctx, &mut reconciler).await;
         assert_eq!(interest_count(&node), 0, "the interest drains");
@@ -71587,24 +71652,29 @@ mod org_leader_tests {
             node.dispatch_ctx(),
             owner_reconciler(&node),
             rx,
+            node.routing_authority.clone(),
             shutdown.clone(),
             notify.clone(),
         ));
+        // Settle first: an authority install BEFORE the reconciler existed left a
+        // wake permit (D-LS13), and its pass is not part of the burst.
+        let passes = || node.org_leader_counters.snapshot().reconcile_passes;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let baseline = passes();
         for value in 1..=1000u64 {
             tx.send_replace(value);
         }
-        // Wait on a PARKING sleep: the reconciler's interval timer only advances
-        // when the runtime parks, so busy yields could starve its first tick.
-        let passes = || node.org_leader_counters.snapshot().reconcile_passes;
+        // Wait on a PARKING sleep: the reconciler's interval timers only advance
+        // when the runtime parks, so busy yields could starve it.
         for _ in 0..400 {
-            if passes() >= 1 {
+            if passes() > baseline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // Give a second pass every chance to (wrongly) run.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(passes(), 1, "1000 coalesced wakes run one pass");
+        assert_eq!(passes(), baseline + 1, "1000 coalesced wakes run one pass");
         shutdown.store(true, Ordering::Release);
         notify.notify_waiters();
         handle.await.expect("the reconciler exits");
@@ -72115,5 +72185,199 @@ mod org_leader_tests {
             !MeshNode::org_watch_admits_signer(&fresh.dispatch_ctx(), &org_commitment(), &cap, &b1),
             "a poisoned store admits nothing"
         );
+    }
+
+    // ---- D-LS13: every change wakes the reconciler, none waits on the tick ---
+
+    /// Spawn the node's REAL reconciler loop (as `start` would) and return its
+    /// shutdown handles.
+    fn spawn_reconciler(
+        node: &Arc<MeshNode>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicBool>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(MeshNode::run_org_leader_reconciler(
+            node.dispatch_ctx(),
+            owner_reconciler(node),
+            node.scoped_publication.subscribe(),
+            node.routing_authority.clone(),
+            shutdown.clone(),
+            notify.clone(),
+        ));
+        (handle, shutdown, notify)
+    }
+
+    async fn stop_reconciler(
+        (handle, shutdown, notify): (
+            tokio::task::JoinHandle<()>,
+            Arc<AtomicBool>,
+            Arc<tokio::sync::Notify>,
+        ),
+    ) {
+        shutdown.store(true, Ordering::Release);
+        notify.notify_waiters();
+        handle.await.expect("the reconciler exits");
+    }
+
+    /// Poll `done` on PARKING sleeps (timers only advance when the runtime
+    /// parks) for at most `limit` — well inside the 5 s backstop tick, so a pass
+    /// here can only have come from the wake under test.
+    async fn within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    const PROMPT: Duration = Duration::from_millis(1500);
+
+    fn passes(node: &MeshNode) -> u64 {
+        node.org_leader_metrics().reconcile_passes_total
+    }
+
+    /// D-LS13: a store POISON withdraws every org branch at once. The store
+    /// reports the poison as an authority change, the node's subscription moves
+    /// routing authority, and that movement wakes the reconciler.
+    ///
+    /// RED coupling: without the authority wake, nothing reconciles until the
+    /// 5 s backstop and the interest is still held here.
+    #[tokio::test]
+    async fn a_poison_withdraws_org_branches_without_waiting_for_the_backstop() {
+        let node = leader_node("wake-poison").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let reconciler = spawn_reconciler(&node);
+        // Settle: the startup pass (the install permit left before the
+        // reconciler existed) must be spent BEFORE the poison, or it — not the
+        // poison's own wake — would be what withdraws the interest.
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(interest_count(&node), 1, "settled with the interest held");
+        node.org_revocation_store()
+            .expect("store")
+            .mark_poisoned_and_notify_for_test();
+        assert!(
+            within(PROMPT, || interest_count(&node) == 0).await,
+            "the poison withdrew the interest promptly"
+        );
+        stop_reconciler(reconciler).await;
+    }
+
+    /// D-LS13: an authority INSTALL wakes the reconciler and forces a full pass.
+    #[tokio::test]
+    async fn an_authority_install_wakes_the_reconciler() {
+        let node = leader_node("wake-install").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let reconciler = spawn_reconciler(&node);
+        // Let the new interest's first (topology-check) pass settle.
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = passes(&node);
+        node.install_node_authority(adopt(&node, "wake-install-b"))
+            .expect("reinstall");
+        assert!(
+            within(PROMPT, || passes(&node) > before).await,
+            "the install woke the reconciler"
+        );
+        assert_eq!(
+            node.org_leader_metrics().dirty_capabilities,
+            1,
+            "a full pass"
+        );
+        stop_reconciler(reconciler).await;
+    }
+
+    /// D-LS13: losing the route to the sensed provider moves the interest to the
+    /// next member within the topology check — no backstop tick.
+    ///
+    /// RED coupling: with no topology check the branch stays on the unreachable
+    /// provider until the 5 s backstop.
+    #[tokio::test]
+    async fn a_lost_route_moves_the_branch_within_the_topology_check() {
+        let node = leader_node("wake-route").await;
+        let b1 = add_provider(&node, 0xB1);
+        let b2 = add_provider(&node, 0xB2);
+        let (first, second) = (b1.min(b2), b1.max(b2));
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let interest = registration.spec().key();
+        assert_eq!(leader_branches(&node, &interest), vec![first]);
+        let reconciler = spawn_reconciler(&node);
+        // The topology check establishes the capability's cached projection.
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        node.router
+            .routing_table()
+            .remove_destination_all_candidates(first);
+        assert!(
+            within(PROMPT, || leader_branches(&node, &interest) == vec![second]).await,
+            "the branch moved off the unreachable provider"
+        );
+        stop_reconciler(reconciler).await;
+    }
+
+    /// D-LS13: a peer-session publication wakes the reconciler.
+    #[tokio::test]
+    async fn a_session_publication_wakes_the_reconciler() {
+        let node = leader_node("wake-session").await;
+        add_provider(&node, 0xB1);
+        let registration = admitted(
+            spec(
+                sensing::ProviderSelector::AnyAuthorized,
+                sensing::ResultMode::Any,
+            ),
+            CONSUMER,
+        );
+        assert!(matches!(
+            intake(&node, &registration),
+            OrgLeaderIntake::Registered { .. }
+        ));
+        let reconciler = spawn_reconciler(&node);
+        assert!(within(PROMPT, || passes(&node) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = passes(&node);
+        node.note_session_transition();
+        assert!(
+            within(PROMPT, || passes(&node) > before).await,
+            "the session publication woke the reconciler"
+        );
+        stop_reconciler(reconciler).await;
     }
 }

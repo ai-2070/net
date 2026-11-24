@@ -173,6 +173,37 @@ impl OrgCapabilityCandidates {
         self.next_expiry.is_none_or(|deadline| now_secs < deadline)
     }
 
+    /// Whether re-joining this set's members with `topology` NOW would change
+    /// anything the resolver reads — any member's reachability, or the
+    /// `(route_estimate, node_id)` rank order (D-LS13). Pure and lock-free over
+    /// the set's own members: the reconciler's fast topology check runs it on
+    /// every cached projection and rebuilds only the capabilities that moved, so
+    /// route churn that changes nothing the leader would decide costs no
+    /// reconciliation.
+    pub(crate) fn differs_under(&self, topology: &impl OrgTopology) -> bool {
+        let rejoined = project_org_candidates(
+            self.ranked
+                .iter()
+                .map(|entry| OrgCandidateBase {
+                    provider: entry.provider.clone(),
+                    node_id: entry.candidate.node_id,
+                    generation: entry.candidate.capability_generation,
+                    expires_at: entry.expires_at,
+                })
+                .collect(),
+            topology,
+        );
+        rejoined.ranked.len() != self.ranked.len()
+            || rejoined
+                .ranked
+                .iter()
+                .zip(self.ranked.iter())
+                .any(|(now, then)| {
+                    now.candidate.node_id != then.candidate.node_id
+                        || now.candidate.reachable != then.candidate.reachable
+                })
+    }
+
     /// Number of candidates (reachable or not).
     pub(crate) fn len(&self) -> usize {
         self.ranked.len()
@@ -448,10 +479,18 @@ impl OrgLeaderCounters {
     }
 }
 
-/// The reconciler's bounded route-refresh tick (D-LS5): every demanded
-/// capability is re-ranked at least this often, so route estimates and
-/// reachability cannot go stale indefinitely with no topology wake seam.
+/// The reconciler's BACKSTOP tick (D-LS5): every demanded capability is fully
+/// re-projected at least this often. Since D-LS13 it is no longer how any change
+/// is noticed — authority movement and session publication wake the reconciler
+/// directly, and the topology check notices route movement within
+/// [`ORG_LEADER_TOPOLOGY_CHECK`] — it only bounds the damage of a missed wake.
 pub(crate) const ORG_LEADER_ROUTE_REFRESH: Duration = Duration::from_secs(5);
+
+/// The reconciler's topology-check cadence (D-LS13): every cached projection is
+/// re-joined with the live topology this often, and only the capabilities whose
+/// reachability or rank order moved are reconciled. Cheap — no lock beyond the
+/// topology maps' own, no projection, no leader work when nothing moved.
+pub(crate) const ORG_LEADER_TOPOLOGY_CHECK: Duration = Duration::from_millis(250);
 
 /// The most org interests one apply batch commits before the reconciler yields
 /// (plan §6), so a 512-interest leader cannot monopolize the runtime.
@@ -552,9 +591,30 @@ impl OrgCandidateCache {
         self.entries.retain(|capability, _| demanded(capability));
     }
 
+    /// Whether `capability` has a cached projection (current or not).
+    pub(crate) fn contains(&self, capability: &CapabilityId) -> bool {
+        self.entries.contains_key(capability)
+    }
+
     /// Cached capabilities.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The cached capabilities whose projection `differs_under` the live
+    /// `topology` (D-LS13) — evicted here, so the next reconciliation of each
+    /// rebuilds it rather than serving the stale ranking.
+    pub(crate) fn take_topology_moved(&mut self, topology: &impl OrgTopology) -> Vec<CapabilityId> {
+        let moved: Vec<CapabilityId> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.candidates.differs_under(topology))
+            .map(|(capability, _)| capability.clone())
+            .collect();
+        for capability in &moved {
+            self.entries.remove(capability);
+        }
+        moved
     }
 }
 
@@ -1116,5 +1176,56 @@ mod tests {
             );
             assert_eq!(org, legacy, "{mode:?}");
         }
+    }
+
+    /// D-LS13: a projection differs under the live topology only when a member's
+    /// reachability or the rank order moved — an estimate shift that keeps the
+    /// order is not a change.
+    #[test]
+    fn a_projection_differs_only_when_reachability_or_order_moves() {
+        let bases = vec![base(1, 9_000), base(2, 9_000)];
+        let mut topology = Topology::default();
+        topology.routed.push(bases[0].node_id);
+        topology.routed.push(bases[1].node_id);
+        topology
+            .estimates
+            .insert(bases[0].node_id, Duration::from_millis(10));
+        topology
+            .estimates
+            .insert(bases[1].node_id, Duration::from_millis(20));
+        let set = project_org_candidates(bases.clone(), &topology);
+        assert!(!set.differs_under(&topology), "unchanged topology");
+
+        let mut drift = Topology {
+            routed: topology.routed.clone(),
+            ..Topology::default()
+        };
+        drift
+            .estimates
+            .insert(bases[0].node_id, Duration::from_millis(12));
+        drift
+            .estimates
+            .insert(bases[1].node_id, Duration::from_millis(25));
+        assert!(
+            !set.differs_under(&drift),
+            "an estimate drift that keeps the order"
+        );
+
+        let mut lost = Topology::default();
+        lost.routed.push(bases[1].node_id);
+        lost.estimates = topology.estimates.clone();
+        assert!(set.differs_under(&lost), "a lost route");
+
+        let mut swapped = Topology {
+            routed: topology.routed.clone(),
+            ..Topology::default()
+        };
+        swapped
+            .estimates
+            .insert(bases[0].node_id, Duration::from_millis(30));
+        swapped
+            .estimates
+            .insert(bases[1].node_id, Duration::from_millis(20));
+        assert!(set.differs_under(&swapped), "a rank swap");
     }
 }

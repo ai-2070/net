@@ -693,11 +693,17 @@ capability in the consumer's **own** store. A proof from a provider the
 consumer cannot itself see is refused (`scope_refusals`).
 
 **Standing reconciliation.** One node-owned task reconciles every org
-interest:
-- a provider's discovery, update, expiry or floor raise wakes it at once
-  (the owner-private change stream);
-- an authority install or rotation, and peer-session movement, wake it too;
-- a 5 s tick re-ranks routes and reaches a poisoned store.
+interest, and every change wakes it directly:
+- a provider's discovery, update, expiry or floor raise (the owner-private
+  change stream);
+- any authority movement: install, removal, rotation, a store swap, a
+  poisoned or recovered store;
+- a peer-session change.
+
+Route and proximity changes are noticed within 250 ms. A cheap check
+re-joins each capability's cached candidates with live routes and
+reconciles only capabilities whose reachability or ranking moved. A 5 s tick
+remains only as a backstop against a missed wake.
 
 Lost authority, a poisoned store, or a revoked provider withdraws the
 affected branches. Org interests never fall back to the legacy universe, and
