@@ -282,12 +282,33 @@ degrades into a silently empty snapshot. Every read requalifies live
 membership and current owner-private visibility, off every pacing
 floor.
 
+**Coalesced watches.** `SensingQuery::new(cap).coalesced(Coalesced::Best)`
+(or `Coalesced::Top(k)`, `1 <= k <= 32`) observes the same capability
+through the organization's sensing leader instead of sensing every
+visible provider directly:
+- the node ELECTS the leader for the capability from its own view: the
+  owner-private announcers minus the capability's providers, bounded to 32,
+  ranked by the shared proximity closeness. The caller never names it;
+- one registration goes to the leader, which senses `Best` / `Top(k)`
+  providers once for every consumer asking the same question. The node
+  keeps it registered, re-elects, and fails over;
+- it does NOT widen what the node sees. Rows are clamped on every read to
+  the providers this node itself sees as authorized, and ranked by this
+  node's own route economics. `SensingSnapshot::is_coalesced()` is `true`;
+- with no member able to lead, `watch` and `snapshot` refuse with
+  `NoSensingLeader` (not terminal), and an out-of-range `Top(k)` with
+  `UnsatisfiableCoalescing`. A coalesced watch never falls back to an exact
+  one.
+
+It needs the SDK's `cortex` feature (the leader substrate rides core
+`redex`); without it a coalesced query is refused with `NoSensingLeader`.
+
 **Not in the SDK.** No interest, audience or wire vocabulary is
 re-exported (no `InterestSpec`, audience commitment, provider selector,
-result mode, lease ticket or leader id), and no provider-free
-(`AnyAuthorized`), tag, group, `Granted` or cross-organization query
-can be expressed — `SensingQuery` cannot name them and `watch` refuses
-what it cannot mean.
+result mode, lease ticket, coalesced ticket or leader id), and no tag,
+group, `Granted` or cross-organization query can be expressed —
+`SensingQuery` cannot name them and `watch` refuses what it cannot mean.
+The coalesced watch is the SDK's own `Coalesced` opt-in, never a selector.
 
 The core boundary has moved, and it is LIT. A local-origin
 OWN-ORGANIZATION exact-provider lease plans and emits
@@ -658,11 +679,27 @@ A row already accepted lives until its soft-state TTL.
 
 An organization member can register a **provider-free** interest — "any
 authorized member serving this capability" — with the scope's sensing
-leader instead of naming providers itself:
+leader instead of naming providers itself. Applications use the SDK's
+coalesced watch (above). In core, the node owns the whole lifecycle:
 
 ```rust
-consumer.register_org_capability_interest(&spec, leader_node_id, d, ttl)?;
+// Elect, register, and keep registered (refresh, failover) until released.
+let ticket = consumer.acquire_org_coalesced_interest(cap, work_latency, ResultMode::Any)?;
+let rows = consumer.org_coalesced_rows(&ticket); // clamped to current visibility
+consumer.release_org_coalesced_interest(&ticket);
 ```
+
+**The leader is elected, per capability.** `MeshNode::org_sensing_leader_for`
+ranks the owner-private announcers this node sees, minus the capability's
+providers (a leader never senses itself), bounded to 32 by rendezvous hash,
+by the existing RedEX closeness election over the shared proximity view. Every
+observer of one view computes the same leader, and a node never registers
+with itself. Every coalescing node holds the org leader role from `start()`,
+so whichever node is elected can serve. LEGACY provider-free intake stays
+behind the explicit `assume_sensing_leader`.
+
+The lower-level one-shot seam is
+`register_org_capability_interest(&spec, leader_node_id, d, ttl)`.
 
 `spec.audience` must be the canonical sensing commitment of the consumer's
 own organization. The frame (`OrgCapabilityRegistration`) carries the
@@ -713,7 +750,12 @@ Limits (v1):
 - at most 512 live org interests per node;
 - no same-node provider;
 - no `Tags` / `Group`;
-- no SDK surface yet (the core `MeshNode` method above is the seam).
+- the elected leader excludes the capability's own providers, so an org
+  whose only members all provide it has no leader (`NoSensingLeader`).
+
+Coalesced demand at the consumer: `MeshNode::org_coalesced_metrics()` returns
+`OrgCoalescedMetrics` (held interests, registrations, failovers, passes that
+found no leader).
 
 Metrics: `MeshNode::org_leader_metrics()` returns `OrgLeaderMetrics`, and
 `OrgLeaderMetrics::prometheus_text()` renders it. It covers:

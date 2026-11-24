@@ -313,3 +313,44 @@ The wire format does not change in any phase.
     M21 first SURVIVED: in that witness the provider was not reachable from
     the consumer, so it lost the election for health, not for exclusion.
     The witness now connects consumer and provider directly, and M21 is RED.
+- **LS-7b (Rust SDK).**
+  - `sdk/src/sensing/consumer.rs`:
+    - `Coalesced { Best, Top(u16) }`, `MAX_COALESCED_TOP` (= 32, asserted
+      equal to the core bound and to `MAX_SENSED_POPULATION`);
+      `SensingQuery::coalesced` / `coalescing`; `SensingSnapshot::is_coalesced`.
+    - The watch now holds a `WatchDemand`: `Exact(OrgSensingFamily)` or
+      `Coalesced(OrgCoalescedTicket)`. A watch and its closers retire one
+      thing, once. The exact path is unchanged in behavior; the coalesced path
+      is `watch_coalesced` / `snapshot_coalesced`, over
+      `org_sensing_demand::project_org_coalesced`.
+    - Without the SDK's `cortex` feature (no leader substrate), a coalesced
+      query is refused with `NoSensingLeader`, never served as an exact
+      watch.
+  - `SensingError::NoSensingLeader` (`no_sensing_leader`, not terminal) and
+    `UnsatisfiableCoalescing` (`unsatisfiable_coalescing`, not terminal),
+    appended so the fixture's existing order holds;
+    `tests/cross_lang_sensing/error_vectors.json` regenerated (two vectors
+    added). The binding suites iterate the fixture through the Rust
+    classifier, so they need no change for it.
+  - The guard test admits exactly `Coalesced` and `is_coalesced`, and now also
+    FORBIDS `OrgCoalescedTicket` / `OrgCoalescedRefused` on the surface.
+  - `docs/SENSING.md`: the coalesced watch, the election, the core lifecycle
+    and `OrgCoalescedMetrics`; the "no SDK surface yet" limit removed.
+  - Witnesses: `sdk/tests/sensing_coalesced.rs` (new, four, retries = 0, a
+    CI required-names gate):
+    - `a_coalesced_watch_reports_signed_readiness_through_the_elected_leader`;
+    - `two_coalesced_watches_share_one_hold_and_close_releases_only_its_own`;
+    - `no_electable_leader_refuses_with_its_own_kind_and_never_falls_back`;
+    - `an_out_of_range_top_is_refused_before_any_state`.
+
+    Plus two SDK unit tests (`a_coalesced_query_validates_only_a_meaningful_size`,
+    `each_coalesced_refusal_keeps_its_own_meaning`). The SDK harness has to
+    SHARE the owner discovery audience across members: each adoption mints
+    its own, and members that do not share one cannot read each other's
+    announcements.
+  - RED, each against its named witness and restored byte-identical:
+    - M27, a coalesced snapshot not flagged;
+    - M28, `watch` ignoring the opt-in (a silent exact fallback);
+    - M29, close keeping the hold;
+    - M30, any `Top(k)` validating;
+    - M31, no leader mapped to no authority.

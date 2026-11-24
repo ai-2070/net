@@ -164,6 +164,11 @@ use net::adapter::net::MeshNode;
 
 use super::{SensingClient, SensingError};
 
+#[cfg(feature = "cortex")]
+use net::adapter::net::behavior::sensing::org_coalesced::{
+    OrgCoalescedRefused, OrgCoalescedTicket,
+};
+
 /// The consumer's three-state readiness surface, straight from the core
 /// projection table. Re-exported rather than mirrored: a second enum
 /// beside it would be a mapping that can drift.
@@ -221,7 +226,28 @@ pub struct SensingQuery {
     capability: String,
     budget: sensing::ConsumerLatencyBudget,
     work_latency: sensing::WorkLatencyEnvelope,
+    coalesced: Option<Coalesced>,
 }
+
+/// How many providers a COALESCED watch asks its organization's sensing
+/// leader to sense for it ([`SensingQuery::coalesced`]).
+///
+/// The leader chooses WHICH providers, from the members it can see; this
+/// node then ranks what it receives by its own route economics, exactly as
+/// an exact watch ranks. Neither form lets a watch see a provider this node
+/// cannot itself see as authorized.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Coalesced {
+    /// The one provider the leader ranks best.
+    Best,
+    /// Up to `k` providers, `1 <= k <=` [`MAX_COALESCED_TOP`].
+    Top(u16),
+}
+
+/// The largest [`Coalesced::Top`] a watch may ask: the exact watch's own
+/// population bound, so a coalesced watch never reports more rows than an
+/// exact one could.
+pub const MAX_COALESCED_TOP: u16 = 32;
 
 impl SensingQuery {
     /// Observe readiness for one capability, asking the DEFAULT
@@ -238,7 +264,40 @@ impl SensingQuery {
             capability: capability.into(),
             budget: sensing::ConsumerLatencyBudget::default(),
             work_latency: org_sensing_demand::fixed_work_latency(),
+            coalesced: None,
         }
+    }
+
+    /// Observe THROUGH this organization's sensing leader instead of
+    /// sensing every visible provider directly.
+    ///
+    /// An exact watch (the default) opens one readiness stream per visible
+    /// provider, up to [`MAX_SENSED_POPULATION`]. A coalesced watch opens
+    /// ONE registration, with the member the node elects to lead this
+    /// capability, and that leader senses `mode`'s providers once for every
+    /// consumer asking the same question. Use it when many consumers watch
+    /// one capability, or when one good provider is all a request needs.
+    ///
+    /// It does NOT widen what this node can see: a provider reaches the
+    /// snapshot only if this node itself sees it as a current authorized
+    /// member, and every read is clamped to that, as an exact watch's is.
+    /// The leader chooses which providers are sensed; this node ranks them
+    /// by its own route economics. [`SensingSnapshot::is_coalesced`] says
+    /// which question a snapshot answers.
+    ///
+    /// A coalesced watch never falls back to an exact one. With no member
+    /// able to lead the capability, [`SensingClient::watch`] and
+    /// [`SensingWatch::snapshot`] refuse with
+    /// [`SensingError::NoSensingLeader`]; open an exact watch yourself if
+    /// that is the right answer for you.
+    pub fn coalesced(mut self, mode: Coalesced) -> Self {
+        self.coalesced = Some(mode);
+        self
+    }
+
+    /// The coalescing this query asks, or `None` for an exact watch.
+    pub fn coalescing(&self) -> Option<Coalesced> {
+        self.coalesced
     }
 
     /// Ask the provider whether it can START the work within `bound`.
@@ -300,6 +359,11 @@ impl SensingQuery {
         }
         if self.work_latency.provider_start_within == Some(Duration::ZERO) {
             return Err(SensingError::UnsatisfiableStartBound);
+        }
+        if let Some(Coalesced::Top(k)) = self.coalesced {
+            if k == 0 || k > MAX_COALESCED_TOP {
+                return Err(SensingError::UnsatisfiableCoalescing);
+            }
         }
         Ok(())
     }
@@ -398,6 +462,7 @@ pub struct SensingSnapshot {
     capability: String,
     providers: Vec<SensedProvider>,
     ranked: Vec<u64>,
+    coalesced: bool,
 }
 
 impl SensingSnapshot {
@@ -432,6 +497,15 @@ impl SensingSnapshot {
     /// One provider's row, if it is in this capture.
     pub fn provider(&self, node_id: u64) -> Option<&SensedProvider> {
         self.providers.iter().find(|row| row.node_id == node_id)
+    }
+
+    /// Whether this capture came from a COALESCED watch
+    /// ([`SensingQuery::coalesced`]): its rows are the providers the
+    /// organization's sensing leader chose to sense, clamped to what this
+    /// node sees, rather than every provider this node sees. The ranking is
+    /// this node's own either way.
+    pub fn is_coalesced(&self) -> bool {
+        self.coalesced
     }
 
     /// The two inputs an exact-lane ORDERING consumes, both folds of this one
@@ -474,6 +548,7 @@ impl SensingSnapshot {
                 })
                 .collect(),
             ranked: ranked.to_vec(),
+            coalesced: false,
         }
     }
 }
@@ -498,10 +573,10 @@ impl SensingSnapshot {
 /// Open a second watch instead — that is the shared-ownership case above.
 pub struct SensingWatch {
     node: Arc<MeshNode>,
-    /// THIS watch's demand ownership root. Its body's `Drop` retires
-    /// whatever the watch still holds, so a forgotten `close` leaks
-    /// nothing.
-    family: OrgSensingFamily,
+    /// THIS watch's demand: an exact-provider ownership root (its body's
+    /// `Drop` retires whatever it still holds, so a forgotten `close` leaks
+    /// nothing), or one coalesced hold, released by `close` / drop.
+    demand: WatchDemand,
     capability: String,
     authority: CapabilityAuthorityId,
     budget: sensing::ConsumerLatencyBudget,
@@ -572,8 +647,17 @@ impl SensingClient {
     /// provider stays in the population and reads `Unknown` — potential
     /// capacity, not a verdict — and a later `snapshot` past the
     /// population floor acquires it once the refusal clears.
+    ///
+    /// A [`SensingQuery::coalesced`] query additionally refuses with
+    /// [`SensingError::NoSensingLeader`] when no member of this node's
+    /// organization can lead the capability right now, and with
+    /// [`SensingError::UnsatisfiableCoalescing`] for a `Top(k)` outside
+    /// `1..=`[`MAX_COALESCED_TOP`]. It never falls back to an exact watch.
     pub fn watch(&self, query: SensingQuery) -> Result<SensingWatch, SensingError> {
         query.validate()?;
+        if let Some(mode) = query.coalesced {
+            return self.watch_coalesced(query, mode);
+        }
         let authority = CapabilityAuthorityId::for_tag(query.capability());
         // QUALIFY THE OBSERVER FIRST. A revoked or expired local
         // membership must not acquire anything, and must not be told
@@ -602,16 +686,70 @@ impl SensingClient {
         family
             .retain(query.capability())
             .map_err(retention_refusal)?;
+        Ok(self.assemble_watch(WatchDemand::Exact(family), authority, query, changes))
+    }
+
+    /// The COALESCED watch (SDK plan LS-7b): one hold on a leader-backed
+    /// organization interest, registered with the elected leader before
+    /// this returns and kept registered — re-elected, failed over — by the
+    /// node until the watch closes.
+    #[cfg(feature = "cortex")]
+    fn watch_coalesced(
+        &self,
+        query: SensingQuery,
+        mode: Coalesced,
+    ) -> Result<SensingWatch, SensingError> {
+        let authority = CapabilityAuthorityId::for_tag(query.capability());
+        // The same observer qualification as an exact watch, first.
+        if self
+            .node
+            .org_sensing_current_visibility(&authority)
+            .is_none()
+        {
+            return Err(SensingError::ObserverNotQualified);
+        }
+        let changes = self.node.subscribe_sensing_overlay_changes();
+        let result_mode = match mode {
+            Coalesced::Best => sensing::ResultMode::Any,
+            Coalesced::Top(k) => sensing::ResultMode::TopK(k),
+        };
+        let ticket = self
+            .node
+            .acquire_org_coalesced_interest(query.capability(), query.work_latency, result_mode)
+            .map_err(coalesced_refusal)?;
+        Ok(self.assemble_watch(WatchDemand::Coalesced(ticket), authority, query, changes))
+    }
+
+    /// Without the leader substrate in this build, no member can lead
+    /// anything: the honest answer is the typed refusal, never an exact
+    /// watch in disguise.
+    #[cfg(not(feature = "cortex"))]
+    fn watch_coalesced(
+        &self,
+        _query: SensingQuery,
+        _mode: Coalesced,
+    ) -> Result<SensingWatch, SensingError> {
+        Err(SensingError::NoSensingLeader)
+    }
+
+    fn assemble_watch(
+        &self,
+        demand: WatchDemand,
+        authority: CapabilityAuthorityId,
+        query: SensingQuery,
+        changes: tokio::sync::watch::Receiver<u64>,
+    ) -> SensingWatch {
         let now = Instant::now();
         let close = Arc::new(WatchClose {
             closed: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
-            family: family.clone(),
+            demand: demand.clone(),
+            node: Arc::clone(&self.node),
             capability: query.capability.clone(),
         });
-        Ok(SensingWatch {
+        SensingWatch {
             node: Arc::clone(&self.node),
-            family,
+            demand,
             authority,
             capability: query.capability,
             budget: query.budget,
@@ -627,7 +765,56 @@ impl SensingClient {
             convergence_suspended: false,
             #[cfg(any(test, feature = "fixtures"))]
             floor_override: None,
-        })
+        }
+    }
+}
+
+/// What one watch holds. Cloning shares the SAME holding — the family is an
+/// `Arc`, and a ticket names one hold — so a watch and its closers retire
+/// one thing, once.
+#[derive(Clone)]
+enum WatchDemand {
+    /// Exact-provider leases over the visible population, through this
+    /// watch's own family.
+    Exact(OrgSensingFamily),
+    /// One coalesced (leader-backed) hold.
+    #[cfg(feature = "cortex")]
+    Coalesced(OrgCoalescedTicket),
+}
+
+impl WatchDemand {
+    /// Release exactly this watch's demand.
+    fn retire(&self, node: &MeshNode, capability: &str) {
+        match self {
+            Self::Exact(family) => family.retire(capability),
+            #[cfg(feature = "cortex")]
+            Self::Coalesced(ticket) => {
+                node.release_org_coalesced_interest(ticket);
+            }
+        }
+        let _ = node;
+    }
+
+    /// The exact-provider family, for an exact watch (the witness seams).
+    #[cfg(any(test, feature = "fixtures"))]
+    fn family(&self) -> Option<&OrgSensingFamily> {
+        match self {
+            Self::Exact(family) => Some(family),
+            #[cfg(feature = "cortex")]
+            Self::Coalesced(_) => None,
+        }
+    }
+}
+
+/// Map a core coalesced refusal onto the SDK's typed refusal.
+#[cfg(feature = "cortex")]
+fn coalesced_refusal(refusal: OrgCoalescedRefused) -> SensingError {
+    match refusal {
+        OrgCoalescedRefused::Disabled => SensingError::Disabled,
+        OrgCoalescedRefused::NoAuthority => SensingError::NoOrganizationAuthority,
+        OrgCoalescedRefused::NoLeader => SensingError::NoSensingLeader,
+        OrgCoalescedRefused::AtCapacity => SensingError::WatchesAtCapacity,
+        OrgCoalescedRefused::UnsupportedMode => SensingError::UnsatisfiableCoalescing,
     }
 }
 
@@ -698,7 +885,15 @@ impl SensingWatch {
             .node
             .org_sensing_current_visibility(&self.authority)
             .ok_or(SensingError::ObserverNotQualified)?;
-        let demand = self.converge()?;
+        let family = match &self.demand {
+            WatchDemand::Exact(family) => family.clone(),
+            #[cfg(feature = "cortex")]
+            WatchDemand::Coalesced(ticket) => {
+                let ticket = ticket.clone();
+                return self.snapshot_coalesced(&ticket);
+            }
+        };
+        let demand = self.converge(&family)?;
         // A close from another task (a `SensingWatchCloser`) may have landed
         // while this read was converging, and the convergence may have
         // installed demand AFTER the closer retired it. Retire again and
@@ -706,11 +901,33 @@ impl SensingWatch {
         // The flag is published before the closer's own retirement, so either
         // this check sees it, or that retirement runs after this convergence.
         if self.close.is_closed() {
-            self.family.retire(&self.capability);
+            family.retire(&self.capability);
             return Err(SensingError::WatchClosed);
         }
         let projection = demand.project_sensed_order(Instant::now(), &self.budget);
-        Ok(self.assemble(&projection, &visible))
+        Ok(self.assemble(&projection, &visible, false))
+    }
+
+    /// The coalesced read (SDK plan D-LS17): the rows leader-delivered
+    /// proofs produced, clamped IN CORE to the full set of providers this
+    /// node currently sees, then ranked by this node's own economics. The
+    /// observer was already requalified by the caller.
+    #[cfg(feature = "cortex")]
+    fn snapshot_coalesced(
+        &mut self,
+        ticket: &OrgCoalescedTicket,
+    ) -> Result<SensingSnapshot, SensingError> {
+        if self.node.org_sensing_leader_for(&self.capability).is_none() {
+            return Err(SensingError::NoSensingLeader);
+        }
+        let projection =
+            org_sensing_demand::project_org_coalesced(&self.node, ticket, &self.budget)
+                .ok_or(SensingError::ObserverNotQualified)?;
+        if self.close.is_closed() {
+            return Err(SensingError::WatchClosed);
+        }
+        let clamped: Vec<u64> = projection.rows().iter().map(|row| row.provider).collect();
+        Ok(self.assemble(&projection, &clamped, true))
     }
 
     /// Park until something that can change the answer moved.
@@ -843,7 +1060,9 @@ impl SensingWatch {
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn retains_demand_for_test(&self) -> bool {
-        self.family.demand(&self.authority).is_some()
+        self.demand
+            .family()
+            .is_some_and(|family| family.demand(&self.authority).is_some())
     }
 
     /// Unstable fixtures-only witness seam; not supported API.
@@ -886,8 +1105,9 @@ impl SensingWatch {
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn retained_providers_for_test(&self) -> Vec<u64> {
-        self.family
-            .demand(&self.authority)
+        self.demand
+            .family()
+            .and_then(|family| family.demand(&self.authority))
             .map(|demand| demand.retained_providers())
             .unwrap_or_default()
     }
@@ -943,8 +1163,11 @@ impl SensingWatch {
 
     /// The demand to project, re-deriving the authorized population when
     /// that is due or when the installed one can no longer be trusted.
-    fn converge(&mut self) -> Result<Arc<OrgSensingCapabilityDemand>, SensingError> {
-        let installed = self.family.demand(&self.authority);
+    fn converge(
+        &mut self,
+        family: &OrgSensingFamily,
+    ) -> Result<Arc<OrgSensingCapabilityDemand>, SensingError> {
+        let installed = family.demand(&self.authority);
         let due = match &installed {
             // Nothing installed: only a convergence can produce one.
             None => true,
@@ -970,7 +1193,7 @@ impl SensingWatch {
         {
             self.convergences += 1;
         }
-        match self.family.retain(&self.capability) {
+        match family.retain(&self.capability) {
             Ok(demand) => {
                 self.converged_at = Instant::now();
                 self.floor_wake = self.converged_at + self.floor();
@@ -1002,7 +1225,12 @@ impl SensingWatch {
     /// route estimate — is the value the projection CLASSIFIED with. A
     /// second read of the proximity plane here would pair this row's
     /// viability and rank with an input that never entered them.
-    fn assemble(&self, projection: &OrgSensedProjection, visible: &[u64]) -> SensingSnapshot {
+    fn assemble(
+        &self,
+        projection: &OrgSensedProjection,
+        visible: &[u64],
+        coalesced: bool,
+    ) -> SensingSnapshot {
         let providers = projection
             .rows()
             .iter()
@@ -1037,6 +1265,7 @@ impl SensingWatch {
                 .copied()
                 .filter(|provider| visible.contains(provider))
                 .collect(),
+            coalesced,
         }
     }
 
@@ -1055,7 +1284,7 @@ impl SensingWatch {
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     pub fn last_attested_status_for_test(&self, provider: u64) -> Option<sensing::AttestedStatus> {
-        let demand = self.family.demand(&self.authority)?;
+        let demand = self.demand.family()?.demand(&self.authority)?;
         let (_, branch) = demand
             .retained_branches_for_test()
             .into_iter()
@@ -1073,7 +1302,8 @@ struct WatchClose {
     closed: AtomicBool,
     /// Wakes every pending [`SensingWatch::changed`] on close.
     wake: tokio::sync::Notify,
-    family: OrgSensingFamily,
+    demand: WatchDemand,
+    node: Arc<MeshNode>,
     capability: String,
 }
 
@@ -1087,7 +1317,7 @@ impl WatchClose {
         if self.closed.swap(true, Ordering::SeqCst) {
             return false;
         }
-        self.family.retire(&self.capability);
+        self.demand.retire(&self.node, &self.capability);
         self.wake.notify_waiters();
         true
     }
@@ -1255,6 +1485,65 @@ mod tests {
         let asked = SensingQuery::new("gpu.infer").start_within(Duration::from_secs(5));
         assert_eq!(asked.provider_start_within(), Some(Duration::from_secs(5)));
         assert_eq!(asked.budget(), None, "asking the provider is not a budget");
+    }
+
+    /// The coalesced opt-in (SDK plan LS-7b): `Best` and `Top(1..=32)`
+    /// validate, `Top(0)` and anything past the exact watch's own bound are
+    /// refused with their own kind, and an exact query asks no coalescing.
+    #[test]
+    fn a_coalesced_query_validates_only_a_meaningful_size() {
+        assert_eq!(SensingQuery::new("gpu.infer").coalescing(), None);
+        for mode in [
+            Coalesced::Best,
+            Coalesced::Top(1),
+            Coalesced::Top(MAX_COALESCED_TOP),
+        ] {
+            let query = SensingQuery::new("gpu.infer").coalesced(mode);
+            query.validate().expect("a meaningful coalescing validates");
+            assert_eq!(query.coalescing(), Some(mode));
+        }
+        for k in [0, MAX_COALESCED_TOP + 1, u16::MAX] {
+            assert_eq!(
+                SensingQuery::new("gpu.infer")
+                    .coalesced(Coalesced::Top(k))
+                    .validate()
+                    .unwrap_err(),
+                SensingError::UnsatisfiableCoalescing,
+                "Top({k})"
+            );
+        }
+        assert_eq!(
+            MAX_COALESCED_TOP, MAX_SENSED_POPULATION as u16,
+            "a coalesced watch never reports more rows than an exact one could"
+        );
+    }
+
+    /// Every core coalesced refusal maps onto a DISTINCT, meaningful SDK
+    /// refusal, and the SDK's bound is the core's.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn each_coalesced_refusal_keeps_its_own_meaning() {
+        use net::adapter::net::behavior::sensing::org_coalesced::MAX_COALESCED_TOP_K;
+        assert_eq!(MAX_COALESCED_TOP, MAX_COALESCED_TOP_K);
+        let mapped = [
+            (OrgCoalescedRefused::Disabled, SensingError::Disabled),
+            (
+                OrgCoalescedRefused::NoAuthority,
+                SensingError::NoOrganizationAuthority,
+            ),
+            (OrgCoalescedRefused::NoLeader, SensingError::NoSensingLeader),
+            (
+                OrgCoalescedRefused::AtCapacity,
+                SensingError::WatchesAtCapacity,
+            ),
+            (
+                OrgCoalescedRefused::UnsupportedMode,
+                SensingError::UnsatisfiableCoalescing,
+            ),
+        ];
+        for (core, sdk) in mapped {
+            assert_eq!(coalesced_refusal(core), sdk, "{core:?}");
+        }
     }
 
     /// Every retention refusal maps onto a DISTINCT typed refusal — a

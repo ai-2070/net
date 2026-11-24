@@ -188,9 +188,9 @@ pub use incarnation_file::FileIncarnation;
 /// notification, and explicit close. See [`consumer`] for the ownership
 /// and reuse contract.
 pub use consumer::{
-    ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
-    SensingWatch, SensingWatchCloser, DEFAULT_PROVIDER_START_WITHIN, MAX_SENSED_POPULATION,
-    POPULATION_RECONCILE_FLOOR,
+    Coalesced, ProjectedReadiness, SensedProvider, SensedViability, SensingQuery, SensingSnapshot,
+    SensingWatch, SensingWatchCloser, DEFAULT_PROVIDER_START_WITHIN, MAX_COALESCED_TOP,
+    MAX_SENSED_POPULATION, POPULATION_RECONCILE_FLOOR,
 };
 
 /// The provider-side evaluator contract. A capability integration
@@ -364,6 +364,27 @@ pub enum SensingError {
     /// inert by design: it reports no state and removes nothing.
     #[error("this capability watch is closed — open a new one with SensingClient::watch")]
     WatchClosed,
+
+    /// A COALESCED watch ([`SensingQuery::coalesced`]) has no sensing
+    /// leader: no member of this node's organization that does not itself
+    /// provide the capability is reachable right now. Not terminal — a
+    /// member can come back — and never answered with an exact watch in
+    /// disguise: open one yourself if that is the right answer.
+    #[error(
+        "no member of this organization can lead sensing for this capability \
+         right now — retry later, or open an exact watch (drop \
+         SensingQuery::coalesced) to sense the providers directly"
+    )]
+    NoSensingLeader,
+
+    /// A [`Coalesced::Top`] outside `1..=`[`MAX_COALESCED_TOP`]: zero
+    /// providers observes nothing, and more than the bound is more than any
+    /// watch reports.
+    #[error(
+        "a coalesced watch asks for 1 to 32 providers — pass \
+         Coalesced::Best or Coalesced::Top(k) with k in 1..=32"
+    )]
+    UnsatisfiableCoalescing,
 }
 
 /// The provider-side sensing surface bound to one live node.
@@ -829,12 +850,16 @@ mod tests {
             "OrgSensingFamily",
             "OrgSensedProjection",
             "OrgSensedRow",
+            // The coalesced demand's core ownership types (SDK plan LS-7b):
+            // a watch owns its hold, the caller never touches one.
+            "OrgCoalescedTicket",
+            "OrgCoalescedRefused",
         ] {
             assert!(
                 !declarations.contains(forbidden),
                 "`{forbidden}` is back in the SDK sensing surface — this surface \
                  is the provider lifecycle plus the own-organization \
-                 exact-provider observation, and neither interest/wire \
+                 exact or coalesced observation, and neither interest/wire \
                  vocabulary nor an unimplemented selector plane may appear on \
                  it without a separate authorization",
             );
@@ -850,6 +875,10 @@ mod tests {
             "Incarnation",
             // Consumer observation.
             "SensingQuery",
+            // The coalesced opt-in (SDK plan LS-7b): the SDK's own two-variant
+            // vocabulary, never the core's selector or result mode.
+            "Coalesced",
+            "is_coalesced",
             "SensingWatch",
             "SensingSnapshot",
             "SensedProvider",

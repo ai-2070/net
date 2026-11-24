@@ -2694,6 +2694,30 @@ jobs:
           a_value_provider_set_reaches_the_snapshot_and_honors_the_start_bound
           REQUIRED
 
+      # === the COALESCED (leader-backed) consumer watch (SDK plan LS-7b) ===
+      #
+      # Same checker, same suite artifact as the step above. These four are the
+      # SDK half of the coalesced watch: signed readiness through an ELECTED
+      # leader with `is_coalesced` set, one shared hold with a close releasing
+      # only its own, the typed `no_sensing_leader` refusal that acquires
+      # nothing (no silent exact fallback), and an out-of-range `Top(k)`
+      # refused before any state. The binary is retries = 0 in
+      # `.config/nextest.toml` for the same reason as `sensing_consumer`.
+      - name: Sensing — coalesced consumer watch
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check-witness-results.py" \
+            --junit "$RUNNER_TEMP/sdk-suite-junit.xml" \
+            --suite sensing_coalesced \
+            --min 4 \
+            --required-file - <<'REQUIRED'
+          a_coalesced_watch_reports_signed_readiness_through_the_elected_leader
+          two_coalesced_watches_share_one_hold_and_close_releases_only_its_own
+          no_electable_leader_refuses_with_its_own_kind_and_never_falls_back
+          an_out_of_range_top_is_refused_before_any_state
+          REQUIRED
+
       # === the PRODUCTION organization exact-sensing call edge =======
       #
       # Same shape and same reasoning as the gate above: the suite step already ran
