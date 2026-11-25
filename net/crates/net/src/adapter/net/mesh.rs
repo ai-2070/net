@@ -16195,6 +16195,7 @@ impl MeshNode {
             org_coalesced_task: parking_lot::Mutex::new(None),
             #[cfg(feature = "redex")]
             org_coalesced_wake: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "redex")]
             org_leader_task: parking_lot::Mutex::new(None),
             #[cfg(feature = "redex")]
             org_leader_started: AtomicBool::new(false),

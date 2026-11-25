@@ -291,9 +291,12 @@ func TestSensingIncarnationSourcesAreMutuallyExclusive(t *testing.T) {
 // meaningful coalescing on a node with no organization authority is refused
 // as "observer_not_qualified" — never served as an exact watch.
 func TestSensingCoalescedRefusalsAreRustsOwnKinds(t *testing.T) {
+	// A durable identity: sensing refuses a generated ephemeral keypair with
+	// durable_identity_required before any query is looked at.
 	node, err := NewMeshNode(MeshConfig{
 		BindAddr:               reserveLocalUDPPort(t),
 		PskHex:                 strings.Repeat("42", 32),
+		IdentitySeedHex:        strings.Repeat("07", 32),
 		EnableSensing:          true,
 		SensingIncarnationPath: filepath.Join(t.TempDir(), "coalesced.incarnation"),
 	})

@@ -88,6 +88,9 @@ describe.skipIf(!HAS_SENSING)('C5 — the Rust-owned sensing error classificatio
     const mesh = await NetMesh.create({
       bindAddr: '127.0.0.1:0',
       psk: '42'.repeat(32),
+      // A durable identity: sensing refuses a generated ephemeral keypair
+      // with durable_identity_required before any query is looked at.
+      identitySeed: Buffer.alloc(32, 7),
       enableSensing: true,
       sensingIncarnationPath: join(incarnationDir, 'coalesced.incarnation'),
     })

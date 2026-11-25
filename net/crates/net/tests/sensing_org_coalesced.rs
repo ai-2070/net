@@ -284,7 +284,15 @@ async fn a_coalesced_interest_reaches_the_elected_leader_without_assuming_the_ro
     // A capability no registration frame can carry is REFUSED, holding
     // nothing — never a held ticket that silently never registers.
     let oversized = "c".repeat(5000);
-    assert_eq!(a.org_sensing_leader_for(&oversized), Some(r.node_id()));
+    // Nobody provides the oversized capability, so P is electable for it too:
+    // the winner between R and P is decided by the (random) node ids. What
+    // matters is that a leader EXISTS, so the refusal below is the frame
+    // bound and not `NoSensingLeader`.
+    let oversized_leader = a.org_sensing_leader_for(&oversized);
+    assert!(
+        oversized_leader == Some(r.node_id()) || oversized_leader == Some(p.node_id()),
+        "the oversized capability has an electable leader: {oversized_leader:?}"
+    );
     assert_eq!(
         a.acquire_org_coalesced_interest(&oversized, start_within(), ResultMode::Any)
             .unwrap_err(),

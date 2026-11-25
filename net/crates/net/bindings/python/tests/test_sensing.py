@@ -91,6 +91,9 @@ def test_a_coalesced_watch_is_refused_with_rusts_own_kinds(tmp_path) -> None:
     mesh = net.NetMesh(
         bind_addr=_free_addr(),
         psk="42" * 32,
+        # A durable identity: sensing() refuses a generated ephemeral keypair
+        # with durable_identity_required before any query is looked at.
+        identity_seed=bytes([7]) * 32,
         enable_sensing=True,
         sensing_incarnation_path=str(tmp_path / "coalesced.incarnation"),
     )
