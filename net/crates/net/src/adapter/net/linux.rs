@@ -27,6 +27,11 @@
 //!    counts; option pointers point at stack-allocated `i32`s
 //!    paired with `size_of::<i32>()`.
 //!
+//! The one exception is `BytesMut::set_len` in `collect_recv_slots`,
+//! which carries its own `// SAFETY:` comment: a receive buffer's
+//! length is claimed only after `recvmmsg` reports writing those bytes
+//! (BUG_AUDIT_2026_11_14 LBAT-01).
+//!
 //! Per-block `// SAFETY:` comments would repeat one of those two
 //! contracts ~15 times. The module-level `#![expect]` below
 //! covers both while keeping the lint enforced everywhere else.
@@ -331,52 +336,7 @@ impl BatchedTransport {
             ));
         }
 
-        // Setup receive buffers.
-        //
-        // Per crypto-session perf #131 (Issue A): the legacy
-        // `resize(MAX_PACKET_SIZE, 0)` memset every slot's bytes
-        // to zero before recvmmsg overwrote them immediately. For
-        // MAX_BATCH_SIZE=64 × MAX_PACKET_SIZE=8KB that's a
-        // ~512 KiB memset per batch call on a path running 10k+
-        // batches/sec. The `clear` + `reserve` + `set_len` triple
-        // below skips the memset: `reserve` ensures the
-        // allocation exists at capacity ≥ MAX_PACKET_SIZE (no-op
-        // once steady-state); `set_len` claims those bytes as
-        // initialized before recvmmsg writes them.
-        //
-        // SAFETY: We just reserved MAX_PACKET_SIZE bytes of
-        // capacity; the recvmmsg syscall below writes the
-        // kernel-supplied bytes into [0..msg_len) for each
-        // received slot. The result-collection loop further down
-        // truncates each slot to its actual `msg_len` BEFORE any
-        // rust code reads through the frozen `Bytes`, so the
-        // uninitialized tail past `msg_len` is never observed.
-        // Slots that don't receive a packet stay in this
-        // in-flight state until the next call, but we re-`set_len`
-        // them before the next recvmmsg — they're never read
-        // between calls.
-        for i in 0..count {
-            self.recv_buffers[i].clear();
-            self.recv_buffers[i].reserve(MAX_PACKET_SIZE);
-            unsafe {
-                self.recv_buffers[i].set_len(MAX_PACKET_SIZE);
-            }
-
-            self.iovecs[i] = libc::iovec {
-                iov_base: self.recv_buffers[i].as_mut_ptr() as *mut _,
-                iov_len: MAX_PACKET_SIZE,
-            };
-
-            self.addrs[i] = unsafe { std::mem::zeroed() };
-
-            // See `new_inner` for the zero-then-assign rationale.
-            self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
-            self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
-            self.msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
-            self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
-            self.msgs[i].msg_hdr.msg_iovlen = 1;
-            self.msgs[i].msg_len = 0;
-        }
+        self.prepare_recv_slots(count);
 
         // Receive (non-blocking)
         let received = unsafe {
@@ -400,21 +360,7 @@ impl BatchedTransport {
             return Err(err);
         }
 
-        // Collect results
-        let mut results = Vec::with_capacity(received as usize);
-        for i in 0..(received as usize) {
-            let len = self.msgs[i].msg_len as usize;
-            let mut buffer = std::mem::replace(
-                &mut self.recv_buffers[i],
-                BytesMut::with_capacity(MAX_PACKET_SIZE),
-            );
-            buffer.truncate(len);
-
-            let addr = sockaddr_to_socket_addr(&self.addrs[i])?;
-            results.push((buffer.freeze(), addr));
-        }
-
-        Ok(results)
+        self.collect_recv_slots(received as usize)
     }
 
     /// Receive multiple packets, blocking until at least one is available.
@@ -437,52 +383,7 @@ impl BatchedTransport {
             ));
         }
 
-        // Setup receive buffers.
-        //
-        // Per crypto-session perf #131 (Issue A): the legacy
-        // `resize(MAX_PACKET_SIZE, 0)` memset every slot's bytes
-        // to zero before recvmmsg overwrote them immediately. For
-        // MAX_BATCH_SIZE=64 × MAX_PACKET_SIZE=8KB that's a
-        // ~512 KiB memset per batch call on a path running 10k+
-        // batches/sec. The `clear` + `reserve` + `set_len` triple
-        // below skips the memset: `reserve` ensures the
-        // allocation exists at capacity ≥ MAX_PACKET_SIZE (no-op
-        // once steady-state); `set_len` claims those bytes as
-        // initialized before recvmmsg writes them.
-        //
-        // SAFETY: We just reserved MAX_PACKET_SIZE bytes of
-        // capacity; the recvmmsg syscall below writes the
-        // kernel-supplied bytes into [0..msg_len) for each
-        // received slot. The result-collection loop further down
-        // truncates each slot to its actual `msg_len` BEFORE any
-        // rust code reads through the frozen `Bytes`, so the
-        // uninitialized tail past `msg_len` is never observed.
-        // Slots that don't receive a packet stay in this
-        // in-flight state until the next call, but we re-`set_len`
-        // them before the next recvmmsg — they're never read
-        // between calls.
-        for i in 0..count {
-            self.recv_buffers[i].clear();
-            self.recv_buffers[i].reserve(MAX_PACKET_SIZE);
-            unsafe {
-                self.recv_buffers[i].set_len(MAX_PACKET_SIZE);
-            }
-
-            self.iovecs[i] = libc::iovec {
-                iov_base: self.recv_buffers[i].as_mut_ptr() as *mut _,
-                iov_len: MAX_PACKET_SIZE,
-            };
-
-            self.addrs[i] = unsafe { std::mem::zeroed() };
-
-            // See `new_inner` for the zero-then-assign rationale.
-            self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
-            self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
-            self.msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
-            self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
-            self.msgs[i].msg_hdr.msg_iovlen = 1;
-            self.msgs[i].msg_len = 0;
-        }
+        self.prepare_recv_slots(count);
 
         // Receive (blocking)
         let received = unsafe {
@@ -501,20 +402,79 @@ impl BatchedTransport {
             return Err(io::Error::last_os_error());
         }
 
-        // Collect results
-        let mut results = Vec::with_capacity(received as usize);
-        for i in 0..(received as usize) {
-            let len = self.msgs[i].msg_len as usize;
+        self.collect_recv_slots(received as usize)
+    }
+
+    /// Point the first `count` msghdr/iovec slots at their receive
+    /// buffers' spare capacity.
+    ///
+    /// Per crypto-session perf #131 (Issue A) the slots are not
+    /// pre-zeroed: that cost a ~512 KiB memset per batch call
+    /// (MAX_BATCH_SIZE × MAX_PACKET_SIZE) only for the kernel to
+    /// overwrite the bytes. The buffers stay at length 0 here, and the
+    /// iovec points at their *uninitialized spare capacity*, which is
+    /// what `recvmmsg` writes into.
+    ///
+    /// BUG_AUDIT_2026_11_14 LBAT-01: this used to `set_len(MAX_PACKET_SIZE)`
+    /// before the syscall and then take `as_mut_ptr()`, which goes
+    /// through `DerefMut` and builds a `&mut [u8]` over uninitialized
+    /// memory. That is undefined behaviour the moment the slice exists,
+    /// whatever is read later, and it happened on every receive,
+    /// including an empty `WouldBlock` one. A length is now claimed only
+    /// in [`Self::collect_recv_slots`], and only for bytes the kernel
+    /// reported writing.
+    fn prepare_recv_slots(&mut self, count: usize) {
+        for i in 0..count {
+            let buffer = &mut self.recv_buffers[i];
+            buffer.clear();
+            buffer.reserve(MAX_PACKET_SIZE);
+            // `spare_capacity_mut` yields `&mut [MaybeUninit<u8>]`, so no
+            // initialized-byte slice is ever formed over these bytes.
+            let spare = buffer.spare_capacity_mut();
+            debug_assert!(spare.len() >= MAX_PACKET_SIZE);
+
+            self.iovecs[i] = libc::iovec {
+                iov_base: spare.as_mut_ptr() as *mut libc::c_void,
+                iov_len: MAX_PACKET_SIZE,
+            };
+
+            self.addrs[i] = unsafe { std::mem::zeroed() };
+
+            // See `new_inner` for the zero-then-assign rationale.
+            self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
+            self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
+            self.msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
+            self.msgs[i].msg_hdr.msg_iovlen = 1;
+            self.msgs[i].msg_len = 0;
+        }
+    }
+
+    /// Take the first `received` slots that `recvmmsg` filled, each set
+    /// to exactly the length the kernel reported.
+    fn collect_recv_slots(&mut self, received: usize) -> io::Result<Vec<(Bytes, SocketAddr)>> {
+        let mut results = Vec::with_capacity(received);
+        for i in 0..received {
+            // The kernel never reports more than `iov_len`; clamp anyway
+            // so the length claimed below can never exceed what the
+            // iovec allowed it to write.
+            let len = (self.msgs[i].msg_len as usize).min(MAX_PACKET_SIZE);
             let mut buffer = std::mem::replace(
                 &mut self.recv_buffers[i],
                 BytesMut::with_capacity(MAX_PACKET_SIZE),
             );
-            buffer.truncate(len);
+            // SAFETY: `prepare_recv_slots` pointed this slot's iovec at
+            // the start of `buffer`'s spare capacity (its length was 0)
+            // with `iov_len = MAX_PACKET_SIZE`, and `recvmmsg` reported
+            // writing `msg_len` bytes there. `len <= MAX_PACKET_SIZE <=
+            // capacity`, and bytes `[0, len)` are initialized.
+            unsafe {
+                buffer.set_len(len);
+            }
 
             let addr = sockaddr_to_socket_addr(&self.addrs[i])?;
             results.push((buffer.freeze(), addr));
         }
-
         Ok(results)
     }
 }
@@ -651,14 +611,71 @@ mod tests {
              this memset ~512 KiB per batch call only for the \
              kernel to overwrite the bytes immediately."
         );
-        // Confirm the alternate (uninit + set_len) path is in use.
-        let good_needle = format!("{}({})", "set_len", "MAX_PACKET_SIZE");
+        // BUG_AUDIT_2026_11_14 LBAT-01: the no-memset path must hand
+        // recvmmsg the buffers' spare capacity, NOT claim the whole slot
+        // as initialized first. `set_len(MAX_PACKET_SIZE)` before the
+        // syscall built an initialized-byte slice over uninitialized
+        // memory (undefined behaviour).
+        let ub_needle = format!("{}({})", "set_len", "MAX_PACKET_SIZE");
+        assert!(
+            !src_no_comments.contains(&ub_needle),
+            "regression (LBAT-01): batched recv must not claim slot \
+             capacity as initialized before recvmmsg writes it."
+        );
+        let good_needle = format!("{}()", "spare_capacity_mut");
         assert!(
             src_no_comments.contains(&good_needle),
-            "regression: batched recv setup must claim slot \
-             capacity via set_len so recvmmsg writes the kernel-\
-             supplied bytes without a pre-zero pass."
+            "regression: batched recv setup must point recvmmsg at \
+             the buffers' spare capacity so it writes without a \
+             pre-zero pass."
         );
+    }
+
+    /// BUG_AUDIT_2026_11_14 LBAT-01: a receive that writes nothing must
+    /// leave every slot at length 0. Before the fix, each prepared slot
+    /// was `set_len(MAX_PACKET_SIZE)` before `recvmmsg`, so after an
+    /// empty `WouldBlock` receive the slots claimed 8 KiB of
+    /// uninitialized bytes as initialized.
+    #[test]
+    fn empty_recv_leaves_slots_uninitialized_and_unclaimed() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut transport = BatchedTransport::new(socket.as_raw_fd());
+
+        let received = transport.recv_batch(MAX_BATCH_SIZE).unwrap();
+        assert!(received.is_empty());
+        for (i, slot) in transport.recv_buffers.iter().enumerate() {
+            assert_eq!(slot.len(), 0, "slot {i} claims bytes nobody wrote");
+            assert!(slot.capacity() >= MAX_PACKET_SIZE);
+        }
+    }
+
+    /// LBAT-01: each received datagram comes back at exactly its sent
+    /// length (including an empty one and a max-size one); slots the
+    /// kernel did not fill stay unclaimed.
+    #[test]
+    fn recv_claims_exactly_the_received_lengths() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+
+        let big = vec![0xA5u8; MAX_PACKET_SIZE];
+        let payloads: [&[u8]; 3] = [b"", b"seven b", &big];
+        for p in payloads {
+            tx.send_to(p, rx_addr).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut transport = BatchedTransport::new(rx.as_raw_fd());
+        let received = transport.recv_batch(MAX_BATCH_SIZE).unwrap();
+        assert_eq!(received.len(), payloads.len());
+        for (got, want) in received.iter().zip(payloads) {
+            assert_eq!(&got.0[..], want);
+        }
+        for slot in &transport.recv_buffers[payloads.len()..] {
+            assert_eq!(slot.len(), 0);
+        }
     }
 
     #[test]
