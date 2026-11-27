@@ -27,13 +27,22 @@ pub struct PacketBuilder {
     session_id: u64,
     /// Origin hash from entity identity (0 if no identity configured)
     origin_hash: u64,
-    /// Channel hash for the current stream (0 if not bound to a channel)
+    /// Channel hash stamped on every packet this builder builds (0 when
+    /// the packet belongs to no channel).
+    ///
+    /// Sticky across `build*` calls while one producer holds the builder,
+    /// but **reset whenever the builder enters or leaves a pool**
+    /// ([`Self::reset_routing`]). BUG_AUDIT_2026_11_14 WIRE-09: it used
+    /// to survive release/acquire, so a builder that last served a
+    /// channel publish stamped that channel's hash on the next, unrelated
+    /// `send_on_stream` packet, and the receiver's channel dispatcher
+    /// took the packet instead of the stream sink.
     channel_hash: u16,
     /// **One-shot** fragment stamp for the next `build*` call:
     /// `(fragment_id, fragment_offset, frag_flags)`.
     ///
-    /// Unlike `origin_hash` / `channel_hash`, which are sticky
-    /// per-session properties, this is cleared by every `build*`
+    /// Unlike `origin_hash` / `channel_hash`, which stay set while one
+    /// producer holds the builder, this is cleared by every `build*`
     /// call. A fragment stamp describes ONE packet's position in ONE
     /// group; leaving it sticky on a pooled builder would silently
     /// mark the next unrelated packet as a fragment of a group that
@@ -133,6 +142,16 @@ impl PacketBuilder {
     /// Set the channel hash for outgoing packets
     pub fn set_channel_hash(&mut self, channel_hash: u16) {
         self.channel_hash = channel_hash;
+    }
+
+    /// Clear the per-packet routing stamps (channel hash and any pending
+    /// fragment stamp), so the next producer starts from a builder that
+    /// routes like a fresh one. The pools call this on every acquire and
+    /// release (BUG_AUDIT_2026_11_14 WIRE-09).
+    #[inline]
+    pub fn reset_routing(&mut self) {
+        self.channel_hash = 0;
+        self.fragment = (0, 0, 0);
     }
 
     /// Stamp the fragment fields on the **next** `build` /
@@ -634,6 +653,8 @@ impl Drop for PooledBuilder<'_> {
             }
             // Sync origin_hash in case it changed
             builder.set_origin_hash(self.pool.origin_hash);
+            // WIRE-09: never hand routing stamps to the next holder.
+            builder.reset_routing();
             // Return to pool (ignore if full)
             let _ = self.pool.builders.push(builder);
         }
@@ -856,6 +877,8 @@ impl ThreadLocalPool {
                 }
                 // Sync origin_hash in case it changed
                 builder.set_origin_hash(self.origin_hash);
+                // WIRE-09: start from clean routing stamps.
+                builder.reset_routing();
                 return builder;
             }
 
@@ -876,6 +899,7 @@ impl ThreadLocalPool {
                         b.set_key_shared(&self.key, self.session_id, self.tx_counter.clone());
                     }
                     b.set_origin_hash(self.origin_hash);
+                    b.reset_routing();
                     b
                 })
                 .unwrap_or_else(|| {
@@ -901,6 +925,8 @@ impl ThreadLocalPool {
         }
         // Sync origin_hash
         builder.set_origin_hash(self.origin_hash);
+        // WIRE-09: never hand routing stamps to the next holder.
+        builder.reset_routing();
 
         LOCAL_BUILDERS.with(|pools| {
             let mut pools = pools.borrow_mut();
@@ -1194,6 +1220,80 @@ mod tests {
                 header.frag_flags
             ),
             (1, 2, 3)
+        );
+    }
+
+    /// BUG_AUDIT_2026_11_14 WIRE-09: a channel hash stamped by one
+    /// producer must not survive the builder's trip back through the
+    /// pool. Before the fix, a builder that last served a channel publish
+    /// stamped that channel's hash on the next unrelated packet built
+    /// from it on the same thread, and the receiver's per-channel
+    /// dispatcher took the packet.
+    #[test]
+    fn channel_hash_does_not_survive_the_pool() {
+        let key = [0x42u8; 32];
+        let events = vec![Bytes::from_static(b"payload")];
+        let pool = ThreadLocalPool::new(2, &key, 0x5151);
+
+        // The RAII guard path, which the mesh's publish and send paths use.
+        {
+            let mut publish = pool.get();
+            publish.set_channel_hash(0xBEEF);
+            let packet = publish.build(9, 0, &events, PacketFlags::NONE);
+            let header = NetHeader::from_bytes(&packet).expect("decodes");
+            assert_eq!(header.channel_hash, 0xBEEF, "the stamp applies while held");
+        }
+        {
+            let mut ordinary = pool.get();
+            let packet = ordinary.build(10, 0, &events, PacketFlags::NONE);
+            let header = NetHeader::from_bytes(&packet).expect("decodes");
+            assert_eq!(
+                header.channel_hash, 0,
+                "a reused builder must not carry the previous channel's hash"
+            );
+        }
+
+        // The explicit acquire/release path.
+        let mut builder = pool.acquire();
+        builder.set_channel_hash(0xCAFE);
+        builder.set_fragment(4, 5, 0b01);
+        pool.release(builder);
+        let mut builder = pool.acquire();
+        let packet = builder.build(11, 0, &events, PacketFlags::NONE);
+        let header = NetHeader::from_bytes(&packet).expect("decodes");
+        assert_eq!(header.channel_hash, 0);
+        assert_eq!(
+            (
+                header.fragment_id,
+                header.fragment_offset,
+                header.frag_flags
+            ),
+            (0, 0, 0),
+            "an unconsumed fragment stamp must not survive release either"
+        );
+        pool.release(builder);
+    }
+
+    /// WIRE-09: while one producer holds a builder, its channel stamp is
+    /// sticky across builds (a multi-packet publish relies on that).
+    #[test]
+    fn channel_hash_is_sticky_while_held() {
+        let key = [0x42u8; 32];
+        let events = vec![Bytes::from_static(b"payload")];
+        let mut builder = PacketBuilder::new(&key, 0x77);
+        builder.set_channel_hash(0x1234);
+        for seq in 0..3 {
+            let packet = builder.build(1, seq, &events, PacketFlags::NONE);
+            let header = NetHeader::from_bytes(&packet).expect("decodes");
+            assert_eq!(header.channel_hash, 0x1234);
+        }
+        builder.reset_routing();
+        let packet = builder.build(1, 3, &events, PacketFlags::NONE);
+        assert_eq!(
+            NetHeader::from_bytes(&packet)
+                .expect("decodes")
+                .channel_hash,
+            0
         );
     }
 
