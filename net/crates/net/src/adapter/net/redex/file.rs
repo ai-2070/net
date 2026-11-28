@@ -132,7 +132,9 @@ impl RedexFile {
     ///
     /// Reads `<base_dir>/<channel_path>/idx` and `.../dat` if they
     /// exist, replays the full dat file into the heap segment, and
-    /// sets `next_seq` to one past the last recovered entry. New
+    /// sets `next_seq` to one past the last recovered entry (or to the
+    /// allocation watermark the last compaction persisted, if that is
+    /// higher). New
     /// appends are mirrored to disk.
     ///
     /// A partial trailing record in `idx` (torn write from a crash)
@@ -153,7 +155,15 @@ impl RedexFile {
             FsyncPolicy::IntervalOrBytes { max_bytes, .. } => (0, max_bytes),
         };
         let recovered = DiskSegment::open(base_dir, &name, fsync_every_n, fsync_max_bytes)?;
-        let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
+        // PERSIST-01: resume at the persisted allocation watermark when it
+        // is ahead of the last surviving entry, as it is after retention
+        // evicted entries (all of them, in the worst case).
+        let next_seq = recovered
+            .index
+            .last()
+            .map(|e| e.seq + 1)
+            .unwrap_or(0)
+            .max(recovered.next_seq_floor);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
         // Use the persisted timestamps if they're present and match
@@ -1394,7 +1404,16 @@ impl RedexFile {
             let surviving_index: Vec<RedexEntry> = state.index[drop..].to_vec();
             let surviving_timestamps: Vec<u64> = state.timestamps[drop..].to_vec();
             let disk = disk.clone();
-            if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
+            // The allocation watermark rides with the compaction
+            // (PERSIST-01). Appends allocate under this same state lock,
+            // so this is exactly the next seq to issue.
+            let next_seq_floor = self.inner.next_seq.load(Ordering::Acquire);
+            if let Err(e) = disk.compact_to(
+                &surviving_index,
+                &surviving_timestamps,
+                dat_base,
+                next_seq_floor,
+            ) {
                 tracing::warn!(
                     error = %e,
                     "redex sweep_retention: disk compaction failed; \
@@ -3691,6 +3710,54 @@ mod tests {
              (pre-fix all 5 would resurrect because sweep didn't touch disk)"
         );
         f2.close().unwrap();
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-01: retention that evicts EVERY
+    /// entry, followed by a reopen, must not restart sequence
+    /// allocation. Before the fix `next_seq` came only from the last
+    /// surviving entry, so the reopened file issued seq 0 again: a
+    /// cursor, token or checkpoint naming seq 0..4 then pointed at
+    /// different content.
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn retention_evicting_everything_keeps_the_allocation_watermark_across_reopen() {
+        use super::super::manager::Redex;
+        let dir = tmp_persistent_dir("sweep_all_watermark");
+        let name = ChannelName::new("sweep/all-watermark").unwrap();
+        let config = || {
+            RedexFileConfig::default()
+                .with_persistent(true)
+                .with_retention_max_events(0)
+        };
+        {
+            let r = Redex::new().with_persistent_dir(&dir);
+            let f = r.open_file(&name, config()).unwrap();
+            for payload in [
+                b"AAAAAAAAA",
+                b"BBBBBBBBB",
+                b"CCCCCCCCC",
+                b"DDDDDDDDD",
+                b"EEEEEEEEE",
+            ] {
+                f.append(payload).unwrap();
+            }
+            f.sweep_retention();
+            assert_eq!(f.len(), 0, "retention evicted every entry");
+            assert_eq!(f.next_seq(), 5);
+            f.close().unwrap();
+        }
+
+        let r = Redex::new().with_persistent_dir(&dir);
+        let f = r.open_file(&name, config()).unwrap();
+        assert_eq!(f.len(), 0);
+        assert_eq!(
+            f.next_seq(),
+            5,
+            "the reopened file resumes after the evicted entries, not at 0"
+        );
+        assert_eq!(f.append(b"FFFFFFFFF").unwrap(), 5);
+        f.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #95: when
