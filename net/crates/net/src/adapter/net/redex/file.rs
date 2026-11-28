@@ -483,6 +483,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         // Pre-validate capacity + offset width under the state lock —
         // no side effects yet.
@@ -548,6 +553,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
@@ -619,6 +629,11 @@ impl RedexFile {
             return Ok(None);
         }
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         // `None` expected_first_seq ⇒ no caller-supplied seq guard;
         // append at whatever the current tail is.
         self.append_batch_locked(&mut state, payloads, None)
@@ -657,6 +672,11 @@ impl RedexFile {
             return Ok(None);
         }
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         self.append_batch_locked(&mut state, payloads, Some(expected_first_seq))
     }
 
@@ -809,6 +829,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         let current_live = state.segment.live_bytes();
         if current_live.saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
@@ -863,6 +888,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
 
@@ -907,6 +937,11 @@ impl RedexFile {
         }
         let ts = now_ns();
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         // Pre-validate capacity + offset width before allocating
         // seq numbers — see [`Self::append_batch`] for rationale.
@@ -1346,6 +1381,11 @@ impl RedexFile {
         }
         let now = now_ns();
         let mut state = self.inner.state.lock();
+        // PERSIST-06: a closed file's on-disk state is final (close
+        // synced it); retention must not compact it afterwards.
+        if self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
         let drop = compute_eviction_count(&state.index, &state.timestamps, now, cfg);
         if drop == 0 {
             return;
@@ -1516,6 +1556,11 @@ impl RedexFile {
         }
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         let current_next = self.inner.next_seq.load(Ordering::Acquire);
         if target_seq <= current_next {
             // Already at or past target. No-op.
@@ -1641,6 +1686,20 @@ impl RedexFile {
         self.inner.disk.as_ref()
     }
 
+    /// Test-only: hold this file's state lock until the guard drops, so a
+    /// sibling module's test can stall `close()` (and every mutator) at a
+    /// chosen point (PERSIST-07's manager witness).
+    #[cfg(test)]
+    pub(super) fn hold_state_lock_for_test(&self) -> StateLockForTest<'_> {
+        StateLockForTest(self.inner.state.lock())
+    }
+
+    /// Test-only: whether two handles are the same file instance.
+    #[cfg(test)]
+    pub(super) fn same_instance_for_test(&self, other: &RedexFile) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     #[inline]
     fn check_not_closed(&self) -> Result<(), RedexError> {
         if self.inner.closed.load(Ordering::Acquire) {
@@ -1650,6 +1709,10 @@ impl RedexFile {
         }
     }
 }
+
+/// Test-only guard returned by [`RedexFile::hold_state_lock_for_test`].
+#[cfg(test)]
+pub(super) struct StateLockForTest<'a>(#[allow(dead_code)] parking_lot::MutexGuard<'a, FileState>);
 
 impl std::fmt::Debug for RedexFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2538,6 +2601,54 @@ mod tests {
         f.append(b"a").unwrap();
         f.close().unwrap();
         assert!(matches!(f.append(b"b"), Err(RedexError::Closed)));
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-06: an append that passed the early
+    /// closed check but reaches the state lock after `close` began must be
+    /// refused. Before the fix it committed after close had disconnected
+    /// the watchers and run its final sync, so with `FsyncPolicy::Never` no
+    /// durability barrier ever covered it.
+    ///
+    /// The test holds the state lock so each mutator, once past its early
+    /// check, waits on it; then it sets `closed` exactly as `close` does
+    /// first, before close takes the lock. (If a mutator thread were so slow
+    /// that it saw `closed` at its early check, it would also return
+    /// `Closed`: the test can only pass vacuously, never fail spuriously.)
+    #[test]
+    fn a_mutator_that_reaches_the_lock_after_close_began_is_refused() {
+        type Mutator = fn(&RedexFile) -> Result<(), RedexError>;
+        let mutators: [(&str, Mutator); 4] = [
+            ("append", |f| f.append(b"late append").map(drop)),
+            ("append_inline", |f| {
+                f.append_inline(&[7u8; INLINE_PAYLOAD_SIZE]).map(drop)
+            }),
+            ("append_batch", |f| {
+                f.append_batch(&[Bytes::from_static(b"late batch")])
+                    .map(drop)
+            }),
+            ("append_ordered", |f| {
+                f.append_ordered(b"late ordered").map(drop)
+            }),
+        ];
+        for (label, mutate) in mutators {
+            let f = make_file("persist06");
+            f.append(b"before close").unwrap();
+            let held = f.inner.state.lock();
+            let writer = {
+                let f = f.clone();
+                std::thread::spawn(move || mutate(&f))
+            };
+            // Let the writer pass its early check and park on the lock.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            f.inner.closed.store(true, Ordering::Release);
+            drop(held);
+            let result = writer.join().unwrap();
+            assert!(
+                matches!(result, Err(RedexError::Closed)),
+                "{label}: a write reaching the lock after close began must be refused, got {result:?}"
+            );
+            assert_eq!(f.len(), 1, "{label}: nothing landed after close");
+        }
     }
 
     #[tokio::test]
