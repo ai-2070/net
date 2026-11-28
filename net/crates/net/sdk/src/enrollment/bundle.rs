@@ -494,18 +494,41 @@ impl MembershipBundle {
     }
 
     /// Device-side check: the receipt answers exactly this invite and intent,
-    /// and the PSK is the trust domain the signed invite named.
+    /// and the PSK is the trust domain the signed invite named. For a bundle
+    /// being INSTALLED: its channel chain must also be valid now.
     pub fn verify_for(
         &self,
         invite: &MembershipInvite,
         intent: &RedemptionIntent,
+    ) -> Result<(), BundleError> {
+        self.verify_for_with(invite, intent, ChannelCheck::ValidNow)
+    }
+
+    /// [`Self::verify_for`] for a bundle read back from DURABLE storage: the
+    /// same exactness checks, but the channel chain only has to be intact,
+    /// not still valid (BUG_AUDIT_2026_11_14 ENR-01). An installed membership
+    /// whose channel credential has since expired is still the membership
+    /// that was installed; using that credential is checked at use.
+    pub fn verify_stored_for(
+        &self,
+        invite: &MembershipInvite,
+        intent: &RedemptionIntent,
+    ) -> Result<(), BundleError> {
+        self.verify_for_with(invite, intent, ChannelCheck::Intact)
+    }
+
+    fn verify_for_with(
+        &self,
+        invite: &MembershipInvite,
+        intent: &RedemptionIntent,
+        channel_check: ChannelCheck,
     ) -> Result<(), BundleError> {
         self.receipt.verify_for(invite, intent)?;
         invite
             .check_trust_domain(self.psk.trust_domain())
             .map_err(|_| BundleError::TrustDomain)?;
         self.verify_subnet_for(invite, intent)?;
-        self.verify_channel_for(invite, intent)?;
+        self.verify_channel_for(invite, intent, channel_check)?;
         match (invite.org(), &self.org) {
             (None, None) => {}
             (Some(offer), Some(cert)) if org_cert_matches(offer, intent.subject(), cert) => {}
@@ -564,14 +587,15 @@ impl MembershipBundle {
         &self,
         invite: &MembershipInvite,
         intent: &RedemptionIntent,
+        channel_check: ChannelCheck,
     ) -> Result<(), BundleError> {
+        let check = match channel_check {
+            ChannelCheck::ValidNow => channel_chain_matches,
+            ChannelCheck::Intact => channel_chain_is_intact,
+        };
         match (invite.channel(), self.channel_chain(), &self.channel) {
             (None, None, None) => Ok(()),
-            (Some(offer), Some(chain), Some(_))
-                if channel_chain_matches(offer, intent.subject(), &chain) =>
-            {
-                Ok(())
-            }
+            (Some(offer), Some(chain), Some(_)) if check(offer, intent.subject(), &chain) => Ok(()),
             _ => Err(BundleError::Mismatch("channel chain")),
         }
     }
@@ -800,6 +824,44 @@ pub fn channel_chain_matches(
                 )
                 .is_ok()
         })
+}
+
+/// [`channel_chain_matches`] without the present: is a STORED `chain` still
+/// exactly the offered credential for `subject` (anchored at the offered
+/// root, signed and nested link by link, scoped to the offered channel and
+/// rights), whether or not it has since expired? For durable state read
+/// back after a restart (BUG_AUDIT_2026_11_14 ENR-01): an expired chain is
+/// still intact, and current validity is checked again at every use.
+pub fn channel_chain_is_intact(
+    offer: &super::invite::ChannelOffer,
+    subject: &EntityId,
+    chain: &net::adapter::net::identity::TokenChain,
+) -> bool {
+    use net::adapter::net::identity::TokenScope;
+    let Some(leaf) = chain.tokens.last() else {
+        return false;
+    };
+    if &leaf.subject != subject || leaf.scope != offer.rights {
+        return false;
+    }
+    let roots = [offer.root.clone()];
+    [TokenScope::PUBLISH, TokenScope::SUBSCRIBE]
+        .into_iter()
+        .filter(|right| offer.rights.contains(*right))
+        .all(|right| {
+            chain
+                .verify_integrity(right, offer.channel.hash(), subject, &roots)
+                .is_ok()
+        })
+}
+
+/// Which channel-chain check a bundle verification applies.
+#[derive(Clone, Copy)]
+enum ChannelCheck {
+    /// Installing: the chain must be valid now.
+    ValidNow,
+    /// Reading back durable state: the chain must be intact.
+    Intact,
 }
 
 /// Clock skew tolerated when a device checks a freshly minted chain.

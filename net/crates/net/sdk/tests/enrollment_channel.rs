@@ -678,3 +678,59 @@ fn an_expired_covering_grant_does_not_shadow_its_live_replacement() {
         &chain
     ));
 }
+
+/// BUG_AUDIT_2026_11_14 ENR-01: a stored channel chain that has since
+/// EXPIRED is still intact. Durable enrollment state is decoded with
+/// `channel_chain_is_intact`, so an expired membership loads (and can be
+/// left) instead of reading as Corrupt; installing still uses
+/// `channel_chain_matches`, which refuses it.
+#[test]
+fn an_expired_stored_chain_is_intact_but_not_installable() {
+    use net_sdk::enrollment::bundle::channel_chain_is_intact;
+    let device = Identity::generate();
+    let offered = offer(CHANNEL, TokenScope::SUBSCRIBE);
+    let mut token = PermissionToken::issue(
+        &root(),
+        device.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel(CHANNEL).hash(),
+        3600,
+        0,
+    );
+    let chain = TokenChain::single(token.clone());
+    assert!(channel_chain_matches(&offered, device.entity_id(), &chain));
+    assert!(channel_chain_is_intact(
+        &offered,
+        device.entity_id(),
+        &chain
+    ));
+
+    // Two days old, expired one day ago: correctly signed, past its window.
+    token.resign_window_for_test(&root(), now() - 2 * DAY, now() - DAY);
+    let expired = TokenChain::single(token);
+    assert!(
+        !channel_chain_matches(&offered, device.entity_id(), &expired),
+        "an expired chain may not be installed"
+    );
+    assert!(
+        channel_chain_is_intact(&offered, device.entity_id(), &expired),
+        "but a stored one is still exactly the credential that was installed"
+    );
+
+    // Intact is still exact: another device, other rights, another channel.
+    assert!(!channel_chain_is_intact(
+        &offered,
+        Identity::generate().entity_id(),
+        &expired
+    ));
+    assert!(!channel_chain_is_intact(
+        &offer(CHANNEL, TokenScope::PUBLISH),
+        device.entity_id(),
+        &expired
+    ));
+    assert!(!channel_chain_is_intact(
+        &offer("fleet.other", TokenScope::SUBSCRIBE),
+        device.entity_id(),
+        &expired
+    ));
+}

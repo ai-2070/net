@@ -354,8 +354,10 @@ fn decode(bytes: &[u8]) -> Result<Decoded, DeviceJoinError> {
         return Err(corrupt());
     }
     intent.check_against(&invite).map_err(|_| corrupt())?;
+    // Stored state: intact, not necessarily still valid (ENR-01).
     if let Some(b) = &bundle {
-        b.verify_for(&invite, &intent).map_err(|_| corrupt())?;
+        b.verify_stored_for(&invite, &intent)
+            .map_err(|_| corrupt())?;
     }
     Ok((identity, invite, intent, bundle, left_at))
 }
