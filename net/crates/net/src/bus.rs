@@ -271,13 +271,18 @@ pub struct EventBusStats {
     pub batches_dispatched: CachePadded<AtomicU64>,
     /// Total events dispatched to the adapter (sum of batch lengths
     /// from successful `on_batch` calls). Companion to
-    /// `batches_dispatched` — by the time `flush()` returns,
-    /// `events_dispatched + events_dropped == events_ingested`. FFI
-    /// consumers can also use this to monitor end-to-end delivery.
+    /// `batches_dispatched` — at quiescence (e.g. once `flush()` has
+    /// returned with no concurrent ingest),
+    /// `events_dispatched + events_lost_after_ingest == events_ingested`.
+    /// `events_dropped` is not part of that equality: it also counts
+    /// ingests refused at admission, which never entered
+    /// `events_ingested`. FFI consumers can also use this to monitor
+    /// end-to-end delivery.
     pub events_dispatched: CachePadded<AtomicU64>,
     /// Events that were ACCEPTED (counted in `events_ingested`) and then
     /// never reached the adapter: stranded by a shard removal or a lossy
-    /// shutdown, or refused by the adapter after its retries. At
+    /// shutdown, dropped because a shard's batch worker went away, or
+    /// refused by the adapter after its retries. At
     /// quiescence `events_dispatched + events_lost_after_ingest ==
     /// events_ingested`.
     ///
@@ -431,6 +436,7 @@ impl EventBus {
                 tx.clone(),
                 shutdown.clone(),
                 drain_finalize_ready.clone(),
+                stats.clone(),
             );
 
             batch_workers.insert(
@@ -585,6 +591,7 @@ impl EventBus {
             tx,
             self.shutdown.clone(),
             self.drain_finalize_ready.clone(),
+            self.stats.clone(),
         );
 
         self.batch_workers.lock().insert(
@@ -1361,6 +1368,7 @@ impl EventBus {
                 tracing::warn!(
                     target = target_ingested,
                     dispatched,
+                    lost,
                     dropped = dropped.saturating_sub(dropped_at_start),
                     "flush: Phase 2 deadline reached before all ingested events were dispatched",
                 );
@@ -1733,11 +1741,13 @@ impl EventBus {
             // the spin which would dominate the shutdown path.
             let actual_drops = stranded.saturating_sub(post_deadline_ingests);
             if actual_drops > 0 {
+                // NOT `events_lost_after_ingest`: these producers
+                // passed `try_enter_ingest` but never reached
+                // `shard_manager.ingest()`, so their events were never
+                // counted in `events_ingested` (and `actual_drops`
+                // counts ingest calls, not events).
                 self.stats
                     .events_dropped
-                    .fetch_add(actual_drops, AtomicOrdering::Relaxed);
-                self.stats
-                    .events_lost_after_ingest
                     .fetch_add(actual_drops, AtomicOrdering::Relaxed);
             } else {
                 // The deadline tripped the eager
@@ -2522,6 +2532,7 @@ fn spawn_drain_worker_for_shard(
     sender: mpsc::Sender<Vec<crate::event::InternalEvent>>,
     shutdown: Arc<AtomicBool>,
     drain_finalize_ready: Arc<AtomicBool>,
+    stats: Arc<EventBusStats>,
 ) -> JoinHandle<()> {
     const STEADY_BATCH: usize = 1_000;
     const FINAL_BATCH: usize = 10_000;
@@ -2624,6 +2635,12 @@ fn spawn_drain_worker_for_shard(
                         // the count loudly so the loss is
                         // observable in operator dashboards rather
                         // than a silent miss in shutdown stats.
+                        // Accepted events, now lost: `flush`'s barrier
+                        // counts them so it does not wait out its
+                        // deadline for them (ING-01).
+                        stats
+                            .events_lost_after_ingest
+                            .fetch_add(batch_len as u64, AtomicOrdering::Relaxed);
                         tracing::error!(
                             shard_id,
                             dropped = batch_len,
@@ -2671,6 +2688,9 @@ fn spawn_drain_worker_for_shard(
                         // shutdown or batch-worker panic shows up
                         // in dashboards rather than as a silent
                         // metric gap.
+                        stats
+                            .events_lost_after_ingest
+                            .fetch_add(batch_len as u64, AtomicOrdering::Relaxed);
                         tracing::error!(
                             shard_id,
                             dropped = batch_len,
