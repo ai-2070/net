@@ -728,15 +728,17 @@ impl Adapter for JetStreamAdapter {
 /// last returned id: a run of trailing records the poll skipped would
 /// otherwise leave the cursor stuck, re-fetching them forever (the analog
 /// of the Redis adapter's `last_seen_seq` fix).
+///
+/// A truncated poll that returned NOTHING (`limit == 0`, where the one
+/// fetched event is pure lookahead) has no cursor: `None` leaves the
+/// caller's position where it was, instead of moving it past the lookahead.
 fn poll_cursor(
     last_seen_seq: Option<u64>,
     returned: &[StoredEvent],
     has_more: bool,
 ) -> Option<String> {
     if has_more {
-        if let Some(last) = returned.last() {
-            return Some(last.id.clone());
-        }
+        return returned.last().map(|last| last.id.clone());
     }
     last_seen_seq
         .map(|s| s.to_string())
@@ -1100,6 +1102,9 @@ mod tests {
     fn a_truncated_poll_resumes_after_the_last_returned_event() {
         let returned = [stored(1), stored(2), stored(3)];
         assert_eq!(poll_cursor(Some(4), &returned, true).as_deref(), Some("3"));
+        // A zero-limit poll fetched only the lookahead: no cursor, so the
+        // caller's position does not move past an event nobody was given.
+        assert_eq!(poll_cursor(Some(1), &[], true), None);
     }
 
     /// BACK-02: an untruncated poll still resumes past records it skipped,
