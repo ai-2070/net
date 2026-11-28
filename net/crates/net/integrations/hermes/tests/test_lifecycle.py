@@ -22,6 +22,9 @@ def test_services_survive_every_hook_the_host_runs_between_turns(plugin, ctx, mo
     # on_session_start only for a new session. Services started for a session
     # must still be running for its next turn, whatever hook the plugin wired.
     monkeypatch.setattr(atexit, "register", lambda _fn: None)
+    # Through monkeypatch, so the "teardown registered" flag this register
+    # sets (with the real atexit stubbed out) is undone after the test.
+    monkeypatch.setattr(plugin, "_shutdown_registered", False, raising=False)
     plugin.register(ctx)
 
     stopped, shutdowns = [], []

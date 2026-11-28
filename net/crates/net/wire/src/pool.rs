@@ -146,8 +146,11 @@ impl PacketBuilder {
 
     /// Clear the per-packet routing stamps (channel hash and any pending
     /// fragment stamp), so the next producer starts from a builder that
-    /// routes like a fresh one. The pools call this on every acquire and
-    /// release (BUG_AUDIT_2026_11_14 WIRE-09).
+    /// routes like a fresh one (BUG_AUDIT_2026_11_14 WIRE-09). Called when
+    /// a builder goes back to [`PacketPool`] (`PooledBuilder`'s drop; its
+    /// `get` hands out only builders that came back that way, or new ones)
+    /// and on both `ThreadLocalPool::acquire` and
+    /// `ThreadLocalPool::release`.
     #[inline]
     pub fn reset_routing(&mut self) {
         self.channel_hash = 0;

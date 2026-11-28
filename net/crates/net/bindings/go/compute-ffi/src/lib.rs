@@ -3832,6 +3832,15 @@ mod tests {
 
     static REENTERED: AtomicU32 = AtomicU32::new(0);
 
+    /// Held by every test that runs the re-entrant dispatcher, so one test's
+    /// callbacks cannot move `REENTERED` while another measures its delta
+    /// (test threads run in parallel under `cargo test`).
+    static REENTRANT_DISPATCH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn reentrant_dispatch_serial() -> parking_lot::MutexGuard<'static, ()> {
+        REENTRANT_DISPATCH.lock()
+    }
+
     /// Stands in for a Go `Process` that calls a blocking Go API (such as
     /// `Snapshot` of another daemon): every such API drives `block_on`.
     unsafe extern "C" fn reentrant_process(
@@ -3924,6 +3933,7 @@ mod tests {
     /// entered thread, so its `block_on` aborted the whole test process.
     #[test]
     fn bridge_callbacks_inside_a_runtime_may_reenter_blocking_ffi() {
+        let _serial = reentrant_dispatch_serial();
         install_reentrant_dispatcher();
         let before = REENTERED.load(AtomicOrdering::SeqCst);
         let (processed, snapshot, restored) = runtime().block_on(async {
@@ -3953,6 +3963,7 @@ mod tests {
         assert!(inside.is_some());
         assert_ne!(inside, Some(caller), "inside a context it hops threads");
 
+        let _serial = reentrant_dispatch_serial();
         install_reentrant_dispatcher();
         let mut bridge = GoBridge::build("inline".to_string(), 0xA2);
         assert!(bridge.process(&event()).is_ok());
