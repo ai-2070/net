@@ -44866,20 +44866,25 @@ impl MeshNode {
         if !matches!(source, PeerAddr::Rtc(_)) {
             return super::rtc::PeerAdmission::default();
         }
-        match Self::ingress_admission(&source, ctx) {
-            IngressAdmission::Denied => {
-                super::rtc::PeerAdmission::provisional(std::time::Instant::now())
-            }
-            IngressAdmission::Permitted => {
-                // `ingress_admission` just resolved this endpoint to a
-                // live, admitted session on exactly this address.
-                let upstream_tenant = ctx
-                    .addr_to_node
-                    .get(&source)
-                    .map(|e| *e.value())
-                    .and_then(|node_id| tenant_of(&ctx.peers, node_id));
-                super::rtc::PeerAdmission::introduced_through(upstream_tenant)
-            }
+        // The admission check and the tenant read happen under ONE guard
+        // on the upstream's peer entry. Validating first (through
+        // `ingress_admission`) and re-reading the tenant afterwards left a
+        // gap: an upstream evicted in between read as "no tenant", which
+        // `introduced_through(None)` turns into an admitted peer that meets
+        // every tenant. An upstream that cannot be resolved now fails closed.
+        let upstream = ctx
+            .addr_to_node
+            .get(&source)
+            .map(|e| *e.value())
+            .and_then(|node_id| {
+                let entry = ctx.peers.get(&node_id)?;
+                let info = entry.value();
+                (info.addr() == source && !info.admission.is_provisional())
+                    .then(|| info.admission.tenant())
+            });
+        match upstream {
+            Some(upstream_tenant) => super::rtc::PeerAdmission::introduced_through(upstream_tenant),
+            None => super::rtc::PeerAdmission::provisional(std::time::Instant::now()),
         }
     }
 
