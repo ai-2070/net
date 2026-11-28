@@ -163,4 +163,36 @@ describe('persistStore close retry (TSDK-07)', () => {
     expect(saving.snapshots).toBe(1);
     expect(await saving.flush()).toBe(false);
   });
+
+  it('a failed final snapshot keeps the interval saving', async () => {
+    vi.useFakeTimers();
+    const f = fakeFile();
+    const s = store({ n: 1 });
+    const saving = persistStore(s, { file: f.file, intervalMs: 1000, sync: false, onError: () => {} });
+    f.failNextAppends(1);
+    await expect(saving.close()).rejects.toThrow('disk full');
+    // Still open, so the periodic save keeps running and picks up the
+    // unsaved document. Before the fix close() stopped the timer first.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.appended).toHaveLength(1);
+    await saving.close();
+  });
+
+  it('a flush queued behind close does not write after it', async () => {
+    const f = fakeFile();
+    const s = store({ n: 1 });
+    const saving = persistStore(s, { file: f.file, intervalMs: 0 });
+    const closing = saving.close();
+    await settle();
+    expect(f.appended).toHaveLength(1);
+    // Queued while close's final snapshot waits on its fsync, with a newer
+    // document. It must not append once close has resolved.
+    s.set({ n: 2 });
+    const flushed = saving.flush();
+    await settle();
+    f.syncs[0]!.resolve();
+    await closing;
+    expect(await flushed).toBe(false);
+    expect(f.appended).toHaveLength(1);
+  });
 });

@@ -149,8 +149,13 @@ export function persistStore<S>(store: PersistableStore<S>, options: PersistStor
     return true;
   };
 
+  // `closed` is checked when a queued snapshot RUNS, not only when it is
+  // queued: a flush or tick queued behind `close()`'s final snapshot must
+  // not append after the close it was queued behind.
+  const snapshotUnlessClosed = (): Promise<boolean> => (closed ? Promise.resolve(false) : writeSnapshot());
+
   const tick = (): void => {
-    serialized(writeSnapshot).catch((error: unknown) => options.onError?.(error));
+    serialized(snapshotUnlessClosed).catch((error: unknown) => options.onError?.(error));
   };
   const timer = intervalMs > 0 ? setInterval(tick, intervalMs) : null;
   // A snapshotter is not a reason to keep the process alive.
@@ -159,17 +164,22 @@ export function persistStore<S>(store: PersistableStore<S>, options: PersistStor
   return {
     flush: () => {
       if (closed) return Promise.resolve(false);
-      return serialized(writeSnapshot);
+      return serialized(snapshotUnlessClosed);
     },
     close: async () => {
       if (closed) return;
-      if (timer !== null) clearInterval(timer);
       // TSDK-07: the snapshotter counts as closed only once its final
       // snapshot is durable. A failed final save (disk full) rejects and
-      // leaves it open, so a later `close()` or `flush()` retries the
-      // unsaved document instead of silently succeeding.
-      await serialized(writeSnapshot);
-      closed = true;
+      // leaves it open, interval included, so periodic saves continue and a
+      // later `close()` or `flush()` retries the unsaved document instead
+      // of silently succeeding. `closed` is set inside the serialized run,
+      // so whatever was queued after it sees it.
+      await serialized(async () => {
+        if (closed) return;
+        await writeSnapshot();
+        closed = true;
+      });
+      if (timer !== null) clearInterval(timer);
     },
     get snapshots() {
       return snapshots;
