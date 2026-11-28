@@ -229,9 +229,17 @@ pub struct ApprovalRecord {
 }
 
 /// How long an approval claim holds without being cleared or released
-/// before another attempt may take it over (PAY-07): long enough for one
-/// paid HTTP round trip, short enough that a crashed attempt does not
-/// strand an operator's approval.
+/// before another attempt may take it over (PAY-07).
+///
+/// A claim spans only local work: the HTTP door claims, runs
+/// `check_and_reserve` (one store transaction), then clears the approval
+/// (reserved) or releases it (not reserved), all before the paid HTTP round
+/// trip. The TTL is therefore far longer than a live claim ever needs, so a
+/// slow but live attempt is never overtaken (a takeover would let two
+/// attempts reserve the same quote and each author a payment). The cost is
+/// on the crash path only: an attempt that dies between claim and clear
+/// leaves the approval unusable for up to this long, after which a later
+/// fetch redeems it.
 pub const APPROVAL_CLAIM_TTL_NS: u64 = 300_000_000_000;
 
 /// One outstanding reservation, keyed by the quote that took it.
@@ -905,17 +913,31 @@ impl SpendPolicyEngine {
         now_ns: u64,
     ) -> Result<Option<(String, Vec<u8>)>, SpendError> {
         use base64::Engine as _;
+        let claimable = move |record: &ApprovalRecord, capability: &str| {
+            let claim_live = record
+                .redeeming_since_ns
+                .is_some_and(|since| now_ns.saturating_sub(since) < APPROVAL_CLAIM_TTL_NS);
+            record.state == ApprovalState::Approved
+                && record.capability == capability
+                && !record.quote_b64.is_empty()
+                && !claim_live
+        };
+        // Lock-free pre-check: almost every paid fetch has no approval to
+        // redeem, and taking the store's exclusive lock just to learn that
+        // would serialize every HTTP 402 payment behind it. A candidate
+        // seen here is re-checked under the lock below.
+        let snapshot: SpendPolicyFile = load_json(&self.path).await?;
+        if !snapshot
+            .approvals
+            .values()
+            .any(|record| claimable(record, capability))
+        {
+            return Ok(None);
+        }
         let capability = capability.to_string();
         let claimed = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
             for (quote_id, record) in s.approvals.iter_mut() {
-                let claim_live = record
-                    .redeeming_since_ns
-                    .is_some_and(|since| now_ns.saturating_sub(since) < APPROVAL_CLAIM_TTL_NS);
-                if record.state != ApprovalState::Approved
-                    || record.capability != capability
-                    || record.quote_b64.is_empty()
-                    || claim_live
-                {
+                if !claimable(record, &capability) {
                     continue;
                 }
                 record.redeeming_since_ns = Some(now_ns);

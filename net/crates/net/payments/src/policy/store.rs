@@ -224,7 +224,7 @@ fn publish_blocking(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         drop(file);
         #[cfg(test)]
         test_hooks::pause_before_rename(path);
-        std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))
+        rename_durably(&tmp, path).map_err(|e| StoreError::io(path, e))
     })();
     if staged.is_err() {
         // Only a temp this save created is removed: a name it could not
@@ -260,13 +260,79 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
-/// Windows has no directory fsync through `std`: renames are made durable
-/// by the filesystem's own metadata journaling. Same policy as RedEX's
-/// `fsync_dir`.
+/// Windows has no directory fsync (`FlushFileBuffers` on a directory
+/// handle is `ERROR_ACCESS_DENIED`). There the rename itself is made
+/// durable instead, by [`rename_durably`]'s `MOVEFILE_WRITE_THROUGH`, so
+/// nothing is left to do here. Same policy as the org revocation store's
+/// `fsync_parent_dir`.
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     test_hooks::count_dir_sync();
+    Ok(())
+}
+
+/// Atomically replace `dest` with `src`. On POSIX a plain rename;
+/// [`sync_parent_dir`] makes it durable afterwards.
+#[cfg(not(windows))]
+fn rename_durably(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::rename(src, dest)
+}
+
+/// Atomically and DURABLY replace `dest` with `src` on Windows (PAY-05).
+///
+/// `std::fs::rename` is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` without
+/// write-through: the new directory entry can sit in the volume's metadata
+/// cache, and a power loss shortly after an acknowledged commit could bring
+/// back the predecessor store. NTFS journaling keeps metadata CONSISTENT
+/// after a crash; it does not promise a completed rename was flushed.
+/// `MOVEFILE_WRITE_THROUGH` is documented to flush the move before
+/// returning.
+#[cfg(windows)]
+fn rename_durably(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    // Verbatim (`\\?\`) form, as `std::fs` builds internally: a raw
+    // `MoveFileExW` is otherwise limited to MAX_PATH, and a valid store
+    // name near the 255-byte component limit already exceeds it.
+    // `std::path::absolute` resolves `.`/`..` and `/` first, which a
+    // verbatim path no longer would.
+    let wide = |p: &Path| -> std::io::Result<Vec<u16>> {
+        let abs = std::path::absolute(p)?;
+        let raw: Vec<u16> = abs.as_os_str().encode_wide().collect();
+        let bs = u16::from(b'\\');
+        let q = u16::from(b'?');
+        let mut out: Vec<u16> = Vec::with_capacity(raw.len() + 9);
+        if raw.starts_with(&[bs, bs, q, bs]) {
+            // Already verbatim.
+        } else if raw.starts_with(&[bs, bs]) {
+            // UNC `\\server\share\…` → `\\?\UNC\server\share\…`.
+            out.extend(r"\\?\UNC".encode_utf16());
+            out.extend_from_slice(&raw[1..]);
+            out.push(0);
+            return Ok(out);
+        } else {
+            out.extend(r"\\?\".encode_utf16());
+        }
+        out.extend_from_slice(&raw);
+        out.push(0);
+        Ok(out)
+    };
+    let (from, to) = (wide(src)?, wide(dest)?);
+    // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the call;
+    // no pointer escapes it, and the result is checked below.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
