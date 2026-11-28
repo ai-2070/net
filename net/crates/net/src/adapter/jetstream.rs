@@ -137,28 +137,18 @@ impl JetStreamAdapter {
             s: u64,
         }
 
+        // A MISSING `r` is a structurally corrupt record: `r` has no
+        // `#[serde(default)]`, so decoding fails with "missing field" and
+        // surfaces as an error here (audit #135).
+        //
+        // A literal `r: null` is NOT corrupt. An event is opaque JSON, so
+        // `Event(Value::Null)` is a valid event, the writer stores it as
+        // `r: null`, and the Redis adapter preserves it the same way.
+        // BUG_AUDIT_2026_11_14 BACK-03: this used to reject it as Fatal, so
+        // a valid null event could never be delivered, and ordinary
+        // pagination could not get past it.
         let parsed: StoredFormat = serde_json::from_slice(data)?;
-        // Reject `r: null` (or a missing `r` that round-trips
-        // through `RawValue` as the literal `null`) with a
-        // typed Fatal error rather than handing `b"null"` back
-        // as the event's raw bytes. Pre-fix downstream consumers
-        // that expected an object/array for `raw` got a 4-byte
-        // `null` literal — valid JSON, but not what an event
-        // payload should ever look like, and easy to mis-route
-        // through code that does `if raw.is_empty()` checks.
-        // The audit (#135) calls this out as "may surprise
-        // downstream consumers" — convert the surprise into a
-        // typed error at the boundary.
-        let raw_str = parsed.r.get();
-        if raw_str == "null" {
-            return Err(AdapterError::Fatal(format!(
-                "JetStream stored event seq={seq} has `r: null` — \
-                 the producer wrote either a literal JSON null or \
-                 omitted the field; downstream consumers expect a \
-                 non-null payload",
-            )));
-        }
-        let raw_bytes = Bytes::copy_from_slice(raw_str.as_bytes());
+        let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
 
         // Pre-fix this was `... as u16`, which silently
         // wrapped on a stored shard_id > 65 535 (e.g. 100 000 →
@@ -411,25 +401,12 @@ impl Adapter for JetStreamAdapter {
         // producer when the persistent path is configured.
         // Use the batch's process_nonce field — bus-loaded once
         // and consistent across every batch from this bus instance.
-        // Pipeline both phases of the publish:
-        //
-        // 1. Enqueue every event into JetStream in parallel —
-        //    `publish_with_headers` is async (it awaits the
-        //    `max_ack_pending` semaphore + the wire write) and
-        //    returns a `PublishAckFuture` once enqueued. Pre-fix
-        //    the loop awaited each `publish_with_headers` inline,
-        //    serializing the wire-side enqueue per event. On a
-        //    1ms-RTT link a 1k-event batch then cost ~1s wall
-        //    time despite the comment claiming "~1 RTT per
-        //    batch."
-        //
-        // 2. Await every `PublishAckFuture` in parallel — these
-        //    are the server acks; the existing code already
-        //    parallelized them via `try_join_all`.
-        //
-        // Both phases use `try_join_all` to short-circuit on the
-        // first error; the JetStream dedup window discards
-        // duplicates from a retry of the same batch.
+        // Publish every event without awaiting each one inline: a
+        // serialized per-event await cost ~1 RTT per event (on a 1 ms
+        // link a 1k-event batch took ~1 s). The publishes are driven by
+        // `publish_windowed` below, enqueue and ack together, a bounded
+        // window at a time; the JetStream dedup window discards duplicates
+        // from a retry of the same batch.
         let mut msg_id_buf = String::new();
         let _ = write!(
             msg_id_buf,
@@ -451,66 +428,32 @@ impl Adapter for JetStreamAdapter {
 
             // Push the un-awaited future. `js.publish_with_headers`
             // borrows `js`, which lives for the rest of this
-            // function — fine for `try_join_all` here.
+            // function — fine for `publish_windowed` here.
             publishes.push(js.publish_with_headers(subject.clone(), headers, data.into()));
         }
 
-        // Phase 1: enqueue all events in parallel. Wrap in
-        // `tokio::time::timeout` so the bus's outer task
-        // cancellation (or any caller-imposed deadline) doesn't
-        // drop the futures mid-iteration, leaving bytes on the
-        // wire that the dedup window will eventually mask but
-        // that the bus believes never landed. The timeout
-        // surfaces as `Transient` so the bus retries with the
-        // same `Nats-Msg-Id` set — JetStream's dedup window
-        // (configured via `JetStreamAdapterConfig::dedup_window`)
-        // discards the prior copies. Pre-fix the unwrapped
-        // `try_join_all` was vulnerable to outer cancellation
-        // in exactly the way the Redis adapter calls out at
-        // `redis.rs:388-407`.
-        let phase1 = tokio::time::timeout(
+        // Enqueue and ack together, a bounded window at a time (BACK-01;
+        // see `publish_windowed`). Each step keeps a timeout, so the bus's
+        // outer task cancellation (or any caller-imposed deadline) doesn't
+        // drop the futures mid-iteration, leaving bytes on the wire that the
+        // dedup window will eventually mask but that the bus believes never
+        // landed; a timeout surfaces as `Transient` so the bus retries with
+        // the same `Nats-Msg-Id` set and JetStream's dedup window
+        // (`JetStreamAdapterConfig::dedup_window`) discards the prior copies
+        // (compare `redis.rs:388-407`).
+        publish_windowed(
+            publishes,
+            JETSTREAM_PUBLISH_WINDOW,
             self.config.request_timeout,
-            futures::future::try_join_all(publishes),
-        );
-        let ack_futures = match phase1.await {
-            Ok(result) => result.map_err(|e| {
-                if is_transient_error(&e) {
+            |e: &async_nats::jetstream::context::PublishError| {
+                if is_transient_error(e) {
                     AdapterError::Transient(e.to_string())
                 } else {
                     AdapterError::Fatal(e.to_string())
                 }
-            })?,
-            Err(_) => {
-                return Err(AdapterError::Transient(
-                    "JetStream publish enqueue phase timed out".into(),
-                ))
-            }
-        };
-
-        // Phase 2: await all server acks in parallel.
-        // `PublishAckFuture` implements `IntoFuture` (not `Future`),
-        // so wrap each in an async block to call `.await`.
-        // Wrapped in the same `request_timeout` for the same
-        // cancellation-safety reason as phase 1.
-        let acks = ack_futures.into_iter().map(|ack| async move {
-            ack.await
-                .map_err(|e| AdapterError::Transient(e.to_string()))
-        });
-        match tokio::time::timeout(
-            self.config.request_timeout,
-            futures::future::try_join_all(acks),
+            },
         )
-        .await
-        {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {
-                return Err(AdapterError::Transient(
-                    "JetStream publish ack phase timed out".into(),
-                ))
-            }
-        }
+        .await?;
 
         tracing::trace!(
             shard_id = batch.shard_id,
@@ -739,14 +682,7 @@ impl Adapter for JetStreamAdapter {
 
         let has_more = events.len() > limit;
         let events: Vec<_> = events.into_iter().take(limit).collect();
-        // Prefer the last *seen* sequence over the last successfully
-        // deserialized event id. Otherwise a run of trailing corrupt
-        // entries leaves the cursor stuck, re-fetching them forever
-        // (analog of the Redis adapter's `last_seen_seq` fix for the
-        // JetStream path).
-        let next_id = last_seen_seq
-            .map(|s| s.to_string())
-            .or_else(|| events.last().map(|e| e.id.clone()));
+        let next_id = poll_cursor(last_seen_seq, &events, has_more);
 
         Ok(ShardPollResult {
             events,
@@ -774,6 +710,95 @@ impl Adapter for JetStreamAdapter {
             false
         }
     }
+}
+
+/// The cursor a poll returns: the exclusive position the next poll resumes
+/// from.
+///
+/// When the poll was truncated (`has_more`), the fetch read one event past
+/// `limit` only to learn that more exist, and that lookahead event is NOT
+/// returned. The cursor must therefore be the last RETURNED event.
+/// BUG_AUDIT_2026_11_14 BACK-02: it was always `last_seen_seq`, which
+/// includes the lookahead, so the next poll started after an event nobody
+/// had been given. A filtered consumer (which keeps the adapter's cursor
+/// even when its filter removed every returned row) lost that event for
+/// good.
+///
+/// When the poll was NOT truncated, `last_seen_seq` is preferred over the
+/// last returned id: a run of trailing records the poll skipped would
+/// otherwise leave the cursor stuck, re-fetching them forever (the analog
+/// of the Redis adapter's `last_seen_seq` fix).
+fn poll_cursor(
+    last_seen_seq: Option<u64>,
+    returned: &[StoredEvent],
+    has_more: bool,
+) -> Option<String> {
+    if has_more {
+        if let Some(last) = returned.last() {
+            return Some(last.id.clone());
+        }
+    }
+    last_seen_seq
+        .map(|s| s.to_string())
+        .or_else(|| returned.last().map(|e| e.id.clone()))
+}
+
+/// How many events of one batch may be in flight (enqueued, ack not yet
+/// received) at once (BACK-01). Well under async-nats's default of 5,000
+/// pending acks per context, which concurrent shard batches share.
+const JETSTREAM_PUBLISH_WINDOW: usize = 256;
+
+/// Publish a batch with at most `window` events in flight, each one's
+/// enqueue and ack driven together.
+///
+/// BUG_AUDIT_2026_11_14 BACK-01: the batch used to be published in two
+/// phases: enqueue EVERY event, then await every ack. In async-nats each
+/// enqueued publish holds one of the context's ack permits until its ack
+/// future is consumed, so a batch larger than the free permits waited in
+/// phase one on permits its own unconsumed phase-two acks held, until the
+/// timeout broke the cycle with the batch half published (and a whole-batch
+/// retry could repeat it). Here every publish that holds a permit is also
+/// being driven to its ack, so permits are always on their way back.
+///
+/// Each step keeps its own `timeout` and error classification; the first
+/// failure ends the batch (the bus retries it, and JetStream's dedup window
+/// discards the events that had already landed).
+async fn publish_windowed<P, A, T, E, E2, F>(
+    publishes: Vec<P>,
+    window: usize,
+    timeout: std::time::Duration,
+    classify: F,
+) -> Result<(), AdapterError>
+where
+    P: std::future::Future<Output = Result<A, E>>,
+    A: std::future::IntoFuture<Output = Result<T, E2>>,
+    E2: std::fmt::Display,
+    F: Fn(&E) -> AdapterError + Copy,
+{
+    use futures::{StreamExt as _, TryStreamExt as _};
+    futures::stream::iter(publishes.into_iter().map(|publish| async move {
+        let ack = match tokio::time::timeout(timeout, publish).await {
+            Ok(Ok(ack)) => ack,
+            Ok(Err(e)) => return Err(classify(&e)),
+            Err(_) => {
+                return Err(AdapterError::Transient(
+                    "JetStream publish enqueue timed out".into(),
+                ))
+            }
+        };
+        match tokio::time::timeout(timeout, ack.into_future()).await {
+            Ok(result) => result
+                .map(drop)
+                .map_err(|e| AdapterError::Transient(e.to_string())),
+            Err(_) => Err(AdapterError::Transient(
+                "JetStream publish ack timed out".into(),
+            )),
+        }
+    }))
+    .buffered(window.max(1))
+    .try_collect::<Vec<()>>()
+    .await
+    .map(drop)
 }
 
 /// Check if a NATS publish error is transient (retryable).
@@ -1041,5 +1066,113 @@ mod tests {
         let fetch_limit = limit.saturating_add(1);
         assert_ne!(fetch_limit, 0, "usize::MAX must not wrap to 0");
         assert_eq!(fetch_limit, usize::MAX);
+    }
+
+    /// BUG_AUDIT_2026_11_14 BACK-03: a literal JSON null is a valid event
+    /// (events are opaque JSON), so it decodes and is delivered as the raw
+    /// bytes `null`. Before the fix it was rejected as Fatal, and pagination
+    /// could not get past it.
+    #[test]
+    fn deserialize_event_delivers_a_literal_null_event() {
+        let event = JetStreamAdapter::deserialize_event(5, br#"{"r":null,"t":7,"s":1}"#)
+            .expect("a null event is a valid event");
+        assert_eq!(&event.raw[..], b"null");
+        assert_eq!(event.insertion_ts, 7);
+        assert_eq!(event.shard_id, 1);
+    }
+
+    /// BACK-03: a record with no `r` at all is still structurally corrupt.
+    #[test]
+    fn deserialize_event_rejects_a_missing_payload_field() {
+        assert!(JetStreamAdapter::deserialize_event(5, br#"{"t":7,"s":1}"#).is_err());
+    }
+
+    fn stored(seq: u64) -> StoredEvent {
+        StoredEvent::new(seq.to_string(), Bytes::from_static(b"{}"), 0, 0)
+    }
+
+    /// BUG_AUDIT_2026_11_14 BACK-02: a truncated poll read one event past
+    /// `limit` (the lookahead) only to learn more exist; the cursor must be
+    /// the last RETURNED event, or the next poll starts after the lookahead
+    /// event and nobody is ever given it. Before the fix this returned
+    /// `last_seen_seq` (the lookahead, here 4).
+    #[test]
+    fn a_truncated_poll_resumes_after_the_last_returned_event() {
+        let returned = [stored(1), stored(2), stored(3)];
+        assert_eq!(poll_cursor(Some(4), &returned, true).as_deref(), Some("3"));
+    }
+
+    /// BACK-02: an untruncated poll still resumes past records it skipped,
+    /// so a run of trailing skipped records cannot pin the cursor.
+    #[test]
+    fn an_untruncated_poll_resumes_past_skipped_records() {
+        let returned = [stored(1), stored(2)];
+        assert_eq!(poll_cursor(Some(5), &returned, false).as_deref(), Some("5"));
+        assert_eq!(poll_cursor(None, &returned, false).as_deref(), Some("2"));
+        assert_eq!(poll_cursor(None, &[], false), None);
+    }
+
+    /// BUG_AUDIT_2026_11_14 BACK-01: a batch larger than the context's ack
+    /// permits completes. The mock mirrors async-nats: enqueueing takes one
+    /// of 4 permits, and the permit is released only when that publish's
+    /// ack is consumed. The old two-phase publish enqueued the whole batch
+    /// before consuming any ack, so the fifth enqueue waited forever on
+    /// permits the batch's own unconsumed acks held.
+    #[tokio::test]
+    async fn a_batch_larger_than_the_ack_permits_publishes_completely() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let permits = Arc::new(tokio::sync::Semaphore::new(4));
+        let acked = Arc::new(AtomicUsize::new(0));
+        let publishes: Vec<_> = (0..50)
+            .map(|_| {
+                let permits = permits.clone();
+                let acked = acked.clone();
+                async move {
+                    let permit = permits.acquire_owned().await.expect("semaphore open");
+                    Ok::<_, std::io::Error>(async move {
+                        tokio::task::yield_now().await;
+                        drop(permit);
+                        acked.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), std::io::Error>(())
+                    })
+                }
+            })
+            .collect();
+        publish_windowed(
+            publishes,
+            3,
+            std::time::Duration::from_secs(5),
+            |e: &std::io::Error| AdapterError::Fatal(e.to_string()),
+        )
+        .await
+        .expect("every event is published within the timeouts");
+        assert_eq!(acked.load(Ordering::SeqCst), 50);
+        assert_eq!(permits.available_permits(), 4, "every permit came back");
+    }
+
+    /// BACK-01: the first failing step ends the batch with its own error
+    /// class (an enqueue error through `classify`, an ack error as
+    /// Transient).
+    #[tokio::test]
+    async fn publish_windowed_surfaces_the_first_failure() {
+        let publishes: Vec<_> = (0..3)
+            .map(|i| async move {
+                if i == 1 {
+                    Err(std::io::Error::other("enqueue refused"))
+                } else {
+                    Ok(async { Ok::<(), std::io::Error>(()) })
+                }
+            })
+            .collect();
+        let err = publish_windowed(
+            publishes,
+            2,
+            std::time::Duration::from_secs(5),
+            |e: &std::io::Error| AdapterError::Fatal(e.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AdapterError::Fatal(ref m) if m.contains("enqueue refused")));
     }
 }
