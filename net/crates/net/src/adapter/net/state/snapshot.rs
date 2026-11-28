@@ -552,11 +552,11 @@ impl SnapshotStore {
         // distinct from the shard for snapshots, so this is two
         // brief lock acquires rather than one held across both
         // operations — fine for a non-hot path.
-        if let Some(prev_seq) = self.high_water.get(&key).map(|v| *v) {
-            if new_seq <= prev_seq {
-                return false;
-            }
+        if !self.high_water_admits(&key, new_seq) {
+            return false;
         }
+        #[cfg(test)]
+        store_hooks::pause_after_high_water_check(&key);
 
         // Real linearization point: the snapshots-side entry
         // guard. Two concurrent `store(seq=N)` calls can each pass
@@ -571,22 +571,49 @@ impl SnapshotStore {
         // saw" — is preserved by the snapshots-side guard alone;
         // the high_water table only bounds *future* stores from
         // rewinding.
+        //
+        // BUG_AUDIT_2026_11_14 STATE-01: the high-water mark is re-checked
+        // HERE, under the live entry's guard, and only ever raised. The
+        // early check alone let a stale store (seq 5) pass it, pause, and
+        // then find the entry VACANT because a fresher store (seq 10)
+        // committed and retention `remove`d it in between; the stale store
+        // then committed seq 5 and lowered the mark to 5, rewinding both
+        // the snapshot and its anti-rewind watermark. `remove` takes the
+        // same entry guard, and every commit raises the mark while holding
+        // it, so the re-check sees any commit that happened before.
         match self.snapshots.entry(key) {
             Entry::Vacant(slot) => {
+                if !self.high_water_admits(&key, new_seq) {
+                    return false;
+                }
                 slot.insert(snapshot);
-                self.high_water.insert(key, new_seq);
+                self.raise_high_water(key, new_seq);
                 true
             }
             Entry::Occupied(mut slot) => {
-                if new_seq > slot.get().through_seq {
+                if new_seq > slot.get().through_seq && self.high_water_admits(&key, new_seq) {
                     slot.insert(snapshot);
-                    self.high_water.insert(key, new_seq);
+                    self.raise_high_water(key, new_seq);
                     true
                 } else {
                     false
                 }
             }
         }
+    }
+
+    /// Would a snapshot at `seq` be fresher than anything this entity
+    /// ever stored?
+    fn high_water_admits(&self, key: &[u8; 32], seq: u64) -> bool {
+        self.high_water.get(key).is_none_or(|prev| seq > *prev)
+    }
+
+    /// Raise (never lower) the entity's high-water mark to `seq`.
+    fn raise_high_water(&self, key: [u8; 32], seq: u64) {
+        self.high_water
+            .entry(key)
+            .and_modify(|prev| *prev = (*prev).max(seq))
+            .or_insert(seq);
     }
 
     /// Clear the per-entity high-water mark.
@@ -633,6 +660,37 @@ impl SnapshotStore {
     /// Number of stored snapshots.
     pub fn count(&self) -> usize {
         self.snapshots.len()
+    }
+}
+
+/// Test-only seam into `SnapshotStore::store` (STATE-01 witness).
+#[cfg(test)]
+mod store_hooks {
+    use std::sync::mpsc::{Receiver, Sender};
+
+    type Pause = ([u8; 32], Sender<()>, Receiver<()>);
+
+    /// The next store for entity `key` signals `entered` right after its
+    /// early high-water check and waits for `resume`. One-shot, scoped to
+    /// one entity so tests sharing a process cannot catch each other.
+    static PAUSE: parking_lot::Mutex<Option<Pause>> = parking_lot::Mutex::new(None);
+
+    pub(super) fn arm(key: [u8; 32], entered: Sender<()>, resume: Receiver<()>) {
+        *PAUSE.lock() = Some((key, entered, resume));
+    }
+
+    pub(super) fn pause_after_high_water_check(key: &[u8; 32]) {
+        let armed = {
+            let mut slot = PAUSE.lock();
+            match slot.as_ref() {
+                Some((armed_for, _, _)) if armed_for == key => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, entered, resume)) = armed {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
     }
 }
 
@@ -889,6 +947,59 @@ mod tests {
             store.get(&entity_id).is_none(),
             "live entry must remain empty — neither the original (removed) \
              nor the stale (rejected) snapshot is present"
+        );
+    }
+
+    /// BUG_AUDIT_2026_11_14 STATE-01: a stale store that passed the early
+    /// high-water check before a fresher store committed AND retention
+    /// removed it must still be refused. Before the fix it found the live
+    /// entry vacant, committed seq 1, and lowered the high-water mark to 1,
+    /// rewinding both the snapshot and its anti-rewind watermark.
+    ///
+    /// A test hook pauses the stale store right after its early check.
+    #[test]
+    fn a_stale_store_racing_retention_cannot_rewind_the_high_water_mark() {
+        let store = std::sync::Arc::new(SnapshotStore::new());
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+
+        let mut stale_builder = CausalChainBuilder::new(kp.origin_hash());
+        stale_builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        let stale = snap_at(entity_id.clone(), &mut stale_builder, b"stale");
+        let mut fresh_builder = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..3 {
+            fresh_builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let fresh = snap_at(entity_id.clone(), &mut fresh_builder, b"fresh");
+        assert_eq!((stale.through_seq, fresh.through_seq), (1, 3));
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        store_hooks::arm(*entity_id.as_bytes(), entered_tx, resume_rx);
+        let racer = {
+            let store = store.clone();
+            std::thread::spawn(move || store.store(stale))
+        };
+        entered_rx.recv().unwrap();
+
+        // While the stale store is paused past its early check: a fresher
+        // snapshot commits, and retention removes it.
+        assert!(store.store(fresh));
+        assert!(store.remove(&entity_id).is_some());
+
+        resume_tx.send(()).unwrap();
+        assert!(
+            !racer.join().unwrap(),
+            "the stale store must be refused at the entry guard"
+        );
+        assert!(
+            store.get(&entity_id).is_none(),
+            "nothing stale was committed"
+        );
+        assert_eq!(
+            store.high_water.get(entity_id.as_bytes()).map(|v| *v),
+            Some(3),
+            "the high-water mark was not rewound"
         );
     }
 
