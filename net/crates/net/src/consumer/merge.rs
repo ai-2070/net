@@ -46,6 +46,78 @@ use crate::event::StoredEvent;
 /// and the other is `456-0`, the lex fallback kicks in. In practice
 /// a single adapter emits a single format, so this only matters for
 /// pathological mixed-source streams.
+/// Order `events` by `(insertion_ts, shard_id, id)` WITHOUT reordering any
+/// shard's events relative to each other: each shard's events keep their
+/// storage (id) order, and shards interleave by the key of each one's next
+/// event. See the call site (POLL-01).
+fn merge_by_insertion_ts(events: Vec<StoredEvent>) -> Vec<StoredEvent> {
+    use std::cmp::Reverse;
+    use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+
+    let total = events.len();
+    let mut by_shard: BTreeMap<u16, Vec<StoredEvent>> = BTreeMap::new();
+    for event in events {
+        by_shard.entry(event.shard_id).or_default().push(event);
+    }
+    let mut queues: Vec<VecDeque<StoredEvent>> = by_shard
+        .into_values()
+        .map(|mut shard| {
+            shard.sort_by(|a, b| compare_stream_ids(&a.id, &b.id));
+            VecDeque::from(shard)
+        })
+        .collect();
+
+    /// The next event of one shard's queue, as a heap key.
+    struct Head {
+        ts: u64,
+        shard: u16,
+        id: String,
+        queue: usize,
+    }
+    impl PartialEq for Head {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == CmpOrdering::Equal
+        }
+    }
+    impl Eq for Head {}
+    impl PartialOrd for Head {
+        fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Head {
+        fn cmp(&self, other: &Self) -> CmpOrdering {
+            self.ts
+                .cmp(&other.ts)
+                .then(self.shard.cmp(&other.shard))
+                .then_with(|| compare_stream_ids(&self.id, &other.id))
+        }
+    }
+    let head = |queue: usize, queues: &[VecDeque<StoredEvent>]| {
+        queues[queue].front().map(|e| {
+            Reverse(Head {
+                ts: e.insertion_ts,
+                shard: e.shard_id,
+                id: e.id.clone(),
+                queue,
+            })
+        })
+    };
+
+    let mut heap: BinaryHeap<Reverse<Head>> =
+        (0..queues.len()).filter_map(|q| head(q, &queues)).collect();
+    let mut merged = Vec::with_capacity(total);
+    while let Some(Reverse(next)) = heap.pop() {
+        if let Some(event) = queues[next.queue].pop_front() {
+            merged.push(event);
+        }
+        if let Some(h) = head(next.queue, &queues) {
+            heap.push(h);
+        }
+    }
+    merged
+}
+
 pub(crate) fn compare_stream_ids(a: &str, b: &str) -> CmpOrdering {
     // Redis Streams `<ms>-<seq>`.
     if let (Some((a_ms, a_seq)), Some((b_ms, b_seq))) = (split_redis_id(a), split_redis_id(b)) {
@@ -755,12 +827,22 @@ impl PollMerger {
                 // `insertion_ts` (rare but legal at millisecond
                 // granularity), the structured id compare is
                 // correct on every adapter format.
-                all_events.sort_by(|a, b| {
-                    a.insertion_ts
-                        .cmp(&b.insertion_ts)
-                        .then(a.shard_id.cmp(&b.shard_id))
-                        .then(compare_stream_ids(&a.id, &b.id))
-                });
+                //
+                // A k-way merge, not a global sort (BUG_AUDIT_2026_11_14
+                // POLL-01). `insertion_ts` is monotonic per shard only
+                // within ONE writer incarnation: a bus reopened against
+                // the same backend starts its clock near zero while the
+                // backend keeps the old, larger timestamps. A global sort
+                // then put a shard's NEWER event (low ts, later id) ahead
+                // of its OLDER one, `truncate(limit)` returned the newer,
+                // and the cursor moved past the older event, which no
+                // later poll could reach. Merging keeps each shard's
+                // events in storage order (so what is returned from a
+                // shard is always a prefix of what was fetched from it)
+                // and interleaves shards by the timestamp of each one's
+                // next event. When timestamps ARE monotonic per shard,
+                // this is exactly the old sorted order.
+                all_events = merge_by_insertion_ts(std::mem::take(&mut all_events));
             }
         }
 
@@ -1661,6 +1743,78 @@ mod tests {
         assert_eq!(response.events.len(), 2);
     }
 
+    /// BUG_AUDIT_2026_11_14 POLL-01: a writer reopened against the same
+    /// backend restarts its timestamp clock near zero while the backend
+    /// keeps the old, larger timestamps, so within ONE shard a newer event
+    /// (later id) can carry a smaller `insertion_ts`. Timestamp-ordered
+    /// paging must still deliver both. Before the fix the global sort put
+    /// the newer event first, `limit = 1` returned it, the cursor moved
+    /// past the older one, and no later poll could reach it.
+    #[tokio::test]
+    async fn insertion_ts_paging_survives_a_restarted_writer_clock() {
+        let adapter = Arc::new(MockAdapter::new());
+        adapter.add_events(
+            0,
+            vec![
+                // Written by the first incarnation, late in its life.
+                StoredEvent::from_value("1-0".to_string(), json!({"n": "old"}), 9_000_000, 0),
+                // Written right after a restart: later id, smaller ts.
+                StoredEvent::from_value("2-0".to_string(), json!({"n": "new"}), 5, 0),
+            ],
+        );
+        let merger = PollMerger::new(adapter, vec![0]);
+
+        let mut seen = Vec::new();
+        let mut from: Option<String> = None;
+        for _ in 0..4 {
+            let mut request = ConsumeRequest::new(1).ordering(Ordering::InsertionTs);
+            if let Some(cursor) = &from {
+                request = request.from(cursor.clone());
+            }
+            let response = merger.poll(request).await.unwrap();
+            seen.extend(response.events.iter().map(|e| e.id.clone()));
+            if response.events.is_empty() {
+                break;
+            }
+            from = response.next_id.clone();
+        }
+        assert_eq!(
+            seen,
+            vec!["1-0", "2-0"],
+            "every persisted event is delivered, once"
+        );
+    }
+
+    /// POLL-01: the merge keeps each shard's storage order and, across
+    /// shards, orders by each shard's next timestamp; with monotonic
+    /// timestamps it is the plain `(ts, shard, id)` sort.
+    #[test]
+    fn merge_by_insertion_ts_keeps_each_shards_storage_order() {
+        let e = |id: &str, ts: u64, shard: u16| {
+            StoredEvent::from_value(id.to_string(), json!({}), ts, shard)
+        };
+        // Shard 0 is non-monotonic (a restarted writer); shard 1 is not.
+        let merged = merge_by_insertion_ts(vec![
+            e("2-0", 5, 0),
+            e("1-0", 900, 0),
+            e("1-0", 100, 1),
+            e("2-0", 1000, 1),
+        ]);
+        let order: Vec<(u16, &str)> = merged.iter().map(|e| (e.shard_id, e.id.as_str())).collect();
+        assert_eq!(order, vec![(1, "1-0"), (0, "1-0"), (0, "2-0"), (1, "2-0")]);
+
+        let monotonic = vec![e("1", 30, 0), e("2", 10, 1), e("3", 20, 1), e("4", 40, 0)];
+        let mut sorted = monotonic.clone();
+        sorted.sort_by(|a, b| {
+            a.insertion_ts
+                .cmp(&b.insertion_ts)
+                .then(a.shard_id.cmp(&b.shard_id))
+                .then(compare_stream_ids(&a.id, &b.id))
+        });
+        let ids = |v: &[StoredEvent]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&merge_by_insertion_ts(monotonic)), ids(&sorted));
+    }
+
     #[tokio::test]
     async fn test_poll_merger_empty_limit() {
         let adapter = Arc::new(MockAdapter::new());
@@ -1896,12 +2050,14 @@ mod tests {
     async fn test_poll_merger_with_ordering() {
         let adapter = Arc::new(MockAdapter::new());
 
-        // Add events with different timestamps
+        // Timestamps interleaved across shards (monotonic within each,
+        // per the per-shard contract; see POLL-01 for the restarted-writer
+        // case where they are not).
         adapter.add_events(
             0,
             vec![
-                StoredEvent::from_value("0-1".to_string(), json!({}), 300, 0),
-                StoredEvent::from_value("0-2".to_string(), json!({}), 100, 0),
+                StoredEvent::from_value("0-1".to_string(), json!({}), 100, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({}), 300, 0),
             ],
         );
         adapter.add_events(
@@ -2751,23 +2907,27 @@ mod tests {
     async fn test_poll_merger_filter_insertion_ts_truncates_after_sort() {
         let adapter = Arc::new(MockAdapter::new());
 
-        // Interleave shards with out-of-order timestamps and a mix of
-        // matching / non-matching events. Matching timestamps: 120, 200,
-        // 260, 400. Non-matching timestamps: 100, 300.
+        // Interleave shards (timestamps monotonic within each shard, as
+        // the per-shard contract says, but interleaved ACROSS shards) with
+        // a mix of matching / non-matching events. Matching timestamps:
+        // 120, 200, 260, 400. Non-matching timestamps: 100, 300. (This
+        // fixture used to run timestamps backwards WITHIN a shard; with
+        // truncation that is POLL-01, now pinned by
+        // `insertion_ts_paging_survives_a_restarted_writer_clock`.)
         adapter.add_events(
             0,
             vec![
-                StoredEvent::from_value("0-1".to_string(), json!({"type": "token"}), 400, 0),
-                StoredEvent::from_value("0-2".to_string(), json!({"type": "noise"}), 100, 0),
-                StoredEvent::from_value("0-3".to_string(), json!({"type": "token"}), 200, 0),
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "noise"}), 100, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({"type": "token"}), 200, 0),
+                StoredEvent::from_value("0-3".to_string(), json!({"type": "token"}), 400, 0),
             ],
         );
         adapter.add_events(
             1,
             vec![
-                StoredEvent::from_value("1-1".to_string(), json!({"type": "token"}), 260, 1),
-                StoredEvent::from_value("1-2".to_string(), json!({"type": "noise"}), 300, 1),
-                StoredEvent::from_value("1-3".to_string(), json!({"type": "token"}), 120, 1),
+                StoredEvent::from_value("1-1".to_string(), json!({"type": "token"}), 120, 1),
+                StoredEvent::from_value("1-2".to_string(), json!({"type": "token"}), 260, 1),
+                StoredEvent::from_value("1-3".to_string(), json!({"type": "noise"}), 300, 1),
             ],
         );
 
