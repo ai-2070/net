@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress. **Phase A done 2026-11-28** on branch `fixes` (six fixes; A5 was already fixed, see below). Phases B–F not started. No release target yet; each phase can ship on its own.
+In progress. **Phases A and B done 2026-11-28** on branch `fixes` (PR #1488). A: six fixes, A5 already fixed. B: all 23 findings (19 High + 4 riding along), see "Phase B as landed". Phases C–F not started. No release target yet; each phase can ship on its own.
 
 ## The gap
 
@@ -114,13 +114,25 @@ Each commit carries its regression test, and each test was checked to fail witho
 
 | Slice | Findings | Proof |
 |---|---|---|
-| B1 | **PERSIST-01/02/03** (sequence allocation and recovery). Medium PERSIST-08 rides along. | Restart tests: empty compaction followed by reopen keeps the next sequence; a missing sidecar never triggers recovery that empties the log; an append after recovery survives the next reopen. |
-| B2 | **PERSIST-06/07** (close lifecycle) | An append racing close either finishes before the final barrier or fails; concurrent close and reopen never yields two disk handles. |
-| B3 | **PERSIST-04/05** (CortEX catch-up) | An incomplete retained replay is refused as a full catch-up; a full live-tail buffer degrades to a recoverable state instead of stopping. |
-| B4 | **SDK-01, TSDK-01.** TSDK-07 rides along. | The Python context manager re-raises a failed sync or close; TypeScript `sync`/`close` reject with the native error. |
-| B5 | **PAY-03/04/05/07** | PAY-05 reuses `store_file::durability_barrier` (from `fb40efab5`). Plus: a cancellation test for staging (PAY-04); an ambiguous settlement keeps its recovery material (PAY-03); two concurrent approvals for one HTTP 402 approval settle at most once (PAY-07). |
-| B6 | **BACK-01/02/03** (JetStream), **POLL-01**, **ING-01**, **ENR-01** | One test per finding. JetStream tests need the service container, the same as CI's existing `jetstream` job. |
-| B7 | **STATE-01/03** | A snapshot taken while retention removes entries never claims a high-water mark beyond what it holds; a host snapshot restores through its own restore path. |
+| B1 ✅ `8b3cc9983` | **PERSIST-01/02/03** (sequence allocation and recovery). Medium PERSIST-08 rides along. | Restart tests: empty compaction followed by reopen keeps the next sequence; a missing sidecar never triggers recovery that empties the log; an append after recovery survives the next reopen. |
+| B2 ✅ `50f116b64` | **PERSIST-06/07** (close lifecycle) | An append racing close either finishes before the final barrier or fails; concurrent close and reopen never yields two disk handles. |
+| B3 ✅ `9986fd4ba` | **PERSIST-04/05** (CortEX catch-up) | An incomplete retained replay is refused as a full catch-up; a full live-tail buffer degrades to a recoverable state instead of stopping. |
+| B4 ✅ `a21a09ff6` `f70099d80` | **SDK-01, TSDK-01.** TSDK-07 rides along. | The Python context manager re-raises a failed sync or close; TypeScript `sync`/`close` reject with the native error. |
+| B5 ✅ `b72ef572a` `553d1a9b7` `5c80d9858` | **PAY-03/04/05/07** | PAY-05 reuses `store_file::durability_barrier` (from `fb40efab5`). Plus: a cancellation test for staging (PAY-04); an ambiguous settlement keeps its recovery material (PAY-03); two concurrent approvals for one HTTP 402 approval settle at most once (PAY-07). |
+| B6 ✅ `5d972e815` `4035f7145` `4ae731de8` `c55993f49` | **BACK-01/02/03** (JetStream), **POLL-01**, **ING-01**, **ENR-01** | One test per finding. JetStream tests need the service container, the same as CI's existing `jetstream` job. |
+| B7 ✅ `b68fc946e` `f865ebb7c` | **STATE-01/03** | A snapshot taken while retention removes entries never claims a high-water mark beyond what it holds; a host snapshot restores through its own restore path. |
+
+#### Phase B as landed (2026-11-28)
+
+Each fix carries a regression test checked to fail with the fix reverted, unless noted. After the phase, the full unit suite (`cargo tfl`) passed 6270/6270.
+
+- **B1 PERSIST-01/02/03/08** (one commit: they share the recovery-publication mechanism). When recovery's state differs from the files in a way a tail `set_len` cannot repair, `DiskSegment::open` publishes it as a fresh generation through `compact_to` before any append. A committed (manifest-named) generation is usable without its `ts` sidecar; one whose idx is gone while dat holds data fails the open closed. `compact_to` persists the allocation watermark in a checksummed `seq` sidecar. Design change from the plan: the fix is "publish the recovered state" rather than separate per-finding repairs. The test `recovery_seq_trim_is_in_memory_only_after_checksum_drop`, which pinned the old in-memory-only behaviour, was replaced.
+- **B2 PERSIST-06/07.** Mutators re-check `closed` under the state lock; `close_file` holds the map entry guard across `close()`.
+- **B3 PERSIST-04/05.** Catch-up requires the events to start at `resume` with no holes; an end of stream on an open file is treated as lag.
+- **B4 SDK-01, TSDK-01, TSDK-07.** Public TypeScript API change (`RedexFile.sync/close` → `Promise<void>`, `persistStore` `flush/close` async), recorded in `sdk-ts/CHANGELOG.md`; docs and skills updated. The native-backed TS tests need the binding, so CI is their first run; the new fake-file durability tests ran locally (4 of 5 RED on the old code). SDK-01 left `tasks_cm`/`memories_cm`/`netdb_cm` unchanged (their closes are not verified idempotent).
+- **B5 PAY-03/04/05/07.** PAY-04's "unlinks another writer's staging file" half was already gone (unique staging names); the remaining half, a cancelled caller dropping its lock while the blocking rename runs, is fixed by moving the lock guard into the one blocking publish task. PAY-05 syncs the directory after the rename. PAY-03 keeps an ambiguous settlement's record (`settle_ambiguous`) instead of releasing it. PAY-07 claims an approval for one attempt (`redeeming_since_ns`, 5-minute TTL). PAY-07's end-to-end concurrency test is timing-dependent and passes on the old code, so it is documented as a guard; the claim's unit test is the deterministic witness. Two pre-existing payments test failures seen locally (`review_seed_python_history`, and `review_round3_caller`'s non-`review_` rows) are excluded by CI's own filter and unrelated.
+- **B6 BACK-01/02/03.** Windowed publish (enqueue + ack together, 256 in flight), a lookahead-safe poll cursor, and literal-null events delivered. Unit tests only; no NATS server. **POLL-01**: the timestamp ordering is a k-way merge that keeps each shard's storage order. Two existing fixtures that ran timestamps backwards within a shard (one under truncation, which is this defect) now use per-shard-monotonic data. **ING-01**: new `EventBusStats::events_lost_after_ingest`; the flush barrier no longer counts admission rejections. The witness needed two shards so flush's deadline outlasts the partial batch; it failed 3/3 on the old code. **ENR-01**: core `TokenChain::verify_integrity` (no wall clock, no revocation, everything else) and SDK `channel_chain_is_intact` / `verify_stored_for` for durable decoding.
+- **B7 STATE-01** re-checks the high-water mark under the entry guard and only raises it. **STATE-03** attaches the builder's real head payload to host snapshots; the payload is still not on the wire, so cross-node migration must re-attach it (residual, unchanged).
 
 ### Phase C: reliable send admission (design first)
 
