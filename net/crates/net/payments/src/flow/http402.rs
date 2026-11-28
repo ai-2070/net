@@ -491,7 +491,10 @@ impl X402HttpFlow {
         // or payee is making a *different* demand, and an approval for
         // the old one does not carry over to it.
         let mut redeeming_approval: Option<String> = None;
-        let held = match self.spend.approved_quote(&capability).await {
+        // Claimed, not merely read (PAY-07): a concurrent fetch must not
+        // redeem the same approval for a second payment of its own. A claim
+        // that ends without a reservation is given back below.
+        let held = match self.spend.claim_approved_quote(&capability, now_ns).await {
             Ok(Some((held_id, held_bytes))) => match decode_local_quote(&held_bytes) {
                 Some(held)
                     if held.quote_id == held_id
@@ -577,20 +580,29 @@ impl X402HttpFlow {
                 policy_reason,
                 approve_hint,
             }) => {
+                if let Some(held_id) = redeeming_approval.take() {
+                    let _ = self.spend.release_approval_claim(&held_id).await;
+                }
                 return X402HttpOutcome::RequiresPaymentApproval {
                     quote_id,
                     policy_reason,
                     approve_hint,
-                }
+                };
             }
             Ok(SpendDecision::Denied { policy_reason }) => {
-                return X402HttpOutcome::Denied { policy_reason }
+                if let Some(held_id) = redeeming_approval.take() {
+                    let _ = self.spend.release_approval_claim(&held_id).await;
+                }
+                return X402HttpOutcome::Denied { policy_reason };
             }
             Err(e) => {
+                if let Some(held_id) = redeeming_approval.take() {
+                    let _ = self.spend.release_approval_claim(&held_id).await;
+                }
                 return X402HttpOutcome::Failed {
                     message: e.to_string(),
                     retryable: false,
-                }
+                };
             }
         }
 

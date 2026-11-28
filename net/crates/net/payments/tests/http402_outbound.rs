@@ -331,6 +331,100 @@ async fn an_approved_hold_is_redeemable_on_the_next_fetch() {
     );
 }
 
+/// BUG_AUDIT_2026_11_14 PAY-07: one approval pays once, even when two
+/// fetches race for it. Before the fix each fetch read the approved hold,
+/// reserved it (the second reservation counted as a retry of the first:
+/// no new spend), and authored its own payment, so a wallet producing
+/// distinct authorizations paid twice against one approval. Now one fetch
+/// claims the approval and pays; the other finds none and asks for its own.
+///
+/// Whether the two fetches actually interleave inside the old read-then-
+/// clear window is up to the scheduler (on the old code this test usually
+/// passes), so it guards the outcome rather than discriminating the fix;
+/// `an_approval_claim_is_exclusive_releasable_and_expires` pins the mechanism
+/// deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fetches_redeem_one_approval_once() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::Production, &dir);
+    let X402HttpOutcome::RequiresPaymentApproval { quote_id, .. } = f.fetch_paid(&server.url).await
+    else {
+        panic!("expected the approval hold");
+    };
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::Production);
+    assert!(spend.approve(&quote_id).await.expect("approve"));
+
+    let (a, b) = tokio::join!(f.fetch_paid(&server.url), f.fetch_paid(&server.url));
+    let paid = [&a, &b]
+        .iter()
+        .filter(|o| matches!(o, X402HttpOutcome::Paid { .. }))
+        .count();
+    let held = [&a, &b]
+        .iter()
+        .filter(|o| matches!(o, X402HttpOutcome::RequiresPaymentApproval { .. }))
+        .count();
+    assert_eq!(
+        (paid, held),
+        (1, 1),
+        "one approval, one payment; the other fetch needs its own approval: {a:?} / {b:?}"
+    );
+    assert_eq!(server.received_payloads.lock().len(), 1);
+}
+
+/// PAY-07: the approval claim. One claim wins; a live claim hides the hold
+/// from every other claim; a released claim, or one older than the TTL (a
+/// dead attempt), is claimable again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approval_claim_is_exclusive_releasable_and_expires() {
+    use net_payments::policy::spend::APPROVAL_CLAIM_TTL_NS;
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::Production, &dir);
+    let X402HttpOutcome::RequiresPaymentApproval { quote_id, .. } = f.fetch_paid(&server.url).await
+    else {
+        panic!("expected the approval hold");
+    };
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::Production);
+    assert!(spend.approve(&quote_id).await.expect("approve"));
+    // The HTTP door keys approvals by `x402-http/<host>` (host only, no port).
+    let host = server
+        .url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split([':', '/']).next())
+        .expect("server url host");
+    let capability = format!("x402-http/{host}");
+
+    let first = spend.claim_approved_quote(&capability, NOW).await.unwrap();
+    assert_eq!(
+        first.as_ref().map(|(id, _)| id.as_str()),
+        Some(quote_id.as_str())
+    );
+    assert!(
+        spend
+            .claim_approved_quote(&capability, NOW + 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "a live claim hides the hold from a second attempt"
+    );
+    spend.release_approval_claim(&quote_id).await.unwrap();
+    assert!(spend
+        .claim_approved_quote(&capability, NOW + 2)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        spend
+            .claim_approved_quote(&capability, NOW + 2 + APPROVAL_CLAIM_TTL_NS)
+            .await
+            .unwrap()
+            .is_some(),
+        "a claim older than the TTL belongs to a dead attempt and is taken over"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_payment_releases_the_reservation() {
     let server = PaidServer::start().await;
