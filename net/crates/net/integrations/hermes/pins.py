@@ -302,7 +302,7 @@ class PinPromotionService:
         # Guard on `is_closed()`: after a prior successful stop the loop is closed,
         # and `call_soon_threadsafe` on a closed loop raises RuntimeError — so an
         # unguarded second stop() would blow up a teardown path documented as
-        # idempotent (`_on_session_end`).
+        # idempotent (the plugin's `_shutdown`).
         if loop is not None and task is not None and not loop.is_closed():
             loop.call_soon_threadsafe(task.cancel)
         if self._thread is not None:

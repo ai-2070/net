@@ -531,7 +531,8 @@ def operator():
 
 
 def shutdown() -> None:
-    """Tear the node down (best-effort, idempotent). Called at session end."""
+    """Tear the node down (best-effort, idempotent). Called at process exit
+    (the plugin's ``_shutdown``)."""
     global _state, _operator, _renewal
     with _lock:
         op_handle = _operator[1] if _operator is not None else None
