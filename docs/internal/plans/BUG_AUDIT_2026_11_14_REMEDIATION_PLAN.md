@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress. **Phases A and B done 2026-11-28** on branch `fixes` (PR #1488). A: six fixes, A5 already fixed. B: all 23 findings (19 High + 4 riding along), see "Phase B as landed". Phases C–F not started. No release target yet; each phase can ship on its own.
+In progress. **Phases A and B done 2026-11-28** on branch `fixes` (PR #1488). A: six fixes, A5 already fixed. B: all 23 findings (21 High + PERSIST-08 and TSDK-07 riding along), see "Phase B as landed". Phases C–F not started. No release target yet; each phase can ship on its own.
 
 ## The gap
 
@@ -14,15 +14,15 @@ In progress. **Phases A and B done 2026-11-28** on branch `fixes` (PR #1488). A:
 |---|---|
 | High, including HERMES-01 (High/P1) | 86 |
 | Conditional or potential high (DELEGATION-01, WORLD-05, GANG-09) | 3 |
-| Medium | ~228 |
+| Medium | ~225 |
 | Low | 16 |
 | Qualified / conditional / known limitation | ~100 |
 
-How these numbers were produced: a script split the document at `## Security fix round` and treated every finding ID named after that point as fixed. Then it read the `**Severity` line of each remaining entry. That over-counts "fixed" slightly, because the fix-round sections also name findings explicitly left unfixed (NHS-02, ORG-04, CONSENT-04, MCP-11, HERMES-01/03/05/06/07); those are listed again under Phase F.
+How these numbers were produced: a script split the document at `## Security fix round` and treated every finding ID named after that point as fixed. Then it read the `**Severity` line of each remaining entry. That over-counts "fixed" slightly, because the fix-round sections also name findings explicitly left unfixed (NHS-02, ORG-04, CONSENT-04, MCP-11, HERMES-01/03/05/06/07); those are listed again under Phase F. Each entry is counted once, by the first word of its severity line, so one that reads "Qualified medium" is in the Qualified row, not Medium; the rows are exclusive on that basis. The Medium row first read ~228; a recount on the same basis gives about 225, the figure used under "Not in scope".
 
-*Corrected 2026-11-28:* the first count also under-counted "fixed". The fix rounds write grouped IDs such as `SUBNET-01/03/04/05/07`, and the script read only the first ID of each group. With groups expanded, two more were already fixed: SUBNET-03 (High) and SUBNET-07 (Low/Medium). The High row above is corrected from 87 to 86. `git log --all --since=2026-11-17` finds no commit naming any finding ID, so nothing has been fixed since the 2026-11-16 round.
+*Corrected 2026-11-28:* the first count also under-counted "fixed". The fix rounds write grouped IDs such as `SUBNET-01/03/04/05/07`, and the script read only the first ID of each group. With groups expanded, two more were already fixed: SUBNET-03 (High) and SUBNET-07 (Low/Medium). The High row above is corrected from 87 to 86. `git log --all --since=2026-11-17` found no commit naming any finding ID, so, as of this count (taken before Phase A), nothing had been fixed since the 2026-11-16 round.
 
-**Re-checked against current source (2026-11-28).** The defect is still present for each of these:
+**Re-checked against source before Phase A (2026-11-28 baseline).** The defect was present for each of these; Phase A has since fixed them (see "Phase A as landed"):
 
 - **LBAT-01:** `net/crates/net/src/adapter/net/linux.rs:138` uses `BytesMut::with_capacity`, then `:362` calls `set_len(MAX_PACKET_SIZE)` before `recvmmsg` writes anything.
 - **WIRE-09:** `net/crates/net/wire/src/pool.rs:134-135` sets `channel_hash`. Builds stamp it at `:232` and `:331`. Acquire/release resets origin but not channel hash.
@@ -119,7 +119,7 @@ Each commit carries its regression test, and each test was checked to fail witho
 | B3 ✅ `9986fd4ba` | **PERSIST-04/05** (CortEX catch-up) | An incomplete retained replay is refused as a full catch-up; a full live-tail buffer degrades to a recoverable state instead of stopping. |
 | B4 ✅ `a21a09ff6` `f70099d80` | **SDK-01, TSDK-01.** TSDK-07 rides along. | The Python context manager re-raises a failed sync or close; TypeScript `sync`/`close` reject with the native error. |
 | B5 ✅ `b72ef572a` `553d1a9b7` `5c80d9858` | **PAY-03/04/05/07** | PAY-05 reuses `store_file::durability_barrier` (from `fb40efab5`). Plus: a cancellation test for staging (PAY-04); an ambiguous settlement keeps its recovery material (PAY-03); two concurrent approvals for one HTTP 402 approval settle at most once (PAY-07). |
-| B6 ✅ `5d972e815` `4035f7145` `4ae731de8` `c55993f49` | **BACK-01/02/03** (JetStream), **POLL-01**, **ING-01**, **ENR-01** | One test per finding. JetStream tests need the service container, the same as CI's existing `jetstream` job. |
+| B6 ✅ `5d972e815` `4035f7145` `4ae731de8` `c55993f49` | **BACK-01/02/03** (JetStream), **POLL-01**, **ING-01**, **ENR-01** | One test per finding. The JetStream witnesses (BACK-01/02/03) are unit tests that need no server; the separate `integration_jetstream` binary, which does need the service container, is unchanged. |
 | B7 ✅ `b68fc946e` `f865ebb7c` | **STATE-01/03** | A snapshot taken while retention removes entries never claims a high-water mark beyond what it holds; a host snapshot restores through its own restore path. |
 
 #### Phase B as landed (2026-11-28)
@@ -129,7 +129,7 @@ Each fix carries a regression test checked to fail with the fix reverted, unless
 - **B1 PERSIST-01/02/03/08** (one commit: they share the recovery-publication mechanism). When recovery's state differs from the files in a way a tail `set_len` cannot repair, `DiskSegment::open` publishes it as a fresh generation through `compact_to` before any append. A committed (manifest-named) generation is usable without its `ts` sidecar; one whose idx is gone while dat holds data fails the open closed. `compact_to` persists the allocation watermark in a checksummed `seq` sidecar. Design change from the plan: the fix is "publish the recovered state" rather than separate per-finding repairs. The test `recovery_seq_trim_is_in_memory_only_after_checksum_drop`, which pinned the old in-memory-only behaviour, was replaced.
 - **B2 PERSIST-06/07.** Mutators re-check `closed` under the state lock; `close_file` holds the map entry guard across `close()`.
 - **B3 PERSIST-04/05.** Catch-up requires the events to start at `resume` with no holes; an end of stream on an open file is treated as lag.
-- **B4 SDK-01, TSDK-01, TSDK-07.** Public TypeScript API change (`RedexFile.sync/close` → `Promise<void>`, `persistStore` `flush/close` async), recorded in `sdk-ts/CHANGELOG.md`; docs and skills updated. The native-backed TS tests need the binding, so CI is their first run; the new fake-file durability tests ran locally (4 of 5 RED on the old code). SDK-01 left `tasks_cm`/`memories_cm`/`netdb_cm` unchanged (their closes are not verified idempotent).
+- **B4 SDK-01, TSDK-01, TSDK-07.** Public TypeScript API change (`RedexFile.sync/close` → `Promise<void>`, `persistStore` `flush/close` async), recorded in [`net/crates/net/sdk-ts/CHANGELOG.md`](../../../net/crates/net/sdk-ts/CHANGELOG.md); docs and skills updated. The native-backed TS tests need the binding, so CI is their first run; the new fake-file durability tests ran locally (4 of 5 RED on the old code). SDK-01 left `tasks_cm`/`memories_cm`/`netdb_cm` unchanged (their closes are not verified idempotent).
 - **B5 PAY-03/04/05/07.** PAY-04's "unlinks another writer's staging file" half was already gone (unique staging names); the remaining half, a cancelled caller dropping its lock while the blocking rename runs, is fixed by moving the lock guard into the one blocking publish task. PAY-05 syncs the directory after the rename. PAY-03 keeps an ambiguous settlement's record (`settle_ambiguous`) instead of releasing it. PAY-07 claims an approval for one attempt (`redeeming_since_ns`, 5-minute TTL). PAY-07's end-to-end concurrency test is timing-dependent and passes on the old code, so it is documented as a guard; the claim's unit test is the deterministic witness. Two pre-existing payments test failures seen locally (`review_seed_python_history`, and `review_round3_caller`'s non-`review_` rows) are excluded by CI's own filter and unrelated.
 - **B6 BACK-01/02/03.** Windowed publish (enqueue + ack together, 256 in flight), a lookahead-safe poll cursor, and literal-null events delivered. Unit tests only; no NATS server. **POLL-01**: the timestamp ordering is a k-way merge that keeps each shard's storage order. Two existing fixtures that ran timestamps backwards within a shard (one under truncation, which is this defect) now use per-shard-monotonic data. **ING-01**: new `EventBusStats::events_lost_after_ingest`; the flush barrier no longer counts admission rejections. The witness needed two shards so flush's deadline outlasts the partial batch; it failed 3/3 on the old code. **ENR-01**: core `TokenChain::verify_integrity` (no wall clock, no revocation, everything else) and SDK `channel_chain_is_intact` / `verify_stored_for` for durable decoding.
 - **B7 STATE-01** re-checks the high-water mark under the entry guard and only raises it. **STATE-03** attaches the builder's real head payload to host snapshots; the payload is still not on the wire, so cross-node migration must re-attach it (residual, unchanged).
