@@ -44856,19 +44856,30 @@ impl MeshNode {
     /// A peer reached over a relay is no more authorized than the
     /// relay that carried its handshake: if the immediate upstream
     /// endpoint is an unenrolled RTC session, the logical peer it
-    /// introduces starts provisional too. A native/UDP upstream is
-    /// unchanged.
+    /// introduces starts provisional too. If the upstream is an
+    /// admitted RTC session, the peer it introduces is confined to that
+    /// session's tenant (BUG_AUDIT_2026_11_14 ANCHOR-02; see
+    /// [`super::rtc::PeerAdmission::introduced_through`]). A native/UDP
+    /// upstream is unchanged.
     #[cfg(feature = "webrtc")]
     fn derived_admission(source: PeerAddr, ctx: &DispatchCtx) -> super::rtc::PeerAdmission {
-        if matches!(source, PeerAddr::Rtc(_))
-            && matches!(
-                Self::ingress_admission(&source, ctx),
-                IngressAdmission::Denied
-            )
-        {
-            super::rtc::PeerAdmission::provisional(std::time::Instant::now())
-        } else {
-            super::rtc::PeerAdmission::default()
+        if !matches!(source, PeerAddr::Rtc(_)) {
+            return super::rtc::PeerAdmission::default();
+        }
+        match Self::ingress_admission(&source, ctx) {
+            IngressAdmission::Denied => {
+                super::rtc::PeerAdmission::provisional(std::time::Instant::now())
+            }
+            IngressAdmission::Permitted => {
+                // `ingress_admission` just resolved this endpoint to a
+                // live, admitted session on exactly this address.
+                let upstream_tenant = ctx
+                    .addr_to_node
+                    .get(&source)
+                    .map(|e| *e.value())
+                    .and_then(|node_id| tenant_of(&ctx.peers, node_id));
+                super::rtc::PeerAdmission::introduced_through(upstream_tenant)
+            }
         }
     }
 

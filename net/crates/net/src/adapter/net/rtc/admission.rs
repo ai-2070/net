@@ -178,6 +178,41 @@ impl Default for PeerAdmission {
 }
 
 impl PeerAdmission {
+    /// The admission for a logical peer introduced (by a routed
+    /// handshake) through an **admitted** upstream session whose tenant
+    /// is `tenant`.
+    ///
+    /// Admitted, like [`Self::default`], but confined to the upstream's
+    /// tenant. BUG_AUDIT_2026_11_14 ANCHOR-02: the introduced peer used
+    /// to get the default admission, tenant `None`, which
+    /// [`tenants_may_meet`] treats as "meets everyone". So a session
+    /// enrolled for game A could introduce another identity that then
+    /// received other games' announcement replay and published into them,
+    /// through a route the game-A client controlled. A relay grants no
+    /// more reach than it has.
+    ///
+    /// The upstream's grant-specific fields (`device`, `enrolled_origin`)
+    /// are deliberately not copied: they describe the enrollment of the
+    /// upstream session, not of the peer it introduced.
+    pub fn introduced_through(tenant: Option<TenantId>) -> Self {
+        match Self::default() {
+            Self::Admitted {
+                promoted_at,
+                session_id,
+                device,
+                enrolled_origin,
+                ..
+            } => Self::Admitted {
+                promoted_at,
+                session_id,
+                tenant,
+                device,
+                enrolled_origin,
+            },
+            provisional => provisional,
+        }
+    }
+
     /// A freshly installed provisional session.
     pub fn provisional(now: Instant) -> Self {
         Self::Provisional {
@@ -814,6 +849,30 @@ mod tests {
         assert!(!admitted.is_provisional());
         assert!(!admitted.is_expired(start + PROVISIONAL_TTL * 10));
         assert_eq!(admitted.admitted_session(), Some(7));
+    }
+
+    /// ANCHOR-02: an introduced peer is admitted, confined to the
+    /// upstream's tenant, and keeps none of the upstream's grant fields.
+    #[test]
+    fn an_introduced_peer_is_confined_to_its_upstreams_tenant() {
+        let game = TenantId(0xA02);
+        let introduced = PeerAdmission::introduced_through(Some(game));
+        assert!(!introduced.is_provisional());
+        assert_eq!(introduced.tenant(), Some(game));
+        assert_eq!(introduced.granted_device(), None);
+        assert_eq!(introduced.bound_origin(), None);
+        assert!(!tenants_may_meet(
+            introduced.tenant(),
+            Some(TenantId(0xB03))
+        ));
+        assert!(!announcement_may_reach(Some(TenantId(0xB03)), &introduced));
+
+        // A native upstream (no tenant) introduces a native-looking peer:
+        // exactly the default admission, so native relaying is unchanged.
+        assert_eq!(
+            PeerAdmission::introduced_through(None).tenant(),
+            PeerAdmission::default().tenant()
+        );
     }
 
     #[test]
