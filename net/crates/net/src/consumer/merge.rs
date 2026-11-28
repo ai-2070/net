@@ -24,32 +24,17 @@ use crate::consumer::filter::{CompiledFilter, Filter};
 use crate::error::{AdapterError, ConsumerError};
 use crate::event::StoredEvent;
 
-/// Compare two adapter-emitted stream ids using numeric semantics for
-/// the formats both built-in adapters produce, with a lex fallback for
-/// already-lex-comparable opaque ids (ULID, UUIDv7, fixed-width hex).
-///
-/// A raw `str::cmp` would invert ordering on the unpadded numeric
-/// ids the JetStream adapter emits (`seq.to_string()`) and the
-/// Redis Streams server-side `{ms}-{seq}` format — `"9" > "10"`
-/// lexicographically would wedge the cursor at every decade
-/// boundary. The structured comparator below handles both formats
-/// numerically. Mixed-padding comparisons across upgrades still
-/// compare correctly because parse-then-compare ignores leading
-/// zeros.
-///
-/// Order of attempts:
-/// 1. Both ids parse as `<u64>-<u64>` (Redis Streams).
-/// 2. Both ids parse as `<u128>` (raw numeric, padded or unpadded).
-/// 3. Lex compare (ULID, UUID, hex digests, etc.).
-///
-/// We deliberately do not try to mix formats — if one side is `123`
-/// and the other is `456-0`, the lex fallback kicks in. In practice
-/// a single adapter emits a single format, so this only matters for
-/// pathological mixed-source streams.
 /// Order `events` by `(insertion_ts, shard_id, id)` WITHOUT reordering any
-/// shard's events relative to each other: each shard's events keep their
-/// storage (id) order, and shards interleave by the key of each one's next
-/// event. See the call site (POLL-01).
+/// shard's events relative to each other: each shard's events keep the
+/// order the adapter returned them in (its storage order), and shards
+/// interleave by the key of each one's next event. See the call site
+/// (POLL-01).
+///
+/// The per-shard order is taken as fetched, never re-sorted by id: not
+/// every adapter's ids are ordered by `compare_stream_ids` (the mesh
+/// adapter's `seq:idx` ids would compare lexicographically there, putting
+/// `10:0` before `9:0`), and the adapter's own order is the one its
+/// cursor follows.
 fn merge_by_insertion_ts(events: Vec<StoredEvent>) -> Vec<StoredEvent> {
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BinaryHeap, VecDeque};
@@ -59,13 +44,8 @@ fn merge_by_insertion_ts(events: Vec<StoredEvent>) -> Vec<StoredEvent> {
     for event in events {
         by_shard.entry(event.shard_id).or_default().push(event);
     }
-    let mut queues: Vec<VecDeque<StoredEvent>> = by_shard
-        .into_values()
-        .map(|mut shard| {
-            shard.sort_by(|a, b| compare_stream_ids(&a.id, &b.id));
-            VecDeque::from(shard)
-        })
-        .collect();
+    let mut queues: Vec<VecDeque<StoredEvent>> =
+        by_shard.into_values().map(VecDeque::from).collect();
 
     /// The next event of one shard's queue, as a heap key.
     struct Head {
@@ -118,6 +98,28 @@ fn merge_by_insertion_ts(events: Vec<StoredEvent>) -> Vec<StoredEvent> {
     merged
 }
 
+/// Compare two adapter-emitted stream ids using numeric semantics for
+/// the formats both built-in adapters produce, with a lex fallback for
+/// already-lex-comparable opaque ids (ULID, UUIDv7, fixed-width hex).
+///
+/// A raw `str::cmp` would invert ordering on the unpadded numeric
+/// ids the JetStream adapter emits (`seq.to_string()`) and the
+/// Redis Streams server-side `{ms}-{seq}` format — `"9" > "10"`
+/// lexicographically would wedge the cursor at every decade
+/// boundary. The structured comparator below handles both formats
+/// numerically. Mixed-padding comparisons across upgrades still
+/// compare correctly because parse-then-compare ignores leading
+/// zeros.
+///
+/// Order of attempts:
+/// 1. Both ids parse as `<u64>-<u64>` (Redis Streams).
+/// 2. Both ids parse as `<u128>` (raw numeric, padded or unpadded).
+/// 3. Lex compare (ULID, UUID, hex digests, etc.).
+///
+/// We deliberately do not try to mix formats — if one side is `123`
+/// and the other is `456-0`, the lex fallback kicks in. In practice
+/// a single adapter emits a single format, so this only matters for
+/// pathological mixed-source streams.
 pub(crate) fn compare_stream_ids(a: &str, b: &str) -> CmpOrdering {
     // Redis Streams `<ms>-<seq>`.
     if let (Some((a_ms, a_seq)), Some((b_ms, b_seq))) = (split_redis_id(a), split_redis_id(b)) {
@@ -1794,14 +1796,23 @@ mod tests {
             StoredEvent::from_value(id.to_string(), json!({}), ts, shard)
         };
         // Shard 0 is non-monotonic (a restarted writer); shard 1 is not.
+        // Each shard's events arrive in storage order, as an adapter
+        // returns them.
         let merged = merge_by_insertion_ts(vec![
-            e("2-0", 5, 0),
             e("1-0", 900, 0),
+            e("2-0", 5, 0),
             e("1-0", 100, 1),
             e("2-0", 1000, 1),
         ]);
         let order: Vec<(u16, &str)> = merged.iter().map(|e| (e.shard_id, e.id.as_str())).collect();
         assert_eq!(order, vec![(1, "1-0"), (0, "1-0"), (0, "2-0"), (1, "2-0")]);
+
+        // The adapter's order is kept as is, not re-sorted by id: the mesh
+        // adapter's `seq:idx` ids sort lexicographically in
+        // `compare_stream_ids`, which would put `10:0` ahead of `9:0`.
+        let mesh_ids = merge_by_insertion_ts(vec![e("9:0", 900, 0), e("10:0", 5, 0)]);
+        let order: Vec<&str> = mesh_ids.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(order, vec!["9:0", "10:0"]);
 
         let monotonic = vec![e("1", 30, 0), e("2", 10, 1), e("3", 20, 1), e("4", 40, 0)];
         let mut sorted = monotonic.clone();
