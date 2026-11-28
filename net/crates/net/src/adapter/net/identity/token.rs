@@ -1029,8 +1029,16 @@ impl TokenChain {
                 }
                 None => {
                     // Integrity only: the signature and the width rule,
-                    // whatever the time now.
+                    // whatever the time now. An empty or inverted window
+                    // (`not_after <= not_before`) was never valid at any
+                    // time, so unlike an expired one it is not "the
+                    // credential that was installed": refuse it. (On the
+                    // clock path the wall-clock bounds already reject it,
+                    // which is why `check_window_width` lets it through.)
                     t.verify()?;
+                    if t.not_after <= t.not_before {
+                        return Err(TokenError::InvalidFormat);
+                    }
                     t.check_window_width()?;
                 }
             }
@@ -4250,5 +4258,28 @@ mod tests {
             ),
             "an overwide window"
         );
+        for (not_before, not_after, label) in [
+            (1_000, 1_000, "an empty window"),
+            (2_000, 1_000, "an inverted window"),
+        ] {
+            let mut never_valid = PermissionToken::issue(
+                &root,
+                device.entity_id().clone(),
+                TokenScope::SUBSCRIBE,
+                channel,
+                3600,
+                0,
+            );
+            never_valid.resign_window_for_test(&root, not_before, not_after);
+            assert!(
+                refuses(
+                    &TokenChain::single(never_valid),
+                    channel,
+                    device.entity_id(),
+                    &roots
+                ),
+                "{label}"
+            );
+        }
     }
 }
