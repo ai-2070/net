@@ -1209,8 +1209,17 @@ mod tests {
             let (r, name) = (Arc::clone(&r), name.clone());
             std::thread::spawn(move || r.close_file(&name))
         };
-        // Let the closer take the map entry and park inside `close()`.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait until the closer is inside `close()`: it takes the map
+        // entry first, and `close()` sets `closed` before parking on the
+        // held state lock, so a closed `old` proves the entry is held.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !old.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the closer never entered close()"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let reopened = Arc::new(AtomicBool::new(false));
         let opener = {
             let (r, name, reopened) = (Arc::clone(&r), name.clone(), Arc::clone(&reopened));

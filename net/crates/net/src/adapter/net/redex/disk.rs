@@ -1973,6 +1973,11 @@ fn generation_is_complete(channel_dir: &Path, gen: u32) -> bool {
 ///   Those bytes are unreachable without the index, and every fallback
 ///   (an older generation, a new empty one) would sweep them. Fail
 ///   closed rather than destroy data an operator may still recover.
+/// - `Err` too for the mirror case: `dat` is missing while the index
+///   still holds entries. Recovery would drop every entry whose payload
+///   lived in the heap and publish the result, making the loss permanent.
+///   Every writer creates `dat` with `idx`, so its absence means it was
+///   removed, not that it was never written.
 /// - `Ok(true)` otherwise, including a generation whose files do not
 ///   exist yet (a fresh channel that crashed before its first open
 ///   created them).
@@ -1988,6 +1993,19 @@ fn committed_generation_is_usable(channel_dir: &Path, gen: u32) -> std::io::Resu
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "redex: committed generation {} has no index but its dat holds {dat_len} \
+                     bytes; refusing to recover over it",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    if !dir.join("dat").is_file() {
+        let idx_len = std::fs::metadata(dir.join("idx")).map_or(0, |m| m.len());
+        if idx_len > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "redex: committed generation {} has no dat but its index holds {idx_len} \
                      bytes; refusing to recover over it",
                     dir.display()
                 ),
@@ -3533,6 +3551,30 @@ mod tests {
             std::fs::metadata(live.join("dat")).unwrap().len(),
             27,
             "the payload bytes are left for the operator"
+        );
+        cleanup(&base);
+    }
+
+    /// PERSIST-02, the mirror case: a committed generation whose dat is
+    /// gone while its idx still holds entries is refused, not recovered
+    /// into an empty generation that the next compaction makes permanent.
+    #[test]
+    fn a_committed_generation_missing_its_dat_fails_closed() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/lost_dat").unwrap();
+        let live = compacted_channel_fixture(&base, &name);
+        let idx_len = std::fs::metadata(live.join("idx")).unwrap().len();
+        assert!(idx_len > 0);
+        std::fs::remove_file(live.join("dat")).unwrap();
+
+        let err = DiskSegment::open(&base, &name, 0, 0)
+            .err()
+            .expect("a committed generation with no dat must not be recovered over");
+        assert!(format!("{err}").contains("no dat"), "{err}");
+        assert_eq!(
+            std::fs::metadata(live.join("idx")).unwrap().len(),
+            idx_len,
+            "the index is left for the operator"
         );
         cleanup(&base);
     }
