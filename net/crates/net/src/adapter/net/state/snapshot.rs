@@ -579,21 +579,25 @@ impl SnapshotStore {
         // committed and retention `remove`d it in between; the stale store
         // then committed seq 5 and lowered the mark to 5, rewinding both
         // the snapshot and its anti-rewind watermark. `remove` takes the
-        // same entry guard, and every commit raises the mark while holding
-        // it, so the re-check sees any commit that happened before.
+        // same entry guard, and every commit raises the mark BEFORE it
+        // inserts, while the slot still holds the guard. (`insert` consumes
+        // the slot and the guard it returns is dropped at once, so a raise
+        // after it would run unguarded: retention could remove the fresh
+        // snapshot in that gap and a paused stale store would then pass the
+        // re-check.) So the re-check sees any commit that happened before.
         match self.snapshots.entry(key) {
             Entry::Vacant(slot) => {
                 if !self.high_water_admits(&key, new_seq) {
                     return false;
                 }
-                slot.insert(snapshot);
                 self.raise_high_water(key, new_seq);
+                slot.insert(snapshot);
                 true
             }
             Entry::Occupied(mut slot) => {
                 if new_seq > slot.get().through_seq && self.high_water_admits(&key, new_seq) {
-                    slot.insert(snapshot);
                     self.raise_high_water(key, new_seq);
+                    slot.insert(snapshot);
                     true
                 } else {
                     false
