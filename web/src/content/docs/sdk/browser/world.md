@@ -92,7 +92,7 @@ const saving = persistStore(host, { file });
 const handoffs = regionHandoffs({
   link, region: 'r:4:7',
   ...storeRegion(host, { region: 'r:4:7', collection: 'ships', ledger: 'handoff' }),
-  persist: () => { saving.flush(); },   // durable BEFORE any message is sent
+  persist: async () => { await saving.flush(); },   // durable BEFORE any message is sent
   onEvent: event => { /* moved | refused | unresolved | admitted */ },
 });
 

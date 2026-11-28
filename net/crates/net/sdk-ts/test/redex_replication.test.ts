@@ -170,7 +170,7 @@ describe('Redex replication with standard placement', () => {
 });
 
 describe('Redex.openFile with an interval fsync policy', () => {
-  it('opens without a mesh (it spawns the fsync timer)', () => {
+  it('opens without a mesh (it spawns the fsync timer)', async () => {
     // RedexFile spawns its fsync timer on open. From the JS thread, with no
     // mesh runtime adopted, that panicked and aborted the process.
     const dir = mkdtempSync(join(tmpdir(), 'net-sdk-fsync-'));
@@ -181,7 +181,7 @@ describe('Redex.openFile with an interval fsync policy', () => {
         fsyncIntervalMs: 50,
       });
       expect(file.append(Buffer.from('durable'))).toBe(0n);
-      file.close();
+      await file.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

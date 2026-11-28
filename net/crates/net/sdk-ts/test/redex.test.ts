@@ -98,7 +98,7 @@ describe('RedexFile.tail — AsyncIterable', () => {
     const first = await iter.next();
     expect(first.done).toBe(false);
 
-    file.close();
+    await file.close();
     // Next read must complete (null → done) without hanging.
     const afterClose = await Promise.race([
       iter.next(),

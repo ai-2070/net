@@ -55,15 +55,15 @@ afterEach(() => {
 });
 
 describe('persistStore', () => {
-  it('writes only when the document changed, and restore returns the newest', () => {
+  it('writes only when the document changed, and restore returns the newest', async () => {
     const file = new Redex().openFile('persist/dirty');
     const store = fakeStore({ ships: { a: { x: 1 } }, tick: 1 });
     const saving = persistStore(store, { file, intervalMs: 0, now: () => 1000 });
 
-    expect(saving.flush()).toBe(true);
-    expect(saving.flush()).toBe(false);
+    expect(await saving.flush()).toBe(true);
+    expect(await saving.flush()).toBe(false);
     store.set({ ships: { a: { x: 2 } }, tick: 2 });
-    expect(saving.flush()).toBe(true);
+    expect(await saving.flush()).toBe(true);
     expect(saving.snapshots).toBe(2);
     expect(file.len()).toBe(2n);
 
@@ -73,28 +73,30 @@ describe('persistStore', () => {
     expect(restored?.seq).toBe(1n);
   });
 
-  it('snapshots on close, once, and not after', () => {
+  it('snapshots on close, once, and not after', async () => {
     const file = new Redex().openFile('persist/close');
     const store = fakeStore({ ships: {}, tick: 0 });
     const saving = persistStore(store, { file, intervalMs: 0 });
-    saving.close();
-    saving.close();
+    await saving.close();
+    await saving.close();
     store.set({ ships: {}, tick: 9 });
-    expect(saving.flush()).toBe(false);
+    expect(await saving.flush()).toBe(false);
     expect(file.len()).toBe(1n);
   });
 
-  it('snapshots on its interval while the document changes', () => {
+  it('snapshots on its interval while the document changes', async () => {
     vi.useFakeTimers();
     const file = new Redex().openFile('persist/interval');
     const store = fakeStore({ ships: {}, tick: 0 });
     const saving = persistStore(store, { file, intervalMs: 1000, sync: false });
-    vi.advanceTimersByTime(1000);
-    vi.advanceTimersByTime(1000); // unchanged: nothing
+    // Async advances: each tick's snapshot runs on the snapshotter's
+    // serialized promise chain.
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(1000); // unchanged: nothing
     store.set({ ships: {}, tick: 1 });
-    vi.advanceTimersByTime(1000);
+    await vi.advanceTimersByTimeAsync(1000);
     expect(saving.snapshots).toBe(2);
-    saving.close();
+    await saving.close();
   });
 
   it('refuses a negative interval', () => {
@@ -123,18 +125,18 @@ describe('restoreStore', () => {
     expect(restoreStore(new Redex().openFile('persist/empty'), definition)).toBeNull();
   });
 
-  it('survives a restart of a disk-backed file', () => {
+  it('survives a restart of a disk-backed file', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'net-store-persist-'));
     cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
     {
       const file = new Redex({ persistentDir: dir }).openFile('game/world', { persistent: true });
       const store = fakeStore({ ships: { a: { x: 3 } }, tick: 3 });
-      persistStore(store, { file, intervalMs: 0 }).close();
-      file.close();
+      await persistStore(store, { file, intervalMs: 0 }).close();
+      await file.close();
     }
     const reopened = new Redex({ persistentDir: dir }).openFile('game/world', { persistent: true });
     expect(restoreStore(reopened, definition)?.state).toEqual({ ships: { a: { x: 3 } }, tick: 3 });
-    reopened.close();
+    await reopened.close();
   });
 });
 
@@ -166,9 +168,9 @@ describe('with the browser package hostStore', () => {
     const first = host({ ships: {}, tick: 0 }, '00000000000000a1');
     const saving = persistStore(first, { file, intervalMs: 0 });
     first.setEntities('ships', { s1: { x: 1 }, s2: { x: 2 } });
-    saving.flush();
+    await saving.flush();
     first.setEntity('ships', 's2', undefined);
-    saving.close();
+    await saving.close();
     await first.close();
 
     const restored = restoreStore(file, world);

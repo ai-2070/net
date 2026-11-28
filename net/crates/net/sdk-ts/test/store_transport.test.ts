@@ -273,8 +273,8 @@ describe('meshStoreTransport: dedicated region hosts', () => {
         link,
         region: name,
         ...world.storeRegion<Region, Ship>(host, { region: name, collection: 'ships', ledger: 'handoff' }),
-        persist: () => {
-          saving.flush();
+        persist: async () => {
+          await saving.flush();
         },
         onEvent: event => events.push(`${name}:${event.type}`),
         tickMs: 50,
@@ -299,7 +299,7 @@ describe('meshStoreTransport: dedicated region hosts', () => {
     for (const r of [west, east]) {
       r.handoffs.close();
       r.link.close();
-      r.saving.close();
+      await r.saving.close();
       await r.host.close();
       r.transport.close();
     }

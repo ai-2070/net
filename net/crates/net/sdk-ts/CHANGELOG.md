@@ -14,6 +14,23 @@ install time.
 
 ## Unreleased
 
+### Changed
+
+- **`RedexFile.sync()` and `RedexFile.close()` return `Promise<void>`.** The
+  native methods were always asynchronous (the fsync runs off the event loop);
+  the wrappers returned `void` and dropped the promise, so `await file.sync()`
+  waited for nothing and a failed fsync surfaced as an unhandled rejection.
+  Await them. A reopen after `await file.close()` no longer races the closing
+  handle.
+- **`persistStore`'s `flush()` returns `Promise<boolean>` and `close()`
+  returns `Promise<void>`.** A snapshot counts as saved, and `flush()` resolves,
+  only once its fsync is done; a failed write or fsync rejects (interval ticks
+  still go to `onError`). Snapshots run one at a time. A failed final snapshot
+  rejects `close()` and leaves it retryable instead of marking the snapshotter
+  closed. In a world `regionHandoffs` `persist` hook, write
+  `persist: async () => { await saving.flush(); }`: the old
+  `() => { saving.flush(); }` returned before the snapshot was durable.
+
 ### Added
 
 - **`meshStoreTransport` discovers too:** `announce(tags)`, which replaces

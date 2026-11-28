@@ -457,20 +457,28 @@ export class RedexFile {
   }
 
   /** Explicit fsync. Always fsyncs regardless of policy; no-op on
-   *  heap-only files. */
-  sync(): void {
+   *  heap-only files. Resolves once the data is durable; rejects with a
+   *  `RedexError` if the fsync failed.
+   *
+   *  BUG_AUDIT_2026_11_14 TSDK-01: the native method is asynchronous (the
+   *  fsync runs off the event loop). This wrapper used to return `void`
+   *  and drop that promise, so even `await file.sync()` waited for
+   *  nothing, and a failed fsync became an unhandled rejection. */
+  async sync(): Promise<void> {
     try {
-      this.napi.sync();
+      await this.napi.sync();
     } catch (e) {
       throw classifyWithRedex(e);
     }
   }
 
   /** Close the file. Outstanding tail iterators end cleanly on
-   *  their next emission. */
-  close(): void {
+   *  their next emission. For a persistent file, resolves once its
+   *  final fsync is done (rejecting if it failed), so a reopen after
+   *  `await file.close()` cannot race the closing handle (TSDK-01). */
+  async close(): Promise<void> {
     try {
-      this.napi.close();
+      await this.napi.close();
     } catch (e) {
       throw classifyWithRedex(e);
     }

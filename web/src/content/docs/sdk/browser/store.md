@@ -237,10 +237,13 @@ const host = hostStore({
 });
 const saving = persistStore(host, { file, intervalMs: 5_000 });
 // on shutdown:
-saving.close();   // one last snapshot
+await saving.close();   // one last snapshot, durable when this resolves
 ```
 
 `persistStore` writes only when the document changed since its last snapshot.
+`flush()` and `close()` return promises that resolve once the snapshot is on
+disk (with the default `sync: true`); a failed write or fsync rejects them, and a
+failed final snapshot leaves `close()` retryable.
 `restoreStore` returns the newest snapshot whose store id and version match the
 definition and that passes its `state` validator. A snapshot from another version
 is skipped, not migrated: migrations are the application's.

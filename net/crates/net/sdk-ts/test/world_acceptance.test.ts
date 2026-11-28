@@ -127,7 +127,8 @@ describe('a world across native region hosts', () => {
         inputs: {},
       });
       const saving = persistStore(host, { file, intervalMs: 0 });
-      saving.flush();
+      // The first durable snapshot; every later one is serialized after it.
+      void saving.flush();
       const stopAnnouncing = announceRegions(transport, WORLD, [name], { everyMs: 300 });
       const directory = regionDirectory({ node: transport, world: WORLD, trustedHosts: trusted });
       const link = handoffLink<Ship>({
@@ -140,8 +141,8 @@ describe('a world across native region hosts', () => {
         link,
         region: name,
         ...storeRegion<Region, Ship>(host, { region: name, collection: 'ships', ledger: 'handoff' }),
-        persist: () => {
-          saving.flush();
+        persist: async () => {
+          await saving.flush();
         },
         onEvent: (event: HandoffEvent) => events.push(`${name}:${event.type}`),
         timing: { retryMs: 100, giveUpMs: 1_500, handledRetentionMs: 60_000 },
@@ -151,10 +152,10 @@ describe('a world across native region hosts', () => {
         handoffs.close();
         link.close();
         stopAnnouncing();
-        saving.close();
+        await saving.close();
         await host.close();
         transport.close();
-        file.close();
+        await file.close();
       };
       return { host, handoffs, directory, stop };
     };
