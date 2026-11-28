@@ -1687,3 +1687,96 @@ async fn the_binding_requirement_can_be_disabled() {
         "the opt-out must still admit a bearer redemption"
     );
 }
+
+// ---------------------------------------------------------------------
+// ambiguous settlement: the provider keeps the evidence (PAY-03)
+// ---------------------------------------------------------------------
+
+/// BUG_AUDIT_2026_11_14 PAY-03: the facilitator settles the transfer, but
+/// its answer is lost (a timeout). Before the fix every settle error
+/// released the claim, deleting the quote record and its replay entry, so a
+/// payment that HAD settled became unknown to the provider. Now the record
+/// survives, a duplicate is told `InProgress`, a DIFFERENT authorization is
+/// refused rather than settled a second time, and a later failed retry of
+/// the same payload cannot delete the record either.
+#[tokio::test]
+async fn an_ambiguous_settlement_keeps_the_provider_record() {
+    const IN_FLIGHT_TTL: u64 = 1_000;
+    let mut h = harness();
+    h.engine = PaymentEngine::new(
+        h.provider.clone(),
+        h.facilitator.clone(),
+        Arc::new(AdmitAll),
+        default_mock_registry(h.provider.entity_id().clone()),
+        h._dir.path().join("engine-ambiguous.json"),
+    )
+    .expect("engine")
+    .with_require_invocation_binding(false)
+    .with_in_flight_ttl_ns(IN_FLIGHT_TTL);
+    let quote = h.quote("2500");
+    h.facilitator.arm(
+        quote.requirements.content_hash(),
+        MockMode::SettleTimeoutAfterSettling,
+    );
+    let payload = payload_for(&quote, "payer-1");
+
+    let decision = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            decision,
+            PaymentDecision::FacilitatorFailure {
+                kind: FacilitatorErrorKind::Timeout,
+                ..
+            }
+        ),
+        "the caller still sees the retryable timeout: {decision:?}"
+    );
+    assert!(
+        h.engine.status(&quote.quote_id).await.unwrap().is_some(),
+        "the provider still holds the record of a purchase that may have paid"
+    );
+
+    let duplicate = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(duplicate, PaymentDecision::InProgress),
+        "{duplicate:?}"
+    );
+
+    // Past the in-flight TTL, a different authorization for the same quote
+    // would be a second settlement of a purchase that may already have paid.
+    let replacement = payload_for(&quote, "payer-2");
+    let after_ttl = NOW + 2 + IN_FLIGHT_TTL;
+    let decision = h
+        .engine
+        .accept_payment(&quote, &replacement, VerificationTier::Observed, after_ttl)
+        .await
+        .unwrap();
+    assert!(
+        matches!(decision, PaymentDecision::InProgress),
+        "{decision:?}"
+    );
+
+    // The same payload may re-run; the mock reports it already settled (a
+    // terminal answer), which must still not erase the record.
+    let retry = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, after_ttl + 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(retry, PaymentDecision::FacilitatorFailure { .. }),
+        "{retry:?}"
+    );
+    assert!(
+        h.engine.status(&quote.quote_id).await.unwrap().is_some(),
+        "a failed retry of an ambiguous settlement must not delete its record"
+    );
+}

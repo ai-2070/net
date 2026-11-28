@@ -419,6 +419,24 @@ struct QuoteRecord {
     /// means a retry will (idempotently) try once more.
     #[serde(default)]
     billing_published: bool,
+    /// A settlement attempt for this record ended AMBIGUOUSLY: the
+    /// facilitator timed out, was unreachable, or answered outside the
+    /// protocol, so the transfer may have settled at the rail without the
+    /// provider learning of it.
+    ///
+    /// BUG_AUDIT_2026_11_14 PAY-03: every settle error used to release the
+    /// claim, deleting this record (with its preserved requirements and
+    /// payload) and its replay entry, so a payment that HAD settled became
+    /// unknown to the provider, with nothing left to reconcile against.
+    /// Now such a record is never released (`release_claim` skips it),
+    /// it stays in flight, and a stale takeover is allowed only for the
+    /// SAME payload: re-presenting the exact authorization is safe (the
+    /// rail settles one authorization at most once), while a different one
+    /// would be a second settlement for an attempt that may already have
+    /// paid. Operators reconcile it from the preserved payload. `false` on
+    /// every legacy record.
+    #[serde(default)]
+    settle_ambiguous: bool,
 }
 
 /// What survives retention of a **redeemed** record: the minimum needed
@@ -1414,6 +1432,13 @@ impl PaymentEngine {
                             // stays claimed forever and the live one is
                             // never registered.
                             if !same_payload {
+                                // PAY-03: an ambiguous settlement may have
+                                // paid; another authorization would be a
+                                // second settlement. Only the exact payload
+                                // may re-run (see `settle_ambiguous`).
+                                if rec.settle_ambiguous {
+                                    break 'claim Claim::InProgress;
+                                }
                                 if payload_consumed_elsewhere {
                                     break 'claim Claim::ReplayOtherQuote;
                                 }
@@ -1480,6 +1505,7 @@ impl PaymentEngine {
                         chain: Vec::new(),
                         billing: None,
                         billing_published: false,
+                        settle_ambiguous: false,
                     };
                     s.consumed.insert(payload_hash.clone(), quote_id.clone());
                     s.quotes.insert(quote_id.clone(), record);
@@ -1589,7 +1615,14 @@ impl PaymentEngine {
         let settle = match self.facilitator.settle(payload, &quote.requirements).await {
             Ok(s) => s,
             Err(e) => {
-                self.release_claim(&quote.quote_id, &payload_hash).await?;
+                if e.kind == FacilitatorErrorKind::Rejected {
+                    // The facilitator answered, and said no: nothing moved.
+                    self.release_claim(&quote.quote_id, &payload_hash).await?;
+                } else {
+                    // Timeout / unavailable / off-protocol: the transfer may
+                    // have settled. Keep the evidence (PAY-03).
+                    self.mark_settle_ambiguous(&quote.quote_id, now_ns).await?;
+                }
                 return Ok(PaymentDecision::FacilitatorFailure {
                     kind: e.kind,
                     retryable: e.retryable,
@@ -2877,16 +2910,37 @@ impl PaymentEngine {
         Ok(())
     }
 
+    /// Record that this quote's settlement ended ambiguously (PAY-03): keep
+    /// the record and its replay entry, in flight from now, so a duplicate
+    /// sees `InProgress` and only the same payload can re-run after the
+    /// TTL.
+    async fn mark_settle_ambiguous(&self, quote_id: &str, now_ns: u64) -> Result<(), EngineError> {
+        let quote_id = quote_id.to_string();
+        mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
+            if let Some(rec) = s.quotes.get_mut(&quote_id) {
+                if rec.chain.is_empty() && rec.billing.is_none() {
+                    rec.settle_ambiguous = true;
+                    rec.in_flight = true;
+                    rec.in_flight_since_ns = Some(now_ns);
+                }
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn release_claim(&self, quote_id: &str, payload_hash: &str) -> Result<(), EngineError> {
         let quote_id = quote_id.to_string();
         let payload_hash = payload_hash.to_string();
         mutate_json::<EngineState, _, _>(&self.state_path, move |s| {
             // Only release an unsettled claim — once a chain exists, value
-            // moved and the record is permanent.
+            // moved and the record is permanent. A record whose settlement
+            // was ever ambiguous may have moved value too, so it is never
+            // released (PAY-03).
             let unsettled = s
                 .quotes
                 .get(&quote_id)
-                .is_some_and(|r| r.chain.is_empty() && r.billing.is_none());
+                .is_some_and(|r| r.chain.is_empty() && r.billing.is_none() && !r.settle_ambiguous);
             if unsettled {
                 s.quotes.remove(&quote_id);
                 s.consumed.remove(&payload_hash);
