@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned, 2026-11-28. Nothing landed yet. Branch `fixes`. No release target yet; each phase can ship on its own.
+In progress. **Phase A done 2026-11-28** on branch `fixes` (six fixes; A5 was already fixed, see below). Phases B–F not started. No release target yet; each phase can ship on its own.
 
 ## The gap
 
@@ -12,13 +12,15 @@ Planned, 2026-11-28. Nothing landed yet. Branch `fixes`. No release target yet; 
 
 | Severity (as the audit labels it) | Open |
 |---|---|
-| High, including HERMES-01 (High/P1) | 87 |
+| High, including HERMES-01 (High/P1) | 86 |
 | Conditional or potential high (DELEGATION-01, WORLD-05, GANG-09) | 3 |
 | Medium | ~228 |
 | Low | 16 |
 | Qualified / conditional / known limitation | ~100 |
 
-How these numbers were produced: a script split the document at `## Security fix round` and treated every finding ID named after that point as fixed. Then it read the `**Severity` line of each remaining entry. That over-counts "fixed" slightly, because the fix-round sections also name findings explicitly left unfixed (NHS-02, ORG-04, CONSENT-04, MCP-11, HERMES-01/03/05/06/07); those are listed again under Phase F. `git log --all --since=2026-11-17` finds no commit naming any finding ID, so nothing has been fixed since the 2026-11-16 round.
+How these numbers were produced: a script split the document at `## Security fix round` and treated every finding ID named after that point as fixed. Then it read the `**Severity` line of each remaining entry. That over-counts "fixed" slightly, because the fix-round sections also name findings explicitly left unfixed (NHS-02, ORG-04, CONSENT-04, MCP-11, HERMES-01/03/05/06/07); those are listed again under Phase F.
+
+*Corrected 2026-11-28:* the first count also under-counted "fixed". The fix rounds write grouped IDs such as `SUBNET-01/03/04/05/07`, and the script read only the first ID of each group. With groups expanded, two more were already fixed: SUBNET-03 (High) and SUBNET-07 (Low/Medium). The High row above is corrected from 87 to 86. `git log --all --since=2026-11-17` finds no commit naming any finding ID, so nothing has been fixed since the 2026-11-16 round.
 
 **Re-checked against current source (2026-11-28).** The defect is still present for each of these:
 
@@ -88,13 +90,25 @@ Each phase is one PR against `master`. Within a phase, slices land in order and 
 
 | Slice | Finding | Proof (fails without the fix) |
 |---|---|---|
-| A1 | **LBAT-01.** Leave the length at 0, get pointers from `spare_capacity_mut`, and after `recvmmsg` set each slot's length only to the bytes actually received. A failure or `WouldBlock` leaves the slots empty. | `cfg(target_os = "linux")` test: receive on an empty nonblocking socket, assert every slot length is 0; then a 2-datagram batch, assert exact lengths. CI on Linux is the only real run; widen the cfg temporarily to compile-check on Windows. |
-| A2 | **WIRE-09.** Reset `channel_hash` (and any other per-packet routing state) when a builder returns to the pool. | Pool test: stamp channel C, release, reacquire, build, assert the header carries channel hash 0. Mesh test: publish on C, then `send_on_stream` reaches the stream sink, not C's dispatcher. |
-| A3 | **POL-01.** Cap the number of expanded nodes while decoding (a constant near the wire node cap), and reject inputs that exceed it before building anything. | A 64-entry list where each And names its predecessor twice: decoding returns `PredicateWireError` quickly. Without the cap it never finishes. |
-| A4 | **ANCHOR-02** (decision 2). | Routed handshake for identity X sent over game A's admitted RTC session: X is confined to tenant A (no replay from other games, no publication into them). Pinned in `ci.yml`. |
-| A5 | **SUBNET-02/03.** The revocation scan also covers contexts installed after it starts (a fence like `fence_installed` from SUBNET-01), and revocation commits replay in the order they were committed. | One interleaving test per finding: revoke while a context install is in progress, and two concurrent commits followed by a restart. |
-| A6 | **GOFFI-01.** Run Go compute callbacks on a thread that is not inside the Tokio runtime, keeping completion synchronous, as `rpc-ffi/src/handles.rs:237-273` does. | Go test where daemon A's `Process` calls `Snapshot(B)`. Today it aborts the process. Needs `CGO_ENABLED=1` and the msys64 gcc. |
-| A7 | **HERMES-01.** Tear down only when the final owner, the session or the process ends, not on the per-turn hook. | pytest that drives two turns of one session: services are still up after turn one. |
+| A1 ✅ `affc1d092` | **LBAT-01.** Leave the length at 0, get pointers from `spare_capacity_mut`, and after `recvmmsg` set each slot's length only to the bytes actually received. A failure or `WouldBlock` leaves the slots empty. | `cfg(target_os = "linux")` test: receive on an empty nonblocking socket, assert every slot length is 0; then a 2-datagram batch, assert exact lengths. CI on Linux is the only real run; widen the cfg temporarily to compile-check on Windows. |
+| A2 ✅ `738a56d3b` | **WIRE-09.** Reset `channel_hash` (and any other per-packet routing state) when a builder returns to the pool. | Pool test: stamp channel C, release, reacquire, build, assert the header carries channel hash 0. Mesh test: publish on C, then `send_on_stream` reaches the stream sink, not C's dispatcher. |
+| A3 ✅ `ac489fa95` | **POL-01.** Cap the number of expanded nodes while decoding (a constant near the wire node cap), and reject inputs that exceed it before building anything. | A 64-entry list where each And names its predecessor twice: decoding returns `PredicateWireError` quickly. Without the cap it never finishes. |
+| A4 ✅ `a5d4c1311` | **ANCHOR-02** (decision 2). | Routed handshake for identity X sent over game A's admitted RTC session: X is confined to tenant A (no replay from other games, no publication into them). Pinned in `ci.yml`. |
+| A5 ✅ already fixed | **SUBNET-02/03.** The revocation scan also covers contexts installed after it starts (a fence like `fence_installed` from SUBNET-01), and revocation commits replay in the order they were committed. | One interleaving test per finding: revoke while a context install is in progress, and two concurrent commits followed by a restart. |
+| A6 ✅ `20a18f1d9` | **GOFFI-01.** Run Go compute callbacks on a thread that is not inside the Tokio runtime, keeping completion synchronous, as `rpc-ffi/src/handles.rs:237-273` does. | Go test where daemon A's `Process` calls `Snapshot(B)`. Today it aborts the process. Needs `CGO_ENABLED=1` and the msys64 gcc. |
+| A7 ✅ `fbeb1a59f` | **HERMES-01.** Tear down only when the final owner, the session or the process ends, not on the per-turn hook. | pytest that drives two turns of one session: services are still up after turn one. |
+
+#### Phase A as landed (2026-11-28)
+
+Each commit carries its regression test, and each test was checked to fail without its fix.
+
+- **A1 LBAT-01.** Built as planned: `prepare_recv_slots` / `collect_recv_slots` replace the two copied setup loops. The existing source pin *required* the old `set_len(MAX_PACKET_SIZE)` call (perf #131A); it now forbids it. Tests: `empty_recv_leaves_slots_uninitialized_and_unclaimed` (failed before: slots claimed 8 KiB after an empty receive) and `recv_claims_exactly_the_received_lengths`. Linux-only, so Linux CI is the first compile and run.
+- **A2 WIRE-09.** `PacketBuilder::reset_routing` (channel hash plus any unconsumed fragment stamp) is called on every pool acquire and release. The pool-level test is the proof; the planned mesh-level test was not added, because the pool test shows the mechanism directly. Tests: `channel_hash_does_not_survive_the_pool` (failed before) and `channel_hash_is_sticky_while_held`.
+- **A3 POL-01.** The design changed: the budget is `max(nodes.len(), MAX_PREDICATE_EXPANDED_NODES = 65_536)` and not a fixed cap, so a tree never meets it. The rebuild was also made iterative, because the FFI entry points accept tables of any length and the recursive rebuild overflowed the stack on a long `Not` chain. New error `PredicateWireError::ExpansionTooLarge`. Tests: five `wire_*` tests (refused beyond the budget, 2^65 bomb through the 4 KiB header, sharing inside the budget still decodes, a tree larger than the budget, 200k-deep `Not` chain).
+- **A4 ANCHOR-02.** Decision 2 taken as recommended: `PeerAdmission::introduced_through(upstream_tenant)`. Witness `rtc_admission::a_peer_introduced_through_a_tenanted_session_inherits_its_tenant` (X reached the anchor through a GAME client; before the fix its tenant read `None`). The `rtc_admission` floor in `ci.yml` is now 29 and the witness is pinned by name.
+- **A5 SUBNET-02/03: already fixed, no code.** SUBNET-03 was fixed by `71ff82a28` (the miscount above); `apply_subject_floor_tracked_with` documents "acceptance and log order are one order (SUBNET-03)". SUBNET-02's interleaving is closed by the SUBNET-01 follow-up `83e99beb3`: the install path re-reads subject floors *after* `subnet_contexts.install` (`fence_installed`, `mesh.rs` admission path). Either the floor lands before that re-read and the fence removes the context, or it lands after the install and its invalidation scan sees the context. Covered by the `fence_installed` tests in `subnet/auth.rs`.
+- **A6 GOFFI-01.** `net_compute_runtime_deliver` called the synchronous `deliver` inside `block_on` only to wrap it. It now calls it directly, so the hot path enters no runtime context. `GoBridge` callbacks and the factory go through `run_go_callback`: inline outside a context, on a scoped thread with no context inside one. Tests: `bridge_callbacks_inside_a_runtime_may_reenter_blocking_ffi` (before the fix it aborted the test process with the audit's `FATAL`) and two more. Go witness `TestDeliver_ProcessMayReenterSnapshotOfAnotherDaemon` passes `go vet`; it links a release `libnet`, so CI's Go job is its first run.
+- **A7 HERMES-01.** Teardown (`_shutdown`) is registered once with `atexit`; `on_session_end` is no longer wired, and `plugin.yaml` lists `on_session_start`. Tests in the new wheel-free `tests/test_lifecycle.py`; the services test failed on the old code (the per-turn hook stopped both services). The Hermes tests are still not in CI (Phase F3).
 
 ### Phase B: durability and data loss
 
