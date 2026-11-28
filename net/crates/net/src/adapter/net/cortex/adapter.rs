@@ -861,6 +861,21 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
                         break 'outer;
                     }
                     next = stream.next() => {
+                        // BUG_AUDIT_2026_11_14 PERSIST-05: the tail stream
+                        // also ENDS when the file evicts a watcher whose
+                        // buffer is full: its `Lagged` signal cannot fit in
+                        // that same full buffer, so the sender is dropped
+                        // with the signal lost. Ending the fold there
+                        // stopped materialization for good while the source
+                        // was still open and the missed events were still
+                        // readable. An end on an open file is lag, and it
+                        // recovers through the same catch-up.
+                        let next = match next {
+                            None if !inner_task.file.is_closed() => {
+                                Some(Err(RedexError::Lagged))
+                            }
+                            other => other,
+                        };
                         match next {
                             None => break 'outer,
                             Some(Err(RedexError::Lagged)) => {
@@ -896,15 +911,35 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
                                     let events = inner_task
                                         .file
                                         .read_range(resume, head);
-                                    if events.is_empty() {
-                                        // Retention has evicted the
-                                        // gap. The fold cannot recover
-                                        // what is no longer durable;
-                                        // halt rather than silently
-                                        // skip ahead.
+                                    // The catch-up must cover the gap from
+                                    // its start with no holes: the first
+                                    // event is `resume` and each one follows
+                                    // its predecessor. Retention (or a
+                                    // replica's `skip_to`) can have removed
+                                    // any prefix of the range, and
+                                    // `read_range` simply omits what is
+                                    // gone. BUG_AUDIT_2026_11_14 PERSIST-04:
+                                    // only an EMPTY result used to halt, so a
+                                    // surviving suffix was folded as if it
+                                    // were the whole history and
+                                    // `folded_through_seq` advanced past the
+                                    // missing prefix. The fold cannot
+                                    // recover what is no longer retained;
+                                    // halt rather than silently skip ahead.
+                                    let mut expected = resume;
+                                    let mut missing_from = events.is_empty().then_some(resume);
+                                    for event in &events {
+                                        if event.entry.seq != expected {
+                                            missing_from = Some(expected);
+                                            break;
+                                        }
+                                        expected = event.entry.seq.saturating_add(1);
+                                    }
+                                    if let Some(gap_start) = missing_from {
                                         tracing::error!(
-                                            gap_start = resume,
+                                            gap_start,
                                             gap_end = head,
+                                            first_retained = events.first().map(|e| e.entry.seq),
                                             "cortex fold task cannot recover \
                                              from tail lag: events evicted by \
                                              retention"
@@ -2400,6 +2435,102 @@ mod tests {
             "fold task must stay alive after recovering from tail lag",
         );
         assert_eq!(adapter.fold_errors(), 0);
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-04: a from-beginning materializer on a
+    /// file whose retention has evicted a PREFIX of the history must not
+    /// fold the surviving suffix as if it were the whole history. Before
+    /// the fix the lag catch-up halted only on an EMPTY range, so it folded
+    /// seqs 3..4, advanced `folded_through_seq` to 4, and `wait_for_seq(4)`
+    /// succeeded on a state missing seqs 0..2.
+    #[tokio::test]
+    async fn catch_up_refuses_a_range_whose_prefix_was_evicted() {
+        let redex = Redex::new();
+        let name = cn("cortex/catch-up-evicted-prefix");
+        let file = redex
+            .open_file(
+                &name,
+                RedexFileConfig::default()
+                    .with_tail_buffer_size(4)
+                    .with_retention_max_events(2),
+            )
+            .unwrap();
+        for _ in 0..5u64 {
+            file.append(b"").unwrap();
+        }
+        file.sweep_retention();
+        assert_eq!(file.lowest_retained_seq(), Some(3), "seqs 0..2 are gone");
+
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &name,
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_secs(5), adapter.wait_for_seq(4))
+                .await
+                .expect("the halted fold must release waiters, not hang them");
+        assert!(
+            waited.is_err(),
+            "wait_for_seq(4) must not succeed on a state missing seqs 0..2"
+        );
+        assert!(
+            !adapter.is_running(),
+            "the fold halts on unrecoverable history loss"
+        );
+        assert_eq!(
+            *adapter.state().read(),
+            0,
+            "nothing of the suffix was folded"
+        );
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-05: when a producer overflows the live
+    /// tail buffer while the fold task is not running, the file drops the
+    /// watcher, and its `Lagged` signal is lost because it cannot fit in the
+    /// same full buffer. The fold task then sees the buffered events and a
+    /// plain end of stream. Before the fix it treated that end as
+    /// terminal, and materialization stopped for good on an open file whose
+    /// missed events were still readable.
+    ///
+    /// A current-thread runtime makes the overflow deterministic: the fold
+    /// task cannot run while the test appends synchronously.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fold_task_recovers_when_overflow_ends_the_tail_stream() {
+        let redex = Redex::new();
+        let name = cn("cortex/overflow-eof");
+        let file = redex
+            .open_file(&name, RedexFileConfig::default().with_tail_buffer_size(4))
+            .unwrap();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &name,
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+        // Let the fold task register its live tail and park on it.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // 20 appends with no yield: the first 4 fill the buffer, the 5th
+        // evicts the watcher (its Lagged signal does not fit), the rest
+        // are readable only from the file.
+        for _ in 0..20u64 {
+            file.append(b"").unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), adapter.wait_for_seq(19))
+            .await
+            .expect("wait_for_seq(19) timed out: the fold stopped at the overflow")
+            .expect("the fold task must recover from an overflow-ended stream");
+        assert_eq!(*adapter.state().read(), 20);
+        assert!(adapter.is_running());
     }
 
     /// `changes()` continues to silently drop lag (the documented
