@@ -275,6 +275,19 @@ pub struct EventBusStats {
     /// `events_dispatched + events_dropped == events_ingested`. FFI
     /// consumers can also use this to monitor end-to-end delivery.
     pub events_dispatched: CachePadded<AtomicU64>,
+    /// Events that were ACCEPTED (counted in `events_ingested`) and then
+    /// never reached the adapter: stranded by a shard removal or a lossy
+    /// shutdown, or refused by the adapter after its retries. At
+    /// quiescence `events_dispatched + events_lost_after_ingest ==
+    /// events_ingested`.
+    ///
+    /// Kept apart from `events_dropped`, which also counts ingests REFUSED
+    /// at admission (backpressure), events that were never in
+    /// `events_ingested` at all. BUG_AUDIT_2026_11_14 ING-01: `flush`'s
+    /// barrier used `events_dropped`, so admission rejections counted as
+    /// "accounted for" and could satisfy the barrier before a single
+    /// accepted event had reached the adapter.
+    pub events_lost_after_ingest: CachePadded<AtomicU64>,
     /// Set to `true` if `shutdown()` / `shutdown_via_ref()` had to
     /// proceed past the in-flight-ingest grace deadline (5 s) with
     /// producers still mid-push. The stranded count is counted into
@@ -727,6 +740,9 @@ impl EventBus {
                     .events_dropped
                     .fetch_add(count as u64, AtomicOrdering::Relaxed);
                 self.stats
+                    .events_lost_after_ingest
+                    .fetch_add(count as u64, AtomicOrdering::Relaxed);
+                self.stats
                     .shutdown_was_lossy
                     .store(true, AtomicOrdering::Release);
                 tracing::error!(
@@ -766,6 +782,9 @@ impl EventBus {
                         "activate-failure rollback: flushed stranded events to adapter",
                     );
                 } else {
+                    self.stats
+                        .events_lost_after_ingest
+                        .fetch_add(count as u64, AtomicOrdering::Relaxed);
                     tracing::error!(
                         shard_id = new_id,
                         count,
@@ -950,6 +969,9 @@ impl EventBus {
                     "Removed shard: flushed stranded ring-buffer events to adapter"
                 );
             } else {
+                self.stats
+                    .events_lost_after_ingest
+                    .fetch_add(count as u64, AtomicOrdering::Relaxed);
                 tracing::error!(
                     shard_id,
                     count,
@@ -1245,11 +1267,12 @@ impl EventBus {
         // Snapshot the `events_ingested` counter at flush entry —
         // that's our target. We then poll `events_dispatched` (sum
         // of batch lengths from successful adapter dispatches) plus
-        // `events_dropped` (events the adapter rejected after retry
-        // exhaustion or that never made it past backpressure). The
-        // barrier is met when `events_dispatched + events_dropped >=
-        // target`: every pre-flush ingest is accounted for in one
-        // bucket or the other.
+        // `events_lost_after_ingest` (accepted events the adapter
+        // refused after retries, or that were stranded). The barrier
+        // is met when their sum reaches the target: every pre-flush
+        // ingest is accounted for in one bucket or the other.
+        // Admission rejections are NOT counted: they were never
+        // ingested (ING-01).
         //
         // This is a true delivery barrier — it doesn't rely on
         // "no progress this window" heuristics that race a
@@ -1261,6 +1284,7 @@ impl EventBus {
         // single-`max_delay`-sleep approach a frequent flake.
         let target_ingested = self.stats.events_ingested.load(AtomicOrdering::Acquire);
         let dropped_at_start = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+        // ING-01: only accepted events can satisfy the barrier.
         let dispatched_at_start = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
 
         // Outer deadline still bounds Phase 2 in case a wedged
@@ -1297,11 +1321,15 @@ impl EventBus {
         loop {
             let dispatched = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
             let dropped = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+            let lost = self
+                .stats
+                .events_lost_after_ingest
+                .load(AtomicOrdering::Acquire);
             // The barrier: every event ingested pre-flush has been
-            // either dispatched or dropped. The bus's invariant
-            // `events_ingested = events_dispatched + events_dropped`
-            // holds at quiescence; we wait until
-            // `dispatched + dropped >= target_ingested`.
+            // either dispatched or lost after admission. The bus's
+            // invariant `events_ingested = events_dispatched +
+            // events_lost_after_ingest` holds at quiescence; we wait
+            // until `dispatched + lost >= target_ingested`.
             //
             // Pre-fix this used `dispatched + (dropped -
             // dropped_at_start) >= target_ingested`, which under-
@@ -1321,7 +1349,10 @@ impl EventBus {
             // ingest, or in `shutdown` (which gates ingest via
             // `try_enter_ingest`).
             let _ = dispatched_at_start; // reserved for future per-shard accounting
-            if dispatched.saturating_add(dropped) >= target_ingested
+                                         // The barrier counts only ACCEPTED events' outcomes
+                                         // (ING-01): `events_dropped` also counts admission
+                                         // rejections, which were never in `target_ingested`.
+            if dispatched.saturating_add(lost) >= target_ingested
                 && self.shard_manager.all_shards_empty()
             {
                 break;
@@ -1705,6 +1736,9 @@ impl EventBus {
                 self.stats
                     .events_dropped
                     .fetch_add(actual_drops, AtomicOrdering::Relaxed);
+                self.stats
+                    .events_lost_after_ingest
+                    .fetch_add(actual_drops, AtomicOrdering::Relaxed);
             } else {
                 // The deadline tripped the eager
                 // `shutdown_was_lossy = true` set above, but the
@@ -1946,6 +1980,9 @@ impl Drop for EventBus {
             if stranded_in_rings > 0 {
                 self.stats
                     .events_dropped
+                    .fetch_add(stranded_in_rings, AtomicOrdering::Relaxed);
+                self.stats
+                    .events_lost_after_ingest
                     .fetch_add(stranded_in_rings, AtomicOrdering::Relaxed);
                 self.stats
                     .shutdown_was_lossy
@@ -2380,6 +2417,11 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                             // to bump an atomic, injecting periodic
                             // latency spikes into the ingest path.
                             shard_manager.record_batch_dispatch(shard_id);
+                        } else {
+                            // ING-01: accepted, refused after retries.
+                            stats
+                                .events_lost_after_ingest
+                                .fetch_add(batch_len, AtomicOrdering::Relaxed);
                         }
                     }
                 }
@@ -2403,6 +2445,10 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                                     .fetch_add(1, AtomicOrdering::Relaxed);
                                 stats
                                     .events_dispatched
+                                    .fetch_add(batch_len, AtomicOrdering::Relaxed);
+                            } else {
+                                stats
+                                    .events_lost_after_ingest
                                     .fetch_add(batch_len, AtomicOrdering::Relaxed);
                             }
                         }
@@ -2441,6 +2487,11 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                             // to bump an atomic, injecting periodic
                             // latency spikes into the ingest path.
                             shard_manager.record_batch_dispatch(shard_id);
+                        } else {
+                            // ING-01: accepted, refused after retries.
+                            stats
+                                .events_lost_after_ingest
+                                .fetch_add(batch_len, AtomicOrdering::Relaxed);
                         }
                     }
                 }
@@ -3216,6 +3267,64 @@ mod tests {
         async fn is_healthy(&self) -> bool {
             true
         }
+    }
+
+    /// BUG_AUDIT_2026_11_14 ING-01: `flush` returns only once every
+    /// ACCEPTED event has reached the adapter. Rejected ingests are not
+    /// accepted events and cannot stand in for them.
+    ///
+    /// On a current-thread runtime the bus's workers cannot run while the
+    /// test ingests synchronously, so the ring fills and the overflow is
+    /// refused (DropNewest); the accepted events then wait in each shard's
+    /// 250 ms partial batch. Before the fix the refused count (in
+    /// `events_dropped`) already exceeded the accepted count, so `flush`
+    /// returned as soon as the rings had drained, before `on_batch` saw a
+    /// single event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_waits_for_accepted_events_whatever_was_rejected() {
+        use crate::config::{BackpressureMode, BatchConfig};
+        let received = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(CountingAdapter {
+            received: received.clone(),
+        });
+        let config = EventBusConfig::builder()
+            // Two shards: flush's Phase 2 deadline is `max_delay` per
+            // worker (500 ms here), so it outlasts the 250 ms partial batch
+            // each shard's accepted events wait in, and a correct flush
+            // returns on the barrier, not on the deadline.
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .backpressure_mode(BackpressureMode::DropNewest)
+            .batch(BatchConfig {
+                min_size: 1,
+                max_size: 10_000,
+                max_delay: Duration::from_millis(250),
+                adaptive: false,
+                velocity_window: Duration::from_millis(100),
+            })
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        // Well over both rings' capacity, so rejections outnumber
+        // acceptances.
+        for i in 0..6_000u32 {
+            let _ = bus.ingest(Event::new(json!({ "i": i })));
+        }
+        let accepted = bus.stats().events_ingested.load(AtomicOrdering::Acquire);
+        let rejected = bus.stats().events_dropped.load(AtomicOrdering::Acquire);
+        assert!(
+            accepted > 0 && rejected > 0,
+            "the schedule must both accept and reject"
+        );
+
+        bus.flush().await.unwrap();
+        assert_eq!(
+            received.load(AtomicOrdering::SeqCst),
+            accepted,
+            "flush returned before the accepted events reached the adapter"
+        );
+        bus.shutdown().await.unwrap();
     }
 
     /// `retry_backoff` exponentially grows the base delay
