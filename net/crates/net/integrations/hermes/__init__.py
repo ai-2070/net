@@ -19,6 +19,7 @@ set ``NET_MESH_PSK`` (and ``NET_MESH_PEERS``) to join your mesh — see
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 from typing import Optional
@@ -37,23 +38,26 @@ _ = a2a
 
 logger = logging.getLogger(__name__)
 
-# The running pin-promotion subscription (Phase 2), if started. Held so the
-# session-end hook can stop it.
+# The plugin's services and its node are PROCESS-scoped: one set serves every
+# session and every turn in this Hermes process, and `_shutdown` (registered
+# with `atexit`) stops them when the process ends. See `_shutdown` for why
+# this is not the host's `on_session_end` hook.
+
+# The running pin-promotion subscription (Phase 2), if started.
 _promotion: Optional["pins.PinPromotionService"] = None
 
 # The running local-tool publication (V2 Phase 2, provider side), if started —
-# this Hermes's OWN tools announced to the mesh. Opt-in; held so the session-end
-# hook can withdraw it.
+# this Hermes's OWN tools announced to the mesh. Opt-in.
 _provider: Optional["provider.LocalToolProvider"] = None
 
 # The running tool-federation service (V2 Phase 2, consumer side), if started —
 # surfaces discovered mesh capabilities as machine-namespaced first-class tools.
-# Opt-in; held so the session-end hook can stop it.
+# Opt-in.
 _federation: Optional["federate.FederationService"] = None
 
 # The running A2A executor service (V2 Phase 3), if started — accepts
 # hand-off tasks from sibling in-root agents and runs them through the host
-# agent loop. Opt-in; held so the session-end hook can stop it.
+# agent loop. Opt-in.
 _a2a_service: Optional["a2a.A2aService"] = None
 
 
@@ -124,12 +128,29 @@ def _on_session_start(**_kwargs) -> None:
             logger.warning("net plugin: A2A executor not started: %s", e)
 
 
-def _on_session_end(**_kwargs) -> None:
-    """Best-effort teardown when the session ends. Idempotent; swallows errors
-    so session end never fails on cleanup — and each step is guarded
-    individually, so one service's failing ``stop()`` can't skip the rest of
-    the teardown (which would leak the mesh node, the silent-renewal daemon
-    thread, and the served RPC handles)."""
+# Whether `register` has already put `_shutdown` on the `atexit` list.
+_shutdown_registered = False
+
+
+def _shutdown() -> None:
+    """Tear the plugin's process-wide services and node down, when the process
+    exits.
+
+    Not wired to the host's ``on_session_end`` hook (BUG_AUDIT_2026_11_14
+    HERMES-01): Hermes emits that hook after EVERY conversation turn
+    (``agent/turn_finalizer.py``), not once per session, and it emits
+    ``on_session_start`` only for a new session, so a continuation does not
+    re-run it. Stopping here at session end shut the A2A executor, federation,
+    local-tool publication, pin promotion and the shared node down after the
+    first reply of every session, with nothing restarting them for the rest of
+    it. Lazy gateway access rebuilt only the node, and without a seed it came
+    back under a new identity, orphaning A2A tasks bound to the old one. The
+    host itself warns against shutting shared providers down in that hook.
+
+    Best-effort and idempotent; each step is guarded individually, so one
+    service's failing ``stop()`` can't skip the rest of the teardown (which
+    would leak the mesh node, the silent-renewal daemon thread, and the served
+    RPC handles)."""
     global _promotion, _provider, _federation, _a2a_service
     services = (
         ("a2a executor", _a2a_service),
@@ -158,8 +179,9 @@ def register(ctx) -> None:
     Every tool shares ``check_fn`` = local node/SDK health (never "peers
     visible"), so a healthy-but-isolated node keeps its tools; only an
     SDK/node failure removes them at the next tools-assembly boundary. The
-    pin-promotion subscription starts per-session (``on_session_start``), so
-    plugin load itself stays a pure, side-effect-free wiring step.
+    services start lazily on the first ``on_session_start`` and live for the
+    process (``_shutdown`` at exit), so plugin load itself stays a pure wiring
+    step: it starts nothing.
     """
     for name, schema, handler, emoji in TOOLS:
         ctx.register_tool(
@@ -172,5 +194,10 @@ def register(ctx) -> None:
             emoji=emoji,
         )
     ctx.register_hook("on_session_start", _on_session_start)
-    ctx.register_hook("on_session_end", _on_session_end)
+    # Process-scoped teardown, not `on_session_end` (HERMES-01; see
+    # `_shutdown`).
+    global _shutdown_registered
+    if not _shutdown_registered:
+        atexit.register(_shutdown)
+        _shutdown_registered = True
     logger.info("net plugin: registered %d mesh tools (toolset 'net')", len(TOOLS))

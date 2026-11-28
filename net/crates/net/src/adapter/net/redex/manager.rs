@@ -942,8 +942,23 @@ impl Redex {
                 shut_down_runtimes(vec![handle]);
             }
         }
-        if let Some((_, file)) = self.files.remove(name) {
-            file.close()?;
+        // BUG_AUDIT_2026_11_14 PERSIST-07: hold the map entry's guard
+        // across `close()`, as `close_and_unlink_file` does, and remove
+        // the entry only after close returns. Removing it first let a
+        // concurrent `open_file` build a SECOND disk segment for the same
+        // directory while the old handle was still closing: its recovery
+        // could truncate the payload tail of an in-flight append whose
+        // index record then landed and reported success, against bytes
+        // the new handle had cut. The entry guard holds the shard lock, so
+        // `open_file` (both its fast path and its first-open entry) waits
+        // for the close to finish.
+        if let dashmap::mapref::entry::Entry::Occupied(occ) = self.files.entry(name.clone()) {
+            let result = occ.get().close();
+            // `close` marks the file closed before it can fail (a failed
+            // final sync), so the entry goes either way and the error is
+            // the caller's.
+            occ.remove();
+            result?;
         }
         Ok(())
     }
@@ -1161,6 +1176,76 @@ mod tests {
         // Idempotent on a second call (file already gone, dir gone).
         r.close_and_unlink_file(&name).unwrap();
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-07: a reopen of a channel whose close
+    /// is still in progress waits for the close, instead of building a
+    /// second disk segment for the same directory beside the closing one.
+    ///
+    /// The test stalls the old file's `close()` by holding its state lock,
+    /// then reopens from another thread. Before the fix `close_file`
+    /// removed the map entry first, so the reopen returned at once with an
+    /// independent handle (recovering, and possibly truncating, files the
+    /// old handle was still writing).
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn a_reopen_waits_for_an_in_progress_close() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("net-redex-reopen-{}-{}", std::process::id(), n));
+        let _ = std::fs::create_dir_all(&base);
+        let r = Arc::new(Redex::new().with_persistent_dir(&base));
+        let name = cn("persist07/reopen");
+        let cfg = || RedexFileConfig::default().with_persistent(true);
+        let old = r.open_file(&name, cfg()).unwrap();
+        old.append(b"before close").unwrap();
+
+        let stall = old.hold_state_lock_for_test();
+        let closer = {
+            let (r, name) = (Arc::clone(&r), name.clone());
+            std::thread::spawn(move || r.close_file(&name))
+        };
+        // Wait until the closer is inside `close()`: it takes the map
+        // entry first, and `close()` sets `closed` before parking on the
+        // held state lock, so a closed `old` proves the entry is held.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !old.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the closer never entered close()"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let reopened = Arc::new(AtomicBool::new(false));
+        let opener = {
+            let (r, name, reopened) = (Arc::clone(&r), name.clone(), Arc::clone(&reopened));
+            std::thread::spawn(move || {
+                let f = r.open_file(&name, cfg());
+                reopened.store(true, Ordering::SeqCst);
+                f
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !reopened.load(Ordering::SeqCst),
+            "a reopen must not complete while the old handle is still closing"
+        );
+
+        drop(stall);
+        closer.join().unwrap().unwrap();
+        let new = opener.join().unwrap().unwrap();
+        assert!(old.is_closed());
+        assert!(!new.is_closed());
+        assert!(
+            !new.same_instance_for_test(&old),
+            "the reopen built a fresh handle"
+        );
+        assert_eq!(new.len(), 1, "and it recovered the closed file's append");
+        new.close().unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 

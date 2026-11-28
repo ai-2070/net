@@ -53,10 +53,12 @@ def test_register_wires_all_tools_and_hook(plugin, ctx):
         assert entry["schema"]["parameters"]["type"] == "object"
         assert callable(entry["handler"])
     assert "on_session_start" in ctx.hooks
-    assert "on_session_end" in ctx.hooks
+    # HERMES-01: Hermes fires on_session_end after every turn, so the plugin
+    # must not tear its process-wide services down there.
+    assert "on_session_end" not in ctx.hooks
 
 
-def test_session_end_teardown_survives_a_failing_stop(plugin, monkeypatch):
+def test_shutdown_survives_a_failing_stop(plugin, monkeypatch):
     # One service's stop() raising must not skip the rest of the teardown —
     # that would leak the mesh node, the renewal daemon thread, and the served
     # RPC handles.
@@ -79,14 +81,14 @@ def test_session_end_teardown_survives_a_failing_stop(plugin, monkeypatch):
     monkeypatch.setattr(plugin, "_provider", _Svc("provider"))
     monkeypatch.setattr(plugin, "_promotion", _Svc("promotion"))
 
-    plugin._on_session_end()
+    plugin._shutdown()
 
     assert stopped == ["a2a", "federation", "provider", "promotion"]
     assert shutdowns == [True], "node.shutdown still ran"
     # The handles are cleared, so a second call is a clean no-op.
     assert plugin._a2a_service is None and plugin._federation is None
     assert plugin._provider is None and plugin._promotion is None
-    plugin._on_session_end()
+    plugin._shutdown()
     assert stopped == ["a2a", "federation", "provider", "promotion"]
 
 

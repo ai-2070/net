@@ -16,4 +16,4 @@ provides_tools:
   - net_a2a_status
   - net_a2a_cancel
 hooks:
-  - on_session_end
+  - on_session_start

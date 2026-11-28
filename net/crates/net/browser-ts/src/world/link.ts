@@ -8,7 +8,7 @@
  * const region = storeRegion(host, { region: 'r:4:7', collection: 'ships', ledger: 'handoff' });
  * const handoffs = regionHandoffs({
  *   link, region: 'r:4:7', ...region,
- *   persist: () => { saving.flush(); },        // persistStore(host, …): durable before any send
+ *   persist: async () => { await saving.flush(); }, // persistStore(host, …): durable before any send
  *   onEvent: event => …,                       // moved / refused / unresolved / admitted
  * });
  * handoffs.handoff('ship-7', 'r:4:8');         // when the ship crosses the border

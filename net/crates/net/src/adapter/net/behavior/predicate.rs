@@ -419,6 +419,30 @@ pub enum PredicateWireError {
         /// Offending child index.
         child: u32,
     },
+    /// Rebuilding the table would construct more nodes than the budget
+    /// allows, because nodes are shared between parents
+    /// ([`MAX_PREDICATE_EXPANDED_NODES`]; BUG_AUDIT_2026_11_14 POL-01).
+    #[error("predicate wire expands to more than {limit} nodes")]
+    ExpansionTooLarge {
+        /// The node budget that was exceeded.
+        limit: usize,
+    },
+    /// Rebuilding the table would clone more leaf string bytes than the
+    /// table holds, or than [`MAX_PREDICATE_EXPANDED_BYTES`] allows,
+    /// because a leaf is shared between parents (POL-01).
+    #[error("predicate wire expands to more than {limit} bytes of leaf data")]
+    ExpansionBytesTooLarge {
+        /// The byte budget that was exceeded.
+        limit: usize,
+    },
+    /// The tree is deeper than [`MAX_PREDICATE_WIRE_DEPTH`]. Evaluation
+    /// and drop of a [`Predicate`] recurse, so a decoded chain deeper than
+    /// this could overflow the thread stack after decoding succeeded.
+    #[error("predicate wire is deeper than {limit} levels")]
+    TooDeep {
+        /// The depth limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl Predicate {
@@ -668,17 +692,169 @@ impl PredicateWire {
     }
 }
 
-/// Recursive rebuild helper. Walks the flat node table from `idx`,
-/// validating child indices and cycles as it goes.
+/// Upper bound on the number of [`Predicate`] nodes one rebuild may
+/// construct, for wire tables whose shape is not a tree.
+///
+/// A table produced by [`Predicate::to_wire`] is a tree: every node is
+/// referenced once, so rebuilding it constructs exactly `nodes.len()`
+/// nodes and never meets this cap (the effective budget is the larger of
+/// the two). The cap exists for hand-built tables that reference one
+/// node from several parents. BUG_AUDIT_2026_11_14 POL-01: before it,
+/// a leaf followed by `n` `And` nodes each naming its predecessor twice
+/// passed the child-below-parent check and expanded into 2^n owned nodes
+/// during decode, before any evaluation, from a payload that fits a
+/// 4 KiB RPC header.
+pub const MAX_PREDICATE_EXPANDED_NODES: usize = 65_536;
+
+/// Upper bound on the leaf string bytes (tag keys, values, versions,
+/// patterns) a wire table may clone while rebuilding, for the same shared-
+/// node tables [`MAX_PREDICATE_EXPANDED_NODES`] bounds. The node cap alone
+/// lets one shared leaf with a multi-KiB key be cloned tens of thousands of
+/// times. As with the node cap, the effective budget is the larger of this
+/// and the table's own leaf bytes, so a tree is never refused.
+pub const MAX_PREDICATE_EXPANDED_BYTES: usize = 1 << 20;
+
+/// Deepest tree a wire table may rebuild into. [`Predicate`]'s evaluation
+/// and drop are recursive, so the decoder bounds depth even though it is
+/// itself iterative. Far above any real filter (the Go FFI's parser caps
+/// depth at 64).
+pub const MAX_PREDICATE_WIRE_DEPTH: usize = 1_024;
+
+/// Iterative rebuild. Walks the flat node table from `root`, validating
+/// child indices and cycles as it goes, and refuses to construct more
+/// than `max(nodes.len(), MAX_PREDICATE_EXPANDED_NODES)` nodes, to clone
+/// more than `max(table leaf bytes, MAX_PREDICATE_EXPANDED_BYTES)` bytes of
+/// leaf strings, or to nest deeper than [`MAX_PREDICATE_WIRE_DEPTH`].
+///
+/// Iterative rather than recursive for the same reason as
+/// [`Predicate::append_to_wire`]: child indices only bound depth by the
+/// table length, and the FFI entry points accept tables of any length, so
+/// a long `Not` chain would otherwise overflow the thread stack.
 fn rebuild_predicate(
     nodes: &[PredicateNodeWire],
-    idx: u32,
+    root: u32,
 ) -> Result<Predicate, PredicateWireError> {
+    enum Step {
+        /// A node to build, and its depth (the root is 1).
+        Visit(u32, usize),
+        FinishAnd(usize),
+        FinishOr(usize),
+        FinishNot,
+    }
+
     let len = nodes.len();
-    let node = nodes
-        .get(idx as usize)
-        .ok_or(PredicateWireError::ChildOutOfBounds { child: idx, len })?;
-    let result = match node {
+    let limit = len.max(MAX_PREDICATE_EXPANDED_NODES);
+    // Nodes scheduled for construction so far, counted when scheduled
+    // (not when built) so the work stack is bounded by the same budget.
+    let mut scheduled: usize = 1;
+    let mut schedule = |n: usize| -> Result<(), PredicateWireError> {
+        scheduled = scheduled.saturating_add(n);
+        if scheduled > limit {
+            return Err(PredicateWireError::ExpansionTooLarge { limit });
+        }
+        Ok(())
+    };
+
+    let byte_limit = nodes
+        .iter()
+        .map(leaf_string_bytes)
+        .fold(0usize, usize::saturating_add)
+        .max(MAX_PREDICATE_EXPANDED_BYTES);
+    let mut cloned_bytes: usize = 0;
+
+    let mut work = vec![Step::Visit(root, 1)];
+    let mut built: Vec<Predicate> = Vec::new();
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Visit(idx, depth) => {
+                if depth > MAX_PREDICATE_WIRE_DEPTH {
+                    return Err(PredicateWireError::TooDeep {
+                        limit: MAX_PREDICATE_WIRE_DEPTH,
+                    });
+                }
+                let node = nodes
+                    .get(idx as usize)
+                    .ok_or(PredicateWireError::ChildOutOfBounds { child: idx, len })?;
+                match node {
+                    PredicateNodeWire::And { children } | PredicateNodeWire::Or { children } => {
+                        check_children_below(children, idx)?;
+                        schedule(children.len())?;
+                        work.push(if matches!(node, PredicateNodeWire::And { .. }) {
+                            Step::FinishAnd(children.len())
+                        } else {
+                            Step::FinishOr(children.len())
+                        });
+                        // Reverse, so the leftmost child is built first and
+                        // the children keep their wire order.
+                        work.extend(children.iter().rev().map(|&c| Step::Visit(c, depth + 1)));
+                    }
+                    PredicateNodeWire::Not { child } => {
+                        if *child >= idx {
+                            return Err(PredicateWireError::CycleDetected {
+                                parent: idx,
+                                child: *child,
+                            });
+                        }
+                        schedule(1)?;
+                        work.push(Step::FinishNot);
+                        work.push(Step::Visit(*child, depth + 1));
+                    }
+                    leaf => {
+                        cloned_bytes = cloned_bytes.saturating_add(leaf_string_bytes(leaf));
+                        if cloned_bytes > byte_limit {
+                            return Err(PredicateWireError::ExpansionBytesTooLarge {
+                                limit: byte_limit,
+                            });
+                        }
+                        built.push(leaf_to_predicate(leaf));
+                    }
+                }
+            }
+            Step::FinishAnd(n) => {
+                let kids = built.split_off(built.len() - n);
+                built.push(Predicate::And(kids));
+            }
+            Step::FinishOr(n) => {
+                let kids = built.split_off(built.len() - n);
+                built.push(Predicate::Or(kids));
+            }
+            Step::FinishNot => {
+                let inner = built.pop().ok_or(PredicateWireError::Empty)?;
+                built.push(Predicate::Not(Box::new(inner)));
+            }
+        }
+    }
+    built.pop().ok_or(PredicateWireError::Empty)
+}
+
+/// The string bytes rebuilding `node` clones (0 for a composite node).
+/// Exhaustive on purpose: a new leaf variant must say what it clones.
+fn leaf_string_bytes(node: &PredicateNodeWire) -> usize {
+    match node {
+        PredicateNodeWire::Exists { key }
+        | PredicateNodeWire::NumericAtLeast { key, .. }
+        | PredicateNodeWire::NumericAtMost { key, .. }
+        | PredicateNodeWire::NumericInRange { key, .. } => key.key.len(),
+        PredicateNodeWire::Equals { key, value: s }
+        | PredicateNodeWire::SemverAtLeast { key, version: s }
+        | PredicateNodeWire::SemverAtMost { key, version: s }
+        | PredicateNodeWire::SemverCompatible { key, version: s }
+        | PredicateNodeWire::StringPrefix { key, prefix: s }
+        | PredicateNodeWire::StringMatches { key, pattern: s } => key.key.len() + s.len(),
+        PredicateNodeWire::MetadataExists { key }
+        | PredicateNodeWire::MetadataNumericAtLeast { key, .. } => key.len(),
+        PredicateNodeWire::MetadataEquals { key, value: s }
+        | PredicateNodeWire::MetadataMatches { key, pattern: s } => key.len() + s.len(),
+        PredicateNodeWire::And { .. }
+        | PredicateNodeWire::Or { .. }
+        | PredicateNodeWire::Not { .. } => 0,
+    }
+}
+
+/// Convert one leaf wire node. Composite nodes never reach here: the
+/// rebuild loop handles them before calling it.
+fn leaf_to_predicate(node: &PredicateNodeWire) -> Predicate {
+    match node {
         PredicateNodeWire::Exists { key } => Predicate::Exists { key: key.clone() },
         PredicateNodeWire::Equals { key, value } => Predicate::Equals {
             key: key.clone(),
@@ -732,33 +908,12 @@ fn rebuild_predicate(
                 threshold: *threshold,
             }
         }
-        PredicateNodeWire::And { children } => {
-            check_children_below(children, idx)?;
-            let kids: Result<Vec<_>, _> = children
-                .iter()
-                .map(|&c| rebuild_predicate(nodes, c))
-                .collect();
-            Predicate::And(kids?)
+        PredicateNodeWire::And { .. }
+        | PredicateNodeWire::Or { .. }
+        | PredicateNodeWire::Not { .. } => {
+            unreachable!("rebuild_predicate handles composite nodes itself")
         }
-        PredicateNodeWire::Or { children } => {
-            check_children_below(children, idx)?;
-            let kids: Result<Vec<_>, _> = children
-                .iter()
-                .map(|&c| rebuild_predicate(nodes, c))
-                .collect();
-            Predicate::Or(kids?)
-        }
-        PredicateNodeWire::Not { child } => {
-            if *child >= idx {
-                return Err(PredicateWireError::CycleDetected {
-                    parent: idx,
-                    child: *child,
-                });
-            }
-            Predicate::Not(Box::new(rebuild_predicate(nodes, *child)?))
-        }
-    };
-    Ok(result)
+    }
 }
 
 /// Validate that every child index in `children` is strictly less
@@ -3195,6 +3350,170 @@ mod tests {
             "expected CycleDetected; got {err:?}",
         );
     }
+    fn pol01_key(key: &str) -> TagKey {
+        TagKey::new(TaxonomyAxis::Software, key)
+    }
+
+    /// BUG_AUDIT_2026_11_14 POL-01: a leaf followed by `n` `And` nodes,
+    /// each naming its predecessor twice. Every child index is below its
+    /// parent, so the cycle check passes, but rebuilding as owned trees
+    /// constructs 2^(n+1) - 1 nodes.
+    fn shared_and_chain(n: u32) -> PredicateWire {
+        let mut nodes = vec![PredicateNodeWire::Exists {
+            key: pol01_key("k"),
+        }];
+        for i in 1..=n {
+            nodes.push(PredicateNodeWire::And {
+                children: vec![i - 1, i - 1],
+            });
+        }
+        PredicateWire { nodes, root_idx: n }
+    }
+
+    /// POL-01: 2^21 - 1 expanded nodes from a 21-entry table is refused.
+    /// Before the fix this decoded (slowly) into a ~2M-node AST.
+    #[test]
+    fn wire_shared_children_beyond_the_budget_are_refused() {
+        let err = shared_and_chain(20).into_predicate().unwrap_err();
+        assert_eq!(
+            err,
+            PredicateWireError::ExpansionTooLarge {
+                limit: MAX_PREDICATE_EXPANDED_NODES
+            }
+        );
+    }
+
+    /// POL-01: the 2^65 case returns promptly instead of exhausting
+    /// memory, and it fits the 4 KiB `net-where` header, so an RPC caller
+    /// can send it to any handler that calls `where_predicate`.
+    #[test]
+    fn wire_exponential_header_is_refused_promptly() {
+        let wire = shared_and_chain(64);
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        assert!(
+            bytes.len() <= MAX_PREDICATE_RPC_HEADER_VALUE_LEN,
+            "the bomb must fit the header cap to be a real trigger ({} bytes)",
+            bytes.len()
+        );
+        let headers = vec![(RPC_WHERE_HEADER.to_string(), bytes)];
+        let started = std::time::Instant::now();
+        let result = predicate_from_rpc_headers(&headers).expect("header present");
+        assert!(
+            matches!(
+                result,
+                Err(PredicateRpcDecodeError::Wire(
+                    PredicateWireError::ExpansionTooLarge { .. }
+                ))
+            ),
+            "expected ExpansionTooLarge; got {result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// POL-01: sharing that stays inside the budget still decodes, with
+    /// each reference rebuilt as its own copy (the pre-fix semantics).
+    #[test]
+    fn wire_shared_children_within_the_budget_still_decode() {
+        let pred = shared_and_chain(3).into_predicate().unwrap();
+        let leaf = Predicate::Exists {
+            key: pol01_key("k"),
+        };
+        let l1 = Predicate::And(vec![leaf.clone(), leaf]);
+        let l2 = Predicate::And(vec![l1.clone(), l1]);
+        assert_eq!(pred, Predicate::And(vec![l2.clone(), l2]));
+    }
+
+    /// POL-01: the budget never refuses a tree, however large: a tree
+    /// rebuilds into exactly `nodes.len()` nodes.
+    #[test]
+    fn wire_tree_larger_than_the_budget_round_trips() {
+        let leaves = MAX_PREDICATE_EXPANDED_NODES + 10;
+        let pred = Predicate::Or(
+            (0..leaves)
+                .map(|i| Predicate::Exists {
+                    key: pol01_key(&format!("k{i}")),
+                })
+                .collect(),
+        );
+        let back = pred.to_wire().into_predicate().unwrap();
+        assert_eq!(back, pred);
+    }
+
+    fn not_chain(nots: u32) -> PredicateWire {
+        let mut nodes = vec![PredicateNodeWire::Exists {
+            key: pol01_key("k"),
+        }];
+        for i in 1..=nots {
+            nodes.push(PredicateNodeWire::Not { child: i - 1 });
+        }
+        PredicateWire {
+            nodes,
+            root_idx: nots,
+        }
+    }
+
+    /// The rebuild is iterative, so a `Not` chain far deeper than any
+    /// thread stack is refused rather than overflowing it (the FFI entry
+    /// points accept tables of any length, and the recursive rebuild
+    /// overflowed the stack on this). It is refused, not decoded, because
+    /// evaluating or dropping the decoded chain would recurse that deep.
+    #[test]
+    fn wire_deep_not_chain_is_refused_without_recursion() {
+        assert_eq!(
+            not_chain(200_000).into_predicate(),
+            Err(PredicateWireError::TooDeep {
+                limit: MAX_PREDICATE_WIRE_DEPTH
+            })
+        );
+    }
+
+    /// The depth limit counts levels, root included: `n` Nots over a leaf
+    /// is `n + 1` deep.
+    #[test]
+    fn wire_depth_limit_is_exact() {
+        let nots = (MAX_PREDICATE_WIRE_DEPTH - 1) as u32;
+        let pred = not_chain(nots).into_predicate().unwrap();
+        let mut d = 0;
+        let mut cur = &pred;
+        while let Predicate::Not(inner) = cur {
+            d += 1;
+            cur = inner;
+        }
+        assert_eq!(d, nots);
+        assert!(matches!(
+            not_chain(nots + 1).into_predicate(),
+            Err(PredicateWireError::TooDeep { .. })
+        ));
+    }
+
+    /// POL-01, the byte budget: one shared leaf with a large key, reached
+    /// through a chain of `And`s naming their predecessor twice, stays
+    /// inside the NODE budget but would clone the key thousands of times.
+    #[test]
+    fn wire_shared_large_leaf_beyond_the_byte_budget_is_refused() {
+        let big = "k".repeat(4096);
+        let mut nodes = vec![PredicateNodeWire::Exists {
+            key: pol01_key(&big),
+        }];
+        // 2^12 leaf copies: 4096 * 4096 bytes = 16 MiB > 1 MiB, while only
+        // 2^13 - 1 nodes, inside the node budget.
+        for i in 1..=12u32 {
+            nodes.push(PredicateNodeWire::And {
+                children: vec![i - 1, i - 1],
+            });
+        }
+        let wire = PredicateWire {
+            nodes,
+            root_idx: 12,
+        };
+        assert_eq!(
+            wire.into_predicate(),
+            Err(PredicateWireError::ExpansionBytesTooLarge {
+                limit: MAX_PREDICATE_EXPANDED_BYTES
+            })
+        );
+    }
+
     #[test]
     fn wire_simple_leaf_round_trips() {
         // Smallest case: a single leaf predicate. nodes has one
@@ -3721,11 +4040,10 @@ mod tests {
         // Build a 10_000-deep `Not(Not(...Exists))` chain;
         // confirm to_wire produces 10_001 nodes (10k Not + 1
         // leaf) and that the root index is the topmost Not.
-        // (The mirror rebuild path `into_predicate` is still
-        // recursive — out of scope for this fix; the FFI parser
-        // caps depth at 64, and SDK consumers build trees via
-        // typed factories where recursion-driven depth is a
-        // developer-controlled property.)
+        // (The mirror rebuild path `into_predicate` is iterative
+        // too, and refuses trees deeper than
+        // `MAX_PREDICATE_WIRE_DEPTH`, since evaluating or dropping
+        // one would recurse that deep.)
         let leaf = Predicate::Exists {
             key: TagKey::new(TaxonomyAxis::Hardware, "gpu"),
         };

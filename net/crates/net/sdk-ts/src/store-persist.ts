@@ -12,7 +12,7 @@
  * const host = hostStore({ definition: world, initialState: restored?.state ?? fresh(), … });
  * const saving = persistStore(host, { file, intervalMs: 5_000 });
  * // … on shutdown:
- * saving.close();                                      // one last snapshot, then stop
+ * await saving.close();                                // one last durable snapshot, then stop
  * ```
  *
  * A snapshot is the whole document as JSON, tagged with the definition's id
@@ -65,10 +65,14 @@ export interface PersistStoreOptions {
 
 /** The running snapshotter {@link persistStore} returns. */
 export interface StorePersistence {
-  /** Snapshot now if the document changed since the last one; `true` if one was written. */
-  flush(): boolean;
-  /** One last {@link flush}, then stop the timer. Idempotent. */
-  close(): void;
+  /** Snapshot now if the document changed since the last one. Resolves
+   *  `true` once one was written (and, with `sync`, fsynced); rejects if the
+   *  write or fsync failed. */
+  flush(): Promise<boolean>;
+  /** Stop the timer and take one last snapshot. Resolves once it is
+   *  durable; idempotent after that. If that final snapshot fails, rejects and
+   *  stays open, so calling `close()` again retries it. */
+  close(): Promise<void>;
   /** Snapshots written so far. */
   readonly snapshots: number;
 }
@@ -112,8 +116,22 @@ export function persistStore<S>(store: PersistableStore<S>, options: PersistStor
   let saved: S | undefined;
   let snapshots = 0;
   let closed = false;
+  // Snapshots run one at a time, in call order. Each awaits its fsync before
+  // the next one looks at `saved`, so an interval tick and a manual flush
+  // never both write the same document, and appends stay in order.
+  let tail: Promise<unknown> = Promise.resolve();
+  const serialized = <T>(op: () => Promise<T>): Promise<T> => {
+    const run = tail.then(op, op);
+    tail = run.catch(() => undefined);
+    return run;
+  };
 
-  const flush = (): boolean => {
+  // BUG_AUDIT_2026_11_14 TSDK-01: `saved` and the count advance only once the
+  // requested durability is done. Before, `file.sync()` returned before its
+  // fsync ran (the wrapper dropped the native promise), so a snapshot was
+  // counted saved, and a world handoff's `persist` returned, before it was on
+  // disk; a failed fsync escaped `onError` as an unhandled rejection.
+  const writeSnapshot = async (): Promise<boolean> => {
     const state = store.getState();
     if (saved !== undefined && Object.is(state, saved)) return false;
     const frame: SnapshotFrame = {
@@ -125,18 +143,19 @@ export function persistStore<S>(store: PersistableStore<S>, options: PersistStor
       state,
     };
     file.append(Buffer.from(JSON.stringify(frame), 'utf8'));
-    if (sync) file.sync();
+    if (sync) await file.sync();
     saved = state;
     snapshots += 1;
     return true;
   };
 
+  // `closed` is checked when a queued snapshot RUNS, not only when it is
+  // queued: a flush or tick queued behind `close()`'s final snapshot must
+  // not append after the close it was queued behind.
+  const snapshotUnlessClosed = (): Promise<boolean> => (closed ? Promise.resolve(false) : writeSnapshot());
+
   const tick = (): void => {
-    try {
-      flush();
-    } catch (error) {
-      options.onError?.(error);
-    }
+    serialized(snapshotUnlessClosed).catch((error: unknown) => options.onError?.(error));
   };
   const timer = intervalMs > 0 ? setInterval(tick, intervalMs) : null;
   // A snapshotter is not a reason to keep the process alive.
@@ -144,14 +163,23 @@ export function persistStore<S>(store: PersistableStore<S>, options: PersistStor
 
   return {
     flush: () => {
-      if (closed) return false;
-      return flush();
+      if (closed) return Promise.resolve(false);
+      return serialized(snapshotUnlessClosed);
     },
-    close: () => {
+    close: async () => {
       if (closed) return;
-      closed = true;
+      // TSDK-07: the snapshotter counts as closed only once its final
+      // snapshot is durable. A failed final save (disk full) rejects and
+      // leaves it open, interval included, so periodic saves continue and a
+      // later `close()` or `flush()` retries the unsaved document instead
+      // of silently succeeding. `closed` is set inside the serialized run,
+      // so whatever was queued after it sees it.
+      await serialized(async () => {
+        if (closed) return;
+        await writeSnapshot();
+        closed = true;
+      });
       if (timer !== null) clearInterval(timer);
-      flush();
     },
     get snapshots() {
       return snapshots;

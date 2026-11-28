@@ -110,7 +110,7 @@ describe('a world across native region hosts', () => {
     const events: string[] = [];
 
     /** One region host: store (restored from RedEX when it has one), persistence, directory, driver. */
-    const regionHost = (mesh: MeshNode, name: string, fresh: Record<string, Ship>) => {
+    const regionHost = async (mesh: MeshNode, name: string, fresh: Record<string, Ship>) => {
       const transport: MeshStoreTransport = meshStoreTransport(mesh, {
         listen: [`store/${definition.id}`, 'acceptance.handoff'],
       });
@@ -127,7 +127,9 @@ describe('a world across native region hosts', () => {
         inputs: {},
       });
       const saving = persistStore(host, { file, intervalMs: 0 });
-      saving.flush();
+      // The first durable snapshot, awaited so setup sees a failed write;
+      // every later one is serialized after it.
+      await saving.flush();
       const stopAnnouncing = announceRegions(transport, WORLD, [name], { everyMs: 300 });
       const directory = regionDirectory({ node: transport, world: WORLD, trustedHosts: trusted });
       const link = handoffLink<Ship>({
@@ -140,8 +142,8 @@ describe('a world across native region hosts', () => {
         link,
         region: name,
         ...storeRegion<Region, Ship>(host, { region: name, collection: 'ships', ledger: 'handoff' }),
-        persist: () => {
-          saving.flush();
+        persist: async () => {
+          await saving.flush();
         },
         onEvent: (event: HandoffEvent) => events.push(`${name}:${event.type}`),
         timing: { retryMs: 100, giveUpMs: 1_500, handledRetentionMs: 60_000 },
@@ -151,16 +153,16 @@ describe('a world across native region hosts', () => {
         handoffs.close();
         link.close();
         stopAnnouncing();
-        saving.close();
+        await saving.close();
         await host.close();
         transport.close();
-        file.close();
+        await file.close();
       };
       return { host, handoffs, directory, stop };
     };
 
-    const westRegion = regionHost(west.mesh, 'r:0:0', { s1: { x: 95, z: 50 } });
-    let eastRegion = regionHost(east.mesh, 'r:1:0', {});
+    const westRegion = await regionHost(west.mesh, 'r:0:0', { s1: { x: 95, z: 50 } });
+    let eastRegion = await regionHost(east.mesh, 'r:1:0', {});
     await until(
       () => westRegion.directory.peerOf('r:1:0') !== null,
       'west to find east',
@@ -228,7 +230,7 @@ describe('a world across native region hosts', () => {
     expect(westRegion.handoffs.locate('s1')).toEqual({ at: 'in-transit', to: 'r:1:0', id });
 
     // East comes back from its RedEX snapshot; the re-offer lands it once.
-    eastRegion = regionHost(east.mesh, 'r:1:0', {});
+    eastRegion = await regionHost(east.mesh, 'r:1:0', {});
     await westRegion.handoffs.reoffer(id);
     await until(() => events.filter(e => e === 'r:0:0:moved').length === 2, 'the re-offer to settle', 10_000);
     expect(eastRegion.host.getState().ships).toEqual({ s1: { x: 105, z: 50 } });

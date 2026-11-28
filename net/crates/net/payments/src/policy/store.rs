@@ -146,15 +146,8 @@ where
     })
 }
 
-/// Atomic save: per-pid temp, 0600 from creation on unix, fsync, rename.
-async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StoreError::io(path, e))?;
-        }
-    }
+/// Serialize a store for saving.
+fn encode_store<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, StoreError> {
     // Compact, not pretty: the store is machine-shared state, never
     // hand-authored config, and pretty-printing costs ~11% more bytes to
     // serialize, write, and fsync on *every* dirty mutation — a tax paid
@@ -163,76 +156,230 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     // stores written by an older build. (The canonical envelope encoding
     // pinned by the cross-language golden vectors is
     // `core::canonical` — a different encoder entirely, untouched here.)
-    let bytes = serde_json::to_vec(value).map_err(|e| StoreError::io(path, e))?;
+    serde_json::to_vec(value).map_err(|e| StoreError::io(path, e))
+}
 
-    // The staging name is chosen by the create below (a taken one is
-    // skipped); until then this placeholder only names errors.
+/// Publish `bytes` as the store at `path` — atomically and durably, on the
+/// blocking pool, while the transaction's lock guard is held — then release
+/// the lock.
+///
+/// The guard MOVES into the blocking task (BUG_AUDIT_2026_11_14 PAY-04).
+/// Tokio cannot abort a blocking task that has started, so when the save
+/// was a series of `spawn_blocking` steps awaited by the async caller, a
+/// cancelled caller dropped its lock while a step (the final rename, say)
+/// kept running. A second transaction could then take the lock and commit,
+/// and the first one's delayed rename landed over it, publishing older
+/// state. Now the lock is released only when the whole filesystem
+/// sequence has finished, whether or not anyone is still awaiting it.
+async fn publish_locked(guard: LockGuard, path: &Path, bytes: Vec<u8>) -> Result<(), StoreError> {
+    let store = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        publish_blocking(&store, &bytes)
+    })
+    .await
+    .map_err(|e| StoreError::io(path, e))?
+}
+
+/// The synchronous save: a uniquely named owner-only staging file, written
+/// and fsynced, renamed over the store, then the directory fsynced.
+fn publish_blocking(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::io(path, e))?;
+        }
+    }
+
+    // Created with its permissions already in place — owner-only from the
+    // instant the name exists. This is why it is a create rather than an
+    // open-then-restrict: on Windows, access is evaluated when a handle is
+    // opened, so a reader that got in before a later DACL change keeps what
+    // it was granted for the life of that handle. There must be no window
+    // at all, not merely a short one.
+    //
+    // `create_new` also means a leftover temp from a crashed same-pid
+    // process cannot be silently reused with its old permissions. A taken
+    // name is skipped for the next candidate, never removed: an existing
+    // file there is not established to be ours.
+    const ATTEMPTS: usize = 64;
     let mut tmp = staging_path(path);
-    let mut created = false;
-    let result: Result<(), StoreError> = async {
-        // Created with its permissions already in place — owner-only from
-        // the instant the name exists. This is why it is a create rather
-        // than an open-then-restrict: on Windows, access is evaluated when
-        // a handle is opened, so a reader that got in before a later DACL
-        // change keeps what it was granted for the life of that handle.
-        // There must be no window at all, not merely a short one.
-        //
-        // `create_new` also means a leftover temp from a crashed same-pid
-        // process cannot be silently reused with its old permissions. A
-        // taken name is skipped for the next candidate, never removed: an
-        // existing file there is not established to be ours.
-        // Off the reactor: `create_owner_only` is synchronous, and on
-        // Windows it is several blocking syscalls (token read, SDDL
-        // conversion, `CreateFileW`). A custom store path on a network or
-        // FUSE filesystem can make those slow, and every payment passes
-        // through here — a stalled worker would stall concurrent
-        // payments, not merely this one.
-        let first = tmp.clone();
-        let store = path.to_path_buf();
-        let (staged, file) = tokio::task::spawn_blocking(move || {
-            const ATTEMPTS: usize = 64;
-            let mut candidate = first;
-            let mut attempt = 1;
-            loop {
-                match super::file_mode::create_owner_only(&candidate) {
-                    Ok(file) => return (candidate, Ok(file)),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < ATTEMPTS =>
-                    {
-                        attempt += 1;
-                        candidate = staging_path(&store);
-                    }
-                    Err(e) => return (candidate, Err(e)),
-                }
+    let mut attempt = 1;
+    let mut file = loop {
+        match super::file_mode::create_owner_only(&tmp) {
+            Ok(file) => break file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < ATTEMPTS => {
+                attempt += 1;
+                tmp = staging_path(path);
             }
-        })
-        .await
-        .map_err(|e| StoreError::io(&tmp, e))?;
-        let file = file.map_err(|e| StoreError::io(&staged, e))?;
-        tmp = staged;
-        created = true;
-        let mut file = tokio::fs::File::from_std(file);
-        use tokio::io::AsyncWriteExt as _;
-        file.write_all(&bytes)
-            .await
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        file.flush().await.map_err(|e| StoreError::io(&tmp, e))?;
+            Err(e) => return Err(StoreError::io(&tmp, e)),
+        }
+    };
+
+    let staged: Result<(), StoreError> = (|| {
+        file.write_all(bytes).map_err(|e| StoreError::io(&tmp, e))?;
         // fsync before the rename so a crash right after the rename can
         // never surface a truncated store.
-        file.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
+        file.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         drop(file);
-        tokio::fs::rename(&tmp, path)
-            .await
-            .map_err(|e| StoreError::io(path, e))
+        #[cfg(test)]
+        test_hooks::pause_before_rename(path);
+        rename_durably(&tmp, path).map_err(|e| StoreError::io(path, e))
+    })();
+    if staged.is_err() {
+        // Only a temp this save created is removed: a name it could not
+        // create belongs to someone else.
+        let _ = std::fs::remove_file(&tmp);
+        return staged;
     }
-    .await;
 
-    // Only a temp this save created is removed: a name it could not create
-    // belongs to someone else.
-    if result.is_err() && created {
-        let _ = tokio::fs::remove_file(&tmp).await;
+    // BUG_AUDIT_2026_11_14 PAY-05: the rename is atomic but, on POSIX, not
+    // durable until the containing directory is synced. A power loss after
+    // an acknowledged reservation or redemption could otherwise restore the
+    // predecessor store, losing the acknowledged state and reopening budget
+    // or execution admission. A transaction is reported committed only
+    // once the directory entry is durable. If this sync fails, the new
+    // store is already visible but not known to be durable, so the
+    // transaction reports the failure rather than success.
+    sync_parent_dir(path).map_err(|e| StoreError::Io {
+        path: path.display().to_string(),
+        reason: format!("store renamed into place but its directory could not be synced: {e}"),
+    })
+}
+
+/// Fsync the directory holding `path`, so a rename into it survives power
+/// loss.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    test_hooks::count_dir_sync();
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+/// Windows has no directory fsync (`FlushFileBuffers` on a directory
+/// handle is `ERROR_ACCESS_DENIED`). There the rename itself is made
+/// durable instead, by [`rename_durably`]'s `MOVEFILE_WRITE_THROUGH`, so
+/// nothing is left to do here. Same policy as the org revocation store's
+/// `fsync_parent_dir`.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    test_hooks::count_dir_sync();
+    Ok(())
+}
+
+/// Atomically replace `dest` with `src`. On POSIX a plain rename;
+/// [`sync_parent_dir`] makes it durable afterwards.
+#[cfg(not(windows))]
+fn rename_durably(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::rename(src, dest)
+}
+
+/// Atomically and DURABLY replace `dest` with `src` on Windows (PAY-05).
+///
+/// `std::fs::rename` is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` without
+/// write-through: the new directory entry can sit in the volume's metadata
+/// cache, and a power loss shortly after an acknowledged commit could bring
+/// back the predecessor store. NTFS journaling keeps metadata CONSISTENT
+/// after a crash; it does not promise a completed rename was flushed.
+/// `MOVEFILE_WRITE_THROUGH` is documented to flush the move before
+/// returning.
+#[cfg(windows)]
+fn rename_durably(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    // Verbatim (`\\?\`) form, as `std::fs` builds internally: a raw
+    // `MoveFileExW` is otherwise limited to MAX_PATH, and a valid store
+    // name near the 255-byte component limit already exceeds it.
+    // `std::path::absolute` resolves `.`/`..` and `/` first, which a
+    // verbatim path no longer would.
+    let wide = |p: &Path| -> std::io::Result<Vec<u16>> {
+        let abs = std::path::absolute(p)?;
+        let raw: Vec<u16> = abs.as_os_str().encode_wide().collect();
+        let bs = u16::from(b'\\');
+        let q = u16::from(b'?');
+        let mut out: Vec<u16> = Vec::with_capacity(raw.len() + 9);
+        if raw.starts_with(&[bs, bs, q, bs]) {
+            // Already verbatim.
+        } else if raw.starts_with(&[bs, bs]) {
+            // UNC `\\server\share\…` → `\\?\UNC\server\share\…`.
+            out.extend(r"\\?\UNC".encode_utf16());
+            out.extend_from_slice(&raw[1..]);
+            out.push(0);
+            return Ok(out);
+        } else {
+            out.extend(r"\\?\".encode_utf16());
+        }
+        out.extend_from_slice(&raw);
+        out.push(0);
+        Ok(out)
+    };
+    let (from, to) = (wide(src)?, wide(dest)?);
+    // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the call;
+    // no pointer escapes it, and the result is checked below.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    result
+    Ok(())
+}
+
+/// Test-only seams into the blocking publish (PAY-04 / PAY-05 witnesses).
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{Receiver, Sender};
+
+    type Pause = (std::path::PathBuf, Sender<()>, Receiver<()>);
+
+    /// `(store, entered, resume)`: the next publish OF `store` signals
+    /// `entered` just before its rename and waits for `resume`. One-shot,
+    /// and scoped to one store path, so tests sharing a process (plain
+    /// `cargo test`) cannot catch each other's saves.
+    static PAUSE: parking_lot::Mutex<Option<Pause>> = parking_lot::Mutex::new(None);
+    static DIR_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn arm_pause_before_rename(
+        store: &std::path::Path,
+        entered: Sender<()>,
+        resume: Receiver<()>,
+    ) {
+        *PAUSE.lock() = Some((store.to_path_buf(), entered, resume));
+    }
+
+    pub(super) fn pause_before_rename(store: &std::path::Path) {
+        let armed = {
+            let mut slot = PAUSE.lock();
+            match slot.as_ref() {
+                Some((armed_for, _, _)) if armed_for == store => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, entered, resume)) = armed {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
+    }
+
+    pub(super) fn count_dir_sync() {
+        DIR_SYNCS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn dir_syncs() -> u64 {
+        DIR_SYNCS.load(Ordering::SeqCst)
+    }
 }
 
 /// The locked read-modify-write transaction. The load happens *inside*
@@ -244,10 +391,11 @@ where
     T: DeserializeOwned + Serialize + Default,
     F: FnOnce(&mut T) -> R,
 {
-    let _guard = LockGuard::acquire(path).await?;
+    let guard = LockGuard::acquire(path).await?;
     let mut state: T = load_json(path).await?;
     let result = f(&mut state);
-    save_json(path, &state).await?;
+    let bytes = encode_store(path, &state)?;
+    publish_locked(guard, path, bytes).await?;
     Ok(result)
 }
 
@@ -274,11 +422,12 @@ where
     T: DeserializeOwned + Serialize + Default,
     F: FnOnce(&mut T) -> (R, bool),
 {
-    let _guard = LockGuard::acquire(path).await?;
+    let guard = LockGuard::acquire(path).await?;
     let mut state: T = load_json(path).await?;
     let (result, dirty) = f(&mut state);
     if dirty {
-        save_json(path, &state).await?;
+        let bytes = encode_store(path, &state)?;
+        publish_locked(guard, path, bytes).await?;
     }
     Ok(result)
 }
@@ -606,6 +755,85 @@ mod tests {
         rb.unwrap();
         let loaded: Counters = load_json(&path).await.unwrap();
         assert_eq!(loaded.counts.len(), 2, "one mutation was lost");
+    }
+
+    /// BUG_AUDIT_2026_11_14 PAY-04: cancelling a transaction while its
+    /// blocking save is in flight must not release the store's lock before
+    /// that save finishes. Before the fix the lock guard lived in the async
+    /// caller, so a cancelled caller released the lock while its rename was
+    /// still pending on the blocking pool. A second transaction then
+    /// committed, and the first one's delayed rename published older state
+    /// over it, losing the second update.
+    ///
+    /// The first save is paused (by a test hook) just before its rename;
+    /// its caller is then aborted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_transaction_keeps_the_lock_until_its_save_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        test_hooks::arm_pause_before_rename(&path, entered_tx, resume_rx);
+
+        let first = tokio::spawn({
+            let path = path.clone();
+            async move {
+                mutate_json::<Counters, _, _>(&path, |s| {
+                    s.counts.insert("first".into(), 1);
+                })
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        first.abort();
+        let _ = first.await;
+
+        let second = tokio::spawn({
+            let path = path.clone();
+            async move {
+                mutate_json::<Counters, _, _>(&path, |s| {
+                    s.counts.insert("second".into(), 1);
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "the second transaction must wait for the cancelled one's save"
+        );
+
+        resume_tx.send(()).unwrap();
+        second.await.unwrap().unwrap();
+        let loaded: Counters = load_json(&path).await.unwrap();
+        assert_eq!(
+            loaded.counts.get("second"),
+            Some(&1),
+            "the second, acknowledged update must not be overwritten"
+        );
+        assert_eq!(
+            loaded.counts.get("first"),
+            Some(&1),
+            "the first save ran to completion before the second loaded"
+        );
+    }
+
+    /// BUG_AUDIT_2026_11_14 PAY-05: a committed transaction syncs the
+    /// store's directory after the rename (the sync is a no-op on Windows,
+    /// but it is reached on every platform).
+    #[tokio::test]
+    async fn a_committed_transaction_syncs_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let before = test_hooks::dir_syncs();
+        mutate_json::<Counters, _, _>(&path, |s| {
+            s.counts.insert("a".into(), 1);
+        })
+        .await
+        .unwrap();
+        assert!(test_hooks::dir_syncs() > before);
     }
 
     /// The pool-exhaustion regression: many contenders on a tiny runtime

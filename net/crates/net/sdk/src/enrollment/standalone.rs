@@ -868,9 +868,12 @@ impl ChannelMembership {
     pub fn open(dir: &Path) -> Result<Self, DeviceJoinError> {
         let storage = EnrollmentStorage::open(dir)?;
         let (invite, subject, issuer_node, chain, left_at) = decode_channel(&storage.read()?)?;
+        // Stored state: the chain must be intact, not still valid. An
+        // expired channel credential is still the one that was installed
+        // (ENR-01); using it is checked at use.
         if let Some(chain) = &chain {
             let offer = invite.channel().ok_or(DeviceJoinError::Corrupt)?;
-            if !super::bundle::channel_chain_matches(offer, &subject, chain) {
+            if !super::bundle::channel_chain_is_intact(offer, &subject, chain) {
                 return Err(DeviceJoinError::Corrupt);
             }
         }

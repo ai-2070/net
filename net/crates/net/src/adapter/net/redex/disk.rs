@@ -102,6 +102,54 @@ pub(super) struct RecoveredSegment {
     /// entries (with reduced fidelity for age-based retention
     /// across the gap).
     pub timestamps: Option<Vec<u64>>,
+    /// The lowest `next_seq` the file may resume at, persisted by the
+    /// last compaction (the generation's `seq` sidecar), independent of
+    /// which entries survived it. `0` when the generation has none
+    /// (written before the sidecar existed, or never compacted).
+    ///
+    /// BUG_AUDIT_2026_11_14 PERSIST-01: `next_seq` used to come only from
+    /// the last recovered entry, so retention that evicted every entry
+    /// followed by a reopen restarted allocation at 0 and re-issued
+    /// sequence numbers that cursors, tokens and checkpoints already named.
+    pub next_seq_floor: u64,
+}
+
+/// File name of a generation's sequence-floor sidecar (PERSIST-01).
+const SEQ_FLOOR_FILE: &str = "seq";
+
+/// Encode the sequence-floor sidecar: `floor` (u64 LE) followed by an
+/// xxh3 of those 8 bytes (u64 LE), so a torn or garbage file reads as
+/// absent rather than as a wrong floor.
+fn encode_seq_floor(floor: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&floor.to_le_bytes());
+    let checksum = xxhash_rust::xxh3::xxh3_64(&buf[0..8]);
+    buf[8..16].copy_from_slice(&checksum.to_le_bytes());
+    buf
+}
+
+/// Read a generation's sequence-floor sidecar. `0` when it is missing
+/// (older generations) or does not validate (logged).
+fn read_seq_floor(gen_dir: &Path) -> u64 {
+    let path = gen_dir.join(SEQ_FLOOR_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "redex: unreadable seq-floor sidecar; ignoring");
+            return 0;
+        }
+    };
+    let valid = bytes.len() == 16 && {
+        let floor_bytes: [u8; 8] = bytes[0..8].try_into().unwrap_or_default();
+        let claimed = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default());
+        claimed == xxhash_rust::xxh3::xxh3_64(&floor_bytes)
+    };
+    if !valid {
+        tracing::warn!(path = %path.display(), "redex: corrupt seq-floor sidecar; ignoring");
+        return 0;
+    }
+    u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default())
 }
 
 /// Disk-backed durability segment: append-only idx + dat files,
@@ -552,33 +600,34 @@ impl DiskSegment {
             );
         }
 
-        // If we dropped mid-file entries, the on-disk ts file no
-        // longer matches the surviving index byte-for-byte. Rewrite
-        // it with the compacted timestamps so the next reopen sees a
-        // file of length `surviving * 8` whose i-th entry pairs with
-        // `index[i]`. When no entries were dropped, just truncate the
-        // trailing slack from the tail-truncation step. The
-        // seq-monotonicity trim above only drops a TAIL (and shortens
-        // `timestamps` in lock-step), so it never needs the mid-file
-        // rewrite — the `else` branch's plain `set_len` re-aligns the
-        // ts file to the shortened index.
-        if let Some(ts) = timestamps.as_ref() {
-            if bad_entries > 0 {
-                if let Ok(mut file) = OpenOptions::new().write(true).truncate(true).open(&ts_path) {
-                    use std::io::Write as _;
-                    let mut buf = Vec::with_capacity(ts.len() * 8);
-                    for &t in ts {
-                        buf.extend_from_slice(&t.to_le_bytes());
-                    }
-                    let _ = file.write_all(&buf);
-                }
-            } else if !index.is_empty() {
-                // No mid-file drops; just align length with idx.
-                if let Ok(file) = OpenOptions::new().write(true).open(&ts_path) {
-                    let _ = file.set_len((index.len() * 8) as u64);
-                }
+        // Does the recovered state differ from what the live
+        // generation's files say, in a way a plain tail `set_len`
+        // cannot repair? Then it is published as a fresh generation
+        // (below, once the segment exists) BEFORE any append can land.
+        //
+        // - A mid-file checksum drop (`bad_entries > 0`) leaves the idx
+        //   file holding the dropped records, and the seq trim above is
+        //   in memory only in that case. BUG_AUDIT_2026_11_14 PERSIST-03:
+        //   an append made after such a recovery went in after the
+        //   un-trimmed non-monotonic suffix, so the next reopen trimmed
+        //   it away with that suffix. PERSIST-08: the ts sidecar was
+        //   rewritten to the survivors while idx was not, so the next
+        //   open saw mismatched lengths and reset every surviving
+        //   entry's age to `now()`, on every restart.
+        // - A missing or mismatched ts sidecar for a non-empty index
+        //   (PERSIST-02 recovers such a generation instead of replacing
+        //   it) would otherwise reset ages on every restart for the
+        //   same reason.
+        //
+        // Otherwise only the tail can have changed, and the plain
+        // `set_len` below re-aligns the ts file to the index.
+        let publish_recovered = bad_entries > 0 || (timestamps.is_none() && !index.is_empty());
+        if !publish_recovered && timestamps.is_some() && !index.is_empty() {
+            if let Ok(file) = OpenOptions::new().write(true).open(&ts_path) {
+                let _ = file.set_len((index.len() * 8) as u64);
             }
         }
+        let recovered_seq_floor = read_seq_floor(&live_dir);
 
         let idx_file = OpenOptions::new()
             .create(true)
@@ -616,51 +665,79 @@ impl DiskSegment {
         let initial_dat_len = dat_file.metadata().map_err(RedexError::io)?.len();
         let initial_ts_len = ts_file.metadata().map_err(RedexError::io)?.len();
 
+        let disk = DiskSegment {
+            dir,
+            live_gen: AtomicU32::new(live_gen),
+            idx_file: Mutex::new(idx_file),
+            dat_file: Mutex::new(dat_file),
+            ts_file: Mutex::new(ts_file),
+            worker_idx_file: Mutex::new(worker_idx_file),
+            worker_dat_file: Mutex::new(worker_dat_file),
+            worker_ts_file: Mutex::new(worker_ts_file),
+            dat_len: AtomicU64::new(initial_dat_len),
+            idx_len: AtomicU64::new(initial_idx_len),
+            ts_len: AtomicU64::new(initial_ts_len),
+            fsync_every_n,
+            fsync_max_bytes,
+            appends_since_sync: AtomicU64::new(0),
+            bytes_since_sync: AtomicU64::new(0),
+            fsync_signal: Arc::new(Notify::new()),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_append: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_dat_write: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_compact: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_idx_metadata: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_ts_metadata: AtomicBool::new(false),
+            #[cfg(test)]
+            sync_count: AtomicU64::new(0),
+        };
+
+        // Publish a recovered state the files do not already hold (see
+        // `publish_recovered` above) as a fresh generation, through the
+        // same atomic manifest flip as a retention compaction. Heap
+        // offsets are unchanged (`dat_base = 0` copies the whole dat; the
+        // dropped records' bytes stay behind as dead space). A missing
+        // ts sidecar is published with `now()`, which is what the file
+        // layer would substitute anyway, but once instead of on every
+        // restart. If the publication fails the open fails: accepting
+        // appends on top of an unpublished recovery is exactly how
+        // PERSIST-03 lost them.
+        let next_seq_floor = recovered_seq_floor.max(index.last().map_or(0, |e| e.seq + 1));
+        if publish_recovered {
+            let ts = timestamps
+                .take()
+                .unwrap_or_else(|| vec![now_ns_disk(); index.len()]);
+            disk.compact_to(&index, &ts, 0, next_seq_floor)?;
+            tracing::warn!(
+                entries = index.len(),
+                generation = disk.live_gen.load(Ordering::Acquire),
+                "DiskSegment::open: published the recovered index and timestamps \
+                 as a fresh generation"
+            );
+            timestamps = Some(ts);
+        }
+
         // Sweep any orphan generation directories left behind by a
         // crashed prior `compact_to`. A crash between writing
         // `v<N+1>/{idx,dat,ts}` and the manifest flip leaves the
         // partial `v<N+1>/` behind; recovery picked the older `v<N>/`
         // and now we delete the stale newer one. Best-effort — sweep
         // failures are logged but don't block open.
-        sweep_orphan_generations(&dir, live_gen);
+        sweep_orphan_generations(&disk.dir, disk.live_gen.load(Ordering::Acquire));
 
         Ok(RecoveredSegment {
-            disk: DiskSegment {
-                dir,
-                live_gen: AtomicU32::new(live_gen),
-                idx_file: Mutex::new(idx_file),
-                dat_file: Mutex::new(dat_file),
-                ts_file: Mutex::new(ts_file),
-                worker_idx_file: Mutex::new(worker_idx_file),
-                worker_dat_file: Mutex::new(worker_dat_file),
-                worker_ts_file: Mutex::new(worker_ts_file),
-                dat_len: AtomicU64::new(initial_dat_len),
-                idx_len: AtomicU64::new(initial_idx_len),
-                ts_len: AtomicU64::new(initial_ts_len),
-                fsync_every_n,
-                fsync_max_bytes,
-                appends_since_sync: AtomicU64::new(0),
-                bytes_since_sync: AtomicU64::new(0),
-                fsync_signal: Arc::new(Notify::new()),
-                poisoned: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(test)]
-                fail_next_append: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_after_dat_write: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_next_sync: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_next_compact: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_next_idx_metadata: AtomicBool::new(false),
-                #[cfg(test)]
-                fail_next_ts_metadata: AtomicBool::new(false),
-                #[cfg(test)]
-                sync_count: AtomicU64::new(0),
-            },
+            disk,
             index,
             payload_bytes,
             timestamps,
+            next_seq_floor: recovered_seq_floor,
         })
     }
 
@@ -1361,6 +1438,7 @@ impl DiskSegment {
         surviving_index: &[RedexEntry],
         surviving_timestamps: &[u64],
         dat_base: u64,
+        next_seq_floor: u64,
     ) -> Result<(), RedexError> {
         // Refuse compact against a poisoned segment. The flag
         // is set by the partial-write rollback paths when they
@@ -1470,6 +1548,21 @@ impl DiskSegment {
         let next_idx_path = next_dir.join("idx");
         let next_dat_path = next_dir.join("dat");
         let next_ts_path = next_dir.join("ts");
+        // PERSIST-01: the allocation watermark, kept independently of
+        // which entries survive, so a compaction that evicts everything
+        // does not reset `next_seq` on the next open. Written and synced
+        // with the other three files, before the manifest flip.
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(next_dir.join(SEQ_FLOOR_FILE))
+                .map_err(RedexError::io)?;
+            f.write_all(&encode_seq_floor(next_seq_floor))
+                .map_err(RedexError::io)?;
+            f.sync_all().map_err(RedexError::io)?;
+        }
         {
             let mut f = OpenOptions::new()
                 .create(true)
@@ -1861,6 +1954,67 @@ fn generation_is_complete(channel_dir: &Path, gen: u32) -> bool {
     dir.join("idx").is_file() && dir.join("dat").is_file() && dir.join("ts").is_file()
 }
 
+/// May recovery use generation `gen`, which a valid manifest names?
+///
+/// A manifest-named generation is COMMITTED: `compact_to` flips the
+/// manifest only after writing and syncing all of its files. So, unlike a
+/// fallback candidate, which might be a crashed compaction's staging
+/// directory, its `ts` sidecar is optional: a lost sidecar costs only
+/// entry ages, which recovery already substitutes. BUG_AUDIT_2026_11_14
+/// PERSIST-02: the old completeness test required `ts`, so losing only
+/// the live generation's `ts` made recovery fall back, find nothing,
+/// create an empty generation 1 and sweep the intact one, deleting a
+/// good idx and dat.
+///
+/// - `Ok(false)`: the directory is gone. Fall back to enumeration (the
+///   existing torn-manifest path); nothing of this generation is left
+///   to lose.
+/// - `Err`: the index is missing while `dat` still holds payload bytes.
+///   Those bytes are unreachable without the index, and every fallback
+///   (an older generation, a new empty one) would sweep them. Fail
+///   closed rather than destroy data an operator may still recover.
+/// - `Err` too for the mirror case: `dat` is missing while the index
+///   still holds entries. Recovery would drop every entry whose payload
+///   lived in the heap and publish the result, making the loss permanent.
+///   Every writer creates `dat` with `idx`, so its absence means it was
+///   removed, not that it was never written.
+/// - `Ok(true)` otherwise, including a generation whose files do not
+///   exist yet (a fresh channel that crashed before its first open
+///   created them).
+fn committed_generation_is_usable(channel_dir: &Path, gen: u32) -> std::io::Result<bool> {
+    let dir = gen_dir(channel_dir, gen);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    if !dir.join("idx").is_file() {
+        let dat_len = std::fs::metadata(dir.join("dat")).map_or(0, |m| m.len());
+        if dat_len > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "redex: committed generation {} has no index but its dat holds {dat_len} \
+                     bytes; refusing to recover over it",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    if !dir.join("dat").is_file() {
+        let idx_len = std::fs::metadata(dir.join("idx")).map_or(0, |m| m.len());
+        if idx_len > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "redex: committed generation {} has no dat but its index holds {idx_len} \
+                     bytes; refusing to recover over it",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(true)
+}
+
 /// Best-effort delete of `gen_dir(channel_dir, gen)`. Failure is
 /// logged but not surfaced — orphan generation cleanup is a
 /// background concern; the live generation is unaffected.
@@ -2001,7 +2155,7 @@ fn resolve_live_generation(channel_dir: &Path) -> std::io::Result<u32> {
         // names actually exists. A manifest pointing at a missing
         // directory means someone deleted v<N>/ between opens; treat
         // that as torn-manifest and fall back to enumeration.
-        if generation_is_complete(channel_dir, gen) {
+        if committed_generation_is_usable(channel_dir, gen)? {
             return Ok(gen);
         }
     }
@@ -2900,7 +3054,7 @@ mod tests {
         let dat_base = entries[2].payload_offset as u64;
         recovered
             .disk
-            .compact_to(&surviving, &surviving_ts, dat_base)
+            .compact_to(&surviving, &surviving_ts, dat_base, 0)
             .unwrap();
 
         let live = recovered.disk.live_dir();
@@ -3170,24 +3324,15 @@ mod tests {
         cleanup(&base);
     }
 
-    /// Companion to `recovery_truncates_at_non_monotonic_seq_header`
-    /// for the `bad_entries > 0` path: when a mid-file checksum drop
-    /// has ALSO occurred, the idx file is intentionally left
-    /// un-rewritten (it re-aligns lazily on the next append/compact),
-    /// so the seq-monotonicity trim must apply IN MEMORY only and must
-    /// NOT `set_len` the (now-misaligned) idx file. We still assert the
-    /// in-memory recovered index is correctly trimmed and that a second
-    /// reopen converges to the same result.
-    #[test]
-    fn recovery_seq_trim_is_in_memory_only_after_checksum_drop() {
-        let base = tmpdir();
-        let name = ChannelName::new("t/seq_monotonic_cksum").unwrap();
-        let dir = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION);
-        let idx_path = dir.join("idx");
-        let dat_path = dir.join("dat");
-
-        // Five strictly-increasing heap entries (seq 0..4).
-        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+    /// Five strictly-increasing heap entries (seq 0..4, payloads
+    /// `AA`..`EE`, timestamps 1000..5000) with TWO kinds of corruption:
+    /// record 1's payload fails its checksum (a mid-file drop,
+    /// `bad_entries > 0`), and record 3's `seq` header is rewritten to 2,
+    /// a monotonicity violation among the survivors. Recovery yields
+    /// `[0, 2]`.
+    fn combined_corruption_fixture(base: &Path, name: &ChannelName) {
+        let dir = gen_dir(&channel_dir(base, name), FIRST_GENERATION);
+        let recovered = DiskSegment::open(base, name, 0, 0).unwrap();
         let payloads: [&[u8]; 5] = [b"AA", b"BB", b"CC", b"DD", b"EE"];
         let timestamps: [u64; 5] = [1000, 2000, 3000, 4000, 5000];
         let mut offset = 0u32;
@@ -3201,47 +3346,257 @@ mod tests {
         }
         recovered.disk.sync().unwrap();
         drop(recovered);
+        // The dat layout is AABBCCDDEE; `BB` starts at offset 2.
+        let mut dat = std::fs::read(dir.join("dat")).unwrap();
+        dat[2] ^= 0xFF;
+        std::fs::write(dir.join("dat"), &dat).unwrap();
+        let mut idx_bytes = std::fs::read(dir.join("idx")).unwrap();
+        let rec3 = 3 * REDEX_ENTRY_SIZE;
+        idx_bytes[rec3..rec3 + 8].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(dir.join("idx"), &idx_bytes).unwrap();
+    }
 
-        // (1) Corrupt the payload of record 1 (`BB`) so its checksum
-        // fails → checksum filter drops it (bad_entries > 0). The dat
-        // layout is AABBCCDDEE; `BB` starts at offset 2.
-        {
-            let mut dat = std::fs::read(&dat_path).unwrap();
-            dat[2] ^= 0xFF;
-            std::fs::write(&dat_path, &dat).unwrap();
-        }
-        // (2) Corrupt the `seq` HEADER of record 3 (`DD`) to 2, which is
-        // <= record 2's seq (2) after the survivor compaction — a
-        // monotonicity violation among survivors. Payload + checksum
-        // left intact so the checksum filter accepts it.
-        {
-            let mut idx_bytes = std::fs::read(&idx_path).unwrap();
-            let rec3 = 3 * REDEX_ENTRY_SIZE;
-            idx_bytes[rec3..rec3 + 8].copy_from_slice(&2u64.to_le_bytes());
-            std::fs::write(&idx_path, &idx_bytes).unwrap();
-        }
+    /// Companion to `recovery_truncates_at_non_monotonic_seq_header`
+    /// for the `bad_entries > 0` path: a mid-file checksum drop leaves the
+    /// idx file misaligned with the recovered index, so a tail `set_len`
+    /// cannot repair it. Recovery publishes the recovered state as a
+    /// fresh generation instead (BUG_AUDIT_2026_11_14 PERSIST-03/-08;
+    /// it used to trim only in memory). The published generation holds
+    /// exactly the two survivors with their original timestamps, and a
+    /// second reopen recovers them with no further repair.
+    #[test]
+    fn recovery_after_a_checksum_drop_publishes_the_recovered_state() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/seq_monotonic_cksum").unwrap();
+        combined_corruption_fixture(&base, &name);
 
-        // Reopen. Checksum filter drops seq 1; survivors are
-        // [0, 2, 2(corrupt), 4]. The seq trim then truncates at the
-        // first non-monotonic survivor (the corrupt 2), leaving [0, 2].
+        // Checksum filter drops seq 1; survivors are [0, 2, 2(corrupt),
+        // 4]. The seq trim truncates at the corrupt 2, leaving [0, 2].
         let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![0, 2], "checksum drop then seq trim → [0, 2]");
-        for w in recovered.index.windows(2) {
-            assert!(w[0].seq < w[1].seq, "recovered index must be sorted by seq");
-        }
         let ts = recovered.timestamps.as_ref().expect("ts sidecar present");
         assert_eq!(ts, &vec![1000, 3000], "timestamps paired with survivors");
+        assert_eq!(
+            recovered.disk.live_gen(),
+            FIRST_GENERATION + 1,
+            "the recovered state was published as a fresh generation"
+        );
+        let live = recovered.disk.live_dir();
+        assert_eq!(
+            std::fs::metadata(live.join("idx")).unwrap().len() as usize,
+            2 * REDEX_ENTRY_SIZE
+        );
+        assert_eq!(std::fs::metadata(live.join("ts")).unwrap().len(), 16);
         drop(recovered);
+        assert!(
+            !gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).exists(),
+            "the corrupt generation is gone"
+        );
 
-        // Second reopen converges to the same in-memory result. (The
-        // idx file was not `set_len` on the seq trim because the
-        // checksum drop had already desynced it; recovery re-derives
-        // the survivors deterministically.)
         let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs2: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
         assert_eq!(seqs2, vec![0, 2], "second reopen is stable");
+        assert_eq!(
+            recovered2.disk.live_gen(),
+            FIRST_GENERATION + 1,
+            "and needs no repair"
+        );
+        assert_eq!(recovered2.timestamps, Some(vec![1000, 3000]));
 
+        cleanup(&base);
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-03: an append acknowledged after a
+    /// combined checksum + non-monotonic recovery survives the next
+    /// reopen. Before the fix the idx file still held the un-trimmed
+    /// suffix, the new record was appended after it, and the next
+    /// recovery trimmed the new record away with that suffix.
+    #[test]
+    fn an_append_after_combined_corruption_recovery_survives_reopen() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/append_after_recovery").unwrap();
+        combined_corruption_fixture(&base, &name);
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(
+            recovered.index.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        let p: &[u8] = b"FF";
+        let offset = recovered.payload_bytes.len() as u32;
+        let e = RedexEntry::new_heap(3, offset, p.len() as u32, 0, payload_checksum(p));
+        recovered.disk.append_entry_at(&e, p, 6000).unwrap();
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        let reopened = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(
+            reopened.index.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 2, 3],
+            "the acknowledged append must survive the next reopen"
+        );
+        assert_eq!(reopened.timestamps, Some(vec![1000, 3000, 6000]));
+        cleanup(&base);
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-08: after a checksum recovery, the
+    /// survivors keep their ORIGINAL timestamps across further restarts.
+    /// Before the fix the ts sidecar was shortened while idx was not, so
+    /// the second open rejected the length mismatch and every survivor's
+    /// age reset to `now()`, on every restart.
+    #[test]
+    fn checksum_recovery_keeps_original_timestamps_across_restarts() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/ts_pair_restarts").unwrap();
+        let dat_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("dat");
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payloads: [&[u8]; 4] = [b"AAAAAAAAA", b"BBBBBBBBB", b"CCCCCCCCC", b"DDDDDDDDD"];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, 1000 * (i as u64 + 1))
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+        let mut bytes = std::fs::read(&dat_path).unwrap();
+        bytes[payloads[0].len()] ^= 0xFF;
+        std::fs::write(&dat_path, &bytes).unwrap();
+
+        for restart in 0..3 {
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+            assert_eq!(
+                recovered.index.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                vec![0, 2, 3]
+            );
+            assert_eq!(
+                recovered.timestamps,
+                Some(vec![1000, 3000, 4000]),
+                "restart {restart}: survivors keep their original ages"
+            );
+        }
+        cleanup(&base);
+    }
+
+    /// Build a channel whose live generation is 2 (one compaction), with
+    /// three heap entries. Returns the live generation directory.
+    fn compacted_channel_fixture(base: &Path, name: &ChannelName) -> PathBuf {
+        let r = DiskSegment::open(base, name, 0, 0).unwrap();
+        let payloads: [&[u8]; 3] = [b"AAAAAAAAA", b"BBBBBBBBB", b"CCCCCCCCC"];
+        let mut entries = Vec::new();
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            r.disk.append_entry_at(&e, p, 100 + i as u64).unwrap();
+            entries.push(e);
+            offset += p.len() as u32;
+        }
+        r.disk.sync().unwrap();
+        r.disk.compact_to(&entries, &[100, 101, 102], 0, 3).unwrap();
+        assert_eq!(r.disk.live_gen(), FIRST_GENERATION + 1);
+        let live = r.disk.live_dir();
+        drop(r);
+        live
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-02: losing ONLY the live generation's
+    /// ts sidecar costs entry ages, not the entries. Before the fix the
+    /// manifest-named generation failed the completeness test, recovery
+    /// created an empty generation 1, and the open's sweep deleted the
+    /// intact idx and dat.
+    #[test]
+    fn a_lost_ts_sidecar_on_a_committed_generation_keeps_its_entries() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/lost_ts").unwrap();
+        let live = compacted_channel_fixture(&base, &name);
+        std::fs::remove_file(live.join("ts")).unwrap();
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(
+            recovered.index.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the committed generation's entries are recovered, not replaced"
+        );
+        assert_eq!(recovered.payload_bytes.len(), 27);
+        let ts = recovered.timestamps.clone().expect("published with now()");
+        assert_eq!(ts.len(), 3);
+        assert!(recovered.disk.live_dir().join("ts").is_file());
+        drop(recovered);
+
+        // The published sidecar is durable: the next open reads the same
+        // timestamps instead of substituting new ones again.
+        let again = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(again.timestamps, Some(ts));
+        cleanup(&base);
+    }
+
+    /// PERSIST-02: a committed generation whose idx is gone while its dat
+    /// still holds payload is refused, and nothing is swept.
+    #[test]
+    fn a_committed_generation_missing_its_index_fails_closed() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/lost_idx").unwrap();
+        let live = compacted_channel_fixture(&base, &name);
+        std::fs::remove_file(live.join("idx")).unwrap();
+
+        let err = DiskSegment::open(&base, &name, 0, 0)
+            .err()
+            .expect("a committed generation with no index must not be recovered over");
+        assert!(format!("{err}").contains("no index"), "{err}");
+        assert_eq!(
+            std::fs::metadata(live.join("dat")).unwrap().len(),
+            27,
+            "the payload bytes are left for the operator"
+        );
+        cleanup(&base);
+    }
+
+    /// PERSIST-02, the mirror case: a committed generation whose dat is
+    /// gone while its idx still holds entries is refused, not recovered
+    /// into an empty generation that the next compaction makes permanent.
+    #[test]
+    fn a_committed_generation_missing_its_dat_fails_closed() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/lost_dat").unwrap();
+        let live = compacted_channel_fixture(&base, &name);
+        let idx_len = std::fs::metadata(live.join("idx")).unwrap().len();
+        assert!(idx_len > 0);
+        std::fs::remove_file(live.join("dat")).unwrap();
+
+        let err = DiskSegment::open(&base, &name, 0, 0)
+            .err()
+            .expect("a committed generation with no dat must not be recovered over");
+        assert!(format!("{err}").contains("no dat"), "{err}");
+        assert_eq!(
+            std::fs::metadata(live.join("idx")).unwrap().len(),
+            idx_len,
+            "the index is left for the operator"
+        );
+        cleanup(&base);
+    }
+
+    /// PERSIST-01 at the disk layer: the allocation watermark a
+    /// compaction persists comes back on open, whatever survived.
+    #[test]
+    fn the_compaction_watermark_survives_an_empty_generation() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/seq_floor").unwrap();
+        let r = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(r.next_seq_floor, 0, "a fresh channel has no floor");
+        let p: &[u8] = b"AAAAAAAAA";
+        let e = RedexEntry::new_heap(0, 0, p.len() as u32, 0, payload_checksum(p));
+        r.disk.append_entry_at(&e, p, 1).unwrap();
+        r.disk.sync().unwrap();
+        r.disk.compact_to(&[], &[], p.len() as u64, 7).unwrap();
+        drop(r);
+
+        let reopened = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert!(reopened.index.is_empty());
+        assert_eq!(reopened.next_seq_floor, 7);
         cleanup(&base);
     }
 
@@ -3483,7 +3838,7 @@ mod tests {
         let surviving_ts = vec![3_000u64];
         recovered
             .disk
-            .compact_to(&surviving, &surviving_ts, third_dat_base)
+            .compact_to(&surviving, &surviving_ts, third_dat_base, 0)
             .unwrap();
 
         // Worker handles must now reflect the compacted file sizes.
@@ -3726,7 +4081,7 @@ mod tests {
         let surviving_ts = vec![3_000u64];
         recovered
             .disk
-            .compact_to(&surviving, &surviving_ts, third_dat_base)
+            .compact_to(&surviving, &surviving_ts, third_dat_base, 0)
             .expect("happy path compact must succeed");
 
         // After successful compact, every cached file slot must
@@ -3837,7 +4192,7 @@ mod tests {
 
         let err = recovered
             .disk
-            .compact_to(&[], &[], 0)
+            .compact_to(&[], &[], 0, 0)
             .expect_err("poisoned segment must refuse compact_to");
         assert!(
             format!("{}", err).contains("poisoned"),
@@ -4285,7 +4640,7 @@ mod tests {
         recovered.disk.append_entry_at(&e, payload, 1).unwrap();
         recovered.disk.sync().unwrap();
         let surviving = vec![*recovered.index.first().unwrap_or(&e)];
-        let _ = recovered.disk.compact_to(&surviving, &[1], 0);
+        let _ = recovered.disk.compact_to(&surviving, &[1], 0, 0);
         // We don't actually care whether compact succeeded; only
         // that there's a v<live>/ directory we can corrupt the
         // manifest to test against.
@@ -4458,7 +4813,7 @@ mod tests {
 
         // Compact: surviving = the one entry, dat_base = 0.
         let surviving = vec![e];
-        r.disk.compact_to(&surviving, &[11], 0).unwrap();
+        r.disk.compact_to(&surviving, &[11], 0, 0).unwrap();
 
         // Generation rolled by exactly one.
         assert_eq!(r.disk.live_gen(), FIRST_GENERATION + 1);
@@ -4498,7 +4853,7 @@ mod tests {
         r.disk.sync().unwrap();
 
         // Compact rolls v1 -> v2 and sweeps v1.
-        r.disk.compact_to(&[e1], &[100], 0).unwrap();
+        r.disk.compact_to(&[e1], &[100], 0, 0).unwrap();
         assert_eq!(r.disk.live_gen(), FIRST_GENERATION + 1);
 
         // Append once more so v2 has a meaningful tail. Then
@@ -4743,7 +5098,7 @@ mod tests {
         // correctly fail compact, which isn't what we're testing).
         super::arm_fsync_dir_failure_at(2);
 
-        r.disk.compact_to(&[e], &[5], 0).expect(
+        r.disk.compact_to(&[e], &[5], 0, 0).expect(
             "compact_to must report success when fsync_dir fails \
              AFTER the manifest rename succeeded",
         );

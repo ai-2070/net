@@ -168,7 +168,10 @@ const saving = persistStore(host, { file, intervalMs: 5_000 });
   already have sessions (`connect` / `accept`).
 - **`persistStore(host, { file, intervalMs })`** snapshots the host's document
   to a RedEX file, only when it changed and again on `close()`, and
-  `flush()` writes one now. **`restoreStore(file, definition)`** returns the
+  `flush()` writes one now. Both return promises that resolve once the
+  snapshot is durable (with the default `sync: true`; with `sync: false` they
+  resolve once it is appended, without an fsync): `await saving.flush()` in a handoff `persist` hook, and
+  `await saving.close()` on shutdown. **`restoreStore(file, definition)`** returns the
   newest snapshot whose store id and version match and that passes the
   validator, or `null`. A snapshot from another version is skipped, never
   migrated.

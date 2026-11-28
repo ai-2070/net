@@ -450,10 +450,35 @@ impl PermissionToken {
         // window and is already handled by the wall-clock bounds above,
         // so treating it as a distinct malformation would only change
         // the error other callers see without closing anything.
+        self.check_window_width()
+    }
+
+    /// The validity window's WIDTH rule alone (see [`Self::check_time_bounds`]):
+    /// no wider than [`MAX_TOKEN_TTL_SECS`]. Independent of the clock, so
+    /// [`TokenChain::verify_integrity`] keeps it.
+    fn check_window_width(&self) -> Result<(), TokenError> {
         if self.not_after.saturating_sub(self.not_before) > MAX_TOKEN_TTL_SECS {
             return Err(TokenError::TtlTooLong);
         }
         Ok(())
+    }
+
+    /// Test fixture: move this token's validity window to
+    /// `[not_before, not_after)` and re-sign it with `issuer`, its real
+    /// issuer, so the result is a correctly signed token for another
+    /// window (an expired one, for instance). Not a production API.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn resign_window_for_test(
+        &mut self,
+        issuer: &EntityKeypair,
+        not_before: u64,
+        not_after: u64,
+    ) {
+        self.not_before = not_before;
+        self.not_after = not_after;
+        let payload = self.signed_payload();
+        self.signature = issuer.sign(&payload).to_bytes();
     }
 
     /// Pure time-bound check: `true` iff the host wall-clock has
@@ -908,6 +933,31 @@ impl TokenChain {
         )
     }
 
+    /// Is this chain an INTACT grant of `action` on `channel_hash` to
+    /// `presenter`, anchored at one of `roots`, whatever the time now?
+    ///
+    /// Every check of [`Self::verify_authorizes`] except the two that depend
+    /// on the present: each link's wall-clock window (its signature, width
+    /// cap, scope, channel binding and nesting are all still checked) and
+    /// revocation. For a chain read back from durable storage: an expired
+    /// credential is still exactly the credential that was installed.
+    /// Whether it may be USED is a separate question, which
+    /// [`Self::verify_authorizes`] answers at every use.
+    ///
+    /// BUG_AUDIT_2026_11_14 ENR-01: durable enrollment state used to be
+    /// decoded with the present-validity check, so a membership whose
+    /// channel chain had expired read as Corrupt: the node could not start
+    /// with it, and an offline `leave` could not open the store to erase it.
+    pub fn verify_integrity(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+    ) -> Result<(), TokenError> {
+        self.verify_links(action, channel_hash, presenter, roots, None, 0, true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn verify_inner(
         &self,
@@ -916,6 +966,31 @@ impl TokenChain {
         presenter: &EntityId,
         roots: &[EntityId],
         revocation: &RevocationRegistry,
+        skew_secs: u64,
+        check_signatures: bool,
+    ) -> Result<(), TokenError> {
+        self.verify_links(
+            action,
+            channel_hash,
+            presenter,
+            roots,
+            Some(revocation),
+            skew_secs,
+            check_signatures,
+        )
+    }
+
+    /// The shared chain walk. `revocation: None` means an integrity check
+    /// ([`Self::verify_integrity`]): no wall-clock window and no revocation,
+    /// everything else unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_links(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: Option<&RevocationRegistry>,
         skew_secs: u64,
         check_signatures: bool,
     ) -> Result<(), TokenError> {
@@ -940,14 +1015,32 @@ impl TokenChain {
         for t in &self.tokens {
             // Signature (unless already verified for this immutable
             // chain) + time bounds.
-            if check_signatures {
-                t.is_valid_with_skew(skew_secs)?;
-            } else {
-                t.check_time_bounds(skew_secs)?;
-            }
-            // Revocation floor (root link catches root revocation).
-            if revocation.is_revoked(t) {
-                return Err(TokenError::Revoked);
+            match revocation {
+                Some(revocation) => {
+                    if check_signatures {
+                        t.is_valid_with_skew(skew_secs)?;
+                    } else {
+                        t.check_time_bounds(skew_secs)?;
+                    }
+                    // Revocation floor (root link catches root revocation).
+                    if revocation.is_revoked(t) {
+                        return Err(TokenError::Revoked);
+                    }
+                }
+                None => {
+                    // Integrity only: the signature and the width rule,
+                    // whatever the time now. An empty or inverted window
+                    // (`not_after <= not_before`) was never valid at any
+                    // time, so unlike an expired one it is not "the
+                    // credential that was installed": refuse it. (On the
+                    // clock path the wall-clock bounds already reject it,
+                    // which is why `check_window_width` lets it through.)
+                    t.verify()?;
+                    if t.not_after <= t.not_before {
+                        return Err(TokenError::InvalidFormat);
+                    }
+                    t.check_window_width()?;
+                }
             }
             // Every link must independently authorize the action on
             // the channel — the chain grant is the intersection.
@@ -4075,5 +4168,118 @@ mod tests {
         )
         .expect("try_issue must succeed with a full keypair");
         assert!(token.verify().is_ok());
+    }
+
+    /// BUG_AUDIT_2026_11_14 ENR-01: `verify_integrity` accepts an intact
+    /// chain whatever the time (an expired one included), while
+    /// `verify_authorizes` still refuses it, and integrity still refuses
+    /// everything structural: a tampered link, a foreign root, another
+    /// channel, a wrong presenter, an overwide window.
+    #[test]
+    fn verify_integrity_ignores_the_clock_but_nothing_else() {
+        let root = EntityKeypair::generate();
+        let device = EntityKeypair::generate();
+        let channel: ChannelHash = 0x7A11;
+        let mut token = PermissionToken::issue(
+            &root,
+            device.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel,
+            3600,
+            0,
+        );
+        // Expired a day ago.
+        token.resign_window_for_test(&root, 1_000, 1_000 + 3600);
+        let chain = TokenChain::single(token.clone());
+        let roots = [root.entity_id().clone()];
+
+        assert!(matches!(
+            chain.verify_authorizes(
+                TokenScope::SUBSCRIBE,
+                channel,
+                device.entity_id(),
+                &roots,
+                &RevocationRegistry::new(),
+                60,
+            ),
+            Err(TokenError::Expired)
+        ));
+        assert!(chain
+            .verify_integrity(TokenScope::SUBSCRIBE, channel, device.entity_id(), &roots)
+            .is_ok());
+
+        let refuses =
+            |chain: &TokenChain, channel: ChannelHash, presenter: &EntityId, roots: &[EntityId]| {
+                chain
+                    .verify_integrity(TokenScope::SUBSCRIBE, channel, presenter, roots)
+                    .is_err()
+            };
+        assert!(
+            refuses(&chain, channel ^ 1, device.entity_id(), &roots),
+            "another channel"
+        );
+        assert!(
+            refuses(
+                &chain,
+                channel,
+                EntityKeypair::generate().entity_id(),
+                &roots
+            ),
+            "another presenter"
+        );
+        assert!(
+            refuses(
+                &chain,
+                channel,
+                device.entity_id(),
+                &[EntityKeypair::generate().entity_id().clone()]
+            ),
+            "a foreign root"
+        );
+        let mut tampered = token.clone();
+        tampered.not_after += 1; // not re-signed
+        assert!(
+            refuses(
+                &TokenChain::single(tampered),
+                channel,
+                device.entity_id(),
+                &roots
+            ),
+            "a bad signature"
+        );
+        let mut overwide = token;
+        overwide.resign_window_for_test(&root, 1_000, 1_000 + MAX_TOKEN_TTL_SECS + 1);
+        assert!(
+            refuses(
+                &TokenChain::single(overwide),
+                channel,
+                device.entity_id(),
+                &roots
+            ),
+            "an overwide window"
+        );
+        for (not_before, not_after, label) in [
+            (1_000, 1_000, "an empty window"),
+            (2_000, 1_000, "an inverted window"),
+        ] {
+            let mut never_valid = PermissionToken::issue(
+                &root,
+                device.entity_id().clone(),
+                TokenScope::SUBSCRIBE,
+                channel,
+                3600,
+                0,
+            );
+            never_valid.resign_window_for_test(&root, not_before, not_after);
+            assert!(
+                refuses(
+                    &TokenChain::single(never_valid),
+                    channel,
+                    device.entity_id(),
+                    &roots
+                ),
+                "{label}"
+            );
+        }
     }
 }

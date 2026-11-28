@@ -261,12 +261,22 @@ impl DaemonHost {
     /// subscribed.
     pub fn take_snapshot(&self) -> Option<StateSnapshot> {
         let state = self.daemon.snapshot()?;
+        // The head event's REAL payload rides with the snapshot, so a
+        // restore continues the chain from it. BUG_AUDIT_2026_11_14
+        // STATE-03: it was left unset, and restore fell back to the
+        // daemon's serialized STATE, so a daemon whose snapshot bytes differ
+        // from its last output restored with the wrong head payload: its
+        // next event's `parent_hash` was computed over the state and
+        // observers holding the real head rejected it as a fork.
+        // (`head_payload` is runtime-only: a snapshot that crosses the wire
+        // still loses it, so a cross-node migration must re-attach it.)
         let mut snapshot = StateSnapshot::new(
             self.keypair.entity_id().clone(),
             *self.chain.head(),
             state,
             self.horizon.clone(),
-        );
+        )
+        .with_head_payload(self.chain.head_payload().clone());
         let bindings = self.bindings_snapshot();
         if !bindings.is_empty() {
             snapshot.bindings_bytes = bindings.to_bytes();
@@ -611,6 +621,80 @@ mod tests {
         let outputs = restored.deliver(&event).unwrap();
         let count = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
         assert_eq!(count, 11);
+    }
+
+    /// A counter whose OUTPUT ("out:<n>") differs from its snapshot bytes
+    /// (the raw count): the daemon shape STATE-03 is about.
+    struct TaggedCounter {
+        count: u64,
+    }
+
+    impl MeshDaemon for TaggedCounter {
+        fn name(&self) -> &str {
+            "tagged-counter"
+        }
+
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+
+        fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+            self.count += 1;
+            Ok(vec![Bytes::from(format!("out:{}", self.count))])
+        }
+
+        fn snapshot(&self) -> Option<Bytes> {
+            Some(Bytes::from(self.count.to_le_bytes().to_vec()))
+        }
+
+        fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
+            let bytes: [u8; 8] = state[..]
+                .try_into()
+                .map_err(|_| DaemonError::RestoreFailed("bad state size".into()))?;
+            self.count = u64::from_le_bytes(bytes);
+            Ok(())
+        }
+    }
+
+    /// BUG_AUDIT_2026_11_14 STATE-03: a restored host continues the
+    /// ORIGINAL chain. `take_snapshot` used to leave `head_payload` unset,
+    /// so restore fell back to the daemon's state bytes as the head
+    /// payload; for a daemon whose snapshot differs from its last output,
+    /// the next event's `parent_hash` was computed over the state, and an
+    /// observer holding the real head saw a fork.
+    #[test]
+    fn a_restored_host_continues_the_original_chain() {
+        let kp = EntityKeypair::generate();
+        let mut original = DaemonHost::new(
+            Box::new(TaggedCounter { count: 0 }),
+            kp.clone(),
+            DaemonHostConfig::default(),
+        );
+        for i in 1..=3 {
+            original.deliver(&make_event(0xEEEE, i, b"tick")).unwrap();
+        }
+        let snapshot = original.take_snapshot().unwrap();
+        assert_eq!(
+            snapshot.head_payload.as_deref(),
+            Some(&b"out:3"[..]),
+            "the snapshot carries the head event's real payload"
+        );
+
+        let mut restored = DaemonHost::from_snapshot(
+            Box::new(TaggedCounter { count: 0 }),
+            kp,
+            &snapshot,
+            DaemonHostConfig::default(),
+        )
+        .unwrap();
+        let next = make_event(0xEEEE, 4, b"tick");
+        let from_original = original.deliver(&next).unwrap();
+        let from_restored = restored.deliver(&next).unwrap();
+        assert_eq!(from_restored[0].payload, from_original[0].payload);
+        assert_eq!(
+            from_restored[0].link, from_original[0].link,
+            "the restored host's next event extends the original head, not a fork"
+        );
     }
 
     #[test]

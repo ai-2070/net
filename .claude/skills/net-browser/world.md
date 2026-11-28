@@ -39,7 +39,7 @@ const link = handoffLink({ transport, label: 'my-world.handoff',
 const handoffs = regionHandoffs({
   link, region: 'r:4:7',
   ...storeRegion(host, { region: 'r:4:7', collection: 'ships', ledger: 'handoff' }),
-  persist: () => { saving.flush(); },                     // persistStore(host, …) from @net-mesh/sdk
+  persist: async () => { await saving.flush(); },         // persistStore(host, …) from @net-mesh/sdk
   onEvent: e => …,                                        // moved / refused / unresolved / admitted
 });
 await directory.lookup('r:4:8');

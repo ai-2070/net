@@ -132,7 +132,9 @@ impl RedexFile {
     ///
     /// Reads `<base_dir>/<channel_path>/idx` and `.../dat` if they
     /// exist, replays the full dat file into the heap segment, and
-    /// sets `next_seq` to one past the last recovered entry. New
+    /// sets `next_seq` to one past the last recovered entry (or to the
+    /// allocation watermark the last compaction persisted, if that is
+    /// higher). New
     /// appends are mirrored to disk.
     ///
     /// A partial trailing record in `idx` (torn write from a crash)
@@ -153,7 +155,15 @@ impl RedexFile {
             FsyncPolicy::IntervalOrBytes { max_bytes, .. } => (0, max_bytes),
         };
         let recovered = DiskSegment::open(base_dir, &name, fsync_every_n, fsync_max_bytes)?;
-        let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
+        // PERSIST-01: resume at the persisted allocation watermark when it
+        // is ahead of the last surviving entry, as it is after retention
+        // evicted entries (all of them, in the worst case).
+        let next_seq = recovered
+            .index
+            .last()
+            .map(|e| e.seq + 1)
+            .unwrap_or(0)
+            .max(recovered.next_seq_floor);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
         // Use the persisted timestamps if they're present and match
@@ -473,6 +483,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         // Pre-validate capacity + offset width under the state lock —
         // no side effects yet.
@@ -538,6 +553,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
@@ -609,6 +629,11 @@ impl RedexFile {
             return Ok(None);
         }
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         // `None` expected_first_seq ⇒ no caller-supplied seq guard;
         // append at whatever the current tail is.
         self.append_batch_locked(&mut state, payloads, None)
@@ -647,6 +672,11 @@ impl RedexFile {
             return Ok(None);
         }
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         self.append_batch_locked(&mut state, payloads, Some(expected_first_seq))
     }
 
@@ -799,6 +829,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         let current_live = state.segment.live_bytes();
         if current_live.saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
@@ -853,6 +888,11 @@ impl RedexFile {
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
 
@@ -897,6 +937,11 @@ impl RedexFile {
         }
         let ts = now_ns();
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
 
         // Pre-validate capacity + offset width before allocating
         // seq numbers — see [`Self::append_batch`] for rationale.
@@ -1336,6 +1381,11 @@ impl RedexFile {
         }
         let now = now_ns();
         let mut state = self.inner.state.lock();
+        // PERSIST-06: a closed file's on-disk state is final (close
+        // synced it); retention must not compact it afterwards.
+        if self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
         let drop = compute_eviction_count(&state.index, &state.timestamps, now, cfg);
         if drop == 0 {
             return;
@@ -1394,7 +1444,16 @@ impl RedexFile {
             let surviving_index: Vec<RedexEntry> = state.index[drop..].to_vec();
             let surviving_timestamps: Vec<u64> = state.timestamps[drop..].to_vec();
             let disk = disk.clone();
-            if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
+            // The allocation watermark rides with the compaction
+            // (PERSIST-01). Appends allocate under this same state lock,
+            // so this is exactly the next seq to issue.
+            let next_seq_floor = self.inner.next_seq.load(Ordering::Acquire);
+            if let Err(e) = disk.compact_to(
+                &surviving_index,
+                &surviving_timestamps,
+                dat_base,
+                next_seq_floor,
+            ) {
                 tracing::warn!(
                     error = %e,
                     "redex sweep_retention: disk compaction failed; \
@@ -1497,6 +1556,11 @@ impl RedexFile {
         }
 
         let mut state = self.inner.state.lock();
+        // PERSIST-06: re-check under the lock. `close` sets `closed` before
+        // it takes this lock, so a mutator that passed the early check but
+        // reaches the lock after `close` refuses here instead of landing
+        // after close's final sync and watcher disconnect.
+        self.check_not_closed()?;
         let current_next = self.inner.next_seq.load(Ordering::Acquire);
         if target_seq <= current_next {
             // Already at or past target. No-op.
@@ -1622,6 +1686,20 @@ impl RedexFile {
         self.inner.disk.as_ref()
     }
 
+    /// Test-only: hold this file's state lock until the guard drops, so a
+    /// sibling module's test can stall `close()` (and every mutator) at a
+    /// chosen point (PERSIST-07's manager witness).
+    #[cfg(test)]
+    pub(super) fn hold_state_lock_for_test(&self) -> StateLockForTest<'_> {
+        StateLockForTest(self.inner.state.lock())
+    }
+
+    /// Test-only: whether two handles are the same file instance.
+    #[cfg(test)]
+    pub(super) fn same_instance_for_test(&self, other: &RedexFile) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     #[inline]
     fn check_not_closed(&self) -> Result<(), RedexError> {
         if self.inner.closed.load(Ordering::Acquire) {
@@ -1631,6 +1709,10 @@ impl RedexFile {
         }
     }
 }
+
+/// Test-only guard returned by [`RedexFile::hold_state_lock_for_test`].
+#[cfg(test)]
+pub(super) struct StateLockForTest<'a>(#[allow(dead_code)] parking_lot::MutexGuard<'a, FileState>);
 
 impl std::fmt::Debug for RedexFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2519,6 +2601,54 @@ mod tests {
         f.append(b"a").unwrap();
         f.close().unwrap();
         assert!(matches!(f.append(b"b"), Err(RedexError::Closed)));
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-06: an append that passed the early
+    /// closed check but reaches the state lock after `close` began must be
+    /// refused. Before the fix it committed after close had disconnected
+    /// the watchers and run its final sync, so with `FsyncPolicy::Never` no
+    /// durability barrier ever covered it.
+    ///
+    /// The test holds the state lock so each mutator, once past its early
+    /// check, waits on it; then it sets `closed` exactly as `close` does
+    /// first, before close takes the lock. (If a mutator thread were so slow
+    /// that it saw `closed` at its early check, it would also return
+    /// `Closed`: the test can only pass vacuously, never fail spuriously.)
+    #[test]
+    fn a_mutator_that_reaches_the_lock_after_close_began_is_refused() {
+        type Mutator = fn(&RedexFile) -> Result<(), RedexError>;
+        let mutators: [(&str, Mutator); 4] = [
+            ("append", |f| f.append(b"late append").map(drop)),
+            ("append_inline", |f| {
+                f.append_inline(&[7u8; INLINE_PAYLOAD_SIZE]).map(drop)
+            }),
+            ("append_batch", |f| {
+                f.append_batch(&[Bytes::from_static(b"late batch")])
+                    .map(drop)
+            }),
+            ("append_ordered", |f| {
+                f.append_ordered(b"late ordered").map(drop)
+            }),
+        ];
+        for (label, mutate) in mutators {
+            let f = make_file("persist06");
+            f.append(b"before close").unwrap();
+            let held = f.inner.state.lock();
+            let writer = {
+                let f = f.clone();
+                std::thread::spawn(move || mutate(&f))
+            };
+            // Let the writer pass its early check and park on the lock.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            f.inner.closed.store(true, Ordering::Release);
+            drop(held);
+            let result = writer.join().unwrap();
+            assert!(
+                matches!(result, Err(RedexError::Closed)),
+                "{label}: a write reaching the lock after close began must be refused, got {result:?}"
+            );
+            assert_eq!(f.len(), 1, "{label}: nothing landed after close");
+        }
     }
 
     #[tokio::test]
@@ -3691,6 +3821,54 @@ mod tests {
              (pre-fix all 5 would resurrect because sweep didn't touch disk)"
         );
         f2.close().unwrap();
+    }
+
+    /// BUG_AUDIT_2026_11_14 PERSIST-01: retention that evicts EVERY
+    /// entry, followed by a reopen, must not restart sequence
+    /// allocation. Before the fix `next_seq` came only from the last
+    /// surviving entry, so the reopened file issued seq 0 again: a
+    /// cursor, token or checkpoint naming seq 0..4 then pointed at
+    /// different content.
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn retention_evicting_everything_keeps_the_allocation_watermark_across_reopen() {
+        use super::super::manager::Redex;
+        let dir = tmp_persistent_dir("sweep_all_watermark");
+        let name = ChannelName::new("sweep/all-watermark").unwrap();
+        let config = || {
+            RedexFileConfig::default()
+                .with_persistent(true)
+                .with_retention_max_events(0)
+        };
+        {
+            let r = Redex::new().with_persistent_dir(&dir);
+            let f = r.open_file(&name, config()).unwrap();
+            for payload in [
+                b"AAAAAAAAA",
+                b"BBBBBBBBB",
+                b"CCCCCCCCC",
+                b"DDDDDDDDD",
+                b"EEEEEEEEE",
+            ] {
+                f.append(payload).unwrap();
+            }
+            f.sweep_retention();
+            assert_eq!(f.len(), 0, "retention evicted every entry");
+            assert_eq!(f.next_seq(), 5);
+            f.close().unwrap();
+        }
+
+        let r = Redex::new().with_persistent_dir(&dir);
+        let f = r.open_file(&name, config()).unwrap();
+        assert_eq!(f.len(), 0);
+        assert_eq!(
+            f.next_seq(),
+            5,
+            "the reopened file resumes after the evicted entries, not at 0"
+        );
+        assert_eq!(f.append(b"FFFFFFFFF").unwrap(), 5);
+        f.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #95: when

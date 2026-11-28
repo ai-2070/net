@@ -1058,6 +1058,78 @@ async fn an_admitted_outcome_refused_at_the_tenant_cap_reaches_the_client_as_a_r
     assert_eq!(anchor.rtc_stats().admission_rejected_outcome(), 1);
 }
 
+/// BUG_AUDIT_2026_11_14 ANCHOR-02: a logical peer introduced through an
+/// **admitted, tenanted** RTC session is confined to that session's
+/// tenant.
+///
+/// Client C enrolls for GAME. Native node X, which holds a UDP session
+/// with C, then runs a routed handshake to the anchor through C, so the
+/// anchor sees it arrive on C's DataChannel. Before the fix the anchor
+/// installed X with the default admission (tenant `None`, "meets
+/// everyone"): a GAME client could introduce an identity that received
+/// other games' announcement replay and published into them.
+///
+/// Inverse: return `PeerAdmission::default()` for a permitted RTC
+/// upstream in `derived_admission`, and X's tenant reads `None`.
+#[cfg(feature = "cortex")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_peer_introduced_through_a_tenanted_session_inherits_its_tenant() {
+    use net::adapter::net::mesh_rpc::CallOptions;
+    use net::adapter::net::rtc::TenantId;
+
+    const GAME: TenantId = TenantId(0xA02);
+    let (anchor, client, _endpoint) = anchor_and_provisional_client().await;
+    let client_id = client.node_id();
+    anchor.set_enrollment_tenant_resolver(Some(Arc::new(|_chain: &[u8]| Some(GAME))));
+    let _serve = anchor
+        .serve_rpc(ENROLL_SERVICE, Arc::new(FixedOutcome(true)))
+        .expect("serve the enrollment service");
+    client
+        .call(
+            anchor.node_id(),
+            ENROLL_SERVICE,
+            Bytes::from_static(b"join request"),
+            CallOptions::default(),
+        )
+        .await
+        .expect("the allow-list permits exactly this call");
+    assert!(
+        wait_for(
+            || anchor.peer_tenant(client_id) == Some(GAME),
+            Duration::from_secs(10)
+        )
+        .await,
+        "precondition: the client is admitted for GAME"
+    );
+
+    let x = node(None).await;
+    // `accept` is pre-start machinery: the not-yet-started X accepts.
+    connect_udp(&client, &x).await;
+    x.start();
+    let x_id = x.node_id();
+    x.connect_via(client.local_addr(), anchor.public_key(), anchor.node_id())
+        .await
+        .expect("X reaches the anchor through the client's DataChannel");
+    assert!(
+        wait_for(
+            || anchor.peer_endpoint(x_id).is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the anchor installed X's routed session"
+    );
+
+    assert!(
+        !anchor.peer_is_provisional(x_id),
+        "X arrived through an admitted session, so it is admitted"
+    );
+    assert_eq!(
+        anchor.peer_tenant(x_id),
+        Some(GAME),
+        "X reached the anchor only through a GAME session, so it is confined to GAME"
+    );
+}
+
 /// WITNESS 8: the whole-session **frame** bound is enforced on the
 /// live ingress path, not merely defined. The 257th inbound frame
 /// from a provisional peer closes and reclaims the session (§12

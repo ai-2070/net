@@ -96,7 +96,10 @@ def main() -> int:
     # [1] register(ctx) drives Hermes's REAL PluginContext -> tools.registry.
     plugin.register(ctx)
     assert manager._plugin_tool_names >= EXPECTED, manager._plugin_tool_names
-    assert "on_session_end" in manager._hooks, "session-end hook not registered"
+    assert "on_session_start" in manager._hooks, "session-start hook not registered"
+    # HERMES-01: Hermes fires on_session_end after every turn; the plugin's
+    # teardown is process-scoped instead.
+    assert "on_session_end" not in manager._hooks, "per-turn teardown hook registered"
     for name in EXPECTED:
         entry = registry.get_entry(name)
         assert entry is not None, f"{name} missing from the registry"
@@ -112,10 +115,9 @@ def main() -> int:
     assert EXPECTED <= got, ("dropped by assembly (check_fn failed?):", EXPECTED - got)
     print("[2] get_definitions -> all 5 net_* tools survive Hermes assembly (check_fn passed)")
 
-    # [3] Session-end hook tears the embedded node down cleanly.
-    for cb in manager._hooks["on_session_end"]:
-        cb()
-    print("[3] on_session_end hook tore the embedded node down cleanly")
+    # [3] The process-exit teardown tears the embedded node down cleanly.
+    plugin._shutdown()
+    print("[3] process-exit teardown tore the embedded node down cleanly")
 
     print("REAL HERMES LOADER VALIDATION PASSED")
     return 0

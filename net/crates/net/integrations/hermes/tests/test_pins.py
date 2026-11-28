@@ -115,7 +115,7 @@ def test_promote_survives_a_registration_error(plugin):
 def test_pin_promotion_service_stop_is_idempotent(plugin, tmp_path):
     # Regression: after a successful stop the promoter's event loop is closed;
     # a second stop() must NOT call `call_soon_threadsafe` on that closed loop
-    # (RuntimeError) — `_on_session_end` documents teardown as idempotent.
+    # (RuntimeError) — `_shutdown` documents teardown as idempotent.
     import time
 
     pins = plugin.pins

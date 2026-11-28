@@ -210,7 +210,37 @@ pub struct ApprovalRecord {
     /// existed carry it too.
     #[serde(default)]
     pub quote_b64: String,
+    /// Set while one payment attempt is redeeming this approval (engine
+    /// time, ns), by [`SpendPolicyEngine::claim_approved_quote`].
+    ///
+    /// BUG_AUDIT_2026_11_14 PAY-07: the HTTP door looked the approval up,
+    /// reserved, and cleared it in three separate transactions, so two
+    /// concurrent fetches could both read the same approved quote. The
+    /// second reservation then counted as a retry of the first (holders + 1,
+    /// no new spend), and each fetch authored its own payment, so one
+    /// approval paid twice wherever the authorizations differ (an opaque
+    /// wallet-signed transaction). A claimed approval is skipped by every
+    /// other claim until it is cleared (redeemed), released (the attempt did
+    /// not reserve), or [`APPROVAL_CLAIM_TTL_NS`] old (the attempt died).
+    /// `None` on every record written before the field existed; an older
+    /// build ignores it.
+    #[serde(default)]
+    pub redeeming_since_ns: Option<u64>,
 }
+
+/// How long an approval claim holds without being cleared or released
+/// before another attempt may take it over (PAY-07).
+///
+/// A claim spans only local work: the HTTP door claims, runs
+/// `check_and_reserve` (one store transaction), then clears the approval
+/// (reserved) or releases it (not reserved), all before the paid HTTP round
+/// trip. The TTL is therefore far longer than a live claim ever needs, so a
+/// slow but live attempt is never overtaken (a takeover would let two
+/// attempts reserve the same quote and each author a payment). The cost is
+/// on the crash path only: an attempt that dies between claim and clear
+/// leaves the approval unusable for up to this long, after which a later
+/// fetch redeems it.
+pub const APPROVAL_CLAIM_TTL_NS: u64 = 300_000_000_000;
 
 /// One outstanding reservation, keyed by the quote that took it.
 ///
@@ -459,6 +489,7 @@ impl SpendPolicyEngine {
                                     capability: capability.clone(),
                                     quote_b64: base64::engine::general_purpose::STANDARD
                                         .encode(bytes),
+                                    redeeming_since_ns: None,
                                 },
                             );
                             *dirty = true;
@@ -865,6 +896,82 @@ impl SpendPolicyEngine {
             return Ok(Some((quote_id.clone(), bytes)));
         }
         Ok(None)
+    }
+
+    /// Claim the approved-but-unredeemed hold for `capability` for ONE
+    /// payment attempt, atomically (PAY-07). Returns the same shape as
+    /// [`Self::approved_quote`], or `None` when there is no approved hold
+    /// that another attempt is not already redeeming.
+    ///
+    /// The claimed record stays `Approved`, so the reservation that follows
+    /// still sees the operator's approval. The attempt then either clears it
+    /// ([`Self::clear_approval`], once it has reserved) or gives it back
+    /// ([`Self::release_approval_claim`]).
+    pub async fn claim_approved_quote(
+        &self,
+        capability: &str,
+        now_ns: u64,
+    ) -> Result<Option<(String, Vec<u8>)>, SpendError> {
+        use base64::Engine as _;
+        let claimable = move |record: &ApprovalRecord, capability: &str| {
+            let claim_live = record
+                .redeeming_since_ns
+                .is_some_and(|since| now_ns.saturating_sub(since) < APPROVAL_CLAIM_TTL_NS);
+            record.state == ApprovalState::Approved
+                && record.capability == capability
+                && !record.quote_b64.is_empty()
+                && !claim_live
+        };
+        // Lock-free pre-check: almost every paid fetch has no approval to
+        // redeem, and taking the store's exclusive lock just to learn that
+        // would serialize every HTTP 402 payment behind it. A candidate
+        // seen here is re-checked under the lock below.
+        let snapshot: SpendPolicyFile = load_json(&self.path).await?;
+        if !snapshot
+            .approvals
+            .values()
+            .any(|record| claimable(record, capability))
+        {
+            return Ok(None);
+        }
+        let capability = capability.to_string();
+        let claimed = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            for (quote_id, record) in s.approvals.iter_mut() {
+                if !claimable(record, &capability) {
+                    continue;
+                }
+                record.redeeming_since_ns = Some(now_ns);
+                return (Some((quote_id.clone(), record.quote_b64.clone())), true);
+            }
+            (None, false)
+        })
+        .await?;
+        match claimed {
+            Some((quote_id, b64)) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| SpendError::Malformed(e.to_string()))?;
+                Ok(Some((quote_id, bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Give back an approval claimed by [`Self::claim_approved_quote`] whose
+    /// attempt did not reserve, so a later attempt can redeem it.
+    pub async fn release_approval_claim(&self, quote_id: &str) -> Result<(), SpendError> {
+        let quote_id = quote_id.to_string();
+        mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            match s.approvals.get_mut(&quote_id) {
+                Some(record) if record.redeeming_since_ns.is_some() => {
+                    record.redeeming_since_ns = None;
+                    ((), true)
+                }
+                _ => ((), false),
+            }
+        })
+        .await?;
+        Ok(())
     }
 
     /// Drop an approval record (redeemed after a successful pay, or a

@@ -678,3 +678,115 @@ fn an_expired_covering_grant_does_not_shadow_its_live_replacement() {
         &chain
     ));
 }
+
+/// BUG_AUDIT_2026_11_14 ENR-01: a stored channel chain that has since
+/// EXPIRED is still intact. Durable enrollment state is decoded with
+/// `channel_chain_is_intact`, so an expired membership loads (and can be
+/// left) instead of reading as Corrupt; installing still uses
+/// `channel_chain_matches`, which refuses it.
+#[test]
+fn an_expired_stored_chain_is_intact_but_not_installable() {
+    use net_sdk::enrollment::bundle::channel_chain_is_intact;
+    use net_sdk::enrollment::standalone::ChannelMembership;
+    const NODE: u64 = 0x0C4A_0E01;
+    let device = Identity::generate();
+    let offered = offer(CHANNEL, TokenScope::SUBSCRIBE);
+    let mut token = PermissionToken::issue(
+        &root(),
+        device.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel(CHANNEL).hash(),
+        3600,
+        0,
+    );
+    let chain = TokenChain::single(token.clone());
+    assert!(channel_chain_matches(&offered, device.entity_id(), &chain));
+    assert!(channel_chain_is_intact(
+        &offered,
+        device.entity_id(),
+        &chain
+    ));
+
+    // Two days old, expired one day ago: correctly signed, past its window.
+    token.resign_window_for_test(&root(), now() - 2 * DAY, now() - DAY);
+    let expired = TokenChain::single(token);
+    assert!(
+        !channel_chain_matches(&offered, device.entity_id(), &expired),
+        "an expired chain may not be installed"
+    );
+    assert!(
+        channel_chain_is_intact(&offered, device.entity_id(), &expired),
+        "but a stored one is still exactly the credential that was installed"
+    );
+
+    // Intact is still exact: another device, other rights, another channel.
+    assert!(!channel_chain_is_intact(
+        &offered,
+        Identity::generate().entity_id(),
+        &expired
+    ));
+    assert!(!channel_chain_is_intact(
+        &offer(CHANNEL, TokenScope::PUBLISH),
+        device.entity_id(),
+        &expired
+    ));
+    assert!(!channel_chain_is_intact(
+        &offer("fleet.other", TokenScope::SUBSCRIBE),
+        device.entity_id(),
+        &expired
+    ));
+
+    // Durably: a stored membership whose chain has since expired opens and
+    // can be left. Before the fix `ChannelMembership::open` decoded it as
+    // Corrupt, so an offline `leave` could not erase it.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("membership");
+    let link = MembershipInvite::sign(
+        &Identity::generate(),
+        spec(vec![Relation::Channel], Some(offered)),
+    )
+    .unwrap();
+    let mut membership =
+        ChannelMembership::begin(&dir, &link, device.entity_id().clone(), NODE).unwrap();
+    membership.install(&chain).unwrap();
+    drop(membership);
+    age_stored_chain(&dir, &chain, &expired);
+
+    let mut membership =
+        ChannelMembership::open(&dir).expect("a membership whose chain expired still opens");
+    assert_eq!(
+        membership.chain().map(TokenChain::to_bytes),
+        Some(expired.to_bytes()),
+        "it holds the expired chain it stored"
+    );
+    assert!(membership.leave(now()).unwrap(), "and it can be left");
+    drop(membership);
+    let reopened = ChannelMembership::open(&dir).unwrap();
+    assert!(reopened.chain().is_none() && reopened.left_at().is_some());
+}
+
+/// Rewrite the standalone membership stored in `dir` so its chain is
+/// `expired` instead of `live`, as if the clock had run past its window.
+/// `install` refuses an expired chain, and its 60 s skew rules out waiting
+/// one out, so the stored bytes are edited: the two chains differ only in
+/// their window and signature (same length), and the record's trailing
+/// checksum is recomputed with the store's context string.
+fn age_stored_chain(dir: &std::path::Path, live: &TokenChain, expired: &TokenChain) {
+    use net::adapter::net::behavior::enrollment_storage::EnrollmentStorage;
+    let (live, expired) = (live.to_bytes(), expired.to_bytes());
+    assert_eq!(live.len(), expired.len());
+    let mut storage = EnrollmentStorage::open(dir).unwrap();
+    let mut bytes = storage.read().unwrap();
+    let body_len = bytes.len() - 32;
+    let at = bytes[..body_len]
+        .windows(live.len())
+        .position(|w| w == live.as_slice())
+        .expect("the stored record holds the installed chain");
+    bytes[at..at + live.len()].copy_from_slice(&expired);
+    let sum = blake3::derive_key(
+        "net-mesh standalone channel membership v1",
+        &bytes[..body_len],
+    );
+    bytes[body_len..].copy_from_slice(&sum);
+    storage.replace(&bytes).unwrap();
+}

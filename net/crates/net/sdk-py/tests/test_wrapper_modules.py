@@ -100,6 +100,61 @@ def test_open_file_cm_closes_underlying_file() -> None:
     assert r2.last_file.close_calls == 1
 
 
+def _failing_close_redex(redex_mod):
+    """A stub Redex whose files fail their close (a failed final fsync)."""
+
+    class _StubFile:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise redex_mod.RedexError("final fsync failed")
+
+    class _StubRedex:
+        def __init__(self) -> None:
+            self.last_file = None
+
+        def open_file(self, _name: str, **_kwargs: object) -> _StubFile:
+            self.last_file = _StubFile()
+            return self.last_file
+
+    return _StubRedex()
+
+
+def test_open_file_cm_raises_a_failed_close() -> None:
+    """BUG_AUDIT_2026_11_14 SDK-01: a failed close is a failed durability
+    barrier. The context manager used to swallow every RedexError from
+    close(), so the with-block reported success."""
+    import pytest
+
+    redex = importlib.import_module("net_sdk.redex")
+    r = _failing_close_redex(redex)
+    with pytest.raises(redex.RedexError, match="final fsync failed"):
+        with redex.open_file_cm(r, "audit"):
+            pass
+    assert r.last_file.close_calls == 1
+
+
+def test_open_file_cm_keeps_the_body_error_when_close_also_fails() -> None:
+    """SDK-01: when the body raised and close then fails, the body's
+    exception propagates (it is the primary error), carrying the close
+    failure as a note on Python 3.11+."""
+    import sys
+
+    import pytest
+
+    redex = importlib.import_module("net_sdk.redex")
+    r = _failing_close_redex(redex)
+    with pytest.raises(RuntimeError, match="body explodes") as raised:
+        with redex.open_file_cm(r, "audit"):
+            raise RuntimeError("body explodes")
+    assert r.last_file.close_calls == 1
+    if sys.version_info >= (3, 11):
+        notes = getattr(raised.value, "__notes__", [])
+        assert any("final fsync failed" in n for n in notes), notes
+
+
 def test_netdb_cm_closes_underlying_db() -> None:
     """netdb.netdb_cm must close() the wrapped NetDb on scope exit."""
     netdb = importlib.import_module("net_sdk.netdb")

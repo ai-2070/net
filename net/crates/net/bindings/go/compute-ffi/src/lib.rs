@@ -190,6 +190,38 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     runtime().block_on(future)
 }
 
+/// Run one Go dispatcher callback on a thread where it may call back into
+/// this library (BUG_AUDIT_2026_11_14 GOFFI-01).
+///
+/// A Go `Process` / `Snapshot` / `Restore` / factory callback is ordinary
+/// Go code and may use any blocking Go API, such as `Snapshot` of another
+/// daemon or a call on another runtime. Each of those enters [`block_on`],
+/// which aborts the process if the calling thread is inside a tokio runtime
+/// context. Callbacks reached from inside a context (the migration, stop and
+/// snapshot paths, and the groups' routing) used to run on that very thread,
+/// so a safe Go API aborted the whole process.
+///
+/// Outside a runtime context, the callback runs inline. That is the
+/// `deliver` hot path, which enters no context, so it costs nothing.
+/// Inside one, the callback runs on a scoped thread with no runtime context
+/// and this thread waits for it, so completion stays synchronous and the
+/// borrowed arguments stay valid. This is the same property `rpc-ffi`'s
+/// `spawn_handler_thread` gives Go RPC handlers. `None` means the callback
+/// could not run: the OS refused a thread, or the callback panicked.
+fn run_go_callback<T: Send>(callback: impl FnOnce() -> T + Send) -> Option<T> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Some(callback());
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("net-go-compute-callback".into())
+            .spawn_scoped(scope, callback)
+            .ok()?
+            .join()
+            .ok()
+    })
+}
+
 // =========================================================================
 // FFI guard — wraps every entry point in `catch_unwind`
 // =========================================================================
@@ -593,14 +625,16 @@ pub extern "C" fn net_compute_register_factory_with_func(
                 ));
             };
             let mut daemon_id: u64 = 0;
-            let code = unsafe {
+            // GOFFI-01: a Go factory may itself call back into this library.
+            let code = run_go_callback(|| unsafe {
                 (d.factory)(
                     runtime_id,
                     kind_for_closure.as_ptr() as *const c_char,
                     kind_for_closure.len(),
                     &mut daemon_id,
                 )
-            };
+            })
+            .unwrap_or(NET_COMPUTE_ERR_CALL_FAILED);
             if code != NET_COMPUTE_OK {
                 let reason = format!("Go factory returned error code {code}");
                 eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
@@ -1146,6 +1180,26 @@ pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
 // GoBridge — `MeshDaemon` impl driven by the registered dispatcher
 // =========================================================================
 
+/// The out-pointer a Go snapshot callback writes, carried across the
+/// [`run_go_callback`] thread hop.
+struct CallbackPtr(*mut u8);
+
+// SAFETY: the pointer is only an out-parameter slot. The callback thread
+// writes it, the waiting thread reads it after `join`, and nothing
+// dereferences it on the callback thread. The buffer it names is
+// Go-allocated and freed only through `free_callback_buffer`, which is
+// thread-agnostic.
+unsafe impl Send for CallbackPtr {}
+
+impl CallbackPtr {
+    /// The out-parameter slot. A method, so a closure that uses it
+    /// captures the whole (`Send`) wrapper rather than the bare pointer
+    /// field, which edition-2021 disjoint capture would otherwise take.
+    fn slot(&mut self) -> *mut *mut u8 {
+        &mut self.0
+    }
+}
+
 /// Daemon bridge holding a `daemon_id` (the Go-side registry key)
 /// and the kind name for debug. `MeshDaemon` impls invoke the
 /// registered dispatcher trampolines with this ID.
@@ -1217,15 +1271,21 @@ impl MeshDaemon for GoBridge {
             ));
         };
         let mut outputs = OutputsVec { inner: Vec::new() };
-        let code = unsafe {
+        let daemon_id = self.daemon_id;
+        // GOFFI-01: Go's Process may call any blocking Go API.
+        let Some(code) = run_go_callback(|| unsafe {
             (d.process)(
-                self.daemon_id,
+                daemon_id,
                 event.link.origin_hash,
                 event.link.sequence,
                 event.payload.as_ptr(),
                 event.payload.len(),
                 &mut outputs,
             )
+        }) else {
+            return Err(CoreDaemonError::ProcessFailed(
+                "the Go process callback could not run".to_string(),
+            ));
         };
         if code != NET_COMPUTE_OK {
             return Err(CoreDaemonError::ProcessFailed(format!(
@@ -1237,9 +1297,19 @@ impl MeshDaemon for GoBridge {
 
     fn snapshot(&self) -> Option<Bytes> {
         let d = DISPATCHER.get()?;
-        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut ptr = CallbackPtr(std::ptr::null_mut());
         let mut len: usize = 0;
-        let code = unsafe { (d.snapshot)(self.daemon_id, &mut ptr, &mut len) };
+        let daemon_id = self.daemon_id;
+        // GOFFI-01: Go's Snapshot may call any blocking Go API.
+        let Some(code) =
+            run_go_callback(|| unsafe { (d.snapshot)(daemon_id, ptr.slot(), &mut len) })
+        else {
+            eprintln!(
+                "GoBridge::snapshot: the Go snapshot callback could not run; treating as None"
+            );
+            return None;
+        };
+        let ptr = ptr.0;
         if code != NET_COMPUTE_OK {
             eprintln!("GoBridge::snapshot: dispatcher returned {code}; treating as None");
             return None;
@@ -1279,7 +1349,15 @@ impl MeshDaemon for GoBridge {
                 "Go dispatcher not registered".to_string(),
             ));
         };
-        let code = unsafe { (d.restore)(self.daemon_id, state.as_ptr(), state.len()) };
+        let daemon_id = self.daemon_id;
+        // GOFFI-01: Go's Restore may call any blocking Go API.
+        let Some(code) =
+            run_go_callback(|| unsafe { (d.restore)(daemon_id, state.as_ptr(), state.len()) })
+        else {
+            return Err(CoreDaemonError::RestoreFailed(
+                "the Go restore callback could not run".to_string(),
+            ));
+        };
         if code != NET_COMPUTE_OK {
             return Err(CoreDaemonError::RestoreFailed(format!(
                 "Go restore callback returned {code}"
@@ -2026,8 +2104,14 @@ pub extern "C" fn net_compute_runtime_deliver(
             received_at: 0,
         };
 
-        let inner = h.inner.clone();
-        let result = block_on(async move { inner.deliver(origin_hash, &event) });
+        // `deliver` is synchronous. It used to run inside `block_on`,
+        // which entered the runtime context only to call it, so the Go
+        // `Process` callback ran inside that context, and any blocking Go
+        // API it used (`Snapshot` of another daemon, a call on another
+        // runtime) aborted the process (BUG_AUDIT_2026_11_14 GOFFI-01).
+        // Called directly, it enters no context and the callback runs
+        // inline (`run_go_callback`).
+        let result = h.inner.deliver(origin_hash, &event);
         match result {
             Ok(outputs) => {
                 let vec = OutputsVec {
@@ -3740,5 +3824,157 @@ mod tests {
         let q = unsafe { libc::malloc(16) } as *mut u8;
         assert!(!q.is_null(), "libc::malloc(16) must succeed");
         net_compute_snapshot_bytes_free(q, 16);
+    }
+
+    // ---- BUG_AUDIT_2026_11_14 GOFFI-01: Go callbacks may re-enter ----
+
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    static REENTERED: AtomicU32 = AtomicU32::new(0);
+
+    /// Held by every test that runs the re-entrant dispatcher, so one test's
+    /// callbacks cannot move `REENTERED` while another measures its delta
+    /// (test threads run in parallel under `cargo test`).
+    static REENTRANT_DISPATCH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn reentrant_dispatch_serial() -> parking_lot::MutexGuard<'static, ()> {
+        REENTRANT_DISPATCH.lock()
+    }
+
+    /// Stands in for a Go `Process` that calls a blocking Go API (such as
+    /// `Snapshot` of another daemon): every such API drives `block_on`.
+    unsafe extern "C" fn reentrant_process(
+        _daemon_id: u64,
+        _origin_hash: u64,
+        _sequence: u64,
+        _payload_ptr: *const u8,
+        _payload_len: usize,
+        _outputs: *mut OutputsVec,
+    ) -> c_int {
+        let v = block_on(async { 1u32 });
+        REENTERED.fetch_add(v, AtomicOrdering::SeqCst);
+        NET_COMPUTE_OK
+    }
+
+    unsafe extern "C" fn reentrant_snapshot(
+        _daemon_id: u64,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> c_int {
+        block_on(async {});
+        REENTERED.fetch_add(1, AtomicOrdering::SeqCst);
+        unsafe {
+            *out_ptr = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        NET_COMPUTE_OK
+    }
+
+    unsafe extern "C" fn reentrant_restore(
+        _daemon_id: u64,
+        _state_ptr: *const u8,
+        _state_len: usize,
+    ) -> c_int {
+        block_on(async {});
+        REENTERED.fetch_add(1, AtomicOrdering::SeqCst);
+        NET_COMPUTE_OK
+    }
+
+    unsafe extern "C" fn noop_free(_daemon_id: u64) {}
+
+    unsafe extern "C" fn refusing_factory(
+        _runtime_id: u64,
+        _kind_ptr: *const c_char,
+        _kind_len: usize,
+        _out_daemon_id: *mut u64,
+    ) -> c_int {
+        NET_COMPUTE_ERR_CALL_FAILED
+    }
+
+    unsafe extern "C" fn libc_callback_free(ptr: *mut std::ffi::c_void) {
+        unsafe { libc::free(ptr) }
+    }
+
+    /// The dispatcher is process-global and first-registration-wins; every
+    /// test that needs it installs the same functions, so order is moot.
+    fn install_reentrant_dispatcher() {
+        assert_eq!(
+            net_compute_set_callback_free(Some(libc_callback_free)),
+            NET_COMPUTE_OK
+        );
+        assert_eq!(
+            net_compute_set_dispatcher(
+                Some(reentrant_process),
+                Some(reentrant_snapshot),
+                Some(reentrant_restore),
+                Some(noop_free),
+                Some(refusing_factory),
+            ),
+            NET_COMPUTE_OK
+        );
+    }
+
+    fn event() -> CausalEvent {
+        CausalEvent {
+            link: ::net::adapter::net::state::causal::CausalLink {
+                origin_hash: 1,
+                horizon_encoded: 0,
+                sequence: 1,
+                parent_hash: 0,
+            },
+            payload: bytes::Bytes::from_static(b"e"),
+            received_at: 0,
+        }
+    }
+
+    /// GOFFI-01: a bridge callback reached from inside a tokio runtime
+    /// context (the migration, stop, snapshot and group paths) may call a
+    /// blocking FFI operation. Before the fix the callback ran on the
+    /// entered thread, so its `block_on` aborted the whole test process.
+    #[test]
+    fn bridge_callbacks_inside_a_runtime_may_reenter_blocking_ffi() {
+        let _serial = reentrant_dispatch_serial();
+        install_reentrant_dispatcher();
+        let before = REENTERED.load(AtomicOrdering::SeqCst);
+        let (processed, snapshot, restored) = runtime().block_on(async {
+            let mut bridge = GoBridge::build("reentrant".to_string(), 0xA1);
+            (
+                bridge.process(&event()),
+                bridge.snapshot(),
+                bridge.restore(bytes::Bytes::from_static(b"state")),
+            )
+        });
+        assert!(processed.is_ok(), "process: {processed:?}");
+        assert!(snapshot.is_none(), "the stand-in snapshot is stateless");
+        assert!(restored.is_ok(), "restore: {restored:?}");
+        assert_eq!(REENTERED.load(AtomicOrdering::SeqCst) - before, 3);
+    }
+
+    /// GOFFI-01: outside a runtime context (the `deliver` hot path, which
+    /// no longer enters one) a callback runs inline, on the caller's thread.
+    #[test]
+    fn callbacks_outside_a_runtime_run_inline() {
+        let caller = std::thread::current().id();
+        assert_eq!(
+            run_go_callback(|| std::thread::current().id()),
+            Some(caller)
+        );
+        let inside = runtime().block_on(async { run_go_callback(|| std::thread::current().id()) });
+        assert!(inside.is_some());
+        assert_ne!(inside, Some(caller), "inside a context it hops threads");
+
+        let _serial = reentrant_dispatch_serial();
+        install_reentrant_dispatcher();
+        let mut bridge = GoBridge::build("inline".to_string(), 0xA2);
+        assert!(bridge.process(&event()).is_ok());
+    }
+
+    /// GOFFI-01: a callback that panics is reported as "could not run",
+    /// not propagated across the hop.
+    #[test]
+    fn a_panicking_callback_inside_a_runtime_reports_none() {
+        let out =
+            runtime().block_on(async { run_go_callback(|| -> u8 { panic!("callback panicked") }) });
+        assert_eq!(out, None);
     }
 }

@@ -939,3 +939,67 @@ func TestDeliver_ACloseDuringProcessDoesNotWaitForDeliver(t *testing.T) {
 		t.Fatalf("after Close: Start = %v, want ErrRuntimeShutDown", err)
 	}
 }
+
+// peekerDaemon's Process calls a blocking Go API on another daemon:
+// Snapshot of `other`, through the same runtime. It returns what it read.
+type peekerDaemon struct {
+	rt    *DaemonRuntime
+	other uint64
+}
+
+func (p *peekerDaemon) Process(_ CausalEvent) ([][]byte, error) {
+	snap, err := p.rt.Snapshot(p.other)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{snap}, nil
+}
+
+// BUG_AUDIT_2026_11_14 GOFFI-01: a daemon's Process may call an ordinary,
+// safe Go API on a different daemon. Deliver used to run Process inside the
+// FFI's tokio runtime context, so the nested Snapshot's blocking entry point
+// hit the runtime-in-runtime guard and aborted the whole process.
+func TestDeliver_ProcessMayReenterSnapshotOfAnotherDaemon(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	counterID := newTestIdentity(t)
+	defer counterID.Close()
+	counter, err := rt.Spawn("counter", counterID, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("Spawn(counter): %v", err)
+	}
+	defer counter.Close()
+	for i := uint64(1); i <= 2; i++ {
+		if _, err := rt.Deliver(counter.OriginHash(), CausalEvent{OriginHash: counterID.OriginHash(), Sequence: i}); err != nil {
+			t.Fatalf("Deliver(counter, %d): %v", i, err)
+		}
+	}
+
+	peekerID := newTestIdentity(t)
+	defer peekerID.Close()
+	peeker, err := rt.Spawn("peeker", peekerID, &peekerDaemon{rt: rt, other: counter.OriginHash()}, nil)
+	if err != nil {
+		t.Fatalf("Spawn(peeker): %v", err)
+	}
+	defer peeker.Close()
+
+	out, err := rt.Deliver(peeker.OriginHash(), CausalEvent{OriginHash: peekerID.OriginHash(), Sequence: 1})
+	if err != nil {
+		t.Fatalf("Deliver(peeker): %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("Deliver(peeker): len(outputs) = %d, want 1", len(out))
+	}
+	if got := readU32LE(out[0]); got != 2 {
+		t.Errorf("the peeker read the counter's snapshot as %d, want 2", got)
+	}
+}

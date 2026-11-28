@@ -204,6 +204,14 @@ impl CausalChainBuilder {
         &self.head
     }
 
+    /// The payload of the head event: the bytes the NEXT event's
+    /// `parent_hash` is computed over. A snapshot must carry exactly this
+    /// (`StateSnapshot::head_payload`) for its restore to continue the chain
+    /// (BUG_AUDIT_2026_11_14 STATE-03). Empty at genesis.
+    pub fn head_payload(&self) -> &Bytes {
+        &self.head_payload
+    }
+
     /// Get the current sequence number.
     #[inline]
     pub fn sequence(&self) -> u64 {

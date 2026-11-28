@@ -48,6 +48,10 @@ pub enum MockMode {
     /// Verify never answers inside the deadline (structured retryable
     /// timeout — policy decides fail-closed / retry / fallback).
     VerificationTimeout,
+    /// Verify passes and the transfer SETTLES, but the settle response is
+    /// lost: the facilitator reports a retryable timeout. The ambiguous
+    /// outcome BUG_AUDIT_2026_11_14 PAY-03 is about.
+    SettleTimeoutAfterSettling,
 }
 
 #[derive(Default)]
@@ -183,7 +187,9 @@ impl Facilitator for MockFacilitator {
             MockMode::Replay => Self::invalid("payload_replayed"),
             MockMode::WrongAmount => Self::invalid("wrong_amount"),
             MockMode::ReorgInvalidate if calls > 1 => Self::invalid("reorged_out"),
-            MockMode::Success | MockMode::ReorgInvalidate => VerifyResponse {
+            MockMode::Success
+            | MockMode::ReorgInvalidate
+            | MockMode::SettleTimeoutAfterSettling => VerifyResponse {
                 is_valid: true,
                 invalid_reason: None,
                 payer: None,
@@ -213,6 +219,12 @@ impl Facilitator for MockFacilitator {
             }
         }
 
+        if mode == MockMode::SettleTimeoutAfterSettling {
+            // Recorded as settled above; only the answer is lost.
+            return Err(FacilitatorError::timeout(
+                "mock facilitator armed with settle_timeout_after_settling",
+            ));
+        }
         let amount = &requirements.view().amount;
         let response = match mode {
             MockMode::Replay => SettlementResponse {
@@ -244,17 +256,18 @@ impl Facilitator for MockFacilitator {
                 amount: Some(short_by_one(amount)),
                 extensions: None,
             },
-            MockMode::Success | MockMode::ReorgInvalidate | MockMode::VerificationTimeout => {
-                SettlementResponse {
-                    success: true,
-                    error_reason: None,
-                    payer: None,
-                    transaction: Self::tx_for(payload),
-                    network: MOCK_NETWORK.to_string(),
-                    amount: Some(amount.clone()),
-                    extensions: None,
-                }
-            }
+            MockMode::Success
+            | MockMode::ReorgInvalidate
+            | MockMode::VerificationTimeout
+            | MockMode::SettleTimeoutAfterSettling => SettlementResponse {
+                success: true,
+                error_reason: None,
+                payer: None,
+                transaction: Self::tx_for(payload),
+                network: MOCK_NETWORK.to_string(),
+                amount: Some(amount.clone()),
+                extensions: None,
+            },
         };
         Ok(SettleOutcome {
             response: Self::author_settle(&response)?,
